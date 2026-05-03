@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Quantitative trading strategy research on China A-shares using BigQuant SDK"
 requires-python = ">=3.11"
 dependencies = [
+    "akshare>=1.18.60",
     "bigquant[all]",
     "httpx<0.28",
     "polars",
