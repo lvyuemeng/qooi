@@ -29,6 +29,10 @@ Thumbs.db
 # Environment (contains API keys)
 .env*
 
+# Generated data (cache + charts)
+data/cache/
+data/charts/
+
 # Logs
 *.log
 logs/
