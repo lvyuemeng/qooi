@@ -23,6 +23,9 @@ Thumbs.db
 # Local scratch issues (tracked in repo but ignored by editors)
 .scratch/**/.DS_Store
 
+# Environment (contains API keys)
+.env
+
 # Logs
 *.log
 logs/

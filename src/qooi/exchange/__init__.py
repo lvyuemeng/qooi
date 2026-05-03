@@ -4,14 +4,14 @@ Public market data (no API key needed):
     >>> from qooi.exchange.market import MarketData
     >>> md = MarketData()
     >>> df = md.candles("BTC-USDT", bar="1H", limit=50)
-    >>> df
 
-Trading (API key required, see ``scripts/trade_okx.py``):
+Trading (API key via env vars OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE):
     >>> from qooi.exchange.trading import TradingClient
-    >>> tc = TradingClient(api_key="...", secret_key="...", passphrase="...")
-    >>> tc.place_order("BTC-USDT", side="buy", sz="0.01")
+    >>> tc = TradingClient()
+    >>> tc.balance()
 """
 
 from qooi.exchange.market import MarketData
+from qooi.exchange.trading import TradingClient
 
-__all__ = ["MarketData"]
+__all__ = ["MarketData", "TradingClient"]
