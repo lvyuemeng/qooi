@@ -1,23 +1,15 @@
-"""Strategy evaluation metrics — IC, IR, win rate, profit/loss ratio, drawdown, etc.
-
-All functions work with the DataFrame produced by ``BacktestResult.equity_curve``
-which has columns: timestamp, close, signal, position, portfolio_value, returns.
-"""
+"""Strategy evaluation metrics — IC, IR, win rate, profit/loss ratio, drawdown, etc."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 
-import numpy as np
 import polars as pl
 
 
 @dataclass
 class EvalMetrics:
-    """Comprehensive strategy evaluation report."""
-
-    # Return & risk
     total_return_pct: float
     annual_return_pct: float
     annual_volatility_pct: float
@@ -27,8 +19,6 @@ class EvalMetrics:
     max_drawdown_pct: float
     avg_drawdown_pct: float
     drawdown_days: int
-
-    # Trade statistics
     num_trades: int
     win_rate_pct: float
     avg_win_pct: float
@@ -36,14 +26,37 @@ class EvalMetrics:
     profit_loss_ratio: float
     expectancy: float
     profit_factor: float
-
-    # Information coefficient
     ic_mean: float
     ic_std: float
     ic_ir: float
     ic_positive_pct: float
-
     factor_return_pct: float
+
+    def __str__(self) -> str:
+        lines = [
+            f"  Return:   {self.total_return_pct:>7.2f}%  Ann.Return: {self.annual_return_pct:.2f}%",  # noqa: E501
+            f"  Ann.Vol:  {self.annual_volatility_pct:>7.2f}%  Sharpe:     {self.sharpe_ratio:.2f}",
+            f"  Sortino:  {self.sortino_ratio:>7.2f}  Calmar:     {self.calmar_ratio:.2f}",
+            f"  Max DD:   {self.max_drawdown_pct:>7.2f}%  Avg DD:     {self.avg_drawdown_pct:.2f}%",
+            f"  DD Days:  {self.drawdown_days:>7d}",
+            f"  Win Rate: {self.win_rate_pct:>7.2f}%  Trades:     {self.num_trades}",
+            f"  IC Mean:  {self.ic_mean:>7.4f}  IC IR:      {self.ic_ir:.2f}",
+            f"  IC Pos:   {self.ic_positive_pct:>7.1f}%",
+        ]
+        sep = "=" * 50
+        return f"\n{sep}\n" + "\n".join(lines) + f"\n{sep}"
+
+
+def _spearman_rho(x: pl.Series, y: pl.Series) -> float:
+    if x.len() < 3:
+        return 0.0
+    rx = x.rank().to_numpy()
+    ry = y.rank().to_numpy()
+    rxm, rym = float(rx.mean()), float(ry.mean())
+    d = rx - rxm
+    e = ry - rym
+    denom = math.sqrt((d * d).sum() * (e * e).sum())
+    return float((d * e).sum()) / denom if denom > 1e-10 else 0.0
 
 
 def compute_metrics(
@@ -52,170 +65,105 @@ def compute_metrics(
     risk_free_rate: float = 0.02,
     periods_per_year: int = 365,
 ) -> EvalMetrics:
-    """Compute all evaluation metrics from a backtest result.
+    has_real_trades = trades is not None and not trades.is_empty() and "pnl" in trades.columns
+    eq = equity_curve["portfolio_value"]
+    rets = equity_curve["returns"]
+    n = rets.len()
 
-    Parameters
-    ----------
-    equity_curve:
-        Must have columns: portfolio_value, returns (daily returns).
-    trades:
-        Optional trade log with columns: entry_time, pnl.
-    risk_free_rate:
-        Annual risk-free rate (default 2%).
-    periods_per_year:
-        Annualization factor (365 for daily, 365*24 for hourly, etc.)
-    """
-    rets = equity_curve["returns"].to_list()
-    equity = equity_curve["portfolio_value"].to_list()
-
-    # --- Basic return & risk ---
-    total_ret = (equity[-1] / equity[0]) - 1
-    n = len(rets)
+    # --- Basic return & risk (Polars expressions) ---
+    total_ret = float(eq.last() / eq.first() - 1)
     ann_factor = periods_per_year / n if n > 0 else 1.0
     ann_ret = (1 + total_ret) ** ann_factor - 1 if total_ret > -1 else -1.0
 
-    ret_arr = np.array(rets, dtype=np.float64)
-    std = float(np.nanstd(ret_arr)) if n > 1 else 0.0
+    std = float(rets.std()) if n > 1 else 0.0
     ann_vol = std * math.sqrt(periods_per_year) if std > 0 else 0.0
     excess = ann_ret - risk_free_rate
     sharpe = excess / ann_vol if ann_vol > 0 else 0.0
 
-    # Sortino (downside deviation only)
-    neg_rets = ret_arr[ret_arr < 0]
-    downside = float(np.nanstd(neg_rets)) if len(neg_rets) > 1 else 0.0
+    # Sortino
+    neg_rets = rets.filter(rets < 0)
+    downside = float(neg_rets.std()) if neg_rets.len() > 1 else 0.0
     ann_downside = downside * math.sqrt(periods_per_year)
     sortino = excess / ann_downside if ann_downside > 0 else 0.0
 
-    # Drawdown
-    peaks = [equity[0]]
-    dd_series = [0.0]
-    for v in equity[1:]:
-        p = max(peaks[-1], v)
-        peaks.append(p)
-        dd_series.append((p - v) / p if p > 0 else 0.0)
-    max_dd = max(dd_series) if dd_series else 0.0
-    avg_dd = float(np.mean(dd_series)) if dd_series else 0.0
-
+    # Drawdown (Polars expression)
+    peak = eq.cum_max()
+    dd = (peak - eq) / peak
+    max_dd = float(dd.max())
+    avg_dd = float(dd.mean())
     calmar = ann_ret / max_dd if max_dd > 0 else 0.0
 
-    # Drawdown duration
+    # Consecutive drawdown days — needs iteration, keep as list
+    dd_iter = iter(dd)
     dd_days = 0
-    for i, dd in enumerate(dd_series):
-        if dd > 0.01:
+    for v in dd_iter:
+        if v > 0.01:
             dd_days += 1
         else:
             dd_days = 0
 
     # --- Trade statistics ---
-    num_trades = 0
-    win_rate = 0.0
-    avg_win = 0.0
-    avg_loss = 0.0
-    pl_ratio = 0.0
-    expectancy = 0.0
-    profit_factor = 0.0
-
-    if trades is not None and not trades.is_empty():
-        pnl_col = "pnl"
-        if pnl_col not in trades.columns:
-            # Try to compute PnL from signal changes if no trade log
-            pnl_vals = []
-        else:
-            pnl_vals = trades[pnl_col].to_list()
-
-        if len(pnl_vals) > 0:
-            wins = [p for p in pnl_vals if p > 0]
-            losses = [p for p in pnl_vals if p <= 0]
-            num_trades = len(pnl_vals)
-            n_wins = len(wins)
-            n_losses = len(losses)
-            win_rate = n_wins / num_trades if num_trades > 0 else 0.0
-            avg_win = float(np.mean(wins)) if n_wins > 0 else 0.0
-            avg_loss = abs(float(np.mean(losses))) if n_losses > 0 else 0.0
-            pl_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
-            expectancy = (win_rate * avg_win - (1 - win_rate) * avg_loss) if avg_loss > 0 else 0.0
-            total_win = sum(wins)
-            total_loss = abs(sum(losses))
-            profit_factor = total_win / total_loss if total_loss > 0 else float("inf")
+    if has_real_trades:
+        pnl = trades["pnl"]
     else:
-        # Infer trades from position changes
-        # A trade starts when position changes value (enter or flip).
-        # Trade PnL = cumulative equity return over the holding period.
-        pos = equity_curve["position"].to_list()
-        trade_rets = []
+        pos = equity_curve["position"]
+        entry_equity: list[float] = []
+        entry_idx: list[int] = []
         i = 1
-        while i < len(pos):
-            if pos[i] != pos[i - 1]:
-                entry = i
-                entry_signal = pos[i]
-                i += 1
-                while i < len(pos) and pos[i] == entry_signal:
-                    i += 1
-                exit_ = min(i, len(pos))
-                if exit_ > entry:
-                    pnl = (equity[exit_ - 1] - equity[entry - 1]) / equity[entry - 1]
-                    trade_rets.append(pnl)
+        pos_arr = pos.to_list()
+        eq_arr = eq.to_list()
+        while i < len(pos_arr):
+            if pos_arr[i] != pos_arr[i - 1]:
+                entry_idx.append(i)
+                j = i + 1
+                while j < len(pos_arr) and pos_arr[j] == pos_arr[i]:
+                    j += 1
+                if j > i:
+                    entry_equity.append((eq_arr[j - 1] - eq_arr[i - 1]) / eq_arr[i - 1])
+                i = j
                 continue
             i += 1
-        if trade_rets:
-            wins = [r for r in trade_rets if r > 0]
-            losses = [r for r in trade_rets if r <= 0]
-            num_trades = len(trade_rets)
-            win_rate = len(wins) / num_trades if num_trades > 0 else 0.0
-            avg_win = float(np.mean(wins)) * 100 if wins else 0.0
-            avg_loss = abs(float(np.mean(losses))) * 100 if losses else 0.0
-            pl_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
+        pnl = pl.Series(entry_equity) if entry_equity else pl.Series([], dtype=pl.Float64)
 
-    # --- Information Coefficient (time-series rank correlation, pure numpy) ---
-    ic_values = []
-    df = equity_curve.with_columns(pl.col("returns").shift(-1).alias("fwd_return")).drop_nulls(
+    win_pnl = pnl.filter(pnl > 0)
+    loss_pnl = pnl.filter(pnl <= 0)
+    num_trades = pnl.len()
+    nw = win_pnl.len()
+    nl = loss_pnl.len()
+    win_rate = nw / num_trades if num_trades > 0 else 0.0
+    avg_win = float(win_pnl.mean()) * 100 if nw > 0 else 0.0
+    avg_loss = abs(float(loss_pnl.mean())) * 100 if nl > 0 else 0.0
+    pl_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
+    total_win = float(win_pnl.sum())
+    total_loss = abs(float(loss_pnl.sum()))
+    profit_factor = total_win / total_loss if total_loss > 0 else float("inf")
+    expectancy = (win_rate * avg_win - (1 - win_rate) * avg_loss) if avg_loss > 0 else 0.0
+
+    # --- Information Coefficient (rolling Spearman) ---
+    ic_df = equity_curve.with_columns(rets.shift(-1).alias("fwd_return")).drop_nulls(
         ["signal", "fwd_return"]
     )
+    ic_values: list[float] = []
+    if ic_df.height > 10:
+        window = min(60, ic_df.height // 2)
+        sig_s = ic_df["signal"]
+        fwd_s = ic_df["fwd_return"]
+        for i in range(window, ic_df.height):
+            sw = sig_s.slice(i - window, window)
+            fw = fwd_s.slice(i - window, window)
+            if sw.std() == 0 or fw.std() == 0:
+                continue
+            ic_values.append(_spearman_rho(sw, fw))
+    elif ic_df.height > 3:
+        rho = _spearman_rho(ic_df["signal"], ic_df["fwd_return"])
+        if rho != 0.0:
+            ic_values.append(rho)
 
-    sig_arr = df["signal"].to_numpy()
-    fwd_arr = df["fwd_return"].to_numpy()
-    if len(sig_arr) > 10:
-        window = min(60, len(sig_arr) // 2)
-        for i in range(window, len(sig_arr)):
-            try:
-                _s = sig_arr[i - window : i]
-                _f = fwd_arr[i - window : i]
-                if np.nanstd(_s) == 0 or np.nanstd(_f) == 0:
-                    continue
-                s_rank = np.argsort(np.argsort(_s)).astype(np.float64)
-                f_rank = np.argsort(np.argsort(_f)).astype(np.float64)
-                s_rank -= s_rank.mean()
-                f_rank -= f_rank.mean()
-                rho = (s_rank * f_rank).sum() / math.sqrt(
-                    (s_rank**2).sum() * (f_rank**2).sum() + 1e-10
-                )
-                ic_values.append(rho)
-            except Exception:
-                pass
-    else:
-        try:
-            if np.nanstd(sig_arr) > 0 and np.nanstd(fwd_arr) > 0:
-                _s = sig_arr
-                _f = fwd_arr
-                s_rank = np.argsort(np.argsort(_s)).astype(np.float64)
-                f_rank = np.argsort(np.argsort(_f)).astype(np.float64)
-                s_rank -= s_rank.mean()
-                f_rank -= f_rank.mean()
-                rho = (s_rank * f_rank).sum() / math.sqrt(
-                    (s_rank**2).sum() * (f_rank**2).sum() + 1e-10
-                )
-                ic_values.append(rho)
-        except Exception:
-            pass
-
-    ic_arr = np.array(ic_values) if ic_values else np.array([0.0])
-    ic_mean = float(np.mean(ic_arr))
-    ic_std = float(np.std(ic_arr)) if len(ic_arr) > 1 else 0.0
+    ic_s = pl.Series(ic_values) if ic_values else pl.Series([0.0])
+    ic_mean = float(ic_s.mean())
+    ic_std = float(ic_s.std()) if ic_s.len() > 1 else 0.0
     ic_ir = ic_mean / ic_std if ic_std > 0 else 0.0
-    ic_pos = float(np.sum(ic_arr > 0)) / len(ic_arr) * 100 if len(ic_arr) > 0 else 0.0
-
-    # --- Factor-style metrics ---
-    factor_ret = total_ret * 100
+    ic_pos = float((ic_s > 0).sum()) / ic_s.len() * 100 if ic_s.len() > 0 else 0.0
 
     return EvalMetrics(
         total_return_pct=round(total_ret * 100, 2),
@@ -238,5 +186,5 @@ def compute_metrics(
         ic_std=round(ic_std, 4),
         ic_ir=round(ic_ir, 2),
         ic_positive_pct=round(ic_pos, 1),
-        factor_return_pct=round(factor_ret, 2),
+        factor_return_pct=round(total_ret * 100, 2),
     )
