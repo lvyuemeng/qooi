@@ -8,6 +8,7 @@ dependencies = [
     "bigquant[all]",
     "httpx<0.28",
     "polars",
+    "python-okx>=0.4.1",
     "tickflow>=0.1.21",
 ]
 

@@ -300,9 +300,10 @@ def add_factor_ranks(df):
     x["rank_quality"] = x.groupby("date")["operating_yield"].rank(
         pct=True, ascending=False
     )
-    x["rank_low_turnover_proxy"] = x.groupby("date")["amount_to_float_mv"].rank(
-        pct=True, ascending=True
-    )
+    if "amount_to_float_mv" in x.columns:
+        x["rank_low_turnover_proxy"] = x.groupby("date")["amount_to_float_mv"].rank(
+            pct=True, ascending=True
+        )
 
     x["rev60_pct"] = x.groupby("date")["ret_60d"].rank(pct=True, ascending=True)
     x["mid_rev60_score_raw"] = (x["rev60_pct"] - 0.40).abs()

@@ -15,8 +15,9 @@ Quantitative trading strategy research on China A-share stock market.
 | Priority | Source | Scope | Cost |
 |----------|--------|-------|------|
 | 1 | **TickFlow** (free tier) | A-share daily K-line, ETFs, futures, HK, US | Free, no auth |
-| 2 | **BigQuant DAI** | Full A-share data (real-time, minute, fundamentals) | Paid plan needed |
-| 3 | **MOOTDX** (fallback) | TDX local/online data | Free, requires TDX |
+| 2 | **OKX Market API** | Crypto spot/perp/futures/option OHLCV, order book, ticker | Free, no auth |
+| 3 | **BigQuant DAI** | Full A-share data (real-time, minute, fundamentals) | Paid plan needed |
+| 4 | **MOOTDX** (fallback) | TDX local/online data | Free, requires TDX |
 
 ## Preferences
 
