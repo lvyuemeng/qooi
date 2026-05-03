@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+
+# BigQuant
+.bigquant/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local scratch issues (tracked in repo but ignored by editors)
+.scratch/**/.DS_Store
+
+# Logs
+*.log
+logs/
