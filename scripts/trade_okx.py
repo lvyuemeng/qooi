@@ -1,31 +1,43 @@
 """Demo: OKX trading client — account, positions, place/cancel orders.
 
-Before running, set your API credentials:
+Before running, set your API credentials in ``.env``:
 
-    # Windows (PowerShell):
-    $env:OKX_API_KEY="your-api-key"
-    $env:OKX_SECRET_KEY="your-secret-key"
-    $env:OKX_PASSPHRASE="your-passphrase"
-
-    # Or create a .env file in project root:
     OKX_API_KEY=your-api-key
     OKX_SECRET_KEY=your-secret-key
     OKX_PASSPHRASE=your-passphrase
+    OKX_FLAG=0        # 0 = live, 1 = testnet (use separate key)
 
-Then run:
+Your current API key was created on the **live** environment.
+To use testnet, create a separate key at https://www.okx.com/account/my-api
+and set ``OKX_FLAG=1``.
+
+Run:
     uv run python scripts/trade_okx.py
 """
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from qooi.exchange import TradingClient
 
 
 def main() -> None:
-    tc = TradingClient(flag="1")  # "1" = demo/testnet, "0" = live
+    flag = os.getenv("OKX_FLAG", "1")
+    print(f"Environment: {'LIVE' if flag == '0' else 'TESTNET'}")
+    print()
+
+    tc = TradingClient(flag=flag)
 
     print("=== Account Balance ===")
     try:
         bal = tc.balance()
-        print(bal.select(["ccy", "eq", "availBal", "frozenBal"]))
+        if bal.is_empty():
+            print("(empty — no assets)")
+        else:
+            print(bal.select(["ccy", "eq", "availBal", "frozenBal"]))
     except Exception as e:
         print(f"Balance error: {e}")
 
@@ -39,14 +51,14 @@ def main() -> None:
     except Exception as e:
         print(f"Positions error: {e}")
 
-    print("\n=== Place a market buy (0.001 BTC-USDT) ===")
+    print("\n=== Place a market buy (10 USDT worth of SOL-USDT) ===")
     try:
-        order = tc.place_order("BTC-USDT", side="buy", ord_type="market", sz="0.001")
+        order = tc.place_order("SOL-USDT", side="buy", ord_type="market", sz="10")
         print("Order placed:", order)
         ord_id = order.get("ordId", "")
         if ord_id:
             print("\n=== Order status ===")
-            status = tc.get_order("BTC-USDT", ord_id=ord_id)
+            status = tc.get_order("SOL-USDT", ord_id=ord_id)
             print(status)
     except Exception as e:
         print(f"Order error: {e}")
