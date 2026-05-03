@@ -1,23 +1,15 @@
 [project]
 name = "qooi"
 version = "0.1.0"
-description = "Quantitative trading strategy research on China A-shares using BigQuant SDK"
+description = "Crypto quantitative trading toolkit — OKX market data, backtesting, evaluation"
 requires-python = ">=3.11"
 dependencies = [
-    "akshare>=1.18.60",
-    "bigquant[all]",
-    "httpx<0.28",
-    "matplotlib>=3.11.0rc1",
-    "polars",
+    "httpx>=0.27,<0.28",
+    "matplotlib>=3.10",
+    "polars>=1.0",
+    "python-dotenv>=1.0",
     "python-okx>=0.4.1",
-
-    "tickflow>=0.1.21",
 ]
-
-[[tool.uv.index]]
-name = "bigquant-pypi"
-url = "https://pypi.bigquant.com/simple/"
-priority = "supplemental"
 
 [build-system]
 requires = ["hatchling"]
@@ -44,5 +36,4 @@ packages = ["src/qooi"]
 [tool.uv]
 prerelease = "allow"
 
-[project.scripts]
-bq = "bigquant.cli.main:main"
+

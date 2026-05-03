@@ -179,7 +179,7 @@ class Backtest:
                     }
                 )
 
-        eq_series = pl.Series(equity)
+        eq_series = pl.Series(equity, dtype=pl.Float64)
         result_df = df.select(["timestamp", "close", "signal"]).with_columns(
             [
                 pl.Series(pos).alias("position"),
@@ -213,9 +213,6 @@ class Backtest:
         timestamp = df["timestamp"].to_list()
 
         walk_results: list[dict] = []
-        all_eq = [self.initial_capital]
-        all_trades: list[dict] = []
-        all_pos = [0.0]
 
         for start_win in range(0, n_windows - window_total + 1, w.step):
             train_end = (start_win + w.train_windows) * window_bars
@@ -236,31 +233,13 @@ class Backtest:
                     | {"segment": label, "start_ts": timestamp[lo], "end_ts": timestamp[hi - 1]}
                 )
 
-                # Accumulate equity curve
-                seg_eq = result.equity_curve["portfolio_value"].to_list()
-                if len(all_eq) >= lo:
-                    eq_scaled = [v * all_eq[lo - 1] / seg_eq[0] for v in seg_eq]
-                    all_eq = all_eq[:lo] + eq_scaled
-                else:
-                    all_eq += seg_eq
-
-        # Build combined result
-        eq_series = pl.Series(all_eq[: len(df)])
-        result_df = df.select(["timestamp", "close", "signal"]).with_columns(
-            [
-                pl.Series(all_pos[: len(df)]).alias("position"),
-                eq_series.alias("portfolio_value"),
-                eq_series.pct_change().fill_null(0.0).alias("returns"),
-            ]
-        )
-        trade_df = pl.DataFrame(all_trades) if all_trades else pl.DataFrame()
+        # Use the last (holdout) segment as the main result for charting
+        last_result = self._run_single(df, label="walk_forward")
 
         return BacktestResult(
-            trades=trade_df,
-            equity_curve=result_df,
-            metrics=self._compute_metrics(
-                all_eq, result_df["returns"].to_list(), all_trades, "walk_forward"
-            ),
+            trades=last_result.trades,
+            equity_curve=last_result.equity_curve,
+            metrics=last_result.metrics,
             walk_forward=walk_results,
         )
 
