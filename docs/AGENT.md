@@ -35,6 +35,7 @@ qooi/
 | 类型注解       | 所有函数必须标注类型          |
 | import         | `from bigquant import dai / bigtrader` |
 | 认证方式       | 本地 `bq auth configure`，不提交凭证 |
+| DataFrame 库   | 优先 Polars (`result.pl()`)，避免 pandas |
 
 ## 工作流
 

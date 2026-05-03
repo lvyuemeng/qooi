@@ -10,6 +10,10 @@ Quantitative trading strategy research on China A-share stock market.
 - **Python management**: `uv` — no global Python state
 - **Python version**: 3.11–3.13
 
+## Preferences
+
+- **DataFrame library**: Polars preferred over pandas. Use `result.pl()` instead of `result.df()` when calling BigQuant DAI queries.
+
 ## Glossary
 
 | Term | Definition |

@@ -1,0 +1,21 @@
+[project]
+name = "qooi"
+version = "0.1.0"
+description = "Quantitative trading strategy research on China A-shares using BigQuant SDK"
+requires-python = ">=3.11"
+dependencies = ["bigquant[all]", "polars"]
+
+[[tool.uv.index]]
+name = "bigquant-pypi"
+url = "https://pypi.bigquant.com/simple/"
+priority = "supplemental"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qooi"]
+
+[tool.uv]
+prerelease = "allow"
