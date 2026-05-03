@@ -32,6 +32,7 @@ from qooi.exchange.backtest import (  # noqa: E402
     Backtest,
     BacktestResult,
     CostModel,
+    RiskConfig,
     WalkForwardConfig,
 )
 from qooi.exchange.eval import EvalMetrics, compute_metrics  # noqa: E402
@@ -91,14 +92,16 @@ class Pipeline:
     def backtest(
         self,
         capital: float = 10_000,
-        cost: CostModel | None = None,
+        cost: CostModel = CostModel(),
+        risk: RiskConfig = RiskConfig(),
         walk_forward: WalkForwardConfig | None = None,
     ) -> Pipeline:
         bt = Backtest(
             data=self._s.df,
             signal_expr=pl.col("signal"),
             initial_capital=capital,
-            cost=cost or CostModel(),
+            cost=cost,
+            risk=risk,
             walk=walk_forward,
         )
         self._s.result = bt.run()
@@ -205,7 +208,8 @@ class Pipeline:
         days: int = 365,
         capital: float = 10_000,
         signal_expr: SignalExpr | None = None,
-        cost: CostModel | None = None,
+        cost: CostModel = CostModel(),
+        risk: RiskConfig = RiskConfig(),
         walk_forward: WalkForwardConfig | None = None,
         plot_out: str | None = None,
     ) -> Stage:
@@ -213,7 +217,7 @@ class Pipeline:
             self.load(symbol, bar, days)
             .indicators()
             .signal(signal_expr)
-            .backtest(capital=capital, cost=cost, walk_forward=walk_forward)
+            .backtest(capital=capital, cost=cost, risk=risk, walk_forward=walk_forward)
             .evaluate()
             .plot(out=plot_out)
         )
