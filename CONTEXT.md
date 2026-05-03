@@ -36,6 +36,13 @@ Quantitative trading strategy research on China A-share stock market.
 
 ## Workflow
 
-1. Explore data via `dai.query()` locally
-2. Develop strategy in `src/`, run backtest via `bigtrader.run()` in `scripts/`
-3. BigQuant AI Studio (cloud) only when distributed compute is essential
+1. **Research** — Paste `scripts/run_notebook.py` into AI Studio web, run to get factor reports + CSV signals
+2. **Download** CSVs from AI Studio to `data/signals/<strategy>.csv`
+3. **Backtest locally** — `uv run python scripts/backtest_csv.py --csv data/signals/<strategy>.csv`
+4. BigQuant AI Studio (cloud) only when DAI data access is needed
+
+## Research pipeline
+
+- `scripts/run_notebook.py` — complete factor research + 7 strategies, runs in AI Studio web
+- `src/qooi/research/` — local factor analysis module (Polars, for when DAI is available)
+- `scripts/backtest_csv.py` — local backtest using signal CSV + TickFlow bar data
