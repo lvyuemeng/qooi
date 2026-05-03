@@ -7,6 +7,7 @@ dependencies = [
     "akshare>=1.18.60",
     "bigquant[all]",
     "httpx<0.28",
+    "matplotlib>=3.11.0rc1",
     "polars",
     "python-okx>=0.4.1",
     "tickflow>=0.1.21",
