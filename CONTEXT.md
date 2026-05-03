@@ -46,4 +46,10 @@ Quantitative trading strategy research on China A-share stock market.
 
 - `scripts/run_notebook.py` — complete factor research + 7 strategies, runs in AI Studio web
 - `src/qooi/research/` — local factor analysis module (Polars, for when DAI is available)
-- `scripts/backtest_csv.py` — local backtest using signal CSV + TickFlow bar data
+
+## Alternative paths (not active)
+
+| Path | When to reconsider |
+|------|-------------------|
+| **A-share cross-section** | BigQuant DAI permission granted, or local factor pipeline via TickFlow + AkShare |
+| **NautilusTrader** | Need tick-level backtest, live trading, or multi-venue execution; current ~300-line engine insufficient |
