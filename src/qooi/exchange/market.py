@@ -74,9 +74,7 @@ class MarketData:
                 for r in rows
             ]
         ).sort("timestamp")
-        return df.with_columns(
-            pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("datetime")
-        )
+        return df.with_columns(pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("datetime"))
 
     def candles_history(
         self,
@@ -114,9 +112,7 @@ class MarketData:
                 for r in rows
             ]
         ).sort("timestamp")
-        return df.with_columns(
-            pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("datetime")
-        )
+        return df.with_columns(pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("datetime"))
 
     # ------------------------------------------------------------------
     # Ticker

@@ -184,9 +184,7 @@ class TradingClient:
         details = resp.get("data", [{}])[0].get("details", [])
         return pl.DataFrame(details)
 
-    def positions(
-        self, inst_type: str | None = None, inst_id: str | None = None
-    ) -> pl.DataFrame:
+    def positions(self, inst_type: str | None = None, inst_id: str | None = None) -> pl.DataFrame:
         """Get current positions."""
         params = {}
         if inst_type:

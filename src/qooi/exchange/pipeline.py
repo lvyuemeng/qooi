@@ -18,11 +18,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
-import polars as pl
 
 import matplotlib
+import polars as pl
 
 matplotlib.use("Agg")
 import matplotlib.dates as mdates
@@ -30,10 +28,11 @@ import matplotlib.pyplot as plt
 
 plt.style.use("dark_background")
 
-from qooi.exchange.backtest import Backtest, BacktestResult
-from qooi.exchange.indicator import add_indicators
-from qooi.exchange.store import CacheStore
-from qooi.strategies import sma_cross_signal
+from qooi.exchange.backtest import Backtest, BacktestResult  # noqa: E402
+from qooi.exchange.eval import EvalMetrics, compute_metrics  # noqa: E402
+from qooi.exchange.indicator import add_indicators  # noqa: E402
+from qooi.exchange.store import CacheStore  # noqa: E402
+from qooi.strategies import sma_cross_signal  # noqa: E402
 
 SignalExpr = pl.Expr
 
@@ -42,6 +41,7 @@ SignalExpr = pl.Expr
 class Stage:
     df: pl.DataFrame = field(default_factory=pl.DataFrame)
     result: BacktestResult | None = None
+    eval: EvalMetrics | None = None
     chart_path: str | None = None
 
 
@@ -66,9 +66,7 @@ class Pipeline:
     # Stage 1 — Load
     # ------------------------------------------------------------------
 
-    def load(
-        self, symbol: str = "BTC-USDT", bar: str = "1D", days: int = 90
-    ) -> "Pipeline":
+    def load(self, symbol: str = "BTC-USDT", bar: str = "1D", days: int = 90) -> Pipeline:
         try:
             df = self._cs.load(symbol, bar=bar)
         except FileNotFoundError:
@@ -80,8 +78,7 @@ class Pipeline:
     # Stage 2 — Indicators
     # ------------------------------------------------------------------
 
-    def indicators(self) -> "Pipeline":
-        cols_before = set(self._s.df.columns)
+    def indicators(self) -> Pipeline:
         self._s.df = add_indicators(self._s.df)
         return self
 
@@ -89,7 +86,7 @@ class Pipeline:
     # Stage 3 — Signal
     # ------------------------------------------------------------------
 
-    def signal(self, expr: SignalExpr | None = None) -> "Pipeline":
+    def signal(self, expr: SignalExpr | None = None) -> Pipeline:
         _expr: SignalExpr = expr if expr is not None else sma_cross_signal(10, 30)
         self._s.df = self._s.df.with_columns(_expr.alias("signal"))
         return self
@@ -103,7 +100,7 @@ class Pipeline:
         capital: float = 10_000,
         commission: float = 0.001,
         slippage: float = 0.0005,
-    ) -> "Pipeline":
+    ) -> Pipeline:
         bt = Backtest(
             data=self._s.df,
             signal_expr=pl.col("signal"),
@@ -125,7 +122,6 @@ class Pipeline:
 
         df = result.equity_curve
         m = result.metrics
-        symbol = "Backtest"
         times = pl.from_epoch(df["timestamp"], time_unit="ms").to_list()
         close = df["close"].to_list()
         equity = df["portfolio_value"].to_list()
@@ -188,6 +184,20 @@ class Pipeline:
         return self._s
 
     # ------------------------------------------------------------------
+    # Stage 5 — Evaluate
+    # ------------------------------------------------------------------
+
+    def evaluate(self) -> Pipeline:
+        result = self._s.result
+        if result is None:
+            raise RuntimeError("call .backtest() before .evaluate()")
+        self._s.eval = compute_metrics(
+            equity_curve=result.equity_curve,
+            trades=result.trades,
+        )
+        return self
+
+    # ------------------------------------------------------------------
     # Shortcuts
     # ------------------------------------------------------------------
 
@@ -206,5 +216,6 @@ class Pipeline:
             .indicators()
             .signal(signal_expr)
             .backtest(capital=capital)
+            .evaluate()
             .plot(out=plot_out)
         )

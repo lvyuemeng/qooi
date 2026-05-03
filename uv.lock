@@ -2020,6 +2020,11 @@ dependencies = [
     { name = "tickflow" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "ruff" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "akshare", specifier = ">=1.18.60" },
@@ -2030,6 +2035,9 @@ requires-dist = [
     { name = "python-okx", specifier = ">=0.4.1" },
     { name = "tickflow", specifier = ">=0.1.21" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "ruff", specifier = ">=0.15.12" }]
 
 [[package]]
 name = "ray"

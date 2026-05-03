@@ -73,9 +73,7 @@ class DataSource:
 
         Requires a paid API key. Free tier will raise an error.
         """
-        df = self._tf.klines.intraday(
-            symbol, period=period, count=count, as_dataframe=True
-        )
+        df = self._tf.klines.intraday(symbol, period=period, count=count, as_dataframe=True)
         return pl.from_pandas(df)
 
     # ------------------------------------------------------------------

@@ -14,8 +14,8 @@ Usage::
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
 import polars as pl
 
 
@@ -88,6 +88,7 @@ class Backtest:
 
         equity = [self.initial_capital]
         trade_log: list[dict] = []
+        active_trades: dict[float, dict] = {}  # signal_value -> trade_info
 
         for i in range(1, n):
             prev_equity = equity[-1]
@@ -95,41 +96,58 @@ class Backtest:
             p_prev = pos[i - 1]
 
             if p != p_prev:
-                # Trade occurred: apply commission + slippage
-                cost = self.commission_pct + self.slippage_pct
-                trade_val = prev_equity * cost
-                equity[-1] = prev_equity - trade_val
-                trade_log.append(
-                    {
-                        "entry_time": df["timestamp"][i],
-                        "exit_time": df["timestamp"][i],
-                        "side": "long"
-                        if p > p_prev
-                        else "short"
-                        if p < p_prev
-                        else "flat",
-                        "size_pct": abs(p - p_prev),
-                        "commission": trade_val,
-                        "pnl": 0.0,
+                # Close existing trades
+                for sig_val, t in list(active_trades.items()):
+                    pnl = prev_equity - t["entry_equity"]
+                    trade_log.append(
+                        {
+                            "entry_time": t["entry_ts"],
+                            "exit_time": df["timestamp"][i],
+                            "side": "long" if sig_val > 0 else "short",
+                            "size_pct": abs(sig_val),
+                            "commission": t["commission"],
+                            "pnl": pnl,
+                        }
+                    )
+                    del active_trades[sig_val]
+
+                # Open new trades
+                if p != 0:
+                    cost = self.commission_pct + self.slippage_pct
+                    commission_cost = prev_equity * cost
+                    equity[-1] = prev_equity - commission_cost
+                    active_trades[p] = {
+                        "entry_ts": df["timestamp"][i],
+                        "entry_equity": equity[-1],
+                        "commission": commission_cost,
                     }
-                )
-                prev_equity = equity[-1]
+                    prev_equity = equity[-1]
 
             ret = (close[i] / close[i - 1] - 1) * p
             equity.append(prev_equity * (1 + ret))
 
+        # Close any remaining open trades at end
+        if active_trades:
+            for sig_val, t in list(active_trades.items()):
+                pnl = equity[-1] - t["entry_equity"]
+                trade_log.append(
+                    {
+                        "entry_time": t["entry_ts"],
+                        "exit_time": df["timestamp"][-1],
+                        "side": "long" if sig_val > 0 else "short",
+                        "size_pct": abs(sig_val),
+                        "commission": t["commission"],
+                        "pnl": pnl,
+                    }
+                )
+
         df = df.with_columns(pl.Series(equity).alias("portfolio_value"))
-        df = df.with_columns(
-            pl.col("portfolio_value").pct_change().fill_null(0.0).alias("returns")
-        )
+        df = df.with_columns(pl.col("portfolio_value").pct_change().fill_null(0.0).alias("returns"))
 
         # --- Metrics ---
         rets = df["returns"].to_list()
         total_ret = (equity[-1] / self.initial_capital) - 1
-        n_days = n
-        ann_factor = (
-            365 if self._bar_is_daily(df) else (365 * 24 * 60 * 60) // self._bar_ms(df)
-        )
+        ann_factor = 365 if self._bar_is_daily(df) else (365 * 24 * 60 * 60) // self._bar_ms(df)
 
         if ann_factor > 1 and len(rets) > 1:
             avg_ret = sum(rets) / len(rets)

@@ -26,9 +26,7 @@ def rsi(df: pl.DataFrame, period: int = 14, col: str = "close") -> pl.Series:
     loss = delta.to_list()
 
     gain_series = pl.Series([0.0 if v is None or v < 0 else float(v) for v in gain])
-    loss_series = pl.Series(
-        [0.0 if v is None or v > 0 else abs(float(v)) for v in loss]
-    )
+    loss_series = pl.Series([0.0 if v is None or v > 0 else abs(float(v)) for v in loss])
 
     avg_gain = gain_series.rolling_mean(period)
     avg_loss = loss_series.rolling_mean(period)
@@ -47,7 +45,6 @@ def atr(df: pl.DataFrame, period: int = 14) -> pl.Series:
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
 
-    tr = pl.DataFrame({"tr1": tr1, "tr2": tr2, "tr3": tr3}).to_series().to_frame()
     # Take max of the three per row
     true_range = pl.Series(
         [
@@ -93,11 +90,7 @@ def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
         ]
     ).with_columns(
         [
-            (pl.col("bb_middle") + 2.0 * pl.col("close").rolling_std(20)).alias(
-                "bb_upper"
-            ),
-            (pl.col("bb_middle") - 2.0 * pl.col("close").rolling_std(20)).alias(
-                "bb_lower"
-            ),
+            (pl.col("bb_middle") + 2.0 * pl.col("close").rolling_std(20)).alias("bb_upper"),
+            (pl.col("bb_middle") - 2.0 * pl.col("close").rolling_std(20)).alias("bb_lower"),
         ]
     )

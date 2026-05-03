@@ -6,8 +6,7 @@ and enables fast local backtesting.
 
 from __future__ import annotations
 
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -51,9 +50,8 @@ class CacheStore:
         Uses ``candles_history`` (archived data, up to 3 months back)
         for older bars and ``candles`` for recent ones.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         after_ms = int((now - timedelta(days=days)).timestamp() * 1000)
-        bar_ms = self._bar_to_ms(bar)
         limit = 300
         # OKX candles_history returns up to 3 months, max 100 per call
         # candles returns up to 300 per call
@@ -88,11 +86,7 @@ class CacheStore:
         if not recent.is_empty():
             recent = recent.filter(~pl.col("timestamp").is_in(seen_ts))
             if not recent.is_empty():
-                df = (
-                    pl.concat([df, recent])
-                    .unique(subset=["timestamp"])
-                    .sort("timestamp")
-                )
+                df = pl.concat([df, recent]).unique(subset=["timestamp"]).sort("timestamp")
                 df.write_parquet(self._path(inst_id, bar))
 
         return self._normalize(df)
@@ -105,9 +99,7 @@ class CacheStore:
         """Load cached OHLCV data. Raises if not found."""
         path = self._path(inst_id, bar)
         if not path.exists():
-            raise FileNotFoundError(
-                f"No cache for {inst_id} ({bar}). Run .refresh() first."
-            )
+            raise FileNotFoundError(f"No cache for {inst_id} ({bar}). Run .refresh() first.")
         return self._normalize(pl.read_parquet(path))
 
     # ------------------------------------------------------------------
@@ -126,9 +118,7 @@ class CacheStore:
             )
             inst_id = f.stem.replace(f"_{bar}", "").replace("_", "-")
             size_kb = f.stat().st_size / 1024
-            results.append(
-                {"inst_id": inst_id, "bar": bar, "size_kb": f"{size_kb:.0f}"}
-            )
+            results.append({"inst_id": inst_id, "bar": bar, "size_kb": f"{size_kb:.0f}"})
         return results
 
     def clear(self, inst_id: str | None = None, bar: str | None = None) -> int:
