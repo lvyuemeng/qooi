@@ -37,8 +37,15 @@ qooi/
 | 认证方式       | 本地 `bq auth configure`，不提交凭证 |
 | DataFrame 库   | 优先 Polars (`result.pl()`)，避免 pandas |
 
+## 初次使用
+
+```bash
+uv sync                          # 安装依赖
+uv run bq auth configure         # 登录 BigQuant (一次性的)
+uv run python scripts/hello_bigquant.py  # 验证 SDK 可用
+```
+
 ## 工作流
 
-1. `uv sync` — 安装依赖
-2. `uv run python scripts/backtest.py` — 运行回测
-3. BigQuant AI Studio 仅用于云端分布式计算或数据探索，策略开发优先本地
+1. `uv run python scripts/backtest.py` — 运行回测
+2. BigQuant AI Studio 仅用于云端分布式计算或数据探索，策略开发优先本地
