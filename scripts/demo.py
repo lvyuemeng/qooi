@@ -1,58 +1,53 @@
-"""Demo: run SMA, EMA, and Bollinger strategies with full evaluation.
+"""Demo: SMA + Bollinger strategies with realistic costs + walk-forward.
 
 Usage:
     uv run python scripts/demo.py
 """
 
-from qooi.exchange.eval import EvalMetrics
+from qooi.exchange.backtest import CostModel, WalkForwardConfig
 from qooi.exchange.pipeline import Pipeline
-from qooi.strategies import bollinger_signal, ema_cross_signal, sma_cross_signal
+from qooi.strategies import bollinger_signal, sma_cross_signal
+
+COST = CostModel(
+    slippage_pct=0.001, spread_pct=0.0005, commission_pct=0.0005, short_borrow_rate=0.0001
+)
+WF = WalkForwardConfig(train_windows=6, test_window=2, holdout_window=1, step=1, rebalance_bars=30)
 
 
-def print_eval(name: str, e: EvalMetrics) -> None:
+def print_result(name: str, s) -> None:
+    if not s.eval:
+        return
+    e = s.eval
     print(f"\n{'=' * 55}")
     print(f"  {name}")
     print(f"{'=' * 55}")
-    print(
-        f"  Return:         {e.total_return_pct:>8.2f}%    Ann. Return: {e.annual_return_pct:.2f}%"
-    )
-    print(
-        f"  Ann. Volatility:{e.annual_volatility_pct:>8.2f}%    Sharpe:      {e.sharpe_ratio:.2f}"
-    )
-    print(f"  Sortino:        {e.sortino_ratio:>8.2f}    Calmar:      {e.calmar_ratio:.2f}")
-    print(
-        f"  Max DD:         {e.max_drawdown_pct:>8.2f}%    Avg DD:      {e.avg_drawdown_pct:.2f}%"
-    )
-    print(f"  DD Days:        {e.drawdown_days:>8d}")
-    print(f"  Win Rate:       {e.win_rate_pct:>8.2f}%    PL Ratio:    {e.profit_loss_ratio:.2f}")
-    print(f"  Profit Factor:  {e.profit_factor:>8.2f}    Expectancy:  {e.expectancy:.4f}")
-    print(f"  IC Mean:        {e.ic_mean:>8.4f}    IC IR:       {e.ic_ir:.2f}")
-    print(f"  IC Positive:    {e.ic_positive_pct:>8.1f}%    Trades:      {e.num_trades}")
+    print(f"  Return:     {e.total_return_pct:>8.2f}%   Sharpe:    {e.sharpe_ratio:.2f}")
+    print(f"  Max DD:     {e.max_drawdown_pct:>8.2f}%   Sortino:   {e.sortino_ratio:.2f}")
+    print(f"  Win Rate:   {e.win_rate_pct:>8.2f}%   PL Ratio:  {e.profit_loss_ratio:.2f}")
+    print(f"  IC Mean:    {e.ic_mean:>8.4f}   IC IR:     {e.ic_ir:.2f}")
+    print(f"  Trades:     {e.num_trades:>8d}")
+    if s.result and s.result.walk_forward:
+        print("\n  Walk-forward segments:")
+        for seg in s.result.walk_forward:
+            print(
+                f"    {seg['segment']:8s}  Ret={seg['total_return_pct']:>7.2f}%  "
+                f"Sharpe={seg['sharpe_ratio']:.2f}  DD={seg['max_drawdown_pct']:.1f}%"
+            )
 
 
 def main() -> None:
-    print("Loading/BTC-USDT 1D (90 days)...")
+    print("Data: BTC-USDT 1D (365 days)")
 
-    print("\n--- SMA Crossover (10,30) ---")
-    s = Pipeline().run(
-        "BTC-USDT", "1D", days=90, capital=10_000, signal_expr=sma_cross_signal(10, 30)
-    )
-    print_eval("SMA(10,30)  BTC-USDT", s.eval)
-    print(f"  Chart: {s.chart_path}")
+    s1 = Pipeline().run("BTC-USDT", "1D", 365, 10_000, sma_cross_signal(10, 30), cost=COST)
+    print_result("SMA(10,30)", s1)
 
-    print("\n--- EMA Crossover (12,26) ---")
-    s2 = Pipeline().run(
-        "BTC-USDT", "1D", days=90, capital=10_000, signal_expr=ema_cross_signal(12, 26)
-    )
-    print_eval("EMA(12,26)  BTC-USDT", s2.eval)
-    print(f"  Chart: {s2.chart_path}")
+    s2 = Pipeline().run("BTC-USDT", "1D", 365, 10_000, bollinger_signal(20, 2), cost=COST)
+    print_result("BB(20,2)", s2)
 
-    print("\n--- Bollinger Mean-Reversion (20,2) ---")
     s3 = Pipeline().run(
-        "BTC-USDT", "1D", days=90, capital=10_000, signal_expr=bollinger_signal(20, 2)
+        "BTC-USDT", "1D", 365, 10_000, bollinger_signal(20, 2), cost=COST, walk_forward=WF
     )
-    print_eval("BB(20,2)    BTC-USDT", s3.eval)
-    print(f"  Chart: {s3.chart_path}")
+    print_result("BB(20,2) Walk-Forward", s3)
 
     print("\nDone.")
 

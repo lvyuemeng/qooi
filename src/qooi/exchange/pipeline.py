@@ -1,17 +1,17 @@
 """OKX pipeline — compose data loading, indicators, signals, backtest, and charting.
 
-Each stage returns a ``Stage`` that hands off to the next. Typical usage::
+Typical usage::
 
     result = (
         Pipeline()
-        .load("BTC-USDT", bar="1D", days=90)
+        .load("BTC-USDT", bar="1D", days=365)
         .indicators()
-        .signal(sma_cross_signal(10, 30))
+        .signal(bollinger_signal(20, 2))
         .backtest(capital=10_000)
+        .evaluate()
         .plot()
     )
-
-    print(result.metrics)
+    print(result.eval)
 """
 
 from __future__ import annotations
@@ -28,7 +28,12 @@ import matplotlib.pyplot as plt
 
 plt.style.use("dark_background")
 
-from qooi.exchange.backtest import Backtest, BacktestResult  # noqa: E402
+from qooi.exchange.backtest import (  # noqa: E402
+    Backtest,
+    BacktestResult,
+    CostModel,
+    WalkForwardConfig,
+)
 from qooi.exchange.eval import EvalMetrics, compute_metrics  # noqa: E402
 from qooi.exchange.indicator import add_indicators  # noqa: E402
 from qooi.exchange.store import CacheStore  # noqa: E402
@@ -46,27 +51,15 @@ class Stage:
 
 
 class Pipeline:
-    """Functional data pipeline for crypto quant.
-
-    Steps::
-
-        Pipeline()                          # init
-            .load(...)                      # fetch/cache OHLCV
-            .indicators()                   # add SMA/RSI/ATR/Bollinger
-            .signal(expr)                   # apply trading signal
-            .backtest(...)                  # run vectorized backtest
-            .plot(...)                      # save chart → return Stage
-    """
-
     def __init__(self) -> None:
         self._s = Stage()
         self._cs = CacheStore()
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     # Stage 1 — Load
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
 
-    def load(self, symbol: str = "BTC-USDT", bar: str = "1D", days: int = 90) -> Pipeline:
+    def load(self, symbol: str = "BTC-USDT", bar: str = "1D", days: int = 365) -> Pipeline:
         try:
             df = self._cs.load(symbol, bar=bar)
         except FileNotFoundError:
@@ -74,46 +67,46 @@ class Pipeline:
         self._s.df = df
         return self
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     # Stage 2 — Indicators
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
 
     def indicators(self) -> Pipeline:
         self._s.df = add_indicators(self._s.df)
         return self
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     # Stage 3 — Signal
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
 
     def signal(self, expr: SignalExpr | None = None) -> Pipeline:
         _expr: SignalExpr = expr if expr is not None else sma_cross_signal(10, 30)
         self._s.df = self._s.df.with_columns(_expr.alias("signal"))
         return self
 
-    # ------------------------------------------------------------------
-    # Stage 4 — Backtest
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # Stage 4 — Backtest (with realistic costs + walk-forward)
+    # ----------------------------------------------------------
 
     def backtest(
         self,
         capital: float = 10_000,
-        commission: float = 0.001,
-        slippage: float = 0.0005,
+        cost: CostModel | None = None,
+        walk_forward: WalkForwardConfig | None = None,
     ) -> Pipeline:
         bt = Backtest(
             data=self._s.df,
             signal_expr=pl.col("signal"),
             initial_capital=capital,
-            commission_pct=commission,
-            slippage_pct=slippage,
+            cost=cost or CostModel(),
+            walk=walk_forward,
         )
         self._s.result = bt.run()
         return self
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     # Stage 5 — Plot
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
 
     def plot(self, out: str | None = None) -> Stage:
         result = self._s.result
@@ -133,30 +126,35 @@ class Pipeline:
         )
 
         ax1.plot(times, close, color="white", linewidth=1, label="Close")
-        ax1.scatter(
-            [times[i] for i, v in enumerate(sig) if v == 1.0],
-            [close[i] for i, v in enumerate(sig) if v == 1.0],
-            color="#00cc66",
-            s=8,
-            alpha=0.5,
-            label="Long",
-        )
-        ax1.scatter(
-            [times[i] for i, v in enumerate(sig) if v == -1.0],
-            [close[i] for i, v in enumerate(sig) if v == -1.0],
-            color="#ff3355",
-            s=8,
-            alpha=0.5,
-            label="Short",
-        )
+        longs = [(times[i], close[i]) for i, v in enumerate(sig) if v == 1.0]
+        shorts = [(times[i], close[i]) for i, v in enumerate(sig) if v == -1.0]
+        if longs:
+            ax1.scatter(
+                [t for t, _ in longs],
+                [c for _, c in longs],
+                color="#00cc66",
+                s=8,
+                alpha=0.5,
+                label="Long",
+            )
+        if shorts:
+            ax1.scatter(
+                [t for t, _ in shorts],
+                [c for _, c in shorts],
+                color="#ff3355",
+                s=8,
+                alpha=0.5,
+                label="Short",
+            )
         ax1.set_ylabel("Price (USDT)")
         ax1.legend(loc="upper left", fontsize=8)
         ax1.grid(alpha=0.15)
         ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+
+        label = m.get("label", "Backtest")
         ax1.set_title(
-            f"Sharpe={m['sharpe_ratio']}  "
-            f"Return={m['total_return_pct']}%  "
-            f"DD={m['max_drawdown_pct']}%  "
+            f"{label}  |  Sharpe={m['sharpe_ratio']}  "
+            f"Return={m['total_return_pct']}%  DD={m['max_drawdown_pct']}%  "
             f"Trades={m['num_trades']}",
             fontsize=11,
         )
@@ -183,9 +181,9 @@ class Pipeline:
         self._s.chart_path = out
         return self._s
 
-    # ------------------------------------------------------------------
-    # Stage 5 — Evaluate
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # Stage 6 — Evaluate
+    # ----------------------------------------------------------
 
     def evaluate(self) -> Pipeline:
         result = self._s.result
@@ -197,25 +195,26 @@ class Pipeline:
         )
         return self
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     # Shortcuts
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
 
     def run(
         self,
         symbol: str = "BTC-USDT",
         bar: str = "1D",
-        days: int = 90,
+        days: int = 365,
         capital: float = 10_000,
         signal_expr: SignalExpr | None = None,
+        cost: CostModel | None = None,
+        walk_forward: WalkForwardConfig | None = None,
         plot_out: str | None = None,
     ) -> Stage:
-        """Run the full pipeline in one call."""
         return (
             self.load(symbol, bar, days)
             .indicators()
             .signal(signal_expr)
-            .backtest(capital=capital)
+            .backtest(capital=capital, cost=cost, walk_forward=walk_forward)
             .evaluate()
             .plot(out=plot_out)
         )
