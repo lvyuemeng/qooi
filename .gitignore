@@ -24,7 +24,7 @@ Thumbs.db
 .scratch/**/.DS_Store
 
 # Environment (contains API keys)
-.env
+.env*
 
 # Logs
 *.log
