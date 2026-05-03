@@ -35,6 +35,39 @@ def ema_cross_signal(fast: int = 12, slow: int = 26) -> pl.Expr:
     ).alias("signal")
 
 
+def ema_vumanchu_signal(
+    ema_short: int = 50,
+    ema_long: int = 200,
+    require_close_above_ema_long: bool = True,
+) -> pl.Expr:
+    """EMA50/200 trend filter + VuManChu Swing Free entry trigger.
+
+    Requires columns from :func:`add_indicators`:
+      ema_50, ema_200, vm_long, vm_short
+
+    +1 (long)  when ema_50 > ema_200 AND vm_long == 1
+    -1 (short) when ema_50 < ema_200 AND vm_short == 1
+     0 (flat)  otherwise
+
+    When require_close_above_ema_long is True (default), close must also
+    be above/below ema_200 for the respective direction.
+    """
+    trend_up = pl.col(f"ema_{ema_short}") > pl.col(f"ema_{ema_long}")
+    trend_dn = pl.col(f"ema_{ema_short}") < pl.col(f"ema_{ema_long}")
+
+    if require_close_above_ema_long:
+        trend_up = trend_up & (pl.col("close") > pl.col(f"ema_{ema_long}"))
+        trend_dn = trend_dn & (pl.col("close") < pl.col(f"ema_{ema_long}"))
+
+    return (
+        pl.when(trend_up & (pl.col("vm_long") == 1))
+        .then(1.0)
+        .when(trend_dn & (pl.col("vm_short") == 1))
+        .then(-1.0)
+        .otherwise(0.0)
+    ).alias("signal")
+
+
 def bollinger_signal(period: int = 20, std_dev: float = 2.0) -> pl.Expr:
     """Bollinger Band mean-reversion signal.
 

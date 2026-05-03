@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import polars as pl
+
+from qooi.exchange.eval import EvalMetrics, compute_metrics
 
 SignalExpr = pl.Expr
 
@@ -14,8 +15,8 @@ SignalExpr = pl.Expr
 class BacktestResult:
     trades: pl.DataFrame
     equity_curve: pl.DataFrame
-    metrics: dict[str, float | str]
-    walk_forward: list[dict] | None = None
+    metrics: EvalMetrics
+    walk_forward: list[EvalMetrics] | None = None
 
 
 @dataclass
@@ -192,7 +193,7 @@ class Backtest:
         return BacktestResult(
             trades=trade_df,
             equity_curve=result_df,
-            metrics=self._compute_metrics(equity, result_df["returns"].to_list(), trade_log, label),
+            metrics=compute_metrics(result_df, trades=trade_df),
         )
 
     # ------------------------------------------------------------------
@@ -210,16 +211,14 @@ class Backtest:
         if n_windows < window_total + 1:
             return self._run_single(df, label="full (too short for walk-forward)")
 
-        timestamp = df["timestamp"].to_list()
-
-        walk_results: list[dict] = []
+        walk_results: list[EvalMetrics] = []
 
         for start_win in range(0, n_windows - window_total + 1, w.step):
             train_end = (start_win + w.train_windows) * window_bars
             test_end = (start_win + w.train_windows + w.test_window) * window_bars
             holdout_end = (start_win + window_total) * window_bars
 
-            for label, (lo, hi) in [
+            for _label, (lo, hi) in [
                 ("train", (start_win * window_bars, train_end)),
                 ("test", (train_end, test_end)),
                 ("holdout", (test_end, holdout_end)),
@@ -227,13 +226,9 @@ class Backtest:
                 seg = df.slice(lo, hi - lo)
                 if seg.height < 2:
                     continue
-                result = self._run_single(seg, label=label)
-                walk_results.append(
-                    result.metrics
-                    | {"segment": label, "start_ts": timestamp[lo], "end_ts": timestamp[hi - 1]}
-                )
+                result = self._run_single(seg, label=_label)
+                walk_results.append(compute_metrics(result.equity_curve, trades=result.trades))
 
-        # Use the last (holdout) segment as the main result for charting
         last_result = self._run_single(df, label="walk_forward")
 
         return BacktestResult(
@@ -242,52 +237,3 @@ class Backtest:
             metrics=last_result.metrics,
             walk_forward=walk_results,
         )
-
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _compute_metrics(
-        equity: list[float],
-        returns: list[float],
-        trades: list[dict],
-        label: str,
-    ) -> dict[str, float | str]:
-        total_ret = (equity[-1] / equity[0]) - 1
-        n = len(returns)
-        ann_factor = 365  # daily
-
-        avg_ret = sum(returns) / n if n > 0 else 0.0
-        std_ret = math.sqrt(sum((r - avg_ret) ** 2 for r in returns) / (n - 1)) if n > 1 else 0.0
-        sharpe = (avg_ret / std_ret * math.sqrt(ann_factor)) if std_ret > 0 else 0.0
-
-        peaks = [equity[0]]
-        dd = [0.0]
-        for v in equity[1:]:
-            p = max(peaks[-1], v)
-            peaks.append(p)
-            dd.append((p - v) / p if p > 0 else 0.0)
-        max_dd = max(dd) if dd else 0.0
-
-        pnl_vals = [t["pnl"] for t in trades if "pnl" in t]
-        wins = [p for p in pnl_vals if p > 0]
-        num_trades = len(pnl_vals)
-        win_rate = len(wins) / num_trades if num_trades > 0 else 0.0
-
-        return {
-            "label": label,
-            "total_return_pct": round(total_ret * 100, 2),
-            "sharpe_ratio": round(sharpe, 2),
-            "max_drawdown_pct": round(max_dd * 100, 2),
-            "num_trades": num_trades,
-            "win_rate_pct": round(win_rate * 100, 2),
-            "final_value": round(equity[-1], 2),
-        }
-
-    @staticmethod
-    def _bar_is_daily(df: pl.DataFrame) -> bool:
-        if df.height < 2:
-            return True
-        diff = df["timestamp"][1] - df["timestamp"][0]
-        return abs(diff - 86_400_000) < 1000

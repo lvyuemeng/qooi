@@ -72,21 +72,54 @@ def volatility(df: pl.DataFrame, period: int = 20, col: str = "close") -> pl.Ser
     return log_ret.rolling_std(period)
 
 
-def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
-    """Convenience: add the most common indicators in one call.
+def vumanchu_swing(
+    df: pl.DataFrame,
+    period: int = 20,
+    multiplier: float = 3.5,
+) -> tuple[pl.Series, pl.Series]:
+    """VuManChu Swing Free — range filter with long/short conditions.
 
-    Adds columns: sma_20, sma_50, ema_12, ema_26, rsi_14, atr_14, bb_upper, bb_lower
+    1. Compute range size = EMA(abs(close - close[1]), period) * multiplier
+    2. Range filter = smoothed series within the range channel
+    3. longCondition = close breaks above range filter by range size
+    4. shortCondition = close breaks below range filter by range size
+
+    Returns (long_condition, short_condition) as +1/0/-1 style signals.
     """
+    close = df["close"]
+    range_raw = (close - close.shift(1)).abs().ewm_mean(span=period, min_periods=period)
+    range_size = range_raw * multiplier
+    # Smooth the range filter — ema of price with range as noise buffer
+    rf = close.ewm_mean(span=period, min_periods=period)
+    rf_upper = rf + range_size
+    rf_lower = rf - range_size
+
+    long_cond = (close > rf_upper).cast(pl.Int32)
+    short_cond = (close < rf_lower).cast(pl.Int32)
+
+    # Persist signal until opposite triggers
+    long_signal = long_cond.shift(1).fill_null(0)
+    short_signal = short_cond.shift(1).fill_null(0)
+    return long_signal, short_signal
+
+
+def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
+    """Convenience: add the most common indicators in one call."""
+    long_sig, short_sig = vumanchu_swing(df)
     return df.with_columns(
         [
             sma(df, 20).alias("sma_20"),
             sma(df, 50).alias("sma_50"),
             ema(df, 12).alias("ema_12"),
             ema(df, 26).alias("ema_26"),
+            ema(df, 50).alias("ema_50"),
+            ema(df, 200).alias("ema_200"),
             rsi(df, 14).alias("rsi_14"),
             atr(df, 14).alias("atr_14"),
             volatility(df, 20).alias("volatility_20"),
             sma(df, 20).alias("bb_middle"),
+            long_sig.alias("vm_long"),
+            short_sig.alias("vm_short"),
         ]
     ).with_columns(
         [

@@ -32,8 +32,9 @@ def main() -> None:
         print("\n  Walk-forward segments:")
         for seg in s3.result.walk_forward:
             print(
-                f"    {seg['segment']:8s}  Ret={seg['total_return_pct']:>7.2f}%  "
-                f"Sharpe={seg['sharpe_ratio']:.2f}  DD={seg['max_drawdown_pct']:.1f}%"
+                f"    Ret={seg.total_return_pct:>7.2f}%  "
+                f"Sharpe={seg.sharpe_ratio:.2f}  DD={seg.max_drawdown_pct:.1f}%  "
+                f"Trades={seg.num_trades}"
             )
 
     print("\nDone.")

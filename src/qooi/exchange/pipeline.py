@@ -151,11 +151,10 @@ class Pipeline:
         ax1.grid(alpha=0.15)
         ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
 
-        label = m.get("label", "Backtest")
         ax1.set_title(
-            f"{label}  |  Sharpe={m['sharpe_ratio']}  "
-            f"Return={m['total_return_pct']}%  DD={m['max_drawdown_pct']}%  "
-            f"Trades={m['num_trades']}",
+            f"Sharpe={m.sharpe_ratio}  "
+            f"Return={m.total_return_pct}%  DD={m.max_drawdown_pct}%  "
+            f"Trades={m.num_trades}",
             fontsize=11,
         )
 
