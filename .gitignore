@@ -8,6 +8,9 @@ build/
 
 # Virtual environments
 .venv/
+.*cache*
+
+.scratch/
 
 # BigQuant
 .bigquant/
