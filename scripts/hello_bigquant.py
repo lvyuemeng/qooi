@@ -14,12 +14,18 @@ def main() -> None:
         return
 
     print("\n==> Testing DAI data query...")
-    df = dai.query(
-        "SELECT date, instrument, close FROM cn_stock_bar1d WHERE date >= '2024-01-01' LIMIT 5",
-        filters={"date": ["2024-01-01", "2024-12-31"]},
-    ).pl()
-    print(f"    Polars DataFrame ({len(df)} rows):")
-    print(df)
+    try:
+        df = dai.query(
+            "SELECT date, instrument, close FROM cn_stock_bar1d WHERE date >= '2024-01-01' LIMIT 5",
+            filters={"date": ["2024-01-01", "2024-12-31"]},
+        ).pl()
+        print(f"    Polars DataFrame ({len(df)} rows):")
+        print(df)
+    except Exception as e:
+        print(f"    [DAI FAIL] {e}")
+        print("    Hint: Run  bq auth --apikey <AK.SK>  with a full API key from")
+        print("    https://bigquant.com/aiuser/access_key")
+        return
 
     print("\n==> Testing BigTrader backtest...")
 
