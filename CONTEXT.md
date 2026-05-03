@@ -10,6 +10,14 @@ Quantitative trading strategy research on China A-share stock market.
 - **Python management**: `uv` — no global Python state
 - **Python version**: 3.11–3.13
 
+## Data sources
+
+| Priority | Source | Scope | Cost |
+|----------|--------|-------|------|
+| 1 | **TickFlow** (free tier) | A-share daily K-line, ETFs, futures, HK, US | Free, no auth |
+| 2 | **BigQuant DAI** | Full A-share data (real-time, minute, fundamentals) | Paid plan needed |
+| 3 | **MOOTDX** (fallback) | TDX local/online data | Free, requires TDX |
+
 ## Preferences
 
 - **DataFrame library**: Polars preferred over pandas. Use `result.pl()` instead of `result.df()` when calling BigQuant DAI queries.

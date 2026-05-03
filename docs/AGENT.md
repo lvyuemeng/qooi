@@ -36,6 +36,7 @@ qooi/
 | import         | `from bigquant import dai / bigtrader` |
 | 认证方式       | 本地 `bq auth configure`，不提交凭证 |
 | DataFrame 库   | 优先 Polars (`result.pl()`)，避免 pandas |
+| 数据源         | 默认 TickFlow 免费版 (`DataSource()`)，需要更全数据再用 BigQuant |
 
 ## 初次使用
 
