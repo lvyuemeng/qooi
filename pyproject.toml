@@ -21,4 +21,4 @@ packages = ["src/qooi"]
 prerelease = "allow"
 
 [project.scripts]
-bq = "bigquant.cli:main"
+bq = "bigquant.cli.main:main"
