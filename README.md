@@ -9,7 +9,7 @@ uv run python scripts/demo.py
 
 ## Pipeline
 
-```
+```text
 OKX REST API
     ↓ MarketData.fetch()          ← public OHLCV, no auth
     ↓ CacheStore.refresh()        ← Parquet cache (avoid re-fetching)
