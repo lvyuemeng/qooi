@@ -34,12 +34,15 @@ class EvalMetrics:
 
     def __str__(self) -> str:
         lines = [
-            f"  Return:   {self.total_return_pct:>7.2f}%  Ann.Return: {self.annual_return_pct:.2f}%",  # noqa: E501
+            f"  Return:   {self.total_return_pct:>7.2f}%  Ann: {self.annual_return_pct:.2f}%",
             f"  Ann.Vol:  {self.annual_volatility_pct:>7.2f}%  Sharpe:     {self.sharpe_ratio:.2f}",
             f"  Sortino:  {self.sortino_ratio:>7.2f}  Calmar:     {self.calmar_ratio:.2f}",
             f"  Max DD:   {self.max_drawdown_pct:>7.2f}%  Avg DD:     {self.avg_drawdown_pct:.2f}%",
             f"  DD Days:  {self.drawdown_days:>7d}",
-            f"  Win Rate: {self.win_rate_pct:>7.2f}%  Trades:     {self.num_trades}",
+            f"  Trades:   {self.num_trades:>5d}  Win Rate:   {self.win_rate_pct:.1f}%",
+            f"  Avg Win:  {self.avg_win_pct:>7.2f}%  Avg Loss:   {self.avg_loss_pct:.2f}%",
+            f"  P/L Ratio:{self.profit_loss_ratio:>7.2f}  Expectancy: {self.expectancy:.2f}%",
+            f"  Profit F: {self.profit_factor:>7.2f}",
             f"  IC Mean:  {self.ic_mean:>7.4f}  IC IR:      {self.ic_ir:.2f}",
             f"  IC Pos:   {self.ic_positive_pct:>7.1f}%",
         ]
