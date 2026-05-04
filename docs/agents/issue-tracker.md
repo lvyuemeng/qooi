@@ -4,7 +4,7 @@ Issues are stored as markdown files under `.scratch/<feature-name>/` in this rep
 
 ## Convention
 
-```
+```text
 .scratch/<feature-name>/
   ├── 001-short-title.md
   ├── 002-another-issue.md
