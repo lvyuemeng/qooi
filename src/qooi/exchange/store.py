@@ -49,56 +49,27 @@ class CacheStore:
     ) -> pl.DataFrame:
         """Fetch OHLCV and cache as Parquet.
 
-        Paginates ``candles_history`` (OKX) or uses ``since`` (CCXT)
-        until ``min_bars`` are collected or the time boundary
-        (``days`` ago) is reached, then merges with recent data.
+        Uses ``candles_range`` for deep paginated history, then merges
+        with recent data from ``candles`` (OKX only).  Works with both
+        OKX SDK and CCXT backends.
         """
-        if self._is_ccxt:
-            since = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
-            df = self._md.candles_range(inst_id, bar=bar, since=since, limit=min_bars)
-            df.write_parquet(self._path(inst_id, bar))
-            return self._normalize(df)
+        since = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+        hist = self._md.candles_range(inst_id, bar=bar, since=since, limit=min_bars)
+        seen_ts: set[int] = set(hist["timestamp"].to_list()) if not hist.is_empty() else set()
 
-        now = datetime.now(UTC)
-        earliest_ms = int((now - timedelta(days=days)).timestamp() * 1000)
+        recent = pl.DataFrame()
+        try:
+            recent = self._md.candles(inst_id, bar=bar, limit=300)
+        except Exception:
+            pass
 
-        seen_ts: set[int] = set()
-        chunks: list[pl.DataFrame] = []
-        after: str | None = None
-
-        for _ in range(200):
-            chunk = self._md.candles_history(inst_id, bar=bar, after=after, limit=100)
-            if chunk.is_empty():
-                break
-            new = chunk.filter(~pl.col("timestamp").is_in(seen_ts))
-            if new.is_empty():
-                break
-            chunks.append(new)
-            seen_ts.update(new["timestamp"].to_list())
-            after = str(new["timestamp"].min())
-            if int(after) < earliest_ms:
-                break
-            if sum(len(c) for c in chunks) >= min_bars:
-                break
-
-        df = (
-            pl.concat(chunks).unique(subset=["timestamp"]).sort("timestamp")
-            if chunks
-            else pl.DataFrame()
-        )
-
-        recent = self._md.candles(inst_id, bar=bar, limit=300)
         if not recent.is_empty():
             new_recent = recent.filter(~pl.col("timestamp").is_in(seen_ts))
             if not new_recent.is_empty():
-                df = pl.concat([df, new_recent]).unique(subset=["timestamp"]).sort("timestamp")
+                hist = pl.concat([hist, new_recent]).unique(subset=["timestamp"]).sort("timestamp")
 
-        df.write_parquet(self._path(inst_id, bar))
-        return self._normalize(df)
-
-    @property
-    def _is_ccxt(self) -> bool:
-        return self._md._is_ccxt
+        hist.write_parquet(self._path(inst_id, bar))
+        return self._normalize(hist)
 
     # ------------------------------------------------------------------
     # Load / list / clear
