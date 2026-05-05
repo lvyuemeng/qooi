@@ -23,8 +23,8 @@ jobs:
           src = default_signal_source()
           config = PortfolioConfig(
               pairs=[
-                  dict(symbol='ETH-USDT', tf='4h', capital=100, risk_pct=0.03),
-                  dict(symbol='SOL-USDT', tf='4h', capital=50,  risk_pct=0.05),
+                  dict(symbol='ETH-USDT', tf='4h', capital=100, risk_pct=0.03, leverage=1.0),
+                  dict(symbol='SOL-USDT', tf='4h', capital=50,  risk_pct=0.05, leverage=1.0),
               ],
               dry_run=False,
           )

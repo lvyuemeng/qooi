@@ -14,6 +14,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
+from qooi.exchange.backtest import CostModel, RiskConfig
+
 load_dotenv()
 
 # === constants ===============================================================
@@ -291,18 +293,24 @@ class LiveExecutor:
         timeframe: str = "4h",
         initial_capital: float = 1000.0,
         max_position_pct: float = 0.05,
+        leverage: float = 1.0,
         post_only: bool = True,
         limit_timeout_sec: int = 120,
         dry_run: bool = True,
         live: bool = False,
+        risk: RiskConfig | None = None,
+        cost: CostModel | None = None,
     ) -> None:
         self._symbol = symbol
         self._tf = timeframe
         self._capital = initial_capital
+        self._leverage = leverage
         self._max_pos = max_position_pct
         self._post_only = post_only
         self._timeout = limit_timeout_sec
         self._dry = dry_run
+        self._risk = risk or RiskConfig(atr_stop_mult=2.0, atr_target_mult=3.0)
+        self._cost = cost or CostModel()
 
         from qooi.exchange.market import MarketData
 
@@ -310,6 +318,11 @@ class LiveExecutor:
         self._client: TradingClient | None = None if dry_run else TradingClient(live=live)
         self._active: OrderState | None = None
         self._trade_count = 0
+        self._equity = [initial_capital]
+        self._stop_price = -1.0
+        self._target_price = -1.0
+        self._trail_high = -1.0
+        self._trail_low = -1.0
 
     # -- public ---------------------------------------------------------------
 
@@ -341,6 +354,42 @@ class LiveExecutor:
             "signal", {"signal": sr.signal, "obi_5": round(obi.imbalance_5, 4), "ofi_flow": sr.flow}
         )
 
+        # --- stop-loss / target / trailing (RiskConfig-integrated) ---
+        exit_reason: str | None = None
+        cur_close = (
+            obi.ask_price
+            if self._active and self._active.side == "buy"
+            else obi.bid_price
+            if self._active
+            else 0
+        )
+        r = self._risk
+        atr_est = obi.ask_price * 0.02  # rough ATR estimate from 2% volatility
+
+        if self._active and self._stop_price > 0:
+            direction = 1 if self._active.side == "buy" else -1
+            if direction > 0:
+                if cur_close <= self._stop_price:
+                    exit_reason = "stop"
+                elif self._target_price > 0 and cur_close >= self._target_price:
+                    exit_reason = "target"
+                elif self._trail_high > 0:
+                    self._trail_high = max(self._trail_high, cur_close)
+                    if self._trail_high - cur_close >= r.trailing_distance_mult * atr_est:
+                        exit_reason = "trailing_stop"
+            else:
+                if cur_close >= self._stop_price:
+                    exit_reason = "stop"
+                elif self._target_price > 0 and cur_close <= self._target_price:
+                    exit_reason = "target"
+                elif self._trail_low > 0:
+                    self._trail_low = min(self._trail_low, cur_close)
+                    if cur_close - self._trail_low >= r.trailing_distance_mult * atr_est:
+                        exit_reason = "trailing_stop"
+
+        if exit_reason and self._active:
+            self._cancel(exit_reason)
+
         if (
             self._active
             and self._active.status == "placed"
@@ -362,7 +411,8 @@ class LiveExecutor:
                     return self._log("skip", {"reason": "already_long"})
 
         entry_px = obi.ask_price if side == "buy" else obi.bid_price
-        sz = self._capital * self._max_pos * abs(sr.signal) / max(entry_px, 1)
+        size_coeff = self._capital * self._max_pos * abs(sr.signal) * self._leverage
+        sz = size_coeff / max(entry_px, 1)
         if sz < 0.00001:
             return self._log("skip", {"reason": "size_too_small"})
 
@@ -373,9 +423,78 @@ class LiveExecutor:
             "symbol": self._symbol,
             "tf": self._tf,
             "capital": self._capital,
+            "leverage": self._leverage,
             "dry": self._dry,
             "trades": self._trade_count,
             "active": self._active.ord_id if self._active else None,
+        }
+
+    @staticmethod
+    def report(symbol: str = "ETH-USDT", timeframe: str = "4h") -> dict:
+        """Read trade logs and compute P&L / Sharpe / Win Rate via compute_metrics."""
+        import polars as pl
+
+        from qooi.exchange.eval import compute_metrics
+
+        fname = LOG_DIR / f"exec_{symbol.replace('-', '_')}_{timeframe}.jsonl"
+        if not fname.exists():
+            return {"error": f"no log file: {fname}"}
+
+        lines = []
+        with open(fname) as f:
+            for line in f:
+                try:
+                    lines.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+        orders = [o for o in lines if o.get("event") == "order"]
+        if not orders:
+            return {"error": "no trades yet"}
+
+        # Build trade log for compute_metrics
+        trades = []
+        entry = {}
+        for o in orders:
+            payload = o.get("payload", {})
+            if o.get("event") != "order":
+                continue
+            if not entry:
+                entry = {
+                    "entry_ts": o["ts"],
+                    "entry_px": payload.get("px", 0),
+                    "side": payload.get("side", ""),
+                }
+            else:
+                exit_px = payload.get("px", 0)
+                pnl = (exit_px / entry["entry_px"] - 1) * (1 if entry["side"] == "long" else -1)
+                trades.append(
+                    {
+                        "entry_time": entry["entry_ts"],
+                        "exit_time": o["ts"],
+                        "side": entry["side"],
+                        "entry_price": entry["entry_px"],
+                        "exit_price": exit_px,
+                        "pnl": pnl,
+                        "reason": "signal",
+                    }
+                )
+                entry = {"entry_ts": o["ts"], "entry_px": exit_px, "side": payload.get("side", "")}
+
+        trade_df = pl.DataFrame(trades) if trades else pl.DataFrame()
+        eq = pl.Series(
+            [1000] + [1000 * (1 + (t["exit_price"] / t["entry_price"] - 1)) for t in trades],
+            dtype=pl.Float64,
+        )
+        eq_df = pl.DataFrame({"portfolio_value": eq, "returns": eq.pct_change().fill_null(0.0)})
+        m = compute_metrics(eq_df, trades=trade_df)
+
+        return {
+            "trades": m.num_trades,
+            "win_rate_pct": m.win_rate_pct,
+            "sharpe": m.sharpe_ratio,
+            "total_return_pct": m.total_return_pct,
+            "max_drawdown_pct": m.max_drawdown_pct,
         }
 
     # -- internals ------------------------------------------------------------
@@ -384,6 +503,17 @@ class LiveExecutor:
         self, side: str, sz: float, px: float, signal: float, obi, flow: float
     ) -> OrderState | None:
         sz, px = round(sz, 8), round(px, 1)
+        r = self._risk
+        atr_est = px * 0.02
+
+        if side == "buy":
+            self._stop_price = px - r.atr_stop_mult * atr_est
+            self._target_price = px + r.atr_target_mult * atr_est
+            self._trail_high = px
+        else:
+            self._stop_price = px + r.atr_stop_mult * atr_est
+            self._target_price = px - r.atr_target_mult * atr_est
+            self._trail_low = px
         st = OrderState()
         st.inst_id = self._symbol
         st.side = side
@@ -469,6 +599,7 @@ class PortfolioRunner:
                 timeframe=p.get("tf", "4h"),
                 initial_capital=p.get("capital", 100),
                 max_position_pct=p.get("risk_pct", 0.03),
+                leverage=p.get("leverage", 1.0),
                 post_only=config.post_only,
                 limit_timeout_sec=config.limit_timeout_sec,
                 dry_run=config.dry_run,
