@@ -16,7 +16,43 @@ from pydantic import BaseModel
 
 from qooi.exchange.backtest import CostModel, RiskConfig
 
-load_dotenv()
+
+def load_okx_env(env_path: str | None = None) -> None:
+    """Load OKX credentials from explicit env file or ``OKX_ENV`` envvar.
+
+    Precedence:
+    1. ``env_path`` argument (e.g. ``.env.test``)
+    2. ``OKX_ENV`` envvar → loads ``.env.{OKX_ENV}``
+    3. Fallback: ``.env``
+
+    Call before ``TradingClient()`` to load correct credentials.
+    """
+    path = None
+    if env_path:
+        path = Path(env_path)
+    elif os.getenv("OKX_ENV"):
+        path_env = (
+            Path(__file__).resolve().parent.parent.parent.parent / f".env.{os.getenv('OKX_ENV')}"
+        )
+        if path_env.exists():
+            path = path_env
+    else:
+        default_env = Path(".env")
+        if default_env.exists():
+            path = default_env
+
+    if path and path.exists():
+        load_dotenv(path)
+    else:
+        load_dotenv()  # loads .env from cwd if present
+
+
+def _env(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"Missing {key}. Set in .env or export {key}=...")
+    return val
+
 
 # === constants ===============================================================
 
@@ -42,18 +78,27 @@ def _env(key: str) -> str:
 class TradingClient:
     """Place/cancel orders, query balance and positions.
 
-    Reads ``OKX_API_KEY``, ``OKX_SECRET_KEY``, ``OKX_PASSPHRASE``.
-    Add ``_LIVE`` suffix for production keys (testnet = default)."""
+    Reads ``OKX_API_KEY``, ``OKX_SECRET_KEY``, ``OKX_PASSPHRASE``,
+    ``OKX_FLAG`` from the environment (``FLAG=1``=testnet, ``FLAG=0``=live).
 
-    def __init__(self, live: bool = False) -> None:
+    Call ``load_okx_env(path)`` before instantiation, or set ``OKX_ENV``
+    envvar (``OKX_ENV=test`` → auto-loads ``.env.test``).
+    """
+
+    def __init__(self) -> None:
         from okx.Account import AccountAPI
         from okx.Trade import TradeAPI
 
-        suffix = "_LIVE" if live else ""
-        flag = "0" if live else "1"
-        k = _env(f"OKX_API_KEY{suffix}")
-        s = _env(f"OKX_SECRET_KEY{suffix}")
-        p = _env(f"OKX_PASSPHRASE{suffix}")
+        # Auto-load if not already done
+        if not os.getenv("OKX_API_KEY"):
+            load_okx_env()
+
+        flag = os.getenv("OKX_FLAG", "1")
+        k = os.getenv("OKX_API_KEY", "")
+        s = os.getenv("OKX_SECRET_KEY", "")
+        p = os.getenv("OKX_PASSPHRASE", "")
+        if not k:
+            raise RuntimeError("Missing OKX_API_KEY — call load_okx_env() or set envvars")
         self._trade = TradeAPI(k, s, p, flag=flag, debug=False)
         self._account = AccountAPI(k, s, p, flag=flag, debug=False)
 
@@ -257,7 +302,7 @@ def default_signal_source() -> SignalSource:
         )
         from qooi.strategies.intraday import multi_factor_intraday_signal
 
-        df = MarketData().candles(symbol, timeframe=timeframe, limit=500)
+        df = MarketData("okx").candles(symbol, timeframe=timeframe, limit=500)
         if df.is_empty():
             return None
         df = add_indicators(df)
@@ -297,7 +342,6 @@ class LiveExecutor:
         post_only: bool = True,
         limit_timeout_sec: int = 120,
         dry_run: bool = True,
-        live: bool = False,
         risk: RiskConfig | None = None,
         cost: CostModel | None = None,
     ) -> None:
@@ -315,7 +359,7 @@ class LiveExecutor:
         from qooi.exchange.market import MarketData
 
         self._md = MarketData()
-        self._client: TradingClient | None = None if dry_run else TradingClient(live=live)
+        self._client: TradingClient | None = None if dry_run else TradingClient()
         self._active: OrderState | None = None
         self._trade_count = 0
         self._equity = [initial_capital]

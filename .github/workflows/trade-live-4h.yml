@@ -51,6 +51,7 @@ jobs:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY_LIVE }}
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY_LIVE }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE_LIVE }}
+          OKX_FLAG: "0"
 
       - name: Upload logs
         if: always()

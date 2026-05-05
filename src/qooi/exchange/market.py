@@ -204,14 +204,30 @@ class OkxSdkBackend(ExchangeBackend):
         from okx.MarketData import MarketAPI
 
         self._api = MarketAPI(flag="1", debug=False)
-        # OKX order book via ccxt (SDK has no synchronous WS)
-        self._ccxt = CcxtBackend("okx", proxy)
+        self._ccxt: CcxtBackend | None = None  # lazy init — only needed for OB
+
+    def _ensure_ccxt(self) -> CcxtBackend:
+        if self._ccxt is None:
+            self._ccxt = CcxtBackend("okx", self._proxy)
+        return self._ccxt
 
     def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
     ) -> list[list]:
-        # Use ccxt for consistent since/pagination support
-        return self._ccxt.fetch_ohlcv(symbol, timeframe, limit=limit, since=since)
+        # Use OKX SDK directly for candles (fast, no CCXT connection needed)
+        try:
+            resp = self._api.get_candlesticks(instId=symbol, bar=timeframe, limit=str(limit))
+            if resp.get("code") != "0":
+                raise RuntimeError(f"OKX SDK error: {resp.get('msg', resp)}")
+            data = []
+            for r in resp.get("data", []):
+                data.append(
+                    [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])]
+                )
+            return data
+        except Exception:
+            pass
+        return self._ensure_ccxt().fetch_ohlcv(symbol, timeframe, limit=limit)
 
     def fetch_ohlcv_range(
         self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
@@ -265,7 +281,33 @@ class OkxSdkBackend(ExchangeBackend):
         return _parse_ohlcv(rows).filter(pl.col("timestamp") >= since_ms).tail(limit)
 
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot:
-        return self._ccxt.fetch_order_book(symbol, limit)
+        # Try OKX SDK natively first (no CCXT connection)
+        try:
+            resp = self._api.get_orderbook(instId=symbol, sz=str(limit))
+            if resp.get("code") == "0" and resp.get("data"):
+                data = resp["data"][0]
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                timestamp = int(data.get("ts", "0"))
+                bid_price = float(bids[0][0]) if bids else 0.0
+                ask_price = float(asks[0][0]) if asks else 0.0
+                return ObSnapshot(
+                    timestamp=timestamp,
+                    bid_price=bid_price,
+                    ask_price=ask_price,
+                    bid_vol_depth_5=sum(float(b[1]) for b in bids[:5]),
+                    ask_vol_depth_5=sum(float(a[1]) for a in asks[:5]),
+                    bid_vol_depth_25=sum(float(b[1]) for b in bids[:25]),
+                    ask_vol_depth_25=sum(float(a[1]) for a in asks[:25]),
+                )
+        except Exception:
+            pass
+        # Fallback to CCXT (if available)
+        return self._ensure_ccxt().fetch_order_book(symbol, limit)
+
+    def close(self) -> None:
+        if self._ccxt:
+            self._ccxt.close()
 
     def funding_rate_history(
         self, inst_id: str = "BTC-USDT-SWAP", limit: int = 100
@@ -323,9 +365,6 @@ class OkxSdkBackend(ExchangeBackend):
         if resp.get("code") != "0":
             raise RuntimeError(f"OKX historical market data error: {resp.get('msg', resp)}")
         return resp.get("data", [])
-
-    def close(self) -> None:
-        self._ccxt.close()
 
 
 # ---------------------------------------------------------------------------

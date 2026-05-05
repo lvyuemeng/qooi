@@ -33,9 +33,10 @@ jobs:
           runner.step(source=src)
           "
         env:
-          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
-          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY_TEST }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY_TEST }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE_TEST }}
+          OKX_FLAG: "1"
 
       - name: Upload logs
         if: always()
