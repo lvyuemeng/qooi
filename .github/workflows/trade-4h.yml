@@ -29,15 +29,15 @@ jobs:
 
           config = PortfolioConfig(
               pairs=[
-                  {'symbol': 'ETH-USDT', 'tf': '4h', 'capital': 100, 'risk_pct': 0.03},
-                  {'symbol': 'SOL-USDT', 'tf': '4h', 'capital': 50,  'risk_pct': 0.05},
+                  dict(symbol='ETH-USDT', tf='4h', capital=100, risk_pct=0.03),
+                  dict(symbol='SOL-USDT', tf='4h', capital=50,  risk_pct=0.05),
               ],
               dry_run=False,
           )
 
           runner = PortfolioRunner(config)
           runner.compute_all_signals(source=src)
-          runner.step()
+          runner.step(source=src)
           "
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
