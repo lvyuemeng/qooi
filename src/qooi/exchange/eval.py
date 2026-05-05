@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
 
 import polars as pl
@@ -62,31 +63,62 @@ def _spearman_rho(x: pl.Series, y: pl.Series) -> float:
     return float((d * e).sum()) / denom if denom > 1e-10 else 0.0
 
 
+def _infer_periods_per_year(equity_curve: pl.DataFrame, fallback: int = 365) -> int:
+    """Infer annualization frequency from timestamp spacing."""
+    if "timestamp" not in equity_curve.columns or equity_curve.height < 2:
+        return fallback
+
+    timestamps = equity_curve["timestamp"].to_list()
+    deltas = [
+        int(timestamps[i] - timestamps[i - 1])
+        for i in range(1, len(timestamps))
+        if (
+            timestamps[i] is not None
+            and timestamps[i - 1] is not None
+            and timestamps[i] > timestamps[i - 1]
+        )
+    ]
+    if not deltas:
+        return fallback
+
+    median_delta_ms = statistics.median(deltas)
+    if median_delta_ms <= 0:
+        return fallback
+
+    periods = int(round((86_400_000.0 / median_delta_ms) * 365.0))
+    return max(1, periods)
+
+
 def compute_metrics(
     equity_curve: pl.DataFrame,
     trades: pl.DataFrame | None = None,
     risk_free_rate: float = 0.02,
-    periods_per_year: int = 365,
+    periods_per_year: int | None = None,
 ) -> EvalMetrics:
     has_real_trades = trades is not None and not trades.is_empty() and "pnl" in trades.columns
     eq = equity_curve["portfolio_value"]
     rets = equity_curve["returns"]
     n = rets.len()
+    effective_periods_per_year = periods_per_year or _infer_periods_per_year(equity_curve)
 
     # --- Basic return & risk (Polars expressions) ---
     total_ret = float(eq.last() / eq.first() - 1)
-    ann_factor = periods_per_year / n if n > 0 else 1.0
-    ann_ret = (1 + total_ret) ** ann_factor - 1 if total_ret > -1 else -1.0
+    ann_factor = effective_periods_per_year / n if n > 0 else 1.0
+    if total_ret > -1:
+        ann_log_return = math.log1p(total_ret) * ann_factor
+        ann_ret = math.expm1(min(ann_log_return, 700.0))
+    else:
+        ann_ret = -1.0
 
     std = float(rets.std()) if n > 1 else 0.0
-    ann_vol = std * math.sqrt(periods_per_year) if std > 0 else 0.0
+    ann_vol = std * math.sqrt(effective_periods_per_year) if std > 0 else 0.0
     excess = ann_ret - risk_free_rate
     sharpe = excess / ann_vol if ann_vol > 0 else 0.0
 
     # Sortino
     neg_rets = rets.filter(rets < 0)
     downside = float(neg_rets.std()) if neg_rets.len() > 1 else 0.0
-    ann_downside = downside * math.sqrt(periods_per_year)
+    ann_downside = downside * math.sqrt(effective_periods_per_year)
     sortino = excess / ann_downside if ann_downside > 0 else 0.0
 
     # Drawdown (Polars expression)
