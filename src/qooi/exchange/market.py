@@ -23,7 +23,7 @@ Usage::
 
     # Async with WebSocket (live)
     md = await MarketData.async_("okx")
-    async for snap in md.ob_stream("BTC/USDT"):
+    async for snap in md.ob_stream("BTC/USDT", params={"depth": "books"}):
         print(snap.imbalance_5)
 """
 
@@ -68,8 +68,14 @@ class ObSnapshot:
             "timestamp": self.timestamp,
             "ob_bid_price": self.bid_price,
             "ob_ask_price": self.ask_price,
+            "ob_bid_vol_5": self.bid_vol_depth_5,
+            "ob_ask_vol_5": self.ask_vol_depth_5,
+            "ob_bid_vol_25": self.bid_vol_depth_25,
+            "ob_ask_vol_25": self.ask_vol_depth_25,
             "ob_bid_vol": self.bid_vol_depth_25,
             "ob_ask_vol": self.ask_vol_depth_25,
+            "ob_imbalance_5": self.imbalance_5,
+            "ob_imbalance_25": self.imbalance_25,
         }
 
     @classmethod
@@ -137,6 +143,18 @@ class ExchangeBackend:
     ) -> pl.DataFrame:
         return pl.DataFrame()
 
+    def market_data_history(
+        self,
+        module: int,
+        inst_type: str,
+        date_aggr_type: str,
+        begin: str,
+        end: str,
+        inst_id_list: list[str] | None = None,
+        inst_family_list: list[str] | None = None,
+    ) -> list[dict]:
+        return []
+
     def close(self) -> None:
         pass
 
@@ -169,7 +187,9 @@ class CcxtBackend(ExchangeBackend):
         return ObSnapshot.from_ccxt_book(raw)
 
     def close(self) -> None:
-        self._ex.close()
+        close = getattr(self._ex, "close", None)
+        if callable(close):
+            close()
 
 
 class OkxSdkBackend(ExchangeBackend):
@@ -192,6 +212,57 @@ class OkxSdkBackend(ExchangeBackend):
     ) -> list[list]:
         # Use ccxt for consistent since/pagination support
         return self._ccxt.fetch_ohlcv(symbol, timeframe, limit=limit, since=since)
+
+    def fetch_ohlcv_range(
+        self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
+    ) -> pl.DataFrame:
+        """Use OKX native history candles for contiguous deep pagination."""
+        since_ms = int(datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
+        page_limit = min(100, limit)
+        after = ""
+        rows: list[list] = []
+        seen: set[int] = set()
+
+        while len(rows) < limit:
+            resp = self._api.get_history_candlesticks(
+                instId=symbol,
+                after=after,
+                bar=_okx_timeframe(timeframe),
+                limit=str(page_limit),
+            )
+            if resp.get("code") != "0":
+                return ExchangeBackend.fetch_ohlcv_range(self, symbol, timeframe, since, limit)
+
+            chunk = resp.get("data", [])
+            if not chunk:
+                break
+
+            oldest_ts = None
+            for candle in chunk:
+                ts = int(candle[0])
+                oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
+                if ts in seen:
+                    continue
+                seen.add(ts)
+                rows.append(
+                    [
+                        ts,
+                        float(candle[1]),
+                        float(candle[2]),
+                        float(candle[3]),
+                        float(candle[4]),
+                        float(candle[5]),
+                    ]
+                )
+
+            if oldest_ts is None or oldest_ts <= since_ms or len(chunk) < page_limit:
+                break
+            after = str(oldest_ts)
+
+        if not rows:
+            return pl.DataFrame()
+
+        return _parse_ohlcv(rows).filter(pl.col("timestamp") >= since_ms).tail(limit)
 
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot:
         return self._ccxt.fetch_order_book(symbol, limit)
@@ -219,6 +290,40 @@ class OkxSdkBackend(ExchangeBackend):
             ]
         ).sort("timestamp")
 
+    def market_data_history(
+        self,
+        module: int,
+        inst_type: str,
+        date_aggr_type: str,
+        begin: str,
+        end: str,
+        inst_id_list: list[str] | None = None,
+        inst_family_list: list[str] | None = None,
+    ) -> list[dict]:
+        """Return downloadable historical-market-data metadata from OKX.
+
+        The documented OKX modules include:
+          - ``3`` funding rate
+          - ``4`` order book depth (400-level)
+          - ``5`` order book depth (5000-level)
+          - ``6`` order book depth (50-level)
+        """
+        from okx.PublicData import PublicAPI
+
+        pub = PublicAPI(flag="1")
+        resp = pub.get_market_data_history(
+            module=str(module),
+            instType=inst_type,
+            dateAggrType=date_aggr_type,
+            begin=begin,
+            end=end,
+            instIdList=",".join(inst_id_list) if inst_id_list else None,
+            instFamilyList=",".join(inst_family_list) if inst_family_list else None,
+        )
+        if resp.get("code") != "0":
+            raise RuntimeError(f"OKX historical market data error: {resp.get('msg', resp)}")
+        return resp.get("data", [])
+
     def close(self) -> None:
         self._ccxt.close()
 
@@ -244,9 +349,11 @@ class CcxtProBackend:
             config["proxies"] = {"https": proxy, "http": proxy}
         self._ex = klass(config)
 
-    async def watch_ob(self, symbol: str, limit: int = 25) -> AsyncIterator[ObSnapshot]:
+    async def watch_ob(
+        self, symbol: str, limit: int = 25, params: dict[str, Any] | None = None
+    ) -> AsyncIterator[ObSnapshot]:
         while True:
-            book = await self._ex.watch_order_book(symbol, limit=limit)
+            book = await self._ex.watch_order_book(symbol, limit=limit, params=params or {})
             yield ObSnapshot.from_ccxt_book(book)
 
     async def close(self) -> None:
@@ -278,6 +385,7 @@ class MarketData:
     def __init__(self, exchange_id: str = "okx", proxy: str | None = None) -> None:
         self._backend: ExchangeBackend
         self._async_backend: CcxtProBackend | None = None
+        self._proxy = proxy
         if exchange_id == "okx":
             self._backend = OkxSdkBackend(proxy)
         else:
@@ -295,18 +403,32 @@ class MarketData:
     def exchange_id(self) -> str:
         return self._exchange_id
 
+    @property
+    def proxy(self) -> str | None:
+        return self._proxy
+
     # -- OHLCV -----------------------------------------------------------
 
     def candles(
         self, symbol: str, timeframe: str = "1d", limit: int = 300, since: int | None = None
     ) -> pl.DataFrame:
-        raw = self._backend.fetch_ohlcv(symbol, timeframe, limit=limit, since=since)
+        raw = self._backend.fetch_ohlcv(
+            symbol,
+            _normalize_timeframe(timeframe),
+            limit=limit,
+            since=since,
+        )
         return _parse_ohlcv(raw)
 
     def candles_range(
         self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
     ) -> pl.DataFrame:
-        return self._backend.fetch_ohlcv_range(symbol, timeframe, since, limit)
+        return self._backend.fetch_ohlcv_range(
+            symbol,
+            _normalize_timeframe(timeframe),
+            since,
+            limit,
+        )
 
     # -- Order book ------------------------------------------------------
 
@@ -314,11 +436,17 @@ class MarketData:
         """REST order book snapshot (synchronous)."""
         return self._backend.fetch_order_book(symbol, limit=limit)
 
-    async def ob_stream(self, symbol: str, limit: int = 25) -> AsyncIterator[ObSnapshot]:
-        """WebSocket order book stream (requires ``.async_()`` constructor)."""
+    async def ob_stream(
+        self, symbol: str, limit: int = 25, params: dict[str, Any] | None = None
+    ) -> AsyncIterator[ObSnapshot]:
+        """WebSocket order-book stream.
+
+        For OKX, ``params`` can pass ``{"depth": "books"}``, ``"books5"``,
+        ``"books50-l2-tbt"`` or ``"bbo-tbt"`` as supported by CCXT Pro.
+        """
         if self._async_backend is None:
             raise RuntimeError("Use MarketData.async_() for WebSocket access")
-        async for snap in self._async_backend.watch_ob(symbol, limit=limit):
+        async for snap in self._async_backend.watch_ob(symbol, limit=limit, params=params):
             yield snap
 
     # -- Funding rate ----------------------------------------------------
@@ -327,6 +455,26 @@ class MarketData:
         self, inst_id: str = "BTC-USDT-SWAP", limit: int = 100
     ) -> pl.DataFrame:
         return self._backend.funding_rate_history(inst_id, limit)
+
+    def market_data_history(
+        self,
+        module: int,
+        inst_type: str,
+        date_aggr_type: str,
+        begin: str,
+        end: str,
+        inst_id_list: list[str] | None = None,
+        inst_family_list: list[str] | None = None,
+    ) -> list[dict]:
+        return self._backend.market_data_history(
+            module,
+            inst_type,
+            date_aggr_type,
+            begin,
+            end,
+            inst_id_list,
+            inst_family_list,
+        )
 
     # -- Lifecycle -------------------------------------------------------
 
@@ -357,6 +505,26 @@ def _parse_ohlcv(raw: list[list]) -> pl.DataFrame:
             for r in raw
         ]
     ).sort("timestamp")
+
+
+def _normalize_timeframe(timeframe: str) -> str:
+    if timeframe.endswith("H"):
+        return f"{timeframe[:-1]}h"
+    if timeframe.endswith("D"):
+        return f"{timeframe[:-1]}d"
+    if timeframe.endswith("W"):
+        return f"{timeframe[:-1]}w"
+    return timeframe
+
+
+def _okx_timeframe(timeframe: str) -> str:
+    if timeframe.endswith("h"):
+        return f"{timeframe[:-1]}H"
+    if timeframe.endswith("d"):
+        return f"{timeframe[:-1]}D"
+    if timeframe.endswith("w"):
+        return f"{timeframe[:-1]}W"
+    return timeframe
 
 
 def _days_since(since: str) -> int:
