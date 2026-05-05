@@ -1,24 +1,6 @@
 """OKX trading — orders, signals, execution, portfolio management.
 
-Layers:
-  1. TradingClient — atomic order/account/position operations
-  2. compute_signal — offline signal pipeline, writes JSON to data/signals/
-  3. LiveExecutor — reads signal file → places limit orders → logs
-  4. PortfolioRunner — multi-asset deployment from a config list
-
-Usage::
-
-    # Offline: compute signal (no API key needed)
-    from qooi.exchange.trading import compute_signal
-    compute_signal("ETH-USDT", "4h")
-
-    # Online: execute from signal file
-    from qooi.exchange.trading import LiveExecutor
-    LiveExecutor(dry_run=False).step()
-
-    # Portfolio: multi-asset
-    from qooi.exchange.trading import PortfolioConfig, PortfolioRunner
-    PortfolioRunner(PortfolioConfig([...], dry_run=False)).step()
+Typed data layer using pydantic — no raw dicts in public API.
 """
 
 from __future__ import annotations
@@ -26,10 +8,11 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -45,21 +28,17 @@ SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
 def _env(key: str) -> str:
     val = os.getenv(key)
     if not val:
-        msg = f"Missing {key}. Set in .env or export {key}=..."
-        raise RuntimeError(msg)
+        raise RuntimeError(f"Missing {key}. Set in .env or export {key}=...")
     return val
 
 
 # ============================================================================
-# 1. Atomic trading client (order / account / position)
+# 1. Trading client
 # ============================================================================
 
 
 class TradingClient:
-    """Place/cancel orders, query balance and positions.
-
-    flag="1" → testnet (demo). flag="0" → live.
-    """
+    """Place/cancel orders, query balance and positions.  flag=\"1\" = testnet."""
 
     def __init__(self, flag: str = "1") -> None:
         from okx.Account import AccountAPI
@@ -68,8 +47,6 @@ class TradingClient:
         k, s, p = _env("OKX_API_KEY"), _env("OKX_SECRET_KEY"), _env("OKX_PASSPHRASE")
         self._trade = TradeAPI(k, s, p, flag=flag, debug=False)
         self._account = AccountAPI(k, s, p, flag=flag, debug=False)
-
-    # -- orders ---------------------------------------------------------------
 
     def place(
         self,
@@ -83,8 +60,7 @@ class TradingClient:
         params = {"instId": inst_id, "side": side, "ordType": ord_type, "sz": sz, "tdMode": td_mode}
         if px:
             params["px"] = px
-        r = self._trade.place_order(**params)
-        return _check(r)
+        return _check(self._trade.place_order(**params))
 
     def cancel(self, inst_id: str, ord_id: str) -> dict:
         return _check(self._trade.cancel_order(instId=inst_id, ordId=ord_id))
@@ -92,14 +68,11 @@ class TradingClient:
     def pending(self) -> list:
         return self._trade.get_order_list().get("data", [])
 
-    # -- account --------------------------------------------------------------
-
     def balance(self, ccy: str | None = None) -> list:
         params = {}
         if ccy:
             params["ccy"] = ccy
-        resp = self._account.get_account_balance(**params)
-        return _check(resp).get("details", [])
+        return _check(self._account.get_account_balance(**params)).get("details", [])
 
     def positions(self) -> list:
         return _check(self._account.get_positions()).get("data", [])
@@ -112,12 +85,37 @@ def _check(resp: dict) -> dict:
 
 
 # ============================================================================
-# 2. Order state tracker (lifecycle record)
+# 2. Typed data models (pydantic — JSON + human readable)
 # ============================================================================
 
 
-@dataclass
-class OrderState:
+class SignalResult(BaseModel):
+    """Output of a signal pipeline — the only format the executor consumes."""
+
+    symbol: str
+    timeframe: str
+    timestamp: int
+    signal: float
+    flow: float = 0.0
+    computed_at: int = 0
+
+    @classmethod
+    def from_dataframe(cls, symbol: str, timeframe: str, df) -> SignalResult:
+        signal_val = float(df["signal"][-1] or 0.0)
+        flow_val = float(df["ofi_flow_score"][-1] or 0.0) if "ofi_flow_score" in df.columns else 0.0
+        return cls(
+            symbol=symbol,
+            timeframe=timeframe,
+            timestamp=int(df["timestamp"][-1]),
+            signal=round(signal_val, 4),
+            flow=round(flow_val, 4),
+            computed_at=int(time.time()),
+        )
+
+
+class OrderRecord(BaseModel):
+    """Immutable snapshot of an order for logging."""
+
     ord_id: str = ""
     inst_id: str = ""
     side: str = ""
@@ -128,93 +126,156 @@ class OrderState:
     filled_px: float = 0.0
     status: str = "placed"
     reason: str = ""
-    signal_value: float = 0.0
-    obi_value: float = 0.0
-    flow_value: float = 0.0
+    signal: float = 0.0
+    obi: float = 0.0
+    ofi_flow: float = 0.0
+
+    @classmethod
+    def from_state(cls, o) -> OrderRecord:
+        return cls(
+            ord_id=o.ord_id,
+            inst_id=o.inst_id,
+            side=o.side,
+            sz=o.sz,
+            px=o.px,
+            placed_at=o.placed_at,
+            filled_sz=o.filled_sz,
+            filled_px=o.filled_px,
+            status=o.status,
+            reason=o.reason,
+            signal=round(o.signal_value, 4),
+            obi=round(o.obi_value, 4),
+            ofi_flow=round(o.flow_value, 4),
+        )
+
+
+class LogLine(BaseModel):
+    """One event line — JSONL record + human readable string."""
+
+    ts: int = 0
+    event: str = ""
+    symbol: str = ""
+    tf: str = ""
+    payload: dict = {}
+
+    def __str__(self) -> str:
+        t = time.strftime("%H:%M:%S", time.localtime(self.ts / 1000))
+        s, tf = self.symbol, self.tf
+        p = self.payload
+        match self.event:
+            case "cycle_start":
+                return f"[{t}] {s} {tf} -- cycle start"
+            case "skip":
+                return f"[{t}] {s} {tf} skip ({p.get('reason', '?')})"
+            case "signal":
+                sig = p.get("signal", 0)
+                obi = p.get("obi_5", 0)
+                flow = p.get("ofi_flow", 0)
+                return f"[{t}] {s} {tf} | sig={sig:+.3f} obi={obi:+.3f} flow={flow:+.3f}"
+            case "order":
+                sd = p.get("side", "?")
+                z = p.get("sz", 0)
+                x = p.get("px", 0)
+                oid = p.get("ord_id", "?")
+                return f"[{t}] {s} {tf} | ORDER {sd:4s} sz={z:.6f} px={x:.1f} id={oid}"
+            case "cancel":
+                return f"[{t}] {s} {tf} | CANCEL {p.get('reason', '?')}"
+            case "order_error" | "error":
+                return f"[{t}] {s} {tf} | ERROR {p.get('error', p.get('msg', '?'))}"
+            case _:
+                return json.dumps(p, default=str)[:120]
 
 
 # ============================================================================
-# 3. Signal pipeline — pluggable (any callable that takes a DataFrame)
+# 3. Order state (mutable lifecycle tracker)
 # ============================================================================
 
 
-def default_pipeline(df):
-    """Multi-factor intraday ensemble — used when no custom pipeline given."""
-    from qooi.exchange.indicator import add_indicators
-    from qooi.strategies.flow_pipeline import (
-        add_adaptive_threshold,
-        add_ofi_flow_columns,
-        add_regime_features,
-        apply_adaptive_gate,
-        apply_micro_confirmation,
+class OrderState:
+    """Mutable tracker — created on place, updated on fill/cancel."""
+
+    __slots__ = (
+        "ord_id",
+        "inst_id",
+        "side",
+        "sz",
+        "px",
+        "placed_at",
+        "filled_sz",
+        "filled_px",
+        "status",
+        "reason",
+        "signal_value",
+        "obi_value",
+        "flow_value",
     )
-    from qooi.strategies.intraday import multi_factor_intraday_signal
 
-    df = add_indicators(df)
-    df = add_regime_features(df)
-    df = multi_factor_intraday_signal(df)
-    df = add_ofi_flow_columns(df)
-    df = apply_micro_confirmation(df)
-    df = add_adaptive_threshold(df)
-    df = apply_adaptive_gate(df)
-    return df
-
-
-def compute_signal(
-    symbol: str = "BTC-USDT",
-    timeframe: str = "4h",
-    pipeline=default_pipeline,
-) -> dict | None:
-    """Run pipeline on latest bar → write signal file → return dict.
-
-    ``pipeline`` is any callable ``DataFrame -> DataFrame`` that
-    produces a ``signal`` column.  Pass your own to swap strategies
-    without touching executor code.
-
-    Example::
-
-        # Use trend-pullback instead of ensemble
-        from qooi.strategies.trend_pullback import trend_pullback_signal
-        def tp_pipeline(df):
-            df = add_indicators(df)
-            return trend_pullback_signal(df)
-        compute_signal(\"BTC-USDT\", \"1D\", pipeline=tp_pipeline)
-    """
-    from qooi.exchange.market import MarketData
-
-    fname = SIGNAL_DIR / f"{symbol.replace('-', '_')}_{timeframe}.json"
-    md = MarketData()
-    df = md.candles(symbol, timeframe=timeframe, limit=500)
-    if df.is_empty():
-        return None
-
-    df = pipeline(df)
-
-    signal_val = float(df["signal"][-1] or 0.0)
-    flow_val = float(df["ofi_flow_score"][-1] or 0.0) if "ofi_flow_score" in df.columns else 0.0
-    ts = int(df["timestamp"][-1])
-
-    result = {
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "timestamp": ts,
-        "signal": round(signal_val, 4),
-        "flow": round(flow_val, 4),
-        "computed_at": int(time.time()),
-    }
-    fname.write_text(json.dumps(result, indent=2))
-    return result
+    def __init__(self) -> None:
+        self.ord_id = ""
+        self.inst_id = ""
+        self.side = ""
+        self.sz = 0.0
+        self.px = 0.0
+        self.placed_at = 0.0
+        self.filled_sz = 0.0
+        self.filled_px = 0.0
+        self.status = "placed"
+        self.reason = ""
+        self.signal_value = 0.0
+        self.obi_value = 0.0
+        self.flow_value = 0.0
 
 
 # ============================================================================
-# 4. Live executor (reads signal file → places limit orders → logs)
+# 4. Signal source protocol
+# ============================================================================
+
+SignalSource = Callable[[str, str], SignalResult | None]
+
+
+def default_signal_source() -> SignalSource:
+    """Factory → multi-factor intraday ensemble."""
+
+    def _src(symbol: str, timeframe: str) -> SignalResult | None:
+        from qooi.exchange.indicator import add_indicators
+        from qooi.exchange.market import MarketData
+        from qooi.strategies.flow_pipeline import (
+            add_adaptive_threshold,
+            add_ofi_flow_columns,
+            add_regime_features,
+            apply_adaptive_gate,
+            apply_micro_confirmation,
+        )
+        from qooi.strategies.intraday import multi_factor_intraday_signal
+
+        df = MarketData().candles(symbol, timeframe=timeframe, limit=500)
+        if df.is_empty():
+            return None
+        df = add_indicators(df)
+        for fn in (
+            add_regime_features,
+            multi_factor_intraday_signal,
+            add_ofi_flow_columns,
+            apply_micro_confirmation,
+            add_adaptive_threshold,
+            apply_adaptive_gate,
+        ):
+            df = fn(df)
+        return SignalResult.from_dataframe(symbol, timeframe, df)
+
+    return _src
+
+
+# ============================================================================
+# 5. Live executor
 # ============================================================================
 
 
 class LiveExecutor:
-    """Read signal file, place/manage limit orders, log everything.
+    """Consume SignalResult → place/manage limit orders → log.
 
-    dry_run=True → simulate only (no orders). dry_run=False → real testnet/live.
+    signal_source=None → reads from data/signals/ (file-based fallback).
+    signal_source=callable → computes directly (recommended).
     """
 
     def __init__(
@@ -242,42 +303,50 @@ class LiveExecutor:
         self._active: OrderState | None = None
         self._trade_count = 0
 
-    def step(self) -> OrderState | None:
-        self._log("cycle_start", {})
-        sf = SIGNAL_DIR / f"{self._symbol.replace('-', '_')}_{self._tf}.json"
-        if not sf.exists():
-            return self._log("skip", {"reason": "no_signal_file"})
+    # -- public ---------------------------------------------------------------
 
-        sig_data = json.loads(sf.read_text())
-        signal = sig_data.get("signal", 0.0)
-        flow_val = sig_data.get("flow", 0.0)
-        sig_ts = sig_data.get("timestamp", 0)
+    def step(self, signal_source: SignalSource | None = None) -> OrderState | None:
+        self._log("cycle_start")
+        sr: SignalResult | None = None
+
+        if signal_source:
+            sr = signal_source(self._symbol, self._tf)
+            if sr:
+                # persist for audit trail
+                (SIGNAL_DIR / f"{self._symbol.replace('-', '_')}_{self._tf}.json").write_text(
+                    sr.model_dump_json(indent=2)
+                )
+        else:
+            sf = SIGNAL_DIR / f"{self._symbol.replace('-', '_')}_{self._tf}.json"
+            if sf.exists():
+                sr = SignalResult.model_validate(json.loads(sf.read_text()))
+
+        if not sr:
+            return self._log("skip", {"reason": "no_signal"})
 
         bar_ms = {"1h": 3600000, "4h": 14400000, "1d": 86400000}.get(self._tf, 14400000)
-        if time.time() * 1000 - sig_ts > bar_ms * 1.5:
+        if time.time() * 1000 - sr.timestamp > bar_ms * 1.5:
             return self._log("skip", {"reason": "stale_signal"})
 
         obi = self._md.ob_snapshot(self._symbol)
         self._log(
-            "signal",
-            {
-                "signal": round(signal, 4),
-                "obi_5": round(obi.imbalance_5, 4),
-                "ofi_flow": round(flow_val, 4),
-            },
+            "signal", {"signal": sr.signal, "obi_5": round(obi.imbalance_5, 4), "ofi_flow": sr.flow}
         )
 
-        if self._active and self._active.status == "placed":
-            if time.time() - self._active.placed_at > self._timeout:
-                self._cancel("timeout")
+        if (
+            self._active
+            and self._active.status == "placed"
+            and time.time() - self._active.placed_at > self._timeout
+        ):
+            self._cancel("timeout")
 
-        if abs(signal) < 0.25:
+        if abs(sr.signal) < 0.25:
             return self._log("skip", {"reason": "weak_signal"})
 
         if self._active and self._active.status in ("placed", "partial_fill"):
             return self._log("skip", {"reason": "order_outstanding"})
 
-        side = "buy" if signal > 0 else "sell"
+        side = "buy" if sr.signal > 0 else "sell"
         if not self._dry and self._client:
             pos = self._client.positions()
             if any(p.get("instId") == self._symbol and float(p.get("pos", "0")) != 0 for p in pos):
@@ -285,11 +354,11 @@ class LiveExecutor:
                     return self._log("skip", {"reason": "already_long"})
 
         entry_px = obi.ask_price if side == "buy" else obi.bid_price
-        sz = self._capital * self._max_pos * abs(signal) / (entry_px or 1)
+        sz = self._capital * self._max_pos * abs(sr.signal) / max(entry_px, 1)
         if sz < 0.00001:
             return self._log("skip", {"reason": "size_too_small"})
 
-        return self._place(side, sz, entry_px, signal, obi, flow_val)
+        return self._place(side, sz, entry_px, sr.signal, obi, sr.flow)
 
     def status(self) -> dict:
         return {
@@ -297,104 +366,84 @@ class LiveExecutor:
             "tf": self._tf,
             "capital": self._capital,
             "dry": self._dry,
-            "active": self._active.ord_id if self._active else None,
             "trades": self._trade_count,
+            "active": self._active.ord_id if self._active else None,
         }
 
     # -- internals ------------------------------------------------------------
 
-    def _place(self, side, sz, px, signal, obi, flow):
+    def _place(
+        self, side: str, sz: float, px: float, signal: float, obi, flow: float
+    ) -> OrderState | None:
         sz, px = round(sz, 8), round(px, 1)
+        st = OrderState()
+        st.inst_id = self._symbol
+        st.side = side
+        st.sz = sz
+        st.px = px
+        st.placed_at = time.time()
+        st.signal_value = signal
+        st.obi_value = obi.imbalance_5
+        st.flow_value = flow
+
         if self._dry:
-            self._active = OrderState(
-                ord_id="dry_" + str(int(time.time())),
-                inst_id=self._symbol,
-                side=side,
-                sz=sz,
-                px=px,
-                placed_at=time.time(),
-                signal_value=signal,
-                obi_value=obi.imbalance_5,
-                flow_value=flow,
-                status="simulated",
-            )
-            self._log("order", self._to_dict(self._active))
+            st.ord_id = "dry_" + str(int(time.time()))
+            st.status = "simulated"
+            self._active = st
+            self._log_order()
             self._trade_count += 1
             return self._active
 
         try:
             otype = "post_only" if self._post_only else "limit"
             resp = self._client.place(self._symbol, side, str(sz), ord_type=otype, px=str(px))
-            self._active = OrderState(
-                ord_id=resp.get("ordId", ""),
-                inst_id=self._symbol,
-                side=side,
-                sz=sz,
-                px=px,
-                placed_at=time.time(),
-                signal_value=signal,
-                obi_value=obi.imbalance_5,
-                flow_value=flow,
-                status="placed",
-            )
-            self._log("order", self._to_dict(self._active))
+            st.ord_id = resp.get("ordId", "")
+            st.status = "placed"
+            self._active = st
+            self._log_order()
             self._trade_count += 1
             return self._active
         except Exception as e:
             self._log("order_error", {"error": str(e)})
             return None
 
-    def _cancel(self, reason):
+    def _cancel(self, reason: str) -> None:
         if not self._active:
             return
         self._active.status, self._active.reason = "cancelled", reason
-        self._log("cancel", self._to_dict(self._active))
+        self._log_order()
         if not self._dry and self._client:
             self._client.cancel(self._symbol, self._active.ord_id)
         self._active = None
 
-    @staticmethod
-    def _to_dict(o):
-        return {
-            "ord_id": o.ord_id,
-            "inst_id": o.inst_id,
-            "side": o.side,
-            "sz": o.sz,
-            "px": o.px,
-            "placed_at": o.placed_at,
-            "filled_sz": o.filled_sz,
-            "filled_px": o.filled_px,
-            "status": o.status,
-            "reason": o.reason,
-            "signal": round(o.signal_value, 4),
-            "obi": round(o.obi_value, 4),
-            "ofi_flow": round(o.flow_value, 4),
-        }
+    def _log_order(self) -> None:
+        if self._active:
+            self._log(
+                "order" if self._active.status == "placed" else "cancel",
+                OrderRecord.from_state(self._active).model_dump(),
+            )
 
-    def _log(self, event, data):
-        record = {
-            "ts": int(time.time() * 1000),
-            "event": event,
-            "symbol": self._symbol,
-            "tf": self._tf,
-            **data,
-        }
+    def _log(self, event: str, payload: dict | None = None) -> None:
+        line = LogLine(
+            ts=int(time.time() * 1000),
+            event=event,
+            symbol=self._symbol,
+            tf=self._tf,
+            payload=payload or {},
+        )
         fname = LOG_DIR / f"exec_{self._symbol.replace('-', '_')}_{self._tf}.jsonl"
         with open(fname, "a") as f:
-            f.write(json.dumps(record) + "\n")
-        print(_human(event, self._symbol, self._tf, data))
-        return (
-            None if event in ("skip", "error") else None
-        )  # return None only when we shouldn't return order
+            f.write(line.model_dump_json() + "\n")
+        print(str(line))
+        return None  # used as return from step() when skipping
 
 
 # ============================================================================
-# 5. Portfolio runner
+# 6. Portfolio runner
 # ============================================================================
 
 
-@dataclass
-class PortfolioConfig:
+class PortfolioConfig(BaseModel):
     pairs: list[dict]
     dry_run: bool = True
     post_only: bool = True
@@ -406,10 +455,8 @@ class PortfolioRunner:
 
     def __init__(self, config: PortfolioConfig) -> None:
         self._config = config
-        self._executors: dict[str, LiveExecutor] = {}
-        for p in config.pairs:
-            key = f"{p['symbol']}_{p.get('tf', '4h')}"
-            self._executors[key] = LiveExecutor(
+        self._executors: dict[str, LiveExecutor] = {
+            f"{p['symbol']}_{p.get('tf', '4h')}": LiveExecutor(
                 symbol=p["symbol"],
                 timeframe=p.get("tf", "4h"),
                 initial_capital=p.get("capital", 100),
@@ -418,30 +465,33 @@ class PortfolioRunner:
                 limit_timeout_sec=config.limit_timeout_sec,
                 dry_run=config.dry_run,
             )
+            for p in config.pairs
+        }
 
-    def step(self) -> dict:
+    def step(self, source: SignalSource | None = None) -> dict:
         results = {}
         t = time.strftime("%Y-%m-%d %H:%M:%S")
-        hdr = f"\n{'=' * 60}\n  Portfolio {t}  Dry: {self._config.dry_run}\n{'=' * 60}"
-        print(hdr)
+        d = self._config.dry_run
+        print(f"\n{'=' * 60}\n  Portfolio {t}  Dry: {d}\n{'=' * 60}")
         for key, exe in self._executors.items():
-            results[key] = exe.step()
+            results[key] = exe.step(signal_source=source)
         self._summary(results)
         return results
 
-    def compute_all_signals(self) -> list[dict]:
+    def compute_all_signals(self, source: SignalSource | None = None) -> list[SignalResult]:
+        src = source or default_signal_source()
         out = []
         for p in self._config.pairs:
-            s = compute_signal(p["symbol"], p.get("tf", "4h"))
+            s = src(p["symbol"], p.get("tf", "4h"))
             if s:
                 out.append(s)
-                print(f"  {p['symbol']:15s} sig={s['signal']:+.4f}")
+                print(f"  {p['symbol']:15s} sig={s.signal:+.4f}")
         return out
 
     def status(self) -> dict:
         return {k: e.status() for k, e in self._executors.items()}
 
-    def _summary(self, results):
+    def _summary(self, results: dict) -> None:
         txt, jl = LOG_DIR / "portfolio_summary.txt", LOG_DIR / "portfolio.jsonl"
         placed = sum(1 for r in results.values() if r and r.status == "placed")
         lines = [f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]"]
@@ -459,35 +509,12 @@ class PortfolioRunner:
             f.write("\n".join(lines) + "\n\n")
         with open(jl, "a") as f:
             f.write(
-                json.dumps({"ts": int(time.time() * 1000), "placed": placed, "total": len(results)})
+                LogLine(
+                    ts=int(time.time() * 1000),
+                    event="portfolio",
+                    symbol="*",
+                    tf="*",
+                    payload={"placed": placed, "total": len(results)},
+                ).model_dump_json()
                 + "\n"
             )
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
-
-
-def _human(event, symbol, tf, data):
-    ts = time.strftime("%H:%M:%S")
-    if event == "cycle_start":
-        return f"[{ts}] {symbol} {tf} ── cycle start"
-    if event == "skip":
-        return f"[{ts}] {symbol} {tf} ⏭  skip ({data.get('reason', '?')})"
-    if event == "signal":
-        s, o, f = data.get("signal", 0), data.get("obi_5", 0), data.get("ofi_flow", 0)
-        return f"[{ts}] {symbol} {tf} | sig={s:+.3f} obi={o:+.3f} flow={f:+.3f}"
-    if event == "order":
-        s, z, p, i = (
-            data.get("side", "?"),
-            data.get("sz", 0),
-            data.get("px", 0),
-            data.get("ord_id", "?"),
-        )
-        return f"[{ts}] {symbol} {tf} | ORDER {s:4s} sz={z:.6f} px={p:.1f} id={i}"
-    if event in ("cancel",):
-        return f"[{ts}] {symbol} {tf} | CANCEL {data.get('reason', '?')}"
-    if event in ("order_error", "error"):
-        return f"[{ts}] {symbol} {tf} | ERROR {data.get('error', data.get('msg', '?'))}"
-    return json.dumps(data)[:120]

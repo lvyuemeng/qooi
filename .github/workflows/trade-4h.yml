@@ -4,7 +4,6 @@ name: qooi-4h
 on:
   schedule:
     - cron: '0 */4 * * *'
-  # Allow manual trigger for testing
   workflow_dispatch:
 
 jobs:
@@ -21,18 +20,13 @@ jobs:
       - name: Sync dependencies
         run: uv sync
 
-      - name: Compute signals (offline — no API key)
+      - name: Compute + execute signals (multi-factor intraday ensemble)
         run: |
           uv run python -c "
-          from qooi.exchange.trading import compute_signal
-          compute_signal('ETH-USDT', '4h')
-          compute_signal('SOL-USDT', '4h')
-          "
+          from qooi.exchange.trading import default_signal_source, PortfolioConfig, PortfolioRunner
 
-      - name: Execute orders (testnet — needs secrets)
-        run: |
-          uv run python -c "
-          from qooi.exchange.trading import PortfolioConfig, PortfolioRunner
+          src = default_signal_source()
+
           config = PortfolioConfig(
               pairs=[
                   {'symbol': 'ETH-USDT', 'tf': '4h', 'capital': 100, 'risk_pct': 0.03},
@@ -40,14 +34,17 @@ jobs:
               ],
               dry_run=False,
           )
-          PortfolioRunner(config).step()
+
+          runner = PortfolioRunner(config)
+          runner.compute_all_signals(source=src)
+          runner.step()
           "
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
 
-      - name: Upload logs (for post-trade analysis)
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
