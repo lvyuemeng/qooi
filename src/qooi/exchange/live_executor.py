@@ -336,11 +336,148 @@ class LiveExecutor:
         fname = self._log_path / f"exec_{self._symbol.replace('-', '_')}_{self._timeframe}.jsonl"
         with open(fname, "a") as f:
             f.write(json.dumps(record) + "\n")
+        # Human-readable echo
+        msg = _human_line(event, self._symbol, self._timeframe, data)
+        print(msg)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio runner
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PortfolioConfig:
+    """Single config for multi-asset deployment.
+
+    Example::
+
+        config = PortfolioConfig(
+            pairs=[
+                {"symbol": "ETH-USDT", "tf": "4h", "capital": 100, "risk_pct": 0.03},
+                {"symbol": "SOL-USDT", "tf": "4h", "capital": 50,  "risk_pct": 0.05},
+            ],
+            dry_run=True,
+        )
+        PortfolioRunner(config).step()
+    """
+
+    pairs: list[dict]
+    dry_run: bool = True
+    post_only: bool = True
+    limit_timeout_sec: int = 120
+
+
+class PortfolioRunner:
+    """Run multiple LiveExecutor instances from one config, with summary log."""
+
+    def __init__(self, config: PortfolioConfig) -> None:
+        self._config = config
+        self._executors: dict[str, LiveExecutor] = {}
+        for pair in config.pairs:
+            sym = pair["symbol"]
+            tf = pair.get("tf", "4h")
+            self._executors[f"{sym}_{tf}"] = LiveExecutor(
+                symbol=sym,
+                timeframe=tf,
+                initial_capital=pair.get("capital", 100),
+                max_position_pct=pair.get("risk_pct", 0.03),
+                post_only=config.post_only,
+                limit_timeout_sec=config.limit_timeout_sec,
+                dry_run=config.dry_run,
+            )
+
+    def step(self) -> dict[str, OrderState | None]:
+        results = {}
+        print(f"\n{'=' * 60}")
+        print(f"  Portfolio step @ {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  Dry: {self._config.dry_run}  Pairs: {len(self._config.pairs)}")
+        print(f"{'=' * 60}")
+        for key, exe in self._executors.items():
+            result = exe.step()
+            results[key] = result
+        self._write_summary(results)
+        return results
+
+    def compute_all_signals(self) -> list[dict]:
+        """Pre-compute signals for all pairs (offline step)."""
+        computed = []
+        print(f"\\n{'=' * 60}")
+        print(f"  Computing signals for {len(self._config.pairs)} pairs")
+        print(f"{'=' * 60}")
+        for pair in self._config.pairs:
+            s = compute_signal(pair["symbol"], pair.get("tf", "4h"))
+            if s:
+                computed.append(s)
+                print(f"  {pair['symbol']:15s} sig={s['signal']:+.4f}  flow={s['flow']:+.4f}")
+        return computed
+
+    def _write_summary(self, results):
+        """Human-readable summary to both JSONL and plain-text."""
+        # Plain-text log
+        txt_path = LOG_DIR / "portfolio_summary.txt"
+        lines = [f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]"]
+        placed = 0
+        for key, result in results.items():
+            if result and result.status == "placed":
+                lines.append(
+                    f"  {key:20s} {result.side.upper():4s}  sz={result.sz:.6f}  "
+                    f"px={result.px:.1f}  sig={result.signal_value:+.3f}  "
+                    f"obi={result.obi_value:+.3f}"
+                )
+                placed += 1
+            elif result:
+                lines.append(f"  {key:20s} {result.status}")
+            else:
+                lines.append(f"  {key:20s} no_signal")
+        lines.append(f"  Placed: {placed}/{len(results)}")
+        with open(txt_path, "a") as f:
+            f.write("\n".join(lines) + "\n\n")
+
+        # JSONL summary
+        jl_path = LOG_DIR / "portfolio.jsonl"
+        summary = {
+            "ts": int(time.time() * 1000),
+            "placed": placed,
+            "total": len(results),
+            "results": {key: (r._order_dict(r) if r else None) for key, r in results.items()},
+        }
+        with open(jl_path, "a") as f:
+            f.write(json.dumps(summary) + "\n")
+
+    def get_status(self) -> dict:
+        return {key: exe.get_status() for key, exe in self._executors.items()}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _human_line(event, symbol, tf, data):
+    ts = time.strftime("%H:%M:%S")
+    if event == "cycle_start":
+        return f"[{ts}] {symbol} {tf} ── cycle start"
+    if event == "skip":
+        return f"[{ts}] {symbol} {tf} ⏭  skip ({data.get('reason', '?')})"
+    if event == "signal":
+        sig = data.get("signal", 0)
+        obi = data.get("obi_5", 0)
+        flow = data.get("ofi_flow", 0)
+        return f"[{ts}] {symbol} {tf} | sig={sig:+.3f}  obi={obi:+.3f}  flow={flow:+.3f}"
+    if event == "order":
+        side = data.get("side", "?")
+        sz = data.get("sz", 0)
+        px = data.get("px", 0)
+        oid = data.get("ord_id", "?")
+        return f"[{ts}] {symbol} {tf} | ORDER {side:4s} sz={sz:.6f} px={px:.1f} id={oid}"
+    if event == "cancel":
+        return f"[{ts}] {symbol} {tf} | CANCEL {data.get('reason', '?')}"
+    if event == "order_error":
+        return f"[{ts}] {symbol} {tf} ❌ ERROR {data.get('error', '?')}"
+    if event == "error":
+        return f"[{ts}] {symbol} {tf} ❌ {data.get('msg', '?')}"
+    return json.dumps(data)[:120]
 
 
 def _timeframe_ms(tf: str) -> int:
