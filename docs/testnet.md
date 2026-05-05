@@ -1,136 +1,111 @@
-# Testnet workflow
+# Testnet deployment
 
 ## Architecture
 
 ```
-Layer 1 (offline)           Layer 2 (online — API key needed)
-compute_signal()             LiveExecutor.step()
-      │                            │
-      ▼                            ▼
-data/signals/                 Read signal file
-  ETH_USDT_4h.json ──────────► Check staleness
-                               Get live OBI
-                               Place limit order
-                               Cancel if timeout
-                               Log → JSONL
+compute_signal()                   LiveExecutor.step()
+  (offline, no API key)              (online, reads signal file)
+      │                                    │
+      ▼                                    ▼
+data/signals/                         Read → check staleness
+  ETH_USDT_4h.json                    Place limit order (post_only)
+                                      Cancel if timeout (120s)
+                                      Log → data/logs/
 ```
 
-Signal computation uses cached OHLCV — no API key, no internet needed.
-Executor reads signal file, places orders via OKX demo (flag='1').
+**Layers** (all in `src/qooi/exchange/trading.py`):
 
-## Setup (once)
+| Class/Function | Purpose | Needs API key |
+|---|---|---|
+| `TradingClient` | place/cancel orders, balance, positions | Yes |
+| `compute_signal(symbol, tf)` | run pipeline → write JSON signal file | No |
+| `LiveExecutor` | read signal file → place limits → log | No (dry_run) / Yes (live) |
+| `PortfolioRunner` | run N executors from config | Same as executor |
+
+## Setup
 
 ```bash
-# 1. Create API keys for testnet at okx.com → API Management
-#    Select "Demo Trading" (flag='1')
-#    Permissions: Read + Trade
+# .env file
+echo 'OKX_API_KEY=demo_key' > .env
+echo 'OKX_SECRET_KEY=demo_secret' >> .env
+echo 'OKX_PASSPHRASE=demo_pass' >> .env
 
-# 2. Create .env
-echo 'OKX_API_KEY=your_demo_key' > .env
-echo 'OKX_SECRET_KEY=your_demo_secret' >> .env
-echo 'OKX_PASSPHRASE=your_passphrase' >> .env
-
-# 3. Sync
 uv sync
 ```
 
-## Workflow for offline / part-time users
+## Usage
 
-### Option A: Manual (check once per bar)
-
-```bash
-# At bar close (e.g. 10:00 for 4H bar), run:
-uv run python -c "
-from qooi.exchange.live_executor import compute_signal
-compute_signal('ETH-USDT', '4h')
-print('Signal written to data/signals/')
-"
-
-# Then anytime within next 4h, execute:
-uv run python -c "
-from qooi.exchange.live_executor import LiveExecutor
-e = LiveExecutor(symbol='ETH-USDT', timeframe='4h', dry_run=False)
-r = e.step()
-print('Order placed' if r else 'No signal')
-"
-```
-
-### Option B: Cron / Task Scheduler (auto, no computer always on)
-
-**Windows Task Scheduler:**
-```
-Trigger: Daily, every 4 hours starting at 02:00 UTC
-Action: uv run python -m qooi.exec.signal_runner ETH-USDT 4h
-        uv run python -m qooi.exec.signal_runner ETH-USDT 4h --live
-```
-
-**Linux cron:**
-```cron
-0 */4 * * * cd /path/to/qooi && uv run python -m qooi.exec.signal_runner ETH-USDT 4h
-5 */4 * * * cd /path/to/qooi && uv run python -m qooi.exec.signal_runner ETH-USDT 4h --live
-```
-
-### Option C: Cloud free tier (always-on, $0)
-
-Deploy to AWS Lambda / Google Cloud Functions / Vercel cron:
+### Dry run (verify)
 
 ```python
-# lambda_handler.py — trigger every 4h
-from qooi.exchange.live_executor import compute_signal
-def handler(event, context):
-    compute_signal("ETH-USDT", "4h")
-    return {"status": "ok"}
+from qooi.exchange.trading import LiveExecutor, PortfolioConfig, PortfolioRunner
+
+# Single asset
+e = LiveExecutor(symbol="ETH-USDT", timeframe="4h", dry_run=True)
+e.step()
+
+# Portfolio
+config = PortfolioConfig(
+    pairs=[
+        {"symbol": "ETH-USDT", "tf": "4h", "capital": 100, "risk_pct": 0.03},
+        {"symbol": "SOL-USDT", "tf": "4h", "capital": 50, "risk_pct": 0.05},
+    ],
+    dry_run=True,
+)
+PortfolioRunner(config).step()
 ```
 
-Signal file stored on S3/GCS. Executor reads from cloud bucket.
+### Live (testnet)
 
-## Dry run → live progression
+```python
+LiveExecutor(symbol="ETH-USDT", timeframe="4h", dry_run=False).step()
+```
+
+## Offline / not always on
+
+### Manual (two-step)
+
+```bash
+# Step 1: compute (anytime, offline)
+uv run python -c "from qooi.exchange.trading import compute_signal; compute_signal('ETH-USDT','4h')"
+
+# Step 2: execute (within 4h of bar close)
+uv run python -c "from qooi.exchange.trading import LiveExecutor; LiveExecutor(symbol='ETH-USDT',timeframe='4h',dry_run=False).step()"
+```
+
+### Cron / Task Scheduler
+
+```cron
+0 */4 * * * cd /path/to/qooi && uv run python -m qooi.exec.run ETH-USDT 4h
+```
+
+### Cloudflare Workers (free, always-on)
+
+1. `npm install -g wrangler && wrangler login`
+2. `wrangler init qooi-worker`
+3. `wrangler.toml`: cron trigger every 4h, R2 bucket for signal storage
+4. `wrangler deploy`
+5. Zero cost at 6 req/day (well within free tier 100k/day)
+
+**Start/Stop**: remove cron trigger from `wrangler.toml` → `wrangler deploy` disables schedule. `wrangler delete` removes entirely.
+
+## Progression
 
 ```
-Phase 1: Dry run (2 weeks)
-  e = LiveExecutor(dry_run=True)
-  -> Verify: log file shows correct signal decisions
-  -> Verify: orders would have been profitable (compare signal vs subsequent price)
-
-Phase 2: Micro-sized live (1 week)
-  e = LiveExecutor(dry_run=False, capital=10, max_position_pct=0.01)
-  -> Real testnet orders at 0.1 USDT size
-  -> Verify: orders fill, P&L tracks, no API errors
-
-Phase 3: Scaled live (ongoing)
-  e = LiveExecutor(dry_run=False, capital=100, max_position_pct=0.03)
-  -> Normal position sizing
+Phase 1: Dry run (2 weeks) — verify signals, no orders
+Phase 2: Micro live     (1 week) — capital=10, risk_pct=0.01
+Phase 3: Scaled live    (ongoing) — capital=100, risk_pct=0.03
 ```
 
 ## Monitoring
 
 ```bash
-# View recent events
-cat data/logs/exec_ETH_USDT_4h.jsonl | tail -5 | jq .
+# Recent events
+tail -5 data/logs/exec_ETH_USDT_4h.jsonl
 
-# Count orders by status
+# Portfolio summary
+cat data/logs/portfolio_summary.txt
+
+# Live counts
 cat data/logs/exec_ETH_USDT_4h.jsonl | jq 'select(.event=="order") | .status' | sort | uniq -c
-
-# Profit/loss analysis
-uv run python -c "
-import polars as pl
-log = pl.read_ndjson('data/logs/exec_ETH_USDT_4h.jsonl')
-orders = log.filter(pl.col('event')=='order')
-print(f'Orders: {len(orders)}')
-print(f'Side mix: {(orders[\"side\"]==\"buy\").sum()}L / {(orders[\"side\"]==\"sell\").sum()}S')
-"
-```
-
-## Per-pair configuration reference
-
-```python
-from qooi.exchange.live_executor import LiveExecutor
-
-# Conservative — ETH 4H (best single Sharpe 0.95, DD 12%)
-e = LiveExecutor(symbol="ETH-USDT", timeframe="4h", capital=100, max_position_pct=0.03)
-
-# Aggressive — SOL 4H (Sharpe 0.67, DD 5.3%)
-e = LiveExecutor(symbol="SOL-USDT", timeframe="4h", capital=50, max_position_pct=0.05)
-
-# Portfolio — run both, share capital allocation via allocate_portfolio_weights
 ```

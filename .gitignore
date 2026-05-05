@@ -11,6 +11,8 @@ build/
 
 # Linter / formatter
 .ruff_cache/
+.rumdl/
+.mypy_cache/
 
 # IDE
 .vscode/
@@ -27,9 +29,11 @@ Thumbs.db
 # Scratch / working notes
 .scratch/
 
-# Generated data (cache + charts)
+# Generated data (cache + charts + signals)
 data/cache/
 data/charts/
+data/signals/
+data/logs/
 
 # Logs
 *.log
