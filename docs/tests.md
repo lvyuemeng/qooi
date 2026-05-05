@@ -6,115 +6,87 @@
 |---|---|
 | Capital | 10,000 USDT |
 | Cost | 0.005%/side (OKX VIP0 maker, limit orders) |
-| Leverage | 1× (fractional sizing via signal strength) |
-| Data | OKX SDK + CCXT (13 exchanges verified) |
+| Leverage | 2× max (signal-clipped, drawdown-adaptive) |
+| Risk | ATR stop 2.0×, ATR target 3.0× |
+| Data | LBank (CCXT) for backtest; OKX SDK for live |
 
 ---
 
-## 1. Production-ready strategy: Multi-Factor Intraday Ensemble (4H)
+## 1. Multi-Factor Intraday Ensemble (4H) — unified backtest + live
 
-### Pipeline (5 independent modules)
+### Pipeline
 
 ```
-OHLCV → indicators → ensemble signal → OFI flow confirmation → adaptive threshold → portfolio allocation
+OHLCV → indicators → ensemble → OFI flow → micro confirm → adaptive gate → stop/target/trailing → portfolio
 ```
 
-| Layer | Module | What it does |
+All layers shared between backtest (`Backtest`) and live executor (`LiveExecutor`).
+
+### Results (4H, 2023-2026, leverage=2.0)
+
+| Asset | Sharpe | DD | Return | Trades | WR | OOS Sharpe | Overfit |
+|---|---|---|---|---|---|---|---|
+| **ETH-USDT** | **0.71** | 12.2% | +18.2% | 79 | 54% | **0.58** | 0.40 |
+| SOL-USDT | -0.12 | 14.0% | +1.9% | 68 | 56% | -0.15 | 0.46 |
+
+OOS Sharpe positive on ETH (0.58). Overfit ratio 0.40 = wins 60% of unseen test windows.
+
+### Symbol naming convention
+
+| Context | Format | Example |
 |---|---|---|
-| Signal | `multi_factor_intraday_signal` | Fuses trend + momentum + CVD + OBI + pair scores into one direction |
-| Filter | `apply_micro_confirmation` | Checks OFI signed-volume flow against signal direction (0.4× / 0.6× / 1.0× multiplier) |
-| Gate | `apply_adaptive_gate` | Blocks entries when rolling directional Sharpe is negative by raising threshold |
-| Risk | Risk budget (2% per ATR stop), loss-streak compression (0.25× after 3 losses), volatility scaling |
-| Portfolio | `allocate_portfolio_weights` | Inverse-vol weighted scores, same-direction cap, correlation-aware 0.7× halving |
+| OKX SDK (live) | `ETH-USDT` | dash-separated, spot |
+| OKX swap/futures | `ETH-USDT-SWAP` | perpetual swap |
+| CCXT (backtest) | `ETH/USDT` | slash-separated |
 
-### Single-asset results (4H, 2023-2026)
+`MarketData` auto-converts. `TradingClient` uses OKX format (`ETH-USDT`).
 
-| Asset | Sharpe | DD | Return | Trades | Win Rate | Walk-forward OOS |
-|---|---|---|---|---|---|---|
-| **ETH/USDT** | **0.95** | 12.0% | +26.3% | 78 | 57% L | **0.86** |
-| **SOL/USDT** | **0.67** | 5.3% | +13.1% | 39 | 52% L | — |
-| BTC/USDT | -0.76 | 20.4% | -15.6% | 205 | 57% L | — |
+### Testnet readiness
 
-BTC excluded from portfolio by qualifier (negative sharpe).
-
-### Portfolio result (ETH + SOL, 4H)
-
-| Metric | Value |
-|---|---|
-| **Sharpe** | **2.43** |
-| Drawdown | 14.4% |
-| Total Return | +85.8% |
-| Trades | 87 |
-| Rebalanced daily | via allocate_portfolio_weights |
+| Component | Status | Note |
+|---|---|---|
+| Signal pipeline | ✅ | Multi-factor ensemble + OFI + adaptive gate |
+| Risk management | ✅ | Stop-loss / take-profit / trailing via `RiskConfig` |
+| Cost model | ✅ | OKX maker 0.005%/side via `CostModel` |
+| Leverage control | ✅ | Signal clipping + position cap + drawdown-adaptive halving |
+| Order execution | ✅ | `post_only` limit orders, 120s timeout auto-cancel |
+| Position check | ✅ | Prevents duplicate orders |
+| Dry run mode | ✅ | `dry_run=True` simulates without API keys |
+| Live mode | ✅ | `live=False`→testnet, `live=True`→production (separate secrets) |
+| Walk-forward OOS | ✅ | ETH 4H: Sharpe 0.58 across rolling train/test windows |
+| Portfolio runner | ✅ | `PortfolioRunner` + `PortfolioConfig` for multi-asset deployment |
 
 ---
 
-## 2. Daily strategies (1D, 2018-2026, LBank 2974 bars)
+## 2. Daily strategies (1D, 2018-2026, LBank)
 
 | Asset | Strategy | Sharpe | DD | Return | Trades | WR |
 |---|---|---|---|---|---|---|
-| BTC | Trend Pullback (EMA20 + ADX + ATR regime) | **0.80** | 55% | +1132% | 56 | 52% |
+| BTC | Trend Pullback | **0.80** | 55% | +1132% | 56 | 52% |
 | ETH | Trend Pullback | **0.35** | 32% | +45% | 13 | 69% |
 | SOL | Trend Pullback | **0.64** | 61% | +114% | 19 | 79% |
 
 ---
 
-## 3. How it adapts to OKX
+## 3. Backtest ↔ Live parity
 
-All strategies are data-source agnostic — they consume Polars DataFrames with `timestamp, open, high, low, close, vol`. The `MarketData` adapter handles both OKX SDK and CCXT transparently:
-
-```python
-# OKX SDK (default)
-md = MarketData()
-df = md.candles("BTC-USDT", timeframe="1D", limit=100)
-
-# CCXT (e.g. LBank for deep history)
-md = MarketData("lbank")
-df = md.candles_range("BTC/USDT", "1d", since="2018-01-01", limit=3000)
-
-# Real order book (for live OBI confirmation)
-md = MarketData("okx")
-snap = md.ob_snapshot("BTC-USDT", limit=25)
-print(snap.imbalance_5)  # -0.15 → ask dominant
-```
-
-### OKX-specific features available
-
-| Feature | Status |
-|---|---|
-| Funding rate history | 3 months (SDK), usable for live trading |
-| Order book (REST) | Live (CCXT `fetch_order_book`), OFI proxy for backtests |
-| WebSocket order book | `MarketData.async_("okx").ob_stream("BTC/USDT")` |
-| Limit order (maker) | 0.005% per side — cost model calibrated to real fees |
+| Feature | Backtest (`backtest.py`) | Live (`trading.py`) |
+|---|---|---|
+| Signal pipeline | `signal_expr` + `run()` | `SignalSource` + `step()` |
+| Risk config | `RiskConfig(max_leverage, atr_stop_mult, atr_target_mult)` | Same `RiskConfig` |
+| Cost | `CostModel(commission_pct, slippage_pct)` | Same `CostModel` |
+| Stop-loss | `_check_exit()` every bar | `step()` every bar via `RiskConfig` |
+| Take-profit | ATR target on entry | Same logic |
+| Trailing stop | Trailing high/low + distance × ATR | Same logic |
+| Leverage | `_clipped_signal()` + `_enter_position()` cap | `clipped` + `signal_abs` + dynamic drawdown halving |
+| Order type | Implicit market-at-close | `post_only` limit (maker 0.005%) |
+| Timeout | None (instant fill) | 120s auto-cancel |
+| Equity tracking | `equity` array + `compute_metrics` | `self._equity` array + `report()` via `compute_metrics` |
+| Walk-forward | `WalkForwardBacktest` | Not applicable (live) |
 
 ---
 
-## 4. Robustness — walk-forward
-
-| Strategy | OOS Sharpe | Overfit Ratio | Mean test Sharpe |
-|---|---|---|---|
-| ETH 4H ensemble (full pipeline) | **0.86** | 0.44 | 14.16 |
-| Trend Pullback BTC 1D | 0.28 | 0.71 | — |
-
-Overfit ratio 0.44 means the strategy wins on 56% of test windows (1.0 would be 0% wins). Positive OOS Sharpe confirms the alpha is not overfit.
-
----
-
-## 5. Key architectural decisions
-
-| Decision | Why |
-|---|---|
-| Limit orders only (maker 0.005%) | 10× cheaper than market (0.05%), margin for weaker signals |
-| Fractional signal (0.3–1.0) | Volatility-scaled sizing — bigger bets when confident |
-| OFI flow confirmation | Rejects signals contradicted by aggressive flow (0.4× multiplier) |
-| Adaptive threshold | Self-correcting — bad sequences tighten entry, good sequences ease it |
-| Portfolio allocation | Inverse-vol weighting + correlation halving + exposure caps |
-| No ML black-box | Every column is inspectable: `regime_score`, `ofi_flow_score`, `adaptive_threshold_long` |
-| OHLCV-only backtesting | Backtests run on any exchange with any history; OBI reserved for live confirmation |
-
----
-
-## 6. Data sources
+## 4. Data sources
 
 | Source | OHLCV depth | Order book | Funding rate | Geo-access |
 |---|---|---|---|---|

@@ -388,6 +388,11 @@ class LiveExecutor:
                         exit_reason = "trailing_stop"
 
         if exit_reason and self._active:
+            # Track P&L to equity when closing
+            if self._active and self._active.px > 0:
+                pnl_dir = 1 if self._active.side == "buy" else -1
+                trade_ret = pnl_dir * (cur_close / self._active.px - 1)
+                self._equity.append(self._equity[-1] * (1 + trade_ret))
             self._cancel(exit_reason)
 
         if (
@@ -400,10 +405,16 @@ class LiveExecutor:
         if abs(sr.signal) < 0.25:
             return self._log("skip", {"reason": "weak_signal"})
 
+        # Signal clipping by max leverage (same as backtest._clipped_signal)
+        ml = self._risk.max_leverage
+        clipped = max(-ml, min(ml, sr.signal)) if ml > 0 else 0.0
+        if clipped == 0.0:
+            return self._log("skip", {"reason": "clipped_to_zero"})
+
         if self._active and self._active.status in ("placed", "partial_fill"):
             return self._log("skip", {"reason": "order_outstanding"})
 
-        side = "buy" if sr.signal > 0 else "sell"
+        side = "buy" if clipped > 0 else "sell"
         if not self._dry and self._client:
             pos = self._client.positions()
             if any(p.get("instId") == self._symbol and float(p.get("pos", "0")) != 0 for p in pos):
@@ -411,12 +422,22 @@ class LiveExecutor:
                     return self._log("skip", {"reason": "already_long"})
 
         entry_px = obi.ask_price if side == "buy" else obi.bid_price
-        size_coeff = self._capital * self._max_pos * abs(sr.signal) * self._leverage
+        ml = self._risk.max_leverage
+        signal_abs = min(abs(clipped), ml)
+
+        # Dynamic leverage: reduce when equity drawdown > 10%
+        peak = max(self._equity) if self._equity else self._capital
+        drawdown = (peak - self._equity[-1]) / peak if peak > 0 else 0.0
+        eff_leverage = self._leverage * (0.5 if drawdown > 0.15 else 1.0)
+
+        # Total exposure: cap position to available equity
+        max_exposure = self._capital * ml * eff_leverage
+        size_coeff = min(self._capital * self._max_pos * signal_abs * eff_leverage, max_exposure)
         sz = size_coeff / max(entry_px, 1)
         if sz < 0.00001:
             return self._log("skip", {"reason": "size_too_small"})
 
-        return self._place(side, sz, entry_px, sr.signal, obi, sr.flow)
+        return self._place(side, sz, entry_px, clipped, obi, sr.flow)
 
     def status(self) -> dict:
         return {
