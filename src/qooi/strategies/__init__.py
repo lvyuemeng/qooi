@@ -5,6 +5,10 @@ Re-exports from strategy modules so callers can do::
     from qooi.strategies import sma_cross_signal, trend_pullback_signal
 """
 
+from qooi.strategies.adaptive_threshold import (
+    add_adaptive_threshold,
+    apply_adaptive_gate,
+)
 from qooi.strategies.intraday import (
     cvd_proxy_signal,
     ensemble_intraday_signal,
@@ -17,6 +21,11 @@ from qooi.strategies.ma_cross import (
     ema_vumanchu_signal,
     sma_cross_signal,
 )
+from qooi.strategies.micro_confirmation import (
+    add_ofi_flow_columns,
+    apply_micro_confirmation,
+    check_obi_alignment,
+)
 from qooi.strategies.pairs import build_pair_frame, pair_spread_signal
 from qooi.strategies.portfolio import (
     AssetSignalState,
@@ -24,6 +33,7 @@ from qooi.strategies.portfolio import (
     allocate_portfolio_weights,
     qualify_asset,
 )
+from qooi.strategies.regime import add_regime_features
 from qooi.strategies.trend_pullback import trend_pullback_signal
 
 __all__ = [
@@ -42,4 +52,10 @@ __all__ = [
     "qualify_asset",
     "sma_cross_signal",
     "trend_pullback_signal",
+    "add_regime_features",
+    "add_ofi_flow_columns",
+    "apply_micro_confirmation",
+    "check_obi_alignment",
+    "add_adaptive_threshold",
+    "apply_adaptive_gate",
 ]
