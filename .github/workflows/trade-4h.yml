@@ -1,0 +1,56 @@
+name: qooi-4h
+
+# Every 4 hours: compute signal → execute on testnet
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  signal-and-execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Compute signals (offline — no API key)
+        run: |
+          uv run python -c "
+          from qooi.exchange.trading import compute_signal
+          compute_signal('ETH-USDT', '4h')
+          compute_signal('SOL-USDT', '4h')
+          "
+
+      - name: Execute orders (testnet — needs secrets)
+        run: |
+          uv run python -c "
+          from qooi.exchange.trading import PortfolioConfig, PortfolioRunner
+          config = PortfolioConfig(
+              pairs=[
+                  {'symbol': 'ETH-USDT', 'tf': '4h', 'capital': 100, 'risk_pct': 0.03},
+                  {'symbol': 'SOL-USDT', 'tf': '4h', 'capital': 50,  'risk_pct': 0.05},
+              ],
+              dry_run=False,
+          )
+          PortfolioRunner(config).step()
+          "
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+
+      - name: Upload logs (for post-trade analysis)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs-${{ github.run_id }}
+          path: data/logs/
+          retention-days: 90

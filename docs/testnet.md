@@ -79,15 +79,19 @@ uv run python -c "from qooi.exchange.trading import LiveExecutor; LiveExecutor(s
 0 */4 * * * cd /path/to/qooi && uv run python -m qooi.exec.run ETH-USDT 4h
 ```
 
-### Cloudflare Workers (free, always-on)
+### GitHub Actions (recommended — free, no server, native Python)
 
-1. `npm install -g wrangler && wrangler login`
-2. `wrangler init qooi-worker`
-3. `wrangler.toml`: cron trigger every 4h, R2 bucket for signal storage
-4. `wrangler deploy`
-5. Zero cost at 6 req/day (well within free tier 100k/day)
+Deploy via `.github/workflows/trade-4h.yml`:
 
-**Start/Stop**: remove cron trigger from `wrangler.toml` → `wrangler deploy` disables schedule. `wrangler delete` removes entirely.
+1. Set secrets: GitHub repo → Settings → Secrets → Actions
+   - `OKX_API_KEY`, `OKX_SECRET_KEY`, `OKX_PASSPHRASE`
+2. Push — workflow runs every 4h automatically
+3. Manual test: Actions tab → `qooi-4h` → Run workflow
+4. Logs: uploaded as artifacts (90-day retention)
+
+**Start/Stop**: disable workflow in Actions tab. Re-enable to resume. No delete needed.
+
+**Cost**: free (180 min/month, 2000 min free limit).
 
 ## Progression
 
