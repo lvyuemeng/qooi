@@ -134,13 +134,13 @@ class OrderState:
 
 
 # ============================================================================
-# 3. Signal computation (offline — no API key)
+# 3. Signal pipeline — pluggable (any callable that takes a DataFrame)
 # ============================================================================
 
 
-def compute_signal(symbol: str = "BTC-USDT", timeframe: str = "4h") -> dict | None:
+def default_pipeline(df):
+    """Multi-factor intraday ensemble — used when no custom pipeline given."""
     from qooi.exchange.indicator import add_indicators
-    from qooi.exchange.market import MarketData
     from qooi.strategies.flow_pipeline import (
         add_adaptive_threshold,
         add_ofi_flow_columns,
@@ -150,12 +150,6 @@ def compute_signal(symbol: str = "BTC-USDT", timeframe: str = "4h") -> dict | No
     )
     from qooi.strategies.intraday import multi_factor_intraday_signal
 
-    fname = SIGNAL_DIR / f"{symbol.replace('-', '_')}_{timeframe}.json"
-    md = MarketData()
-    df = md.candles(symbol, timeframe=timeframe, limit=500)
-    if df.is_empty():
-        return None
-
     df = add_indicators(df)
     df = add_regime_features(df)
     df = multi_factor_intraday_signal(df)
@@ -163,9 +157,41 @@ def compute_signal(symbol: str = "BTC-USDT", timeframe: str = "4h") -> dict | No
     df = apply_micro_confirmation(df)
     df = add_adaptive_threshold(df)
     df = apply_adaptive_gate(df)
+    return df
+
+
+def compute_signal(
+    symbol: str = "BTC-USDT",
+    timeframe: str = "4h",
+    pipeline=default_pipeline,
+) -> dict | None:
+    """Run pipeline on latest bar → write signal file → return dict.
+
+    ``pipeline`` is any callable ``DataFrame -> DataFrame`` that
+    produces a ``signal`` column.  Pass your own to swap strategies
+    without touching executor code.
+
+    Example::
+
+        # Use trend-pullback instead of ensemble
+        from qooi.strategies.trend_pullback import trend_pullback_signal
+        def tp_pipeline(df):
+            df = add_indicators(df)
+            return trend_pullback_signal(df)
+        compute_signal(\"BTC-USDT\", \"1D\", pipeline=tp_pipeline)
+    """
+    from qooi.exchange.market import MarketData
+
+    fname = SIGNAL_DIR / f"{symbol.replace('-', '_')}_{timeframe}.json"
+    md = MarketData()
+    df = md.candles(symbol, timeframe=timeframe, limit=500)
+    if df.is_empty():
+        return None
+
+    df = pipeline(df)
 
     signal_val = float(df["signal"][-1] or 0.0)
-    flow_val = float(df["ofi_flow_score"][-1] or 0.0)
+    flow_val = float(df["ofi_flow_score"][-1] or 0.0) if "ofi_flow_score" in df.columns else 0.0
     ts = int(df["timestamp"][-1])
 
     result = {

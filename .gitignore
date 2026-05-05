@@ -11,7 +11,7 @@ build/
 
 # Linter / formatter
 .ruff_cache/
-.rumdl/
+.rumdl_cache/
 .mypy_cache/
 
 # IDE
