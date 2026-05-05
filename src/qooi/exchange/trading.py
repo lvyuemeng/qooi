@@ -38,13 +38,20 @@ def _env(key: str) -> str:
 
 
 class TradingClient:
-    """Place/cancel orders, query balance and positions.  flag=\"1\" = testnet."""
+    """Place/cancel orders, query balance and positions.
 
-    def __init__(self, flag: str = "1") -> None:
+    Reads ``OKX_API_KEY``, ``OKX_SECRET_KEY``, ``OKX_PASSPHRASE``.
+    Add ``_LIVE`` suffix for production keys (testnet = default)."""
+
+    def __init__(self, live: bool = False) -> None:
         from okx.Account import AccountAPI
         from okx.Trade import TradeAPI
 
-        k, s, p = _env("OKX_API_KEY"), _env("OKX_SECRET_KEY"), _env("OKX_PASSPHRASE")
+        suffix = "_LIVE" if live else ""
+        flag = "0" if live else "1"
+        k = _env(f"OKX_API_KEY{suffix}")
+        s = _env(f"OKX_SECRET_KEY{suffix}")
+        p = _env(f"OKX_PASSPHRASE{suffix}")
         self._trade = TradeAPI(k, s, p, flag=flag, debug=False)
         self._account = AccountAPI(k, s, p, flag=flag, debug=False)
 
@@ -287,6 +294,7 @@ class LiveExecutor:
         post_only: bool = True,
         limit_timeout_sec: int = 120,
         dry_run: bool = True,
+        live: bool = False,
     ) -> None:
         self._symbol = symbol
         self._tf = timeframe
@@ -299,7 +307,7 @@ class LiveExecutor:
         from qooi.exchange.market import MarketData
 
         self._md = MarketData()
-        self._client: TradingClient | None = None if dry_run else TradingClient()
+        self._client: TradingClient | None = None if dry_run else TradingClient(live=live)
         self._active: OrderState | None = None
         self._trade_count = 0
 

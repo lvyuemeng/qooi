@@ -1,0 +1,61 @@
+name: qooi-live-4h
+
+# Live: manual trigger only, must pass dry-run guard first
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "LIVE" to confirm real order placement'
+        required: true
+        default: ''
+      dry_run:
+        description: 'Dry run first (recommended)'
+        type: boolean
+        default: true
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Safety check
+        if: github.event.inputs.confirm != 'LIVE' && github.event.inputs.dry_run == 'false'
+        run: |
+          echo "ERROR: Set confirm='LIVE' to place real orders"
+          exit 1
+
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync
+
+      - name: Execute (live or dry-run)
+        run: |
+          uv run python -c "
+          from qooi.exchange.trading import default_signal_source, PortfolioConfig, PortfolioRunner
+
+          dry = ${{ github.event.inputs.dry_run }}
+
+          src = default_signal_source()
+          config = PortfolioConfig(
+              pairs=[
+                  dict(symbol='ETH-USDT', tf='4h', capital=100, risk_pct=0.03),
+              ],
+              dry_run=dry,
+          )
+          runner = PortfolioRunner(config)
+          runner.compute_all_signals(source=src)
+          runner.step(source=src)
+          "
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY_LIVE }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY_LIVE }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE_LIVE }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-logs-${{ github.run_id }}
+          path: data/logs/
+          retention-days: 365
