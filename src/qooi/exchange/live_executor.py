@@ -1,9 +1,12 @@
-"""Live strategy executor — signal pipeline + paper trader + order lifecycle.
+"""Live strategy executor — reads signal file → places orders → tracks lifecycle.
 
-Wires together: OHLCV fetch → indicator → ensemble signal → OFI flow →
-adaptive gate → limit order placement → fill tracking → cancel/timeout.
+Separated from signal computation. To run:
 
-All events logged as structured JSONL for post-trade evaluation.
+1. ``compute_signal("BTC-USDT-SWAP", "4h")`` — writes ``data/signals/BTC_USDT_SWAP_4h.json``
+2. ``LiveExecutor().step()`` — reads signal file, places limit orders, logs events
+
+No internet connection needed for step 1 (uses cached data).
+Step 2 auto-skips if signal file missing or stale (>1 bar old).
 """
 
 from __future__ import annotations
@@ -25,13 +28,13 @@ from qooi.strategies.flow_pipeline import (
 )
 from qooi.strategies.intraday import multi_factor_intraday_signal
 
-LOG_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "logs"
+LOG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "logs"
+SIGNAL_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "signals"
+SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
 class OrderState:
-    """Live order tracking — created when we place, updated on fill/cancel."""
-
     ord_id: str = ""
     inst_id: str = ""
     side: str = ""
@@ -47,19 +50,60 @@ class OrderState:
     flow_value: float = 0.0
 
 
-class LiveExecutor:
-    """Run strategy on each bar close, place limit orders, track fills.
+# ---------------------------------------------------------------------------
+# 1. Signal computation (offline / batch — no exchange connection needed)
+# ---------------------------------------------------------------------------
 
-    Parameters:
-        symbol: e.g. "BTC-USDT-SWAP"
-        timeframe: "4h" or "1h"
-        initial_capital: USDT
-        max_position_pct: max % of capital to risk per trade
-        post_only: use post_only limit orders (maker fee 0.005%)
-        limit_timeout_sec: cancel unfilled limit after this many seconds
-        sleep_sec: poll interval while waiting for fill
-        log_dir: where to write JSONL logs
-        dry_run: compute signal but don't send orders
+
+def compute_signal(symbol: str = "BTC-USDT-SWAP", timeframe: str = "4h") -> dict | None:
+    """Compute latest bar signal and write to ``data/signals/``.
+
+    Uses cached OHLCV if available (no API key needed). Returns the
+    computed signal dict, also writes JSON file for executor to consume.
+    """
+    fname = SIGNAL_DIR / f"{symbol.replace('-', '_')}_{timeframe}.json"
+
+    md = MarketData()
+    df = md.candles(symbol, timeframe=timeframe, limit=500)
+    if df.is_empty():
+        return None
+
+    df = add_indicators(df)
+    df = add_regime_features(df)
+    df = multi_factor_intraday_signal(df)
+    df = add_ofi_flow_columns(df)
+    df = apply_micro_confirmation(df)
+    df = add_adaptive_threshold(df)
+    df = apply_adaptive_gate(df)
+
+    signal_val = float(df["signal"][-1] or 0.0)
+    flow_val = float(df["ofi_flow_score"][-1] or 0.0)
+    ts = int(df["timestamp"][-1])
+
+    result = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "timestamp": ts,
+        "signal": round(signal_val, 4),
+        "flow": round(flow_val, 4),
+        "computed_at": int(time.time()),
+    }
+    fname.write_text(json.dumps(result, indent=2))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 2. Live executor (reads signal file → places orders)
+# ---------------------------------------------------------------------------
+
+
+class LiveExecutor:
+    """Read signal file, place/manage limit orders, log everything.
+
+    No signal computation — reads from ``data/signals/`` (produced by
+    ``compute_signal``). This decouples compute from execute.
+
+    Use ``dry_run=True`` to verify without sending real orders.
     """
 
     def __init__(
@@ -107,42 +151,42 @@ class LiveExecutor:
     # ------------------------------------------------------------------
 
     def step(self) -> OrderState | None:
-        """Run one bar cycle: fetch → signal → order → track → log.
+        """Read signal file → place order if warranted → track lifecycle.
 
-        Returns the OrderState if an order was placed, None otherwise.
+        Skips if signal file missing or older than 1 bar (signal stale).
         """
         self._log_event("cycle_start", {})
 
-        # 1. Fetch data
-        df = self._md.candles(self._symbol, timeframe=self._timeframe, limit=500)
-        if df.is_empty():
-            self._log_event("error", {"msg": "empty candles"})
+        # 1. Read signal file
+        sf = SIGNAL_DIR / f"{self._symbol.replace('-', '_')}_{self._timeframe}.json"
+        if not sf.exists():
+            self._log_event("skip", {"reason": "no_signal_file"})
             return None
 
-        # 2. Compute indicators & signal
-        df = add_indicators(df)
-        df = add_regime_features(df)
-        df = multi_factor_intraday_signal(df)
-        df = add_ofi_flow_columns(df)
-        df = apply_micro_confirmation(df)
-        df = add_adaptive_threshold(df)
-        df = apply_adaptive_gate(df)
+        sig_data = json.loads(sf.read_text())
+        signal = sig_data.get("signal", 0.0)
+        flow_val = sig_data.get("flow", 0.0)
+        sig_ts = sig_data.get("timestamp", 0)
 
-        signal = float(df["signal"][-1] or 0.0)
+        # Check staleness: signal must be from current bar window
+        bar_ms = _timeframe_ms(self._timeframe)
+        if time.time() * 1000 - sig_ts > bar_ms * 1.5:
+            self._log_event("skip", {"reason": "stale_signal", "signal_ts": sig_ts})
+            return None
+
+        # 2. Get live order book
         obi = self._md.ob_snapshot(self._symbol)
-        flow_val = float(df["ofi_flow_score"][-1] or 0.0)
 
         self._log_event(
             "signal",
             {
                 "signal": round(signal, 4),
                 "obi_5": round(obi.imbalance_5, 4),
-                "obi_25": round(obi.imbalance_25, 4),
                 "ofi_flow": round(flow_val, 4),
             },
         )
 
-        # 3. Cancel stale orders / manage existing position
+        # 3. Cancel stale orders
         if self._active and self._active.status == "placed":
             elapsed = time.time() - self._active.placed_at
             if elapsed > self._timeout:
@@ -154,12 +198,22 @@ class LiveExecutor:
             return None
 
         if self._active and self._active.status in ("placed", "partial_fill"):
-            # Don't stack orders
             self._log_event("skip", {"reason": "order_outstanding", "ord_id": self._active.ord_id})
             return None
 
-        # 5. Calculate size & place order
+        # 5. Position check
         side = "buy" if signal > 0 else "sell"
+        if not self._dry and self._trader:
+            pos = self._trader.get_positions()
+            has_pos = any(
+                p.get("instId") == self._symbol and float(p.get("pos", "0")) != 0
+                for p in pos.get("data", [])
+            )
+            if has_pos and side == "buy":
+                self._log_event("skip", {"reason": "already_long"})
+                return None
+
+        # 6. Size
         entry_px = obi.ask_price if side == "buy" else obi.bid_price
         risk = self._capital * self._max_pos * abs(signal)
         sz = risk / entry_px if entry_px > 0 else 0.001
@@ -172,7 +226,6 @@ class LiveExecutor:
         return order
 
     def get_status(self) -> dict:
-        """Current executor state for monitoring."""
         return {
             "symbol": self._symbol,
             "timeframe": self._timeframe,
@@ -195,15 +248,7 @@ class LiveExecutor:
     # Internals
     # ------------------------------------------------------------------
 
-    def _place_limit(
-        self,
-        side: str,
-        sz: float,
-        px: float,
-        signal: float,
-        obi: object,
-        flow: float,
-    ) -> OrderState | None:
+    def _place_limit(self, side, sz, px, signal, obi, flow):
         sz = round(sz, 8)
         px = round(px, 1)
 
@@ -251,7 +296,7 @@ class LiveExecutor:
             self._log_event("order_error", {"error": str(e), "side": side, "sz": sz, "px": px})
             return None
 
-    def _cancel_order(self, reason: str) -> None:
+    def _cancel_order(self, reason):
         if not self._active:
             return
         self._active.status = "cancelled"
@@ -263,7 +308,7 @@ class LiveExecutor:
 
         self._active = None
 
-    def _order_dict(self, o: OrderState) -> dict:
+    def _order_dict(self, o):
         return {
             "ord_id": o.ord_id,
             "inst_id": o.inst_id,
@@ -280,7 +325,7 @@ class LiveExecutor:
             "ofi_flow": round(o.flow_value, 4),
         }
 
-    def _log_event(self, event: str, data: dict) -> None:
+    def _log_event(self, event, data):
         record = {
             "ts": int(time.time() * 1000),
             "event": event,
@@ -291,3 +336,12 @@ class LiveExecutor:
         fname = self._log_path / f"exec_{self._symbol.replace('-', '_')}_{self._timeframe}.jsonl"
         with open(fname, "a") as f:
             f.write(json.dumps(record) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _timeframe_ms(tf: str) -> int:
+    return {"1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}.get(tf, 14_400_000)
