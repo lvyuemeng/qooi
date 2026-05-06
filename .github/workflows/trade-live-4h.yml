@@ -1,6 +1,5 @@
 name: qooi-live-4h
 
-# Live: manual trigger only, with safety gate
 on:
   workflow_dispatch:
     inputs:
@@ -17,86 +16,27 @@ jobs:
   live:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Safety gate
         if: github.event.inputs.confirm != 'LIVE' && github.event.inputs.dry_run == 'false'
         run: |
           echo "ERROR: Set confirm='LIVE' to place real orders"
           exit 1
-
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - run: uv sync
-
-      - name: Run ensemble (ETH 4H)
-        id: trade
+      - name: Run
         run: |
-          uv run python -c "
-          import json, os
-          from qooi.exchange.trading import (
-              TradingClient, LiveExecutor,
-              default_signal_source, PortfolioConfig, PortfolioRunner,
-          )
-
-          dry = ${{ github.event.inputs.dry_run }}
-
-          tc = TradingClient()
-          bal = tc.balance('USDT')
-          usdt_pre = float(bal[0].get('availBal','0') or 0) if bal else 0.0
-          pos_pre = tc.positions()
-
-          config = PortfolioConfig(
-              pairs=[
-                  dict(symbol='ETH-USDT', tf='4h', capital=100, risk_pct=0.03, leverage=1.0),
-              ],
-              dry_run=dry,
-          )
-          runner = PortfolioRunner(config)
-          runner.compute_all_signals(source=default_signal_source())
-          runner.step(source=default_signal_source())
-
-          bal2 = tc.balance('USDT')
-          usdt_post = float(bal2[0].get('availBal','0') or 0) if bal2 else 0.0
-          pos_post = tc.positions()
-          report = LiveExecutor.report('ETH-USDT', '4h')
-
-          out = os.environ.get('GITHUB_OUTPUT', 'summary.json')
-          state = {
-              'usdt_pre': round(usdt_pre, 2),
-              'usdt_post': round(usdt_post, 2),
-              'change': round(usdt_post - usdt_pre, 2),
-              'positions_pre': len(pos_pre),
-              'positions_post': len(pos_post),
-              'dry_run': dry,
-              'eth': report,
-          }
-          with open(out, 'w') as f:
-              json.dump(state, f)
-          print(json.dumps(state, indent=2))
-          "
+          MODE="dry"
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ] && [ "${{ github.event.inputs.confirm }}" = "LIVE" ]; then
+            MODE="live"
+          fi
+          uv run python scripts/trade.py live "$MODE"
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY_LIVE }}
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY_LIVE }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE_LIVE }}
           OKX_FLAG: "0"
-
-      - name: Summary
-        run: |
-          echo '## qooi Live 4H' >> $GITHUB_STEP_SUMMARY
-          if [ -f summary.json ]; then
-            echo '' >> $GITHUB_STEP_SUMMARY
-            python3 -c "
-          import json
-          with open('summary.json') as f:
-              s = json.load(f)
-          for k,v in s.items():
-              print(f'|{k}|{v}|')
-          " >> $GITHUB_STEP_SUMMARY
-          fi
-          echo '' >> $GITHUB_STEP_SUMMARY
-          echo 'Full logs available in artifacts tab.' >> $GITHUB_STEP_SUMMARY
-
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
