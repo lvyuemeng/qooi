@@ -29,8 +29,11 @@ def add_ofi_flow_columns(
     signed = pl.when(close > open_p).then(vol).when(close < open_p).then(-vol).otherwise(0.0)
 
     net_flow = signed.rolling_sum(flow_window)
-    atr = pl.col(atr_col).fill_nan(0).fill_null(0) if atr_col in df.columns else pl.lit(1.0)
-    flow_score = (net_flow / (atr * close.clip(1e-9))).clip(-1.0, 1.0)
+    # Scale-invariant normalization: net flow as fraction of total volume.
+    # Replaces the old price-biased (net_flow / (atr × close)) which gave
+    # BTC scores 1,450× smaller than ETH — making cross-asset comparison impossible.
+    vol_total = signed.abs().rolling_sum(flow_window).clip(1e-9)
+    flow_score = (net_flow / vol_total).fill_null(0).clip(-1.0, 1.0)
 
     return df.with_columns(
         signed.alias("ofi_signed_vol"),
@@ -95,109 +98,27 @@ def add_regime_features(
 
 
 # =============================================================================
-# 3. Adaptive threshold — lightweight stateful loop
+# 3. Regime gate — zero-out signal in strong trends
 # =============================================================================
 
 
-def _clip(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def _thresh(pnl_ema: float, base: float, lo: float, hi: float) -> float:
-    if pnl_ema > 0.02:
-        return lo
-    if pnl_ema > 0.005:
-        return base - (pnl_ema - 0.005) / 0.015 * (base - lo)
-    if pnl_ema > -0.005:
-        return base
-    return _clip(base + (abs(pnl_ema) - 0.005) / 0.02 * (hi - base), base, hi)
-
-
-def _ema_update(prev: float, cur: float, period: int) -> float:
-    alpha = 2.0 / (period + 1)
-    return alpha * cur + (1 - alpha) * prev
-
-
-def add_adaptive_threshold(
+def apply_regime_gate(
     df: pl.DataFrame,
     signal_col: str = "signal",
-    *,
-    lookback: int = 50,
-    base_threshold: float = 0.40,
-    max_threshold: float = 0.70,
-    min_threshold: float = 0.25,
+    regime_col: str = "regime_score",
+    max_regime: float = 0.7,
 ) -> pl.DataFrame:
-    """Add ``adaptive_threshold_long`` and ``adaptive_threshold_short`` columns.
+    """Zero out the signal when regime strength exceeds ``max_regime``.
 
-    Uses a minimal Python loop because the threshold update depends on
-    the trade state (entry/exit) which is inherently sequential.
+    In strong trending markets the ensemble signal predicts the wrong
+    direction (mean-reversion bias).  This gate skips entries entirely
+    when the trend is too strong.
     """
-    if df.is_empty() or signal_col not in df.columns:
-        return df.with_columns(
-            pl.lit(base_threshold).alias("adaptive_threshold_long"),
-            pl.lit(base_threshold).alias("adaptive_threshold_short"),
-        )
-
-    close = df["close"].to_list()
-    sig = df[signal_col].to_list()
-    n = len(df)
-
-    tl = [base_threshold] * n
-    ts = [base_threshold] * n
-    lpe = 0.0
-    spe = 0.0
-    active = 0.0
-    entry = 0.0
-
-    for i in range(1, n):
-        ps = sig[i - 1]
-        pnl = 0.0
-        if active and ps != active:
-            if entry > 0:
-                pnl = active * (close[i - 1] / entry - 1)
-            active = ps
-            if active:
-                entry = close[i - 1]
-        elif active == 0.0 and ps:
-            active = ps
-            entry = close[i - 1]
-
-        if active > 0:
-            lpe = _ema_update(lpe, pnl or 0.0, lookback)
-        elif active < 0:
-            spe = _ema_update(spe, pnl or 0.0, lookback)
-
-        tl[i] = _thresh(lpe, base_threshold, min_threshold, max_threshold)
-        ts[i] = _thresh(spe, base_threshold, min_threshold, max_threshold)
-
-    return df.with_columns(
-        pl.Series(tl).alias("adaptive_threshold_long"),
-        pl.Series(ts).alias("adaptive_threshold_short"),
-    )
-
-
-def apply_adaptive_gate(
-    df: pl.DataFrame,
-    signal_col: str = "signal",
-) -> pl.DataFrame:
-    if signal_col not in df.columns:
+    if signal_col not in df.columns or regime_col not in df.columns:
         return df
-    sig = pl.col(signal_col)
-    tl = (
-        pl.col("adaptive_threshold_long")
-        if "adaptive_threshold_long" in df.columns
-        else pl.lit(0.4)
-    )
-    ts = (
-        pl.col("adaptive_threshold_short")
-        if "adaptive_threshold_short" in df.columns
-        else pl.lit(0.4)
-    )
     return df.with_columns(
-        pl.when((sig > 0) & (sig < tl))
+        pl.when(pl.col(regime_col).abs() > max_regime)
         .then(0.0)
-        .when((sig < 0) & (sig.abs() < ts))
-        .then(0.0)
-        .otherwise(sig)
+        .otherwise(pl.col(signal_col))
         .alias(signal_col)
     )

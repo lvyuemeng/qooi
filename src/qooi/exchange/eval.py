@@ -140,7 +140,7 @@ def compute_metrics(
     # --- Trade statistics ---
     if has_real_trades:
         pnl = trades["pnl"]
-    else:
+    elif "position" in equity_curve.columns:
         pos = equity_curve["position"]
         entry_equity: list[float] = []
         entry_idx: list[int] = []
@@ -159,6 +159,8 @@ def compute_metrics(
                 continue
             i += 1
         pnl = pl.Series(entry_equity) if entry_equity else pl.Series([], dtype=pl.Float64)
+    else:
+        pnl = pl.Series([], dtype=pl.Float64)
 
     win_pnl = pnl.filter(pnl > 0)
     loss_pnl = pnl.filter(pnl <= 0)
@@ -175,10 +177,14 @@ def compute_metrics(
     expectancy = (win_rate * avg_win - (1 - win_rate) * avg_loss) if avg_loss > 0 else 0.0
 
     # --- Information Coefficient (rolling Spearman) ---
-    ic_df = equity_curve.with_columns(rets.shift(-1).alias("fwd_return")).drop_nulls(
-        ["signal", "fwd_return"]
-    )
+    has_signal = "signal" in equity_curve.columns and equity_curve["signal"].n_unique() > 1
     ic_values: list[float] = []
+    if has_signal:
+        ic_df = equity_curve.with_columns(rets.shift(-1).alias("fwd_return")).drop_nulls(
+            ["signal", "fwd_return"]
+        )
+    else:
+        ic_df = pl.DataFrame()
     if ic_df.height > 10:
         window = min(60, ic_df.height // 2)
         sig_s = ic_df["signal"]

@@ -101,10 +101,11 @@ class RiskConfig:
     max_leverage: float = 1.0
     position_sizing: str = "fixed"
     max_risk_pct: float = 0.02
-    atr_stop_mult: float = 3.0
-    atr_target_mult: float = 6.0
+    atr_stop_mult: float = 2.0
+    atr_target_mult: float = 3.0
     trailing_activation_mult: float = 2.0
-    trailing_distance_mult: float = 2.0
+    trailing_distance_mult: float = 1.0
+    max_bars_held: int = 0  # 0 = hold indefinitely; N = exit after N bars in ACTIVE
     atr_col: str = "atr_14"
 
 
@@ -115,6 +116,27 @@ class WalkForwardConfig:
     holdout_window: int = 1
     step: int = 1
     rebalance_bars: int = 20
+
+
+# ======================================================================
+# Adaptive threshold helpers (shared with live executor logic)
+# ======================================================================
+
+
+def _thresh(pnl_ema: float, base: float, lo: float, hi: float) -> float:
+    """Adaptive entry threshold from PnL history."""
+    if abs(pnl_ema) < 0.001 or pnl_ema > 0.02:
+        return lo
+    if pnl_ema > 0.005:
+        return base - (pnl_ema - 0.005) / 0.015 * (base - lo)
+    if pnl_ema > -0.005:
+        return base
+    return max(lo, min(hi, base + (abs(pnl_ema) - 0.005) / 0.02 * (hi - base)))
+
+
+def _ema_update(prev: float, cur: float, period: int) -> float:
+    alpha = 2.0 / (period + 1)
+    return alpha * cur + (1 - alpha) * prev
 
 
 # ======================================================================
@@ -129,6 +151,8 @@ class Backtest:
     initial_capital: float = 10_000.0
     cost: CostModel = field(default_factory=CostModel)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    threshold: float | None = None  # per-asset threshold; None=use old 0.40/0.25/0.70
+    ord_type: str = "limit"  # "limit" or "market"
 
     def run(self) -> BacktestResult:
         df = self.data.sort("timestamp").with_columns(self.signal_expr.alias("signal"))
@@ -136,52 +160,93 @@ class Backtest:
         return self._run_single(df)
 
     def _run_single(self, df: pl.DataFrame) -> BacktestResult:
+        # Lazy import to avoid circular dependency (trading.py imports RiskConfig)
+        from qooi.exchange.trading import FillStatus, PositionState, State
+
         n = len(df)
         close = df["close"].to_list()
         signal = df["signal"].to_list()
+        high = df["high"].to_list() if "high" in df.columns else close
+        low = df["low"].to_list() if "low" in df.columns else close
         atr = self._clean_atr(df, n)
         r = self.risk
+
+        # B3: limit-order simulation — max bars before order expires
+        max_bars_pending = 2  # 2 bars for 4h = 8h timeout (matches live)
+
+        # B4: adaptive threshold (scaled per-asset if threshold provided)
+        t = self.threshold
+        if t is not None and t > 0:
+            _ADAPTIVE_BASE, _ADAPTIVE_MIN, _ADAPTIVE_MAX = t, t * 0.625, t * 1.75
+        else:
+            _ADAPTIVE_BASE, _ADAPTIVE_MIN, _ADAPTIVE_MAX = 0.40, 0.25, 0.70
+        _ADAPTIVE_LOOKBACK = 50
+        pnl_ema = 0.0
 
         equity = [self.initial_capital]
         trade_log: list[dict] = []
         pos = [0.0]
-        active: dict | None = None
-        stop_price = -1.0
-        target_price = -1.0
-        trailing_high = -1.0
-        trailing_low = -1.0
+        bstate: State = State.IDLE
+        position: PositionState | None = None
+        order_px: float = 0.0
+        bars_pending: int = 0
+        entry_equity = self.initial_capital
         size = 0.0
+        direction = 0  # 1=long, -1=short, 0=none
 
         for i in range(1, n):
             p_prev = pos[-1]
             prev_eq = equity[-1]
             atr_i = atr[i - 1] if atr[i - 1] > 0 else atr[i] if atr[i] > 0 else 1.0
             p = self._clipped_signal(signal[i - 1])
+            cur_close = close[i - 1]
+            cur_low = low[i - 1]
+            cur_high = high[i - 1]
 
+            # --- PENDING: check if limit order filled this bar ---
+            if bstate == State.PENDING and position is not None:
+                bars_pending += 1
+                is_buy = position.order.side == "buy"
+                filled = (is_buy and cur_low <= order_px) or (not is_buy and cur_high >= order_px)
+                if filled:
+                    fill_px = order_px  # filled at limit price
+                    position.fill_status = FillStatus.FILLED
+                    position.entry_price = fill_px
+                    bstate = State.ACTIVE
+                    direction = 1 if is_buy else -1
+                    size = position.order.sz
+                elif bars_pending >= max_bars_pending:
+                    # Timeout — cancel order
+                    position = None
+                    direction = 0
+                    bstate = State.IDLE
+                    size = 0.0
+                    bars_pending = 0
+
+            # --- ACTIVE: check exits ---
             exit_reason: str | None = None
-            if p_prev != 0 and stop_price > 0:
-                exit_reason = self._check_exit(
-                    p_prev,
-                    close[i - 1],
-                    stop_price,
-                    target_price,
-                    trailing_high,
-                    trailing_low,
-                    atr_i,
-                    r,
-                )
+            if bstate == State.ACTIVE and position is not None:
+                position.bars_held += 1
+                # Time-based exit: close after N bars in ACTIVE
+                if r.max_bars_held > 0 and position.bars_held >= r.max_bars_held:
+                    exit_reason = "time"
+                else:
+                    exit_reason = position.check_exit(cur_close, atr_i, r)
 
             if exit_reason:
                 p = 0.0
             sign_flip = p_prev != 0 and p != 0 and (p_prev * p < 0)
-            if active is not None and (exit_reason or (p == 0 and p_prev != 0) or sign_flip):
+            if bstate == State.ACTIVE and (exit_reason or (p == 0 and p_prev != 0) or sign_flip):
                 reason = exit_reason or "signal"
+                pnl = direction * (cur_close / position.entry_price - 1) if position else 0.0
+                pnl_ema = _ema_update(pnl_ema, pnl, _ADAPTIVE_LOOKBACK)
                 trade_log.append(
-                    self._close_active(active, df["timestamp"][i - 1], close[i - 1], reason)
+                    self._close_position(position, direction, entry_equity,
+                                         df["timestamp"][i - 1], cur_close, reason)
                 )
-                stop_price = target_price = -1.0
-                trailing_high = trailing_low = -1.0
-                active = None
+                position = None
+                direction = 0
+                bstate = State.IDLE
                 size = 0.0
 
             turnover = abs(p - p_prev)
@@ -190,33 +255,39 @@ class Backtest:
                     0.0, 1.0 - turnover * (self.cost.total_per_side + self.cost.market_impact_pct)
                 )
 
-            if abs(p) > 0 and p != p_prev:
-                if active is not None and p_prev != 0 and p_prev * p > 0:
-                    size = abs(p)
-                    active["size"] = size
-                else:
-                    entry_price = close[i - 1]
-                    entry_price, size, stop_price, target_price, trailing_high, trailing_low = (
-                        self._enter_position(p, entry_price, 0.0, prev_eq, atr_i, r)
+            # --- IDLE: check if signal triggers entry ---
+            if bstate == State.IDLE and abs(signal[i - 1]) > 0:
+                # B4: adaptive threshold gate — check against raw signal
+                threshold = _thresh(pnl_ema, _ADAPTIVE_BASE, _ADAPTIVE_MIN, _ADAPTIVE_MAX)
+                if abs(signal[i - 1]) >= threshold:
+                    entry_px = cur_close
+                    position, size = self._enter_position_state(
+                        p, entry_px, prev_eq, atr_i, r, df["timestamp"][i - 1]
                     )
-                    if size > 0:
-                        active = {
-                            "direction": 1 if p > 0 else -1,
-                            "entry_ts": df["timestamp"][i - 1],
-                            "entry_price": entry_price,
-                            "entry_equity": prev_eq,
-                            "size": size,
-                        }
-            elif p == 0:
-                size = 0.0
+                    if position is not None and size > 0:
+                        entry_equity = prev_eq
+                        direction = 1 if p > 0 else -1
+                        if self.ord_type == "market":
+                            # Market order: instant fill at bar close
+                            position.fill_status = FillStatus.FILLED
+                            position.entry_price = entry_px
+                            bstate = State.ACTIVE
+                        else:
+                            # Limit order: PENDING until bar touches price
+                            order_px = entry_px
+                            bars_pending = 0
+                            bstate = State.PENDING
 
-            pos_current = size * (1.0 if p > 0 else -1.0) if abs(p) > 0 else 0.0
-            daily_ret = self._bar_return(close[i], close[i - 1], pos_current)
+            pos_current = size * direction if direction != 0 else 0.0
+            daily_ret = self._bar_return(close[i], cur_close, pos_current)
             equity.append(prev_eq * (1.0 + daily_ret))
             pos.append(pos_current)
 
-        if active is not None:
-            trade_log.append(self._close_active(active, df["timestamp"][-1], close[-1], "end"))
+        if bstate == State.ACTIVE and position is not None:
+            trade_log.append(
+                self._close_position(position, direction, entry_equity,
+                                     df["timestamp"][-1], close[-1], "end")
+            )
 
         eq_series = pl.Series(equity, dtype=pl.Float64)
         result_df = df.select(["timestamp", "close", "signal"]).with_columns(
@@ -234,6 +305,51 @@ class Backtest:
             ),
         )
 
+    def _enter_position_state(self, p, entry_px, prev_eq, atr_i, r, ts):
+        """Create a PositionState using the same sizing as before."""
+        from qooi.exchange.trading import PositionState
+
+        if p > 0:
+            entry_px *= 1.0 + self.cost.total_per_side
+            parent = PositionState.enter_long
+        else:
+            entry_px *= 1.0 - self.cost.total_per_side
+            parent = PositionState.enter_short
+
+        if r.position_sizing == "atr" and atr_i > 0:
+            sz = r.max_risk_pct * prev_eq / (atr_i * r.atr_stop_mult)
+            sz = min(sz, r.max_leverage)
+        else:
+            sz = min(abs(p), r.max_leverage) if r.max_leverage > 0 else 1.0
+        sz = max(sz, 0.0)
+        if sz <= 0:
+            return None, 0.0
+
+        position = parent(entry_px, atr_i, r, int(ts))
+        position.order.sz = sz
+        return position, sz
+
+    def _close_position(self, position, direction, entry_equity, exit_ts, exit_price, reason):
+        """Extract trade log entry from PositionState."""
+        if position is None:
+            return {}
+        net_price = (
+            exit_price * (1.0 - self.cost.total_per_side)
+            if direction > 0
+            else exit_price * (1.0 + self.cost.total_per_side)
+        )
+        sz = position.order.sz if position.order.sz > 0 else 1.0
+        pnl = (net_price / position.entry_price - 1) * sz * entry_equity
+        return {
+            "entry_time": position.entry_ts,
+            "exit_time": exit_ts,
+            "side": "long" if direction > 0 else "short",
+            "entry_price": position.entry_price,
+            "exit_price": net_price,
+            "pnl": pnl,
+            "reason": reason,
+        }
+
     def _clean_atr(self, df: pl.DataFrame, n: int) -> list[float]:
         col = self.risk.atr_col
         raw = (
@@ -250,66 +366,6 @@ class Backtest:
         if r.max_leverage <= 0:
             return 0.0
         return max(-r.max_leverage, min(r.max_leverage, raw))
-
-    @staticmethod
-    def _check_exit(
-        p_prev, cur_close, stop_price, target_price, trailing_high, trailing_low, atr_i, r
-    ):
-        if p_prev > 0:
-            if cur_close <= stop_price:
-                return "stop"
-            if target_price > 0 and cur_close >= target_price:
-                return "target"
-            if trailing_high > 0:
-                new_high = max(trailing_high, cur_close)
-                if new_high - cur_close >= r.trailing_distance_mult * atr_i:
-                    return "trailing_stop"
-            return None
-        if cur_close >= stop_price:
-            return "stop"
-        if target_price > 0 and cur_close <= target_price:
-            return "target"
-        if trailing_low > 0:
-            new_low = min(trailing_low, cur_close)
-            if cur_close - new_low >= r.trailing_distance_mult * atr_i:
-                return "trailing_stop"
-        return None
-
-    def _close_active(self, active, exit_ts, exit_price, reason):
-        net_price = (
-            exit_price * (1.0 - self.cost.total_per_side)
-            if active["direction"] > 0
-            else exit_price * (1.0 + self.cost.total_per_side)
-        )
-        pnl = (net_price / active["entry_price"] - 1) * active["size"] * active["entry_equity"]
-        return {
-            "entry_time": active["entry_ts"],
-            "exit_time": exit_ts,
-            "side": "long" if active["direction"] > 0 else "short",
-            "entry_price": active["entry_price"],
-            "exit_price": net_price,
-            "pnl": pnl,
-            "reason": reason,
-        }
-
-    def _enter_position(self, p, entry_price, impact, prev_eq, atr_i, r):
-        if p > 0:
-            entry_price *= 1.0 + self.cost.total_per_side + impact
-            stop = entry_price - r.atr_stop_mult * atr_i
-            target = entry_price + r.atr_target_mult * atr_i
-            trail_h, trail_l = entry_price, -1.0
-        else:
-            entry_price *= 1.0 - self.cost.total_per_side - impact
-            stop = entry_price + r.atr_stop_mult * atr_i
-            target = entry_price - r.atr_target_mult * atr_i
-            trail_h, trail_l = -1.0, entry_price
-
-        if r.position_sizing == "atr" and atr_i > 0:
-            sz = r.max_risk_pct * prev_eq / (atr_i * r.atr_stop_mult)
-            sz = min(sz, r.max_leverage)
-        else:
-            sz = min(abs(p), r.max_leverage) if r.max_leverage > 0 else 1.0
-        return entry_price, max(sz, 0.0), stop, target, trail_h, trail_l
 
     def _bar_return(self, cur_close, prev_close, pos_current):
         if pos_current == 0:

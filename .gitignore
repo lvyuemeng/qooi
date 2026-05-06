@@ -28,6 +28,7 @@ Thumbs.db
 
 # Scratch / working notes
 .scratch/
+.deepseek/
 
 # Generated data (cache + charts + signals)
 data/cache/

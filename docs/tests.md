@@ -1,35 +1,45 @@
-# Qooi — proficient strategy summary
+# Qooi — strategy summary
 
 ## Test config
 
 | Param | Value |
 |---|---|
 | Capital | 10,000 USDT |
-| Cost | 0.005%/side (OKX VIP0 maker, limit orders) |
-| Leverage | 2× max (signal-clipped, drawdown-adaptive) |
-| Risk | ATR stop 2.0×, ATR target 3.0× |
-| Data | LBank (CCXT) for backtest; OKX SDK for live |
+| Cost | 0.005%/side (OKX VIP0 maker fee) |
+| Leverage | 0.4× max (signal-clipped, drawdown-adaptive) |
+| Risk | ATR stop 2.0×, ATR target 3.0×, trail distance 1.0× |
+| Signal | OFI flow with |sig| > 0.4 magnitude filter |
+| Data | OKX (parquet cache) for backtest; OKX SDK for live |
 
 ---
 
-## 1. Multi-Factor Intraday Ensemble (4H) — unified backtest + live
+## 1. OFI Flow Signal (4H) — unified backtest + live
 
 ### Pipeline
 
 ```
-OHLCV → indicators → ensemble → OFI flow → micro confirm → adaptive gate → stop/target/trailing → portfolio
+OHLCV → add_indicators → add_regime_features → add_ofi_flow_columns → magnitude filter (|OFI| ≥ 0.4)
 ```
 
-All layers shared between backtest (`Backtest`) and live executor (`LiveExecutor`).
+Risk management (`State`, `PositionState`, `RiskConfig`) is fully separate from the signal pipeline. Either can be changed independently.
 
-### Results (4H, 2023-2026, leverage=2.0)
+### Results (4H, market orders, scale-invariant OFI flow)
 
-| Asset | Sharpe | DD | Return | Trades | WR | OOS Sharpe | Overfit |
-|---|---|---|---|---|---|---|---|
-| **ETH-USDT** | **0.71** | 12.2% | +18.2% | 79 | 54% | **0.58** | 0.40 |
-| SOL-USDT | -0.12 | 14.0% | +1.9% | 68 | 56% | -0.15 | 0.46 |
+| Asset | Threshold | Sharpe | DD | Return | Trades | WR |
+|-------|-----------|--------|-----|--------|--------|-----|
+| **SOL-USDT** | 0.35 | **+1.88** | 7.2% | +30.7% | 248 | 51% |
+| **BTC-USDT** | 0.25 | **+1.52** | 6.8% | +19.7% | 447 | 57% |
+| XRP-USDT | 0.45 | +0.18 | 9.4% | +1.7% | 71 | 54% |
 
-OOS Sharpe positive on ETH (0.58). Overfit ratio 0.40 = wins 60% of unseen test windows.
+\* ETH-USDT not included — spot cache was overwritten (SWAP data not equivalent).
+
+**Exit reason distribution (SOL, lev=0.5, th=0.35):**
+- Stop-loss: 70
+- Target: 27
+- Trailing stop: 69
+- Signal-based exit: 553
+
+**Sides:** long=169, short=550 (short-biased in the test period).
 
 ### Symbol naming convention
 
@@ -41,52 +51,60 @@ OOS Sharpe positive on ETH (0.58). Overfit ratio 0.40 = wins 60% of unseen test 
 
 `MarketData` auto-converts. `TradingClient` uses OKX format (`ETH-USDT`).
 
-### Testnet readiness
+### Signal quality
+
+| Metric | Ensemble (old) | OFI flow (current) |
+|---|---|---|
+| IC (4-bar forward) | +0.021 | +0.051 |
+| Hit rate (4-bar) | 49% | 51% |
+| Sharpe (market orders) | -0.04 | +1.37 |
+| Interpretability | Opaque ensemble | "Order flow imbalance" |
+
+## 2. Testnet readiness
 
 | Component | Status | Note |
 |---|---|---|
-| Signal pipeline | ✅ | Multi-factor ensemble + OFI + adaptive gate |
-| Risk management | ✅ | Stop-loss / take-profit / trailing via `RiskConfig` |
+| Signal pipeline | ✅ | OFI flow, magnitude filter at 0.4 |
+| Risk management | ✅ | Stop-loss / target / trailing via `RiskConfig` + ADR D1/D2 |
 | Cost model | ✅ | OKX maker 0.005%/side via `CostModel` |
-| Leverage control | ✅ | Signal clipping + position cap + drawdown-adaptive halving |
-| Order execution | ✅ | `post_only` limit orders, 120s timeout auto-cancel |
-| Position check | ✅ | Prevents duplicate orders |
+| Leverage control | ✅ | 0.4× max, signal-clipped, drawdown-adaptive halving |
+| Order execution | ✅ | `post_only` (ETH) / `limit` (SOL) per-pair, 8h timeout |
+| Duplicate prevention | ✅ | `sync()` cancels old orders, log-fallback if API down |
 | Dry run mode | ✅ | `dry_run=True` simulates without API keys |
-| Live mode | ✅ | `live=False`→testnet, `live=True`→production (separate secrets) |
-| Walk-forward OOS | ✅ | ETH 4H: Sharpe 0.58 across rolling train/test windows |
-| Portfolio runner | ✅ | `PortfolioRunner` + `PortfolioConfig` for multi-asset deployment |
-
----
-
-## 2. Daily strategies (1D, 2018-2026, LBank)
-
-| Asset | Strategy | Sharpe | DD | Return | Trades | WR |
-|---|---|---|---|---|---|---|
-| BTC | Trend Pullback | **0.80** | 55% | +1132% | 56 | 52% |
-| ETH | Trend Pullback | **0.35** | 32% | +45% | 13 | 69% |
-| SOL | Trend Pullback | **0.64** | 61% | +114% | 19 | 79% |
-
----
+| Live mode | ✅ | `testnet` → OKX demo, `live` → production (separate secrets) |
+| Portfolio runner | ✅ | `PortfolioRunner` + `PortfolioConfig` for multi-asset |
+| Pre-flight status | ✅ | Balance, positions, pending orders printed before execution |
 
 ## 3. Backtest ↔ Live parity
 
 | Feature | Backtest (`backtest.py`) | Live (`trading.py`) |
 |---|---|---|
-| Signal pipeline | `signal_expr` + `run()` | `SignalSource` + `step()` |
-| Risk config | `RiskConfig(max_leverage, atr_stop_mult, atr_target_mult)` | Same `RiskConfig` |
-| Cost | `CostModel(commission_pct, slippage_pct)` | Same `CostModel` |
-| Stop-loss | `_check_exit()` every bar | `step()` every bar via `RiskConfig` |
+| State machine | `State` enum (IDLE → PENDING → ACTIVE → EXITING) | Same `State` enum |
+| Position state | `PositionState` with stops/targets/trails | Same `PositionState` |
+| Risk config | `RiskConfig(max_leverage, atr_stop, atr_target, trail_act, trail_dist)` | Same `RiskConfig` |
+| Cost | `CostModel(commission_pct=0.00005)` | Same `CostModel` |
+| Stop-loss | `check_exit()` every bar | `_decide_from_active()` → `check_exit()` |
 | Take-profit | ATR target on entry | Same logic |
-| Trailing stop | Trailing high/low + distance × ATR | Same logic |
-| Leverage | `_clipped_signal()` + `_enter_position()` cap | `clipped` + `signal_abs` + dynamic drawdown halving |
-| Order type | Implicit market-at-close | `post_only` limit (maker 0.005%) |
-| Timeout | None (instant fill) | 120s auto-cancel |
-| Equity tracking | `equity` array + `compute_metrics` | `self._equity` array + `report()` via `compute_metrics` |
-| Walk-forward | `WalkForwardBacktest` | Not applicable (live) |
+| Trailing stop | Activation at 2× ATR profit, trail at 1× ATR | Same logic (D2) |
+| Signal-based exit | Exit on signal flip | Same logic (D1) |
+| Breakeven stop | Via stop exit (not tracked separately) | Moves stop to entry at +1 ATR |
+| Adaptive threshold | `_thresh()` based on PnL EMA | Same `_thresh()` on real PnL |
+| Order type | `ord_type="market"` or `"limit"` | `post_only` or `limit` per-pair |
+| Limit fill | Fills if `bar.low <= order_px` | Exchange fills, checked via `pending()` |
+| Timeout | 2 bars (8h for 4h) | 2× bar duration (8h for 4h, D4) |
 
----
+## 4. Known gaps (deferred)
 
-## 4. Data sources
+| Gap | Priority | Adr ref |
+|-----|----------|---------|
+| Frozen-capital gate (>50% blocked → skip) | High | C1 |
+| SOL data depth (400 bars → need 2000+) | High | — |
+| OOS walk-forward validation for OFI flow | High | — |
+| Trailing target (move target up in trend) | Medium | ADR-002 |
+| Time-based exit in ACTIVE (N bars max) | Medium | ADR-002 |
+| Market order fallback (taker after N fails) | Low | ADR-002 |
+
+## 5. Data sources
 
 | Source | OHLCV depth | Order book | Funding rate | Geo-access |
 |---|---|---|---|---|
@@ -95,3 +113,17 @@ OOS Sharpe positive on ETH (0.58). Overfit ratio 0.40 = wins 60% of unseen test 
 | **Bitfinex** | 10000 bars (2019-2023) | Live (REST) | Yes | Open |
 | Gate, Bitstamp, KuCoin, MEXC | 500-999 bars | Live (REST) | Yes | Open |
 | Binance, Bybit | Blocked | — | — | Proxy-needed |
+
+## 6. Running
+
+```bash
+# Backtest report
+uv run python scripts/backtest_report.py
+
+# Live trading (testnet)
+uv run python scripts/trade.py testnet
+
+# Live trading (production — manual confirmation required)
+uv run python scripts/trade.py live dry
+uv run python scripts/trade.py live live  # places real orders
+```
