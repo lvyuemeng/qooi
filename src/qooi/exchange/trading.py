@@ -75,7 +75,10 @@ class TradingClient:
     @staticmethod
     def _okx(resp: dict, key: str = "data") -> dict:
         if resp.get("code") != "0":
-            raise RuntimeError(f"OKX error: {resp.get('msg', resp)}")
+            code = resp.get("code", "?")
+            msg = resp.get("msg", str(resp))
+            data = resp.get("data", [])
+            raise RuntimeError(f"OKX error [{code}]: {msg}  data={data}")
         return resp.get(key, [{}])[0] if resp.get(key) else {}
 
     @staticmethod
@@ -610,6 +613,10 @@ class LiveExecutor:
                 self._state = State.PENDING
             return result
 
+        # --- log skip decisions ---
+        if decision.action == "skip":
+            self._log_skip(decision.detail)
+
         return None
 
     # -- state machine (pure functions) ---------------------------------------
@@ -931,10 +938,11 @@ class LiveExecutor:
         dd = (peak - self._equity[-1]) / peak if peak > 0 else 0.0
         eff_lev = self._leverage * (0.5 if dd > 0.15 else 1.0)
         ml = self._risk.max_leverage
-        sz = min(
-            self._capital * self._max_pos * min(abs(clipped), ml) * eff_lev,
-            self._capital * ml * eff_lev,
-        ) / max(entry_px, 1)
+        notional = self._capital * self._max_pos * min(abs(clipped), ml) * eff_lev
+        sz = min(notional, self._capital * ml * eff_lev) / max(entry_px, 1)
+        # Minimum order value gate ($10 USDT equivalent for OKX spot)
+        if notional < 10.0:
+            return 0.0
         return sz
 
     def _check_fill_status(self) -> None:
