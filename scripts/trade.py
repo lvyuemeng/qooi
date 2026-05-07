@@ -27,12 +27,14 @@ from qooi.exchange.trading import (
 # Design: enter with LIMIT (signal verification), exit with MARKET (risk guarantee).
 #   An unfilled limit order = prevented loss from bad signal.  Fill rate IS signal accuracy.
 TESTNET_PAIRS = [
+    # Lowered thresholds for testnet validation (ETH 0.20, SOL 0.25, BTC 0.20).
+    # Production thresholds: ETH 0.25, SOL 0.35, BTC 0.25.
     {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0,
-     "ct_val": 0.1, "sig_threshold": 0.25},
+     "ct_val": 0.1, "sig_threshold": 0.20},
     {"symbol": "SOL-USDT-SWAP", "tf": "4h", "capital": 200, "risk_pct": 0.50, "leverage": 3.0,
-     "ct_val": 1.0, "sig_threshold": 0.35},
+     "ct_val": 1.0, "sig_threshold": 0.25},
     {"symbol": "BTC-USDT-SWAP", "tf": "4h", "capital": 1000, "risk_pct": 0.80, "leverage": 2.0,
-     "ct_val": 0.01, "sig_threshold": 0.25},
+     "ct_val": 0.01, "sig_threshold": 0.20},
 ]
 LIVE_PAIRS = [
     {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0, "ct_val": 0.1},
