@@ -1,129 +1,86 @@
-# Qooi — strategy summary
+# Qooi — Perpetual Futures Strategy
 
-## Test config
+## Instruments
 
-| Param | Value |
-|---|---|
-| Capital | 10,000 USDT |
-| Cost | 0.005%/side (OKX VIP0 maker fee) |
-| Leverage | 0.4× max (signal-clipped, drawdown-adaptive) |
-| Risk | ATR stop 2.0×, ATR target 3.0×, trail distance 1.0× |
-| Signal | OFI flow with |sig| > 0.4 magnitude filter |
-| Data | OKX (parquet cache) for backtest; OKX SDK for live |
+All trading is on OKX perpetual swaps (futures). Positions persist on exchange across runs.
 
----
+| Symbol | ctVal | Min | Threshold | Leverage | Capital |
+|--------|-------|-----|-----------|----------|---------|
+| ETH-USDT-SWAP | 0.1 ETH/ct | 1 ct | 0.25 | 2× | $500 |
+| SOL-USDT-SWAP | 1 SOL/ct | 1 ct | 0.35 | 3× | $200 |
+| BTC-USDT-SWAP | 0.01 BTC/ct | 1 ct | 0.25 | 2× | $1,000 |
 
-## 1. OFI Flow Signal (4H) — unified backtest + live
-
-### Pipeline
+## Signal Pipeline
 
 ```
-OHLCV → add_indicators → add_regime_features → add_ofi_flow_columns → magnitude filter (|OFI| ≥ 0.4)
+OHLCV → add_indicators → add_regime_features → add_ofi_flow_columns
+      → magnitude filter (|OFI| ≥ sig_threshold) → signal
 ```
 
-Risk management (`State`, `PositionState`, `RiskConfig`) is fully separate from the signal pipeline. Either can be changed independently.
+OFI flow normalization: `net_flow / vol_total` (fraction of directional volume). Scale-invariant across assets.
 
-### Results (4H, market orders, scale-invariant OFI flow)
+Thresholds are per-asset, set via `sig_threshold` in pair config. Adaptive entry gate uses PnL-based EMA.
 
-| Asset | Threshold | Sharpe | DD | Return | Trades | WR |
-|-------|-----------|--------|-----|--------|--------|-----|
-| **SOL-USDT** | 0.35 | **+1.88** | 7.2% | +30.7% | 248 | 51% |
-| **BTC-USDT** | 0.25 | **+1.52** | 6.8% | +19.7% | 447 | 57% |
-| XRP-USDT | 0.45 | +0.18 | 9.4% | +1.7% | 71 | 54% |
+## Design: Limit as Signal Verification
 
-\* ETH-USDT not included — spot cache was overwritten (SWAP data not equivalent).
+- **Entry**: limit orders (post_only or limit). An unfilled order = the market disagreed with the signal = prevented loss.
+- **Exit**: market orders. When risk triggers, guaranteed execution.
+- **Fill rate**: directly measures signal accuracy.
 
-**Exit reason distribution (SOL, lev=0.5, th=0.35):**
-- Stop-loss: 70
-- Target: 27
-- Trailing stop: 69
-- Signal-based exit: 553
+## Backtest Results (Swap Data)
 
-**Sides:** long=169, short=550 (short-biased in the test period).
+Swap data is limited to 300 bars (OKX API restriction). Cache accumulates over time via `MarketData.candles(cache=True)`.
 
-### Symbol naming convention
+| Asset | Bars | Threshold | Sharpe | DD | Trades | Note |
+|-------|------|-----------|--------|-----|--------|------|
+| SOL-USDT-SWAP | 300 | 0.35 | -2.21 | 2.7% | 34 | Insufficient data |
+| BTC-USDT-SWAP | 300 | 0.25 | -1.24 | 3.4% | 59 | Insufficient data |
+| ETH-USDT-SWAP | 300 | 0.25 | -4.62 | 9.3% | 55 | Insufficient data |
 
-| Context | Format | Example |
-|---|---|---|
-| OKX SDK (live) | `ETH-USDT` | dash-separated, spot |
-| OKX swap/futures | `ETH-USDT-SWAP` | perpetual swap |
-| CCXT (backtest) | `ETH/USDT` | slash-separated |
+Spot data (historical, for reference only — spot is no longer used):
 
-`MarketData` auto-converts. `TradingClient` uses OKX format (`ETH-USDT`).
+| Asset | Bars | Sharpe | DD | Trades | WR |
+|-------|------|--------|-----|--------|-----|
+| SOL-USDT | 1,999 | +1.88 | 7.2% | 248 | 51% |
+| BTC-USDT | 2,000 | +1.52 | 6.8% | 447 | 57% |
 
-### Signal quality
-
-| Metric | Ensemble (old) | OFI flow (current) |
-|---|---|---|
-| IC (4-bar forward) | +0.021 | +0.051 |
-| Hit rate (4-bar) | 49% | 51% |
-| Sharpe (market orders) | -0.04 | +1.37 |
-| Interpretability | Opaque ensemble | "Order flow imbalance" |
-
-## 2. Testnet readiness
-
-| Component | Status | Note |
-|---|---|---|
-| Signal pipeline | ✅ | OFI flow, magnitude filter at 0.4 |
-| Risk management | ✅ | Stop-loss / target / trailing via `RiskConfig` + ADR D1/D2 |
-| Cost model | ✅ | OKX maker 0.005%/side via `CostModel` |
-| Leverage control | ✅ | 0.4× max, signal-clipped, drawdown-adaptive halving |
-| Order execution | ✅ | `post_only` (ETH) / `limit` (SOL) per-pair, 8h timeout |
-| Duplicate prevention | ✅ | `sync()` cancels old orders, log-fallback if API down |
-| Dry run mode | ✅ | `dry_run=True` simulates without API keys |
-| Live mode | ✅ | `testnet` → OKX demo, `live` → production (separate secrets) |
-| Portfolio runner | ✅ | `PortfolioRunner` + `PortfolioConfig` for multi-asset |
-| Pre-flight status | ✅ | Balance, positions, pending orders printed before execution |
-
-## 3. Backtest ↔ Live parity
+## Backtest ↔ Live Parity
 
 | Feature | Backtest (`backtest.py`) | Live (`trading.py`) |
 |---|---|---|
-| State machine | `State` enum (IDLE → PENDING → ACTIVE → EXITING) | Same `State` enum |
-| Position state | `PositionState` with stops/targets/trails | Same `PositionState` |
-| Risk config | `RiskConfig(max_leverage, atr_stop, atr_target, trail_act, trail_dist)` | Same `RiskConfig` |
-| Cost | `CostModel(commission_pct=0.00005)` | Same `CostModel` |
+| State machine | `State` enum (IDLE→PENDING→ACTIVE→EXITING) | Same |
+| Risk config | `RiskConfig(atr_stop=2.0, atr_target=3.0, trail=1.0)` | Same |
 | Stop-loss | `check_exit()` every bar | `_decide_from_active()` → `check_exit()` |
-| Take-profit | ATR target on entry | Same logic |
-| Trailing stop | Activation at 2× ATR profit, trail at 1× ATR | Same logic (D2) |
-| Signal-based exit | Exit on signal flip | Same logic (D1) |
-| Breakeven stop | Via stop exit (not tracked separately) | Moves stop to entry at +1 ATR |
-| Adaptive threshold | `_thresh()` based on PnL EMA | Same `_thresh()` on real PnL |
-| Order type | `ord_type="market"` or `"limit"` | `post_only` or `limit` per-pair |
-| Limit fill | Fills if `bar.low <= order_px` | Exchange fills, checked via `pending()` |
-| Timeout | 2 bars (8h for 4h) | 2× bar duration (8h for 4h, D4) |
+| Trailing stop | Activation at 2×ATR profit, trail at 1×ATR | Same (D2) |
+| Signal-based exit | Exit on signal flip | Same (D1) |
+| Breakeven stop | Via stop exit | Moves stop to entry at +1 ATR |
+| Adaptive threshold | PnL EMA-based | Same, scaled per-asset |
+| Order type | Market (backtest) / Limit (live entry) / Market (live exit) | Per-path |
+| Limit fill simulation | `bar.low <= order_px` | Exchange API |
+| Timeout | 2 bars (8h for 4h) | 8h (D4) |
 
-## 4. Known gaps (deferred)
+## Data Sources
 
-| Gap | Priority | Adr ref |
-|-----|----------|---------|
-| Frozen-capital gate (>50% blocked → skip) | High | C1 |
-| SOL data depth (400 bars → need 2000+) | High | — |
-| OOS walk-forward validation for OFI flow | High | — |
-| Trailing target (move target up in trend) | Medium | ADR-002 |
-| Time-based exit in ACTIVE (N bars max) | Medium | ADR-002 |
-| Market order fallback (taker after N fails) | Low | ADR-002 |
+| Source | Depth | Use |
+|--------|-------|-----|
+| OKX SDK | 300 bars/request | Live signals, accumulating cache |
+| OKX parquet cache | Grows over time | Backtest |
+| LBank | 2,000+ bars | Historical spot (reference only) |
 
-## 5. Data sources
-
-| Source | OHLCV depth | Order book | Funding rate | Geo-access |
-|---|---|---|---|---|
-| **OKX SDK** | 300-1200 bars (2023+) | Live (REST) | 3-month history | Open |
-| **LBank (CCXT)** | 3000-10000 bars (2018+) | Live (REST) | — | Open |
-| **Bitfinex** | 10000 bars (2019-2023) | Live (REST) | Yes | Open |
-| Gate, Bitstamp, KuCoin, MEXC | 500-999 bars | Live (REST) | Yes | Open |
-| Binance, Bybit | Blocked | — | — | Proxy-needed |
-
-## 6. Running
+## Running
 
 ```bash
-# Backtest report
-uv run python scripts/backtest_report.py
+# Backtest (swap data)
+uv run python scripts/backtest.py
 
-# Live trading (testnet)
+# Live trading — testnet
 uv run python scripts/trade.py testnet
 
-# Live trading (production — manual confirmation required)
-uv run python scripts/trade.py live dry
-uv run python scripts/trade.py live live  # places real orders
+# Live trading — production (requires "LIVE" confirmation)
+uv run python scripts/trade.py live dry    # dry run
+uv run python scripts/trade.py live live   # real orders
 ```
+
+## Account Setup
+
+Perpetual swaps require OKX account in "single-currency margin" or "multi-currency margin" mode. Error `51010` means the account is in "simple" mode — switch in OKX settings, transfer USDT to swap sub-account.
