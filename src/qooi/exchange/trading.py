@@ -386,47 +386,77 @@ class Summary(BaseModel):
     pre_usdt: float = 0.0
     post_usdt: float = 0.0
     usdt_change: float = 0.0
-    positions_pre: int = 0
-    positions_post: int = 0
+    total_upl: float = 0.0
+    total_margin: float = 0.0
+    positions: list[dict] = []
     assets: dict[str, AssetReport] = {}
 
     @classmethod
     def from_runner(cls, runner, tc: TradingClient, pre_usdt: float, pre_pos: int) -> Summary:
+        # --- real-time position snapshot ---
+        positions: list[dict] = []
+        total_upl = 0.0
+        total_margin = 0.0
+        try:
+            for p in tc.positions():
+                inst = p.get("instId", "?")
+                pos_sz = float(p.get("pos", 0))
+                upl = float(p.get("upl", 0))
+                margin = float(p.get("margin", 0))
+                avg_px = float(p.get("avgPx", 0))
+                mark_px = float(p.get("markPx", 0))
+                side = "long" if pos_sz > 0 else "short"
+                positions.append({
+                    "inst": inst, "side": side, "sz": abs(pos_sz),
+                    "avg_px": avg_px, "mark_px": mark_px, "upl": upl, "margin": margin,
+                })
+                total_upl += upl
+                total_margin += margin
+        except Exception:
+            pass
+
+        # --- USDT balance ---
         try:
             post_usdt = float(tc.balance("USDT")[0].get("availBal", 0))
         except Exception:
             post_usdt = 0.0
-        try:
-            post_pos = len(tc.positions())
-        except Exception:
-            post_pos = -1
+
         pairs = [(p["symbol"], p.get("tf", "4h")) for p in runner.config.pairs]
         return cls(
-            pre_usdt=pre_usdt,
-            post_usdt=post_usdt,
+            pre_usdt=pre_usdt, post_usdt=post_usdt,
             usdt_change=post_usdt - pre_usdt,
-            positions_pre=pre_pos,
-            positions_post=post_pos,
+            total_upl=total_upl, total_margin=total_margin,
+            positions=positions,
             assets={s: asset_report(s, tf) for s, tf in pairs},
         )
 
     def write_to(self, fh: object = sys.stdout, tc: TradingClient | None = None) -> None:
         fh.write("## qooi Portfolio\n\n")
-        fh.write(f"USDT: {self.pre_usdt:.2f} -> {self.post_usdt:.2f} ({self.usdt_change:+.2f})\n")
 
-        # Show held assets (not just USDT) for spot trading
-        if tc:
-            try:
-                asset_balances = [b for b in tc.balance() if b.get('ccy','') != 'USDT'
-                                  and float(b.get('availBal', 0)) > 1e-10]
-                if asset_balances:
-                    fh.write(" Held assets:")
-                    for b in asset_balances:
-                        fh.write(f"  {b.get('ccy','?')}={b.get('availBal','?')}")
-                    fh.write("\n")
-            except Exception:
-                pass
-        fh.write(f"Positions: {self.positions_pre} -> {self.positions_post}\n\n")
+        # --- total portfolio value ---
+        total_value = self.post_usdt + self.total_margin + self.total_upl
+        yield_pct = (total_value / self.pre_usdt - 1) * 100 if self.pre_usdt > 0 else 0.0
+        fh.write(f"Total: ${total_value:,.2f} ({yield_pct:+.2f}% since inception)\n")
+
+        # --- USDT + margin breakdown ---
+        free = self.post_usdt
+        deployed = self.total_margin
+        fh.write(f"  USDT free:   ${free:,.2f}\n")
+        fh.write(f"  USDT margin: ${deployed:,.2f}\n")
+
+        # --- open positions ---
+        if self.positions:
+            fh.write("\n  Positions:\n")
+            for p in self.positions:
+                pnl_pct = (p["upl"] / p["margin"] * 100) if p["margin"] > 0 else 0.0
+                fh.write(
+                    f"    {p['inst']:20s} {p['side']:5s} "
+                    f"{p['sz']}ct @ {p['avg_px']:,.1f} → {p['mark_px']:,.1f}  "
+                    f"upl=${p['upl']:+,.2f} ({pnl_pct:+.1f}%)\n"
+                )
+
+        # --- per-symbol trading stats ---
+        fh.write("\n")
         for sym, rpt in self.assets.items():
             if rpt.error:
                 fh.write(f"**{sym}**: {rpt.error}\n")
@@ -967,11 +997,11 @@ class LiveExecutor:
         ml = self._risk.max_leverage
         notional = self._capital * self._max_pos * min(abs(clipped), ml) * eff_lev
         # For perpetual swaps: sz is in contracts.  Min 1 contract.
-        sz_contracts = max(1.0, notional / max(entry_px, 1))
         # Floor: minimum order value ($10 USDT)
         if notional < 10.0:
             return 0.0
-        return round(sz_contracts)
+        contracts = max(1.0, notional / max(entry_px, 1))
+        return round(contracts)
 
     def _check_fill_status(self) -> None:
         """Query OKX for fill status of the active order."""
@@ -1022,7 +1052,7 @@ class LiveExecutor:
             px=px,
             placed_at=time.time(),
             signal=signal,
-            obi=obi.imbalance_5,
+            obi=getattr(obi, 'imbalance_5', 0) if obi else 0,
             ofi_flow=flow,
             status="placed",
         )
