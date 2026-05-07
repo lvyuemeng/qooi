@@ -485,7 +485,7 @@ def default_signal_source(sig_threshold: float = 0.35) -> SignalSource:
             add_regime_features,
         )
 
-        df = MarketData("okx").candles(symbol, timeframe=timeframe, limit=500)
+        df = MarketData("okx").candles(symbol, timeframe=timeframe, limit=500, cache=True)
         if df.is_empty():
             return None
         df = add_indicators(df)

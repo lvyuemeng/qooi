@@ -449,7 +449,8 @@ class MarketData:
     # -- OHLCV -----------------------------------------------------------
 
     def candles(
-        self, symbol: str, timeframe: str = "1d", limit: int = 300, since: int | None = None
+        self, symbol: str, timeframe: str = "1d", limit: int = 300,
+        since: int | None = None, cache: bool = False,
     ) -> pl.DataFrame:
         raw = self._backend.fetch_ohlcv(
             symbol,
@@ -457,7 +458,22 @@ class MarketData:
             limit=limit,
             since=since,
         )
-        return _parse_ohlcv(raw)
+        df = _parse_ohlcv(raw)
+
+        if cache and not df.is_empty():
+            # Merge with existing cache: keep the larger of (cached, fetched).
+            # This allows the cache to grow over time as different calls
+            # fetch different date ranges.
+            cache_path = _cache_path(symbol, timeframe)
+            if cache_path.exists():
+                cached = pl.read_parquet(cache_path)
+                # Merge, drop duplicate timestamps, sort
+                merged = pl.concat([cached, df]).unique(subset=["timestamp"]).sort("timestamp")
+                merged.write_parquet(cache_path)
+            else:
+                df.write_parquet(cache_path)
+
+        return df
 
     def candles_range(
         self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
@@ -570,3 +586,13 @@ def _days_since(since: str) -> int:
     return max(
         1, (datetime.now(UTC) - datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC)).days
     )
+
+
+def _cache_path(symbol: str, timeframe: str) -> Path:
+    """Parquet cache path: data/cache/{S}_{T}.parquet"""
+    from pathlib import Path
+    cache_dir = Path(__file__).resolve().parent.parent.parent.parent / "data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe = symbol.replace("-", "_").replace("/", "_").upper()
+    tf = timeframe.replace(" ", "").upper()
+    return cache_dir / f"{safe}_{tf}.parquet"
