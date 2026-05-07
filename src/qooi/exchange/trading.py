@@ -1189,42 +1189,57 @@ def asset_report(symbol: str = "ETH-USDT", timeframe: str = "4h") -> AssetReport
     orders = [LogLine.model_validate(o) for o in raw if o.get("event") == "order"]
     if not orders:
         return AssetReport(error="no trades yet")
-    trades = []
-    entry: LogLine | None = None
+
+    # Extract OrderPayloads in chronological order
+    ops: list[OrderPayload] = []
     for o in orders:
         p = o.payload
-        if not isinstance(p, OrderPayload):
-            continue
-        if not entry:
-            entry = o
-            continue
-        ep: OrderPayload = entry.payload  # type: ignore[assignment]
-        pnl = (p.px / ep.px - 1) * (1 if ep.side in ("long", "buy") else -1)
-        trades.append(
-            {
-                "entry_time": entry.ts,
-                "exit_time": o.ts,
-                "side": ep.side,
-                "entry_price": ep.px,
-                "exit_price": p.px,
-                "pnl": pnl,
-                "reason": "signal",
-            }
-        )
-        entry = o
-    if not trades:
-        return AssetReport(error="need >=2 trades", trades=0)
+        if isinstance(p, OrderPayload):
+            ops.append(p)
+    if not ops:
+        return AssetReport(error="no trades yet")
+
+    # Pair buys with sells for PnL.  Unpaired buys are open positions.
+    # For spot: buy = entry, sell = exit.
+    trades = []
+    open_buys: list[OrderPayload] = []
+    for p in ops:
+        if p.side == "buy":
+            open_buys.append(p)
+        elif p.side == "sell" and open_buys:
+            entry = open_buys.pop(0)
+            pnl = (p.px / entry.px - 1) if entry.px > 0 else 0.0
+            trades.append({
+                "entry_time": 0, "exit_time": 0,
+                "side": entry.side, "entry_price": entry.px,
+                "exit_price": p.px, "pnl": pnl, "reason": "sold",
+            })
+
+    n_total = len(ops)
+    n_closed = len(trades)
+    n_open = len(open_buys)
+    if n_closed == 0 and n_open == 0:
+        return AssetReport(trades=0, win_rate_pct=0.0, sharpe=0.0,
+                           total_return_pct=0.0, max_drawdown_pct=0.0)
+
+    if n_closed == 0:
+        return AssetReport(trades=n_open, win_rate_pct=0.0, sharpe=0.0,
+                           total_return_pct=0.0, max_drawdown_pct=0.0,
+                           error=f"{n_open} open position{'s' if n_open>1 else ''}, no closed trades")
+
     trade_df = pl.DataFrame(trades)
-    eq = pl.Series(
-        [1000, *(1000 * (1 + (t["exit_price"] / t["entry_price"] - 1)) for t in trades)],
-        dtype=pl.Float64,
-    )
+    initial = 1000.0
+    eq = pl.Series([initial] + [initial * (1.0 + float(t["pnl"])) for t in trades],
+                   dtype=pl.Float64)
     eq_df = pl.DataFrame({"portfolio_value": eq, "returns": eq.pct_change().fill_null(0.0)})
     m = compute_metrics(eq_df, trades=trade_df)
+    note = f" ({n_open} open)" if n_open > 0 else ""
+    # Total trades = all orders placed (closed + open)
     return AssetReport(
-        trades=m.num_trades,
+        trades=n_closed + n_open,
         win_rate_pct=m.win_rate_pct,
         sharpe=round(m.sharpe_ratio, 2),
         total_return_pct=round(m.total_return_pct, 1),
         max_drawdown_pct=round(m.max_drawdown_pct, 1),
+        error=f"closed={n_closed} open={n_open}" if n_open > 0 else None,
     )

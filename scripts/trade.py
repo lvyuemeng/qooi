@@ -20,7 +20,7 @@ from qooi.exchange.trading import (
 
 TESTNET_PAIRS = [
     {"symbol": "ETH-USDT", "tf": "4h", "capital": 1000, "risk_pct": 0.10, "leverage": 2.0, "post_only": True, "sig_threshold": 0.25},
-    {"symbol": "SOL-USDT", "tf": "4h", "capital": 500, "risk_pct": 0.15, "leverage": 3.0, "ord_type": "market", "sig_threshold": 0.35},
+    {"symbol": "SOL-USDT", "tf": "4h", "capital": 500, "risk_pct": 0.15, "leverage": 3.0, "ord_type": "limit", "sig_threshold": 0.35},
     {"symbol": "BTC-USDT", "tf": "4h", "capital": 1000, "risk_pct": 0.10, "leverage": 2.0, "ord_type": "limit", "sig_threshold": 0.25},
 ]
 LIVE_PAIRS = [
