@@ -54,39 +54,29 @@ def _run(pairs: list[dict], dry_run: bool, env: str) -> None:
     os.environ["OKX_ENV"] = env
     tc = TradingClient()
 
-    def _usdt() -> float:
-        try:
-            b = tc.balance("USDT")
-            return float(b[0].get("availBal", 0)) if b else 0.0
-        except Exception:
-            return 0.0
+    # --- pre-flight: query once, reuse (was 5 API calls, now 3) ---
+    pre_balance: list[dict] = []
+    pre_positions: list[dict] = []
+    pre_pending: list[dict] = []
+    try:
+        pre_balance = tc.balance()
+        pre_positions = tc.positions()
+        pre_pending = tc.pending()
+    except Exception:
+        pass
 
-    def _pos_count() -> int:
-        try:
-            return len(tc.positions())
-        except Exception:
-            return -1
+    pre_usdt = 0.0
+    for b in pre_balance:
+        if b.get("ccy") == "USDT":
+            pre_usdt = float(b.get("availBal", 0))
+            break
+    pre_pos = len(pre_positions)
 
-    pre_usdt = _usdt()
-    pre_pos = _pos_count()
-
-    # --- pre-flight status ---
     print("=== pre-flight ===")
-    try:
-        for b in tc.balance():
-            print(f"  {b.get('ccy','?'):6s} avail={b.get('availBal','?')} frozen={b.get('frozenBal','?')}")
-    except Exception:
-        print("  balance: unavailable")
-    try:
-        pos_list = tc.positions()
-        print(f"  positions: {len(pos_list)} open")
-    except Exception:
-        print("  positions: unavailable")
-    try:
-        pend = tc.pending()
-        print(f"  pending orders: {len(pend)}")
-    except Exception:
-        print("  pending orders: unavailable")
+    for b in pre_balance:
+        print(f"  {b.get('ccy','?'):6s} avail={b.get('availBal','?')} frozen={b.get('frozenBal','?')}")
+    print(f"  positions: {pre_pos} open")
+    print(f"  pending orders: {len(pre_pending)}")
     print("==================\n")
 
     max_frozen = 0.95 if env == "test" else 0.50  # testnet has frozen display artifacts

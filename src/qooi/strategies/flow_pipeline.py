@@ -34,6 +34,9 @@ def add_ofi_flow_columns(
     # BTC scores 1,450× smaller than ETH — making cross-asset comparison impossible.
     vol_total = signed.abs().rolling_sum(flow_window).clip(1e-9)
     flow_score = (net_flow / vol_total).fill_null(0).clip(-1.0, 1.0)
+    # Gate: zero out OFI when total volume is trivially small (dead bars).
+    # Without this, a single ±1 trade on a low-volume bar creates ±1.0 signal.
+    flow_score = pl.when(vol_total < 1e-6).then(0.0).otherwise(flow_score)
 
     return df.with_columns(
         signed.alias("ofi_signed_vol"),

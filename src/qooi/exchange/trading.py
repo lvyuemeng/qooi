@@ -477,15 +477,19 @@ SignalSource = Callable[[str, str], SignalResult | None]
 
 
 def default_signal_source(sig_threshold: float = 0.35) -> SignalSource:
+    # Share a single MarketData instance across all calls to avoid
+    # re-initializing ccxt for every symbol (3× ~10s → 1× ~12s).
+    from qooi.exchange.market import MarketData
+    _md = MarketData("okx")
+
     def _src(symbol: str, timeframe: str) -> SignalResult | None:
         from qooi.exchange.indicator import add_indicators
-        from qooi.exchange.market import MarketData
         from qooi.strategies.flow_pipeline import (
             add_ofi_flow_columns,
             add_regime_features,
         )
 
-        df = MarketData("okx").candles(symbol, timeframe=timeframe, limit=500, cache=True)
+        df = _md.candles(symbol, timeframe=timeframe, limit=500, cache=True)
         if df.is_empty():
             return None
         df = add_indicators(df)
@@ -623,11 +627,21 @@ class LiveExecutor:
         if time.time() * 1000 - sr.timestamp > bar_ms * 1.5:
             return self._log_skip("stale_signal")
 
-        obi = self._md.ob_snapshot(self._symbol)
-        self._log(
-            "signal",
-            SignalPayload(signal=sr.signal, obi_5=round(obi.imbalance_5, 4), ofi_flow=sr.flow),
-        )
+        # Optimize: only fetch order book when we might actually trade.
+        # Skip OB for weak_signal (IDLE) — saves ~2s per symbol.
+        need_ob = (self._state != State.IDLE
+                   or abs(sr.signal) >= self._entry_threshold())
+        obi = self._md.ob_snapshot(self._symbol) if need_ob else None
+        if obi:
+            self._log(
+                "signal",
+                SignalPayload(signal=sr.signal, obi_5=round(obi.imbalance_5, 4), ofi_flow=sr.flow),
+            )
+        else:
+            self._log(
+                "signal",
+                SignalPayload(signal=sr.signal, obi_5=0, ofi_flow=sr.flow),
+            )
 
         self._check_fill_status()
         decision = self._decide(sr, obi)
