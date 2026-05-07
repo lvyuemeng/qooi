@@ -410,9 +410,22 @@ class Summary(BaseModel):
             assets={s: asset_report(s, tf) for s, tf in pairs},
         )
 
-    def write_to(self, fh: object = sys.stdout) -> None:
+    def write_to(self, fh: object = sys.stdout, tc: TradingClient | None = None) -> None:
         fh.write("## qooi Portfolio\n\n")
         fh.write(f"USDT: {self.pre_usdt:.2f} -> {self.post_usdt:.2f} ({self.usdt_change:+.2f})\n")
+
+        # Show held assets (not just USDT) for spot trading
+        if tc:
+            try:
+                asset_balances = [b for b in tc.balance() if b.get('ccy','') != 'USDT'
+                                  and float(b.get('availBal', 0)) > 1e-10]
+                if asset_balances:
+                    fh.write(" Held assets:")
+                    for b in asset_balances:
+                        fh.write(f"  {b.get('ccy','?')}={b.get('availBal','?')}")
+                    fh.write("\n")
+            except Exception:
+                pass
         fh.write(f"Positions: {self.positions_pre} -> {self.positions_post}\n\n")
         for sym, rpt in self.assets.items():
             if rpt.error:
@@ -554,6 +567,10 @@ class LiveExecutor:
                 if len(symbol_orders) > 1:
                     self._cancel_duplicates(symbol_orders)
                 self._adopt_order(symbol_orders[0])
+            elif self._state == State.IDLE:
+                # API shows nothing open, but we may have spot positions from
+                # previous runs (buys filled, no sells yet).  Check the log.
+                self._resume_spot_from_logs()
         else:
             self._resume_from_logs()
 
@@ -592,14 +609,28 @@ class LiveExecutor:
         # --- execute exit ---
         if decision.action == "exit":
             if self._position and self._position.order.px > 0:
+                # For spot positions that are filled (held in balance),
+                # place a sell order instead of cancelling.
+                if self._state == State.ACTIVE and self._position.fill_status == FillStatus.FILLED:
+                    exit_side = "sell" if self._position.order.side == "buy" else "buy"
+                    exit_px = decision.exit_px
+                    exit_sz = self._position.order.sz
+                    d = 1 if self._position.order.side == "buy" else -1
+                    pnl = d * (exit_px / self._position.order.px - 1)
+                    self._equity.append(self._equity[-1] * (1 + pnl))
+                    self._pnl_ema = self._ema_update(self._pnl_ema, pnl, self._ADAPTIVE_LOOKBACK)
+                    if pnl < 0: self._loss_streak += 1
+                    else: self._loss_streak = 0
+                    self._place(exit_side, exit_sz, exit_px,
+                                -self._position.order.signal, None, 0)
+                    self._state = State.IDLE
+                    return None
                 d = 1 if self._position.order.side == "buy" else -1
                 pnl = d * (decision.exit_px / self._position.order.px - 1)
                 self._equity.append(self._equity[-1] * (1 + pnl))
                 self._pnl_ema = self._ema_update(self._pnl_ema, pnl, self._ADAPTIVE_LOOKBACK)
-                if pnl < 0:
-                    self._loss_streak += 1
-                else:
-                    self._loss_streak = 0
+                if pnl < 0: self._loss_streak += 1
+                else: self._loss_streak = 0
             self._cancel(decision.detail)
             self._state = State.IDLE
             return None
@@ -832,6 +863,67 @@ class LiveExecutor:
                     self._log("cancel", CancelPayload(reason="duplicate", ord_id=oid))
             except Exception:
                 pass
+
+    def _resume_spot_from_logs(self) -> None:
+        """Resume spot positions from execution log when API shows nothing.
+
+        For spot trading, filled orders don't create exchange-tracked
+        positions — the asset just appears in the balance.  This method
+        reconstructs the net held position from the log and resumes
+        tracking in ACTIVE state.
+        """
+        log_path = LOG_DIR / f"exec_{self._symbol.replace('-', '_')}_{self._tf}.jsonl"
+        if not log_path.exists():
+            return
+        try:
+            lines = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+        except Exception:
+            return
+
+        # FIFO net position: buys add, sells subtract
+        buys: list[dict] = []
+        for entry in lines:
+            if entry.get("event") != "order":
+                continue
+            p = entry.get("payload", {})
+            if not isinstance(p, dict):
+                continue
+            side = p.get("side", "")
+            sz = float(p.get("sz", 0))
+            px = float(p.get("px", 0))
+            signal = float(p.get("signal", 0))
+            if side == "buy":
+                buys.append({"sz": sz, "px": px, "signal": signal})
+            elif side == "sell" and buys:
+                # FIFO: reduce the oldest buy
+                remaining_sell = sz
+                while remaining_sell > 0 and buys:
+                    oldest = buys[0]
+                    if oldest["sz"] <= remaining_sell:
+                        remaining_sell -= oldest["sz"]
+                        buys.pop(0)
+                    else:
+                        oldest["sz"] -= remaining_sell
+                        remaining_sell = 0
+
+        if not buys:
+            return  # nothing held
+
+        # Resume the last buy as ACTIVE
+        last = buys[-1]
+        held_sz = sum(b["sz"] for b in buys)
+        avg_px = sum(b["sz"] * b["px"] for b in buys) / held_sz if held_sz > 0 else last["px"]
+        entry_sig = last.get("signal", 0)
+        atr = avg_px * 0.02  # estimate from price (2% ATR)
+
+        self._position = PositionState.enter_long(avg_px, atr, self._risk, int(time.time() * 1000))
+        self._position.order = OrderPayload(
+            inst_id=self._symbol, side="buy", sz=held_sz, px=avg_px,
+            placed_at=time.time(), signal=entry_sig, status="filled",
+        )
+        self._position.fill_status = FillStatus.FILLED
+        self._state = State.ACTIVE
+        self._log("skip", SkipPayload(reason=f"resumed_spot ({held_sz:.6f} @ {avg_px:.1f})"))
 
     def _resume_from_logs(self) -> None:
         """Layer 2 fallback: reconstruct state from append-only log file."""
@@ -1165,7 +1257,7 @@ class PortfolioRunner:
 
     def write_summary(self, tc: TradingClient, pre_usdt: float, pre_pos: int) -> Summary:
         summary = Summary.from_runner(self, tc, pre_usdt, pre_pos)
-        summary.write_to()
+        summary.write_to(tc=tc)
         return summary
 
 
