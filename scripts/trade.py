@@ -18,13 +18,17 @@ from qooi.exchange.trading import (
     default_signal_source,
 )
 
+# Perpetual swap instruments.  Contract sizes:
+#   ETH-USDT-SWAP: ctVal=0.1 ETH, min 1 contract
+#   SOL-USDT-SWAP: ctVal=1 SOL,   min 1 contract
+#   BTC-USDT-SWAP: ctVal=0.01 BTC, min 1 contract
 TESTNET_PAIRS = [
-    {"symbol": "ETH-USDT", "tf": "4h", "capital": 1000, "risk_pct": 0.10, "leverage": 2.0, "post_only": True, "sig_threshold": 0.25},
-    {"symbol": "SOL-USDT", "tf": "4h", "capital": 500, "risk_pct": 0.15, "leverage": 3.0, "ord_type": "limit", "sig_threshold": 0.35},
-    {"symbol": "BTC-USDT", "tf": "4h", "capital": 1000, "risk_pct": 0.10, "leverage": 2.0, "ord_type": "limit", "sig_threshold": 0.25},
+    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0, "ord_type": "limit", "sig_threshold": 0.25},
+    {"symbol": "SOL-USDT-SWAP", "tf": "4h", "capital": 200, "risk_pct": 0.50, "leverage": 3.0, "ord_type": "limit", "sig_threshold": 0.35},
+    {"symbol": "BTC-USDT-SWAP", "tf": "4h", "capital": 1000, "risk_pct": 0.80, "leverage": 2.0, "ord_type": "limit", "sig_threshold": 0.25},
 ]
 LIVE_PAIRS = [
-    {"symbol": "ETH-USDT", "tf": "4h", "capital": 100, "risk_pct": 0.03, "leverage": 1.0},
+    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0},
 ]
 
 

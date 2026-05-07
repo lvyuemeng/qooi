@@ -10,10 +10,9 @@ from qooi.strategies.flow_pipeline import add_regime_features, add_ofi_flow_colu
 cost = CostModel(commission_pct=0.00005)
 
 DATASETS = {
-    "ETH-USDT": "data/cache/ETH_USDT_SWAP_4H.parquet",
-    "SOL-USDT": "data/cache/SOL_USDT_4H.parquet",
-    "BTC-USDT": "data/cache/BTC_USDT_4H.parquet",
-    "XRP-USDT": "data/cache/XRP_USDT_4H.parquet",
+    "ETH-USDT-SWAP": "data/cache/ETH_USDT_SWAP_4H.parquet",
+    "SOL-USDT-SWAP": "data/cache/SOL_USDT_SWAP_4H.parquet",
+    "BTC-USDT-SWAP": "data/cache/BTC_USDT_SWAP_4H.parquet",
 }
 
 
@@ -27,8 +26,8 @@ def run_report(symbol: str, cache_path: str) -> None:
     abs_ofi = ofi.abs()
 
     # Optimal per-asset thresholds (post normalization fix):
-    #   SOL: 0.35, BTC: 0.25, ETH: 0.25 (SWAP data), XRP: 0.45
-    thresholds = {"SOL-USDT": 0.35, "BTC-USDT": 0.25, "ETH-USDT": 0.25, "XRP-USDT": 0.45}
+    #   SOL-SWAP: 0.35, BTC-SWAP: 0.25, ETH-SWAP: 0.25
+    thresholds = {"ETH-USDT-SWAP": 0.25, "SOL-USDT-SWAP": 0.35, "BTC-USDT-SWAP": 0.25}
     threshold = thresholds.get(symbol, 0.35)
     nz_all = ofi.filter(ofi.abs() > 0.001).len()
     nz_thresh = ofi.filter(ofi.abs() >= threshold).len()

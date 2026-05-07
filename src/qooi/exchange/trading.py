@@ -102,7 +102,7 @@ class TradingClient:
         sz: str,
         ord_type: str = "post_only",
         px: str | None = None,
-        td_mode: str = "cash",
+        td_mode: str = "cross",
     ) -> dict:
         params = {"instId": inst_id, "side": side, "ordType": ord_type, "sz": sz, "tdMode": td_mode}
         if px:
@@ -567,10 +567,7 @@ class LiveExecutor:
                 if len(symbol_orders) > 1:
                     self._cancel_duplicates(symbol_orders)
                 self._adopt_order(symbol_orders[0])
-            elif self._state == State.IDLE:
-                # API shows nothing open, but we may have spot positions from
-                # previous runs (buys filled, no sells yet).  Check the log.
-                self._resume_spot_from_logs()
+            # Futures positions persist on exchange — no log-based resume needed.
         else:
             self._resume_from_logs()
 
@@ -609,8 +606,7 @@ class LiveExecutor:
         # --- execute exit ---
         if decision.action == "exit":
             if self._position and self._position.order.px > 0:
-                # For spot positions that are filled (held in balance),
-                # place a sell order instead of cancelling.
+                # For filled positions (futures), place a closing order.
                 if self._state == State.ACTIVE and self._position.fill_status == FillStatus.FILLED:
                     exit_side = "sell" if self._position.order.side == "buy" else "buy"
                     exit_px = decision.exit_px
@@ -625,6 +621,7 @@ class LiveExecutor:
                                 -self._position.order.signal, None, 0)
                     self._state = State.IDLE
                     return None
+                # For PENDING unfilled orders, just cancel.
                 d = 1 if self._position.order.side == "buy" else -1
                 pnl = d * (decision.exit_px / self._position.order.px - 1)
                 self._equity.append(self._equity[-1] * (1 + pnl))
@@ -864,67 +861,6 @@ class LiveExecutor:
             except Exception:
                 pass
 
-    def _resume_spot_from_logs(self) -> None:
-        """Resume spot positions from execution log when API shows nothing.
-
-        For spot trading, filled orders don't create exchange-tracked
-        positions — the asset just appears in the balance.  This method
-        reconstructs the net held position from the log and resumes
-        tracking in ACTIVE state.
-        """
-        log_path = LOG_DIR / f"exec_{self._symbol.replace('-', '_')}_{self._tf}.jsonl"
-        if not log_path.exists():
-            return
-        try:
-            lines = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
-        except Exception:
-            return
-
-        # FIFO net position: buys add, sells subtract
-        buys: list[dict] = []
-        for entry in lines:
-            if entry.get("event") != "order":
-                continue
-            p = entry.get("payload", {})
-            if not isinstance(p, dict):
-                continue
-            side = p.get("side", "")
-            sz = float(p.get("sz", 0))
-            px = float(p.get("px", 0))
-            signal = float(p.get("signal", 0))
-            if side == "buy":
-                buys.append({"sz": sz, "px": px, "signal": signal})
-            elif side == "sell" and buys:
-                # FIFO: reduce the oldest buy
-                remaining_sell = sz
-                while remaining_sell > 0 and buys:
-                    oldest = buys[0]
-                    if oldest["sz"] <= remaining_sell:
-                        remaining_sell -= oldest["sz"]
-                        buys.pop(0)
-                    else:
-                        oldest["sz"] -= remaining_sell
-                        remaining_sell = 0
-
-        if not buys:
-            return  # nothing held
-
-        # Resume the last buy as ACTIVE
-        last = buys[-1]
-        held_sz = sum(b["sz"] for b in buys)
-        avg_px = sum(b["sz"] * b["px"] for b in buys) / held_sz if held_sz > 0 else last["px"]
-        entry_sig = last.get("signal", 0)
-        atr = avg_px * 0.02  # estimate from price (2% ATR)
-
-        self._position = PositionState.enter_long(avg_px, atr, self._risk, int(time.time() * 1000))
-        self._position.order = OrderPayload(
-            inst_id=self._symbol, side="buy", sz=held_sz, px=avg_px,
-            placed_at=time.time(), signal=entry_sig, status="filled",
-        )
-        self._position.fill_status = FillStatus.FILLED
-        self._state = State.ACTIVE
-        self._log("skip", SkipPayload(reason=f"resumed_spot ({held_sz:.6f} @ {avg_px:.1f})"))
-
     def _resume_from_logs(self) -> None:
         """Layer 2 fallback: reconstruct state from append-only log file."""
         log_path = LOG_DIR / f"exec_{self._symbol.replace('-', '_')}_{self._tf}.jsonl"
@@ -1007,7 +943,6 @@ class LiveExecutor:
                     "sell" if self._position.order.side == "buy" else "buy",
                     str(round(exit_sz, 8)),
                     ord_type="market",
-                    td_mode="cash",
                 )
                 self._position.order.sz *= (1 - decision.scale_out_pct)
             except Exception as e:
@@ -1031,11 +966,12 @@ class LiveExecutor:
         eff_lev = self._leverage * (0.5 if dd > 0.15 else 1.0)
         ml = self._risk.max_leverage
         notional = self._capital * self._max_pos * min(abs(clipped), ml) * eff_lev
-        sz = min(notional, self._capital * ml * eff_lev) / max(entry_px, 1)
-        # Minimum order value gate ($10 USDT equivalent for OKX spot)
+        # For perpetual swaps: sz is in contracts.  Min 1 contract.
+        sz_contracts = max(1.0, notional / max(entry_px, 1))
+        # Floor: minimum order value ($10 USDT)
         if notional < 10.0:
             return 0.0
-        return sz
+        return round(sz_contracts)
 
     def _check_fill_status(self) -> None:
         """Query OKX for fill status of the active order."""
