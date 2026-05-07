@@ -18,17 +18,24 @@ from qooi.exchange.trading import (
     default_signal_source,
 )
 
-# Perpetual swap instruments.  Contract sizes:
-#   ETH-USDT-SWAP: ctVal=0.1 ETH, min 1 contract
-#   SOL-USDT-SWAP: ctVal=1 SOL,   min 1 contract
-#   BTC-USDT-SWAP: ctVal=0.01 BTC, min 1 contract
+# Perpetual swap instruments.
+#   ctVal = contract value in base currency (OKX standard)
+#   ETH-USDT-SWAP: 0.1 ETH/ct,  min 1 contract
+#   SOL-USDT-SWAP: 1 SOL/ct,    min 1 contract
+#   BTC-USDT-SWAP: 0.01 BTC/ct, min 1 contract
+#
+# Design: enter with LIMIT (signal verification), exit with MARKET (risk guarantee).
+#   An unfilled limit order = prevented loss from bad signal.  Fill rate IS signal accuracy.
 TESTNET_PAIRS = [
-    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0, "ord_type": "limit", "sig_threshold": 0.25},
-    {"symbol": "SOL-USDT-SWAP", "tf": "4h", "capital": 200, "risk_pct": 0.50, "leverage": 3.0, "ord_type": "limit", "sig_threshold": 0.35},
-    {"symbol": "BTC-USDT-SWAP", "tf": "4h", "capital": 1000, "risk_pct": 0.80, "leverage": 2.0, "ord_type": "limit", "sig_threshold": 0.25},
+    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0,
+     "ct_val": 0.1, "sig_threshold": 0.25},
+    {"symbol": "SOL-USDT-SWAP", "tf": "4h", "capital": 200, "risk_pct": 0.50, "leverage": 3.0,
+     "ct_val": 1.0, "sig_threshold": 0.35},
+    {"symbol": "BTC-USDT-SWAP", "tf": "4h", "capital": 1000, "risk_pct": 0.80, "leverage": 2.0,
+     "ct_val": 0.01, "sig_threshold": 0.25},
 ]
 LIVE_PAIRS = [
-    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0},
+    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0, "ct_val": 0.1},
 ]
 
 

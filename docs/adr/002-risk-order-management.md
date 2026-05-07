@@ -151,6 +151,27 @@ Default `limit_timeout_sec` in `PortfolioConfig` changes from 120 to 0 (0 = deri
 - **OFI flow magnitude is not cross-asset comparable.** BTC has std=0.03 vs ETH std≈0.3. A fixed 0.4 threshold filters out all BTC trades. Per-asset percentile-based thresholds needed for multi-asset.
 - **ETH SWAP data ≠ spot data.** Perpetual swap OHLCV differs from spot, making swap data unsuitable for spot strategy backtesting.
 
+### Limit-as-Verification Design (May 7, 2026)
+
+**Principle:** Enter with limit orders, exit with market orders. A limit order is not an impediment — it's the strategy's second confirmation layer.
+
+The signal says "buy at $88." If the market agrees, it comes to our limit and fills. If the market disagrees, the order expires harmlessly. On perpetual swaps with cross-margin, unfilled limit orders cost negligible capital.
+
+- Fill rate = signal accuracy metric directly
+- Unfilled orders = prevented losses, not missed gains
+- Timeout (8h for 4H bars) ensures stale orders don't linger
+- After expiry → return to IDLE → wait for next signal
+
+| Component | Design |
+|-----------|--------|
+| Entry | Limit (post_only or limit) — verifies signal |
+| Exit | Market — guarantees risk management execution |
+| Sizing | `notional / (entry_px × ct_val)`, min 1 contract |
+| Margin gate | Skip if `free_usdt < 1.2 × required_margin` |
+| ct_val | Per-instrument (ETH=0.1, SOL=1.0, BTC=0.01) |
+| Instruments | Perpetual swaps (ETH-USDT-SWAP, etc.) |
+| td_mode | Cross margin |
+
 ## Consequences
 
 ### Positive

@@ -532,6 +532,7 @@ class LiveExecutor:
         initial_capital: float = 1000.0,
         max_position_pct: float = 0.05,
         leverage: float = 1.0,
+        ct_val: float = 1.0,
         post_only: bool = True,
         ord_type: str = "",
         limit_timeout_sec: int = 0,  # 0 = derive from timeframe (2x bar duration)
@@ -545,6 +546,7 @@ class LiveExecutor:
         self._leverage = leverage
         self._max_pos = max_position_pct
         self._post_only = post_only
+        self._ct_val = ct_val  # contract value in base currency (ETH=0.1, SOL=1, BTC=0.01)
         self._ord_type = ord_type  # "" = derive from post_only, else "market"/"limit"/"post_only"
         # Timeframe-aware timeout: 0 = derive from bar duration, else explicit
         bar_map = {"1h": 3600, "4h": 14400, "1d": 86400}
@@ -648,7 +650,8 @@ class LiveExecutor:
                     if pnl < 0: self._loss_streak += 1
                     else: self._loss_streak = 0
                     self._place(exit_side, exit_sz, exit_px,
-                                -self._position.order.signal, None, 0)
+                                -self._position.order.signal, None, 0,
+                                force_market=True)
                     self._state = State.IDLE
                     return None
                 # For PENDING unfilled orders, just cancel.
@@ -705,6 +708,11 @@ class LiveExecutor:
         sz = self._compute_size(clipped, entry_px)
         if sz < 0.00001:
             return Decision.skip("size_too_small")
+        # Margin check: ensure free USDT covers required initial margin
+        required = sz * self._ct_val * entry_px / max(self._leverage, 1)
+        free = self._free_usdt()
+        if free < required * 1.2:
+            return Decision.skip(f"insufficient_margin (need ${required:.0f}, have ${free:.0f})")
         return Decision.enter(side, sz, entry_px)
 
     def _decide_from_pending(self, sr: SignalResult, obi) -> Decision:
@@ -830,6 +838,18 @@ class LiveExecutor:
     def _ema_update(prev: float, cur: float, period: int) -> float:
         alpha = 2.0 / (period + 1)
         return alpha * cur + (1 - alpha) * prev
+
+    def _free_usdt(self) -> float:
+        """Query free USDT balance.  Returns 0 on any error."""
+        if not self._client:
+            return float("inf")  # dry run — no margin constraint
+        try:
+            for b in self._client.balance():
+                if b.get("ccy") == "USDT":
+                    return float(b.get("availBal", 0))
+        except Exception:
+            pass
+        return 0.0
 
     def _entry_threshold(self) -> float:
         """Current adaptive entry threshold based on real PnL EMA.
@@ -996,11 +1016,11 @@ class LiveExecutor:
         eff_lev = self._leverage * (0.5 if dd > 0.15 else 1.0)
         ml = self._risk.max_leverage
         notional = self._capital * self._max_pos * min(abs(clipped), ml) * eff_lev
-        # For perpetual swaps: sz is in contracts.  Min 1 contract.
-        # Floor: minimum order value ($10 USDT)
         if notional < 10.0:
             return 0.0
-        contracts = max(1.0, notional / max(entry_px, 1))
+        # Contracts = notional / (entry_px * ct_val), min 1 contract
+        contract_notional = entry_px * self._ct_val
+        contracts = max(1.0, notional / max(contract_notional, 1))
         return round(contracts)
 
     def _check_fill_status(self) -> None:
@@ -1039,7 +1059,8 @@ class LiveExecutor:
     # -- internals ------------------------------------------------------------
 
     def _place(
-        self, side: str, sz: float, px: float, signal: float, obi, flow: float
+        self, side: str, sz: float, px: float, signal: float, obi, flow: float,
+        force_market: bool = False,
     ) -> OrderPayload | None:
         sz, px = round(sz, 8), round(px, 1)
         atr = px * 0.02
@@ -1068,8 +1089,8 @@ class LiveExecutor:
             self._log("order_error", ErrorPayload(error="circuit_breaker"))
             return None
         try:
-            otype = self._ord_type or ("post_only" if self._post_only else "limit")
-            # Market orders don't accept a price parameter
+            # Entries: limit orders (signal verification).  Exits: market (risk guarantee).
+            otype = "market" if force_market else (self._ord_type or ("post_only" if self._post_only else "limit"))
             if otype == "market":
                 resp = self._client.place(self._symbol, side, str(sz), ord_type=otype)
             else:
@@ -1142,6 +1163,7 @@ class PortfolioRunner:
                 initial_capital=p.get("capital", config.capital),
                 max_position_pct=p.get("risk_pct", config.risk_pct),
                 leverage=p.get("leverage", config.leverage),
+                ct_val=p.get("ct_val", 1.0),
                 post_only=p.get("post_only", config.post_only),
                 ord_type=p.get("ord_type", ""),
                 limit_timeout_sec=config.limit_timeout_sec,
