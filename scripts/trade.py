@@ -18,26 +18,22 @@ from qooi.exchange.trading import (
     default_signal_source,
 )
 
-# Perpetual swap instruments.
-#   ctVal = contract value in base currency (OKX standard)
-#   ETH-USDT-SWAP: 0.1 ETH/ct,  min 1 contract
-#   SOL-USDT-SWAP: 1 SOL/ct,    min 1 contract
-#   BTC-USDT-SWAP: 0.01 BTC/ct, min 1 contract
-#
-# Design: enter with LIMIT (signal verification), exit with MARKET (risk guarantee).
-#   An unfilled limit order = prevented loss from bad signal.  Fill rate IS signal accuracy.
+# Testnet uses SPOT (demo accounts are spot-only by default).
+# Production uses SWAP (futures=positions persist, better margin efficiency).
+# Strategy: limit-for-entries, market-for-exits.  Thresholds lowered for testnet.
 TESTNET_PAIRS = [
-    # Lowered thresholds for testnet validation (ETH 0.20, SOL 0.25, BTC 0.20).
-    # Production thresholds: ETH 0.25, SOL 0.35, BTC 0.25.
-    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0,
-     "ct_val": 0.1, "sig_threshold": 0.20},
-    {"symbol": "SOL-USDT-SWAP", "tf": "4h", "capital": 200, "risk_pct": 0.50, "leverage": 3.0,
-     "ct_val": 1.0, "sig_threshold": 0.25},
-    {"symbol": "BTC-USDT-SWAP", "tf": "4h", "capital": 1000, "risk_pct": 0.80, "leverage": 2.0,
-     "ct_val": 0.01, "sig_threshold": 0.20},
+    {"symbol": "ETH-USDT", "tf": "4h", "capital": 500, "risk_pct": 0.20, "leverage": 1.0,
+     "sig_threshold": 0.20},
+    {"symbol": "SOL-USDT", "tf": "4h", "capital": 200, "risk_pct": 0.30, "leverage": 1.0,
+     "sig_threshold": 0.25},
 ]
 LIVE_PAIRS = [
-    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0, "ct_val": 0.1},
+    {"symbol": "ETH-USDT-SWAP", "tf": "4h", "capital": 500, "risk_pct": 0.50, "leverage": 2.0,
+     "ct_val": 0.1, "td_mode": "cross", "sig_threshold": 0.25},
+    {"symbol": "SOL-USDT-SWAP", "tf": "4h", "capital": 200, "risk_pct": 0.50, "leverage": 3.0,
+     "ct_val": 1.0, "td_mode": "cross", "sig_threshold": 0.35},
+    {"symbol": "BTC-USDT-SWAP", "tf": "4h", "capital": 1000, "risk_pct": 0.80, "leverage": 2.0,
+     "ct_val": 0.01, "td_mode": "cross", "sig_threshold": 0.25},
 ]
 
 

@@ -102,7 +102,7 @@ class TradingClient:
         sz: str,
         ord_type: str = "post_only",
         px: str | None = None,
-        td_mode: str = "cross",
+        td_mode: str = "cash",
     ) -> dict:
         params = {"instId": inst_id, "side": side, "ordType": ord_type, "sz": sz, "tdMode": td_mode}
         if px:
@@ -533,6 +533,7 @@ class LiveExecutor:
         max_position_pct: float = 0.05,
         leverage: float = 1.0,
         ct_val: float = 1.0,
+        td_mode: str = "cash",
         post_only: bool = True,
         ord_type: str = "",
         limit_timeout_sec: int = 0,  # 0 = derive from timeframe (2x bar duration)
@@ -547,6 +548,7 @@ class LiveExecutor:
         self._max_pos = max_position_pct
         self._post_only = post_only
         self._ct_val = ct_val  # contract value in base currency (ETH=0.1, SOL=1, BTC=0.01)
+        self._td_mode = td_mode  # "cash" for spot, "cross" for swap
         self._ord_type = ord_type  # "" = derive from post_only, else "market"/"limit"/"post_only"
         # Timeframe-aware timeout: 0 = derive from bar duration, else explicit
         bar_map = {"1h": 3600, "4h": 14400, "1d": 86400}
@@ -1092,9 +1094,9 @@ class LiveExecutor:
             # Entries: limit orders (signal verification).  Exits: market (risk guarantee).
             otype = "market" if force_market else (self._ord_type or ("post_only" if self._post_only else "limit"))
             if otype == "market":
-                resp = self._client.place(self._symbol, side, str(sz), ord_type=otype)
+                resp = self._client.place(self._symbol, side, str(sz), ord_type=otype, td_mode=self._td_mode)
             else:
-                resp = self._client.place(self._symbol, side, str(sz), ord_type=otype, px=str(px))
+                resp = self._client.place(self._symbol, side, str(sz), ord_type=otype, px=str(px), td_mode=self._td_mode)
             pos.order.ord_id = resp.get("ordId", "")
             self._position = pos
             self._trade_count += 1
@@ -1164,6 +1166,7 @@ class PortfolioRunner:
                 max_position_pct=p.get("risk_pct", config.risk_pct),
                 leverage=p.get("leverage", config.leverage),
                 ct_val=p.get("ct_val", 1.0),
+                td_mode=p.get("td_mode", "cash"),
                 post_only=p.get("post_only", config.post_only),
                 ord_type=p.get("ord_type", ""),
                 limit_timeout_sec=config.limit_timeout_sec,
