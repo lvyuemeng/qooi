@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import polars as pl
-
 from qooi.strategies.flow_pipeline import (
     add_ofi_flow_columns,
     add_regime_features,
@@ -63,7 +61,8 @@ def trace_signal_pipeline(
 
     result: dict[str, Any] = {}
 
-    df = MarketData("okx").candles(symbol, timeframe=timeframe, limit=500)
+    with MarketData("okx") as md:
+        df = md.candles(symbol, timeframe=timeframe, limit=500)
     if df.is_empty():
         raise RuntimeError(f"No market data for {symbol} {timeframe}")
 
@@ -71,7 +70,9 @@ def trace_signal_pipeline(
     result["last_close"] = float(df["close"][-1])
     if verbose:
         print(f"=== Signal trace: {symbol} {timeframe} ===\n")
-        print(f"Bars: {df.height}  |  Close range: {df['close'].min():.2f} - {df['close'].max():.2f}")
+        print(
+            f"Bars: {df.height}  |  Close range: {df['close'].min():.2f} - {df['close'].max():.2f}"
+        )
         print(f"Last close: {df['close'][-1]:.2f}  at ts={df['timestamp'][-1]}")
 
     # Step 1: indicators
@@ -88,8 +89,12 @@ def trace_signal_pipeline(
     result["mom_mid"] = float(df["regime_mom_mid"][-1])
     result["mom_slow"] = float(df["regime_mom_slow"][-1])
     if verbose:
-        print(f"[2] regime:   score={df['regime_score'][-1]:.4f}  strength={df['regime_strength'][-1]:.4f}")
-        print(f"    mom_fast={df['regime_mom_fast'][-1]:.4f}  mom_mid={df['regime_mom_mid'][-1]:.4f}  mom_slow={df['regime_mom_slow'][-1]:.4f}")
+        print(
+            f"[2] regime:   score={df['regime_score'][-1]:.4f}  strength={df['regime_strength'][-1]:.4f}"
+        )
+        print(
+            f"    mom_fast={df['regime_mom_fast'][-1]:.4f}  mom_mid={df['regime_mom_mid'][-1]:.4f}  mom_slow={df['regime_mom_slow'][-1]:.4f}"
+        )
 
     # Step 3: multi-factor intraday
     df = multi_factor_intraday_signal(df)
@@ -101,14 +106,18 @@ def trace_signal_pipeline(
     result["avg_nonzero_signal"] = sum(nonzero) / max(len(nonzero), 1)
     if verbose:
         print(f"[3] multi_factor_intraday_signal: raw_signal={raw_signal:.4f}")
-        print(f"    Non-zero signals in last 50 bars: {len(nonzero)} (avg={result['avg_nonzero_signal']:.4f})")
+        print(
+            f"    Non-zero signals in last 50 bars: {len(nonzero)} (avg={result['avg_nonzero_signal']:.4f})"
+        )
 
     # Step 4: OFI flow
     df = add_ofi_flow_columns(df)
     result["ofi_flow_score"] = float(df["ofi_flow_score"][-1])
     result["ofi_net_flow"] = float(df["ofi_net_flow"][-1])
     if verbose:
-        print(f"[4] OFI flow:  score={df['ofi_flow_score'][-1]:.4f}  net_flow={df['ofi_net_flow'][-1]:.4f}")
+        print(
+            f"[4] OFI flow:  score={df['ofi_flow_score'][-1]:.4f}  net_flow={df['ofi_net_flow'][-1]:.4f}"
+        )
 
     # Step 5: micro confirmation
     before_mc = float(df["signal"][-1])

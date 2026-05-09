@@ -102,7 +102,10 @@ def compute_metrics(
     effective_periods_per_year = periods_per_year or _infer_periods_per_year(equity_curve)
 
     # --- Basic return & risk (Polars expressions) ---
-    total_ret = float(eq.last() / eq.first() - 1)
+    lv = eq.last()
+    fv = eq.first()
+    assert lv is not None and fv is not None
+    total_ret = float(lv / fv - 1)
     ann_factor = effective_periods_per_year / n if n > 0 else 1.0
     if total_ret > -1:
         ann_log_return = math.log1p(total_ret) * ann_factor
@@ -110,22 +113,27 @@ def compute_metrics(
     else:
         ann_ret = -1.0
 
-    std = float(rets.std()) if n > 1 else 0.0
+    std_val = rets.std()
+    std = float(std_val) if std_val is not None and n > 1 else 0.0
     ann_vol = std * math.sqrt(effective_periods_per_year) if std > 0 else 0.0
     excess = ann_ret - risk_free_rate
     sharpe = excess / ann_vol if ann_vol > 0 else 0.0
 
     # Sortino
     neg_rets = rets.filter(rets < 0)
-    downside = float(neg_rets.std()) if neg_rets.len() > 1 else 0.0
+    ds = neg_rets.std()
+    downside = float(ds) if ds is not None and neg_rets.len() > 1 else 0.0
     ann_downside = downside * math.sqrt(effective_periods_per_year)
     sortino = excess / ann_downside if ann_downside > 0 else 0.0
 
     # Drawdown (Polars expression)
     peak = eq.cum_max()
     dd = (peak - eq) / peak
-    max_dd = float(dd.max())
-    avg_dd = float(dd.mean())
+    md = dd.max()
+    ad = dd.mean()
+    assert md is not None and ad is not None
+    max_dd = float(md)
+    avg_dd = float(ad)
     calmar = ann_ret / max_dd if max_dd > 0 else 0.0
 
     # Consecutive drawdown days — needs iteration, keep as list
@@ -168,8 +176,8 @@ def compute_metrics(
     nw = win_pnl.len()
     nl = loss_pnl.len()
     win_rate = nw / num_trades if num_trades > 0 else 0.0
-    avg_win = float(win_pnl.mean()) * 100 if nw > 0 else 0.0
-    avg_loss = abs(float(loss_pnl.mean())) * 100 if nl > 0 else 0.0
+    avg_win = float(win_pnl.mean()) * 100 if nw > 0 else 0.0  # type: ignore[arg-type]
+    avg_loss = abs(float(loss_pnl.mean())) * 100 if nl > 0 else 0.0  # type: ignore[arg-type]
     pl_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
     total_win = float(win_pnl.sum())
     total_loss = abs(float(loss_pnl.sum()))
@@ -201,8 +209,8 @@ def compute_metrics(
             ic_values.append(rho)
 
     ic_s = pl.Series(ic_values) if ic_values else pl.Series([0.0])
-    ic_mean = float(ic_s.mean())
-    ic_std = float(ic_s.std()) if ic_s.len() > 1 else 0.0
+    ic_mean = float(ic_s.mean())  # type: ignore[arg-type]
+    ic_std = float(ic_s.std()) if ic_s.len() > 1 else 0.0  # type: ignore[arg-type]
     ic_ir = ic_mean / ic_std if ic_std > 0 else 0.0
     ic_pos = float((ic_s > 0).sum()) / ic_s.len() * 100 if ic_s.len() > 0 else 0.0
 

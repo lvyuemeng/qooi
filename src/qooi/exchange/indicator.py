@@ -16,7 +16,7 @@ def sma(df: pl.DataFrame, period: int = 20, col: str = "close") -> pl.Series:
 
 def ema(df: pl.DataFrame, period: int = 20, col: str = "close") -> pl.Series:
     """Exponential Moving Average (span = period)."""
-    return df[col].ewm_mean(span=period, min_periods=period)
+    return df[col].ewm_mean(span=period, min_samples=period)
 
 
 def rsi(df: pl.DataFrame, period: int = 14, col: str = "close") -> pl.Series:
@@ -127,9 +127,9 @@ def vumanchu_swing(
     Returns (long_signal, short_signal) as 1/0 booleans.
     """
     close = df["close"]
-    range_raw = (close - close.shift(1)).abs().ewm_mean(span=period, min_periods=period)
+    range_raw = (close - close.shift(1)).abs().ewm_mean(span=period, min_samples=period)
     range_size = range_raw * multiplier
-    rf = close.ewm_mean(span=period, min_periods=period)
+    rf = close.ewm_mean(span=period, min_samples=period)
     rf_upper = rf + range_size
     rf_lower = rf - range_size
 

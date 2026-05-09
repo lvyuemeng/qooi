@@ -177,10 +177,10 @@ class Backtest:
         # B4: adaptive threshold (scaled per-asset if threshold provided)
         t = self.threshold
         if t is not None and t > 0:
-            _ADAPTIVE_BASE, _ADAPTIVE_MIN, _ADAPTIVE_MAX = t, t * 0.625, t * 1.75
+            adp_base, adp_min, adp_max = t, t * 0.625, t * 1.75
         else:
-            _ADAPTIVE_BASE, _ADAPTIVE_MIN, _ADAPTIVE_MAX = 0.40, 0.25, 0.70
-        _ADAPTIVE_LOOKBACK = 50
+            adp_base, adp_min, adp_max = 0.40, 0.25, 0.70
+        adp_lookback = 50
         pnl_ema = 0.0
 
         equity = [self.initial_capital]
@@ -239,10 +239,11 @@ class Backtest:
             if bstate == State.ACTIVE and (exit_reason or (p == 0 and p_prev != 0) or sign_flip):
                 reason = exit_reason or "signal"
                 pnl = direction * (cur_close / position.entry_price - 1) if position else 0.0
-                pnl_ema = _ema_update(pnl_ema, pnl, _ADAPTIVE_LOOKBACK)
+                pnl_ema = _ema_update(pnl_ema, pnl, adp_lookback)
                 trade_log.append(
-                    self._close_position(position, direction, entry_equity,
-                                         df["timestamp"][i - 1], cur_close, reason)
+                    self._close_position(
+                        position, direction, entry_equity, df["timestamp"][i - 1], cur_close, reason
+                    )
                 )
                 position = None
                 direction = 0
@@ -258,7 +259,7 @@ class Backtest:
             # --- IDLE: check if signal triggers entry ---
             if bstate == State.IDLE and abs(signal[i - 1]) > 0:
                 # B4: adaptive threshold gate — check against raw signal
-                threshold = _thresh(pnl_ema, _ADAPTIVE_BASE, _ADAPTIVE_MIN, _ADAPTIVE_MAX)
+                threshold = _thresh(pnl_ema, adp_base, adp_min, adp_max)
                 if abs(signal[i - 1]) >= threshold:
                     entry_px = cur_close
                     position, size = self._enter_position_state(
@@ -285,8 +286,9 @@ class Backtest:
 
         if bstate == State.ACTIVE and position is not None:
             trade_log.append(
-                self._close_position(position, direction, entry_equity,
-                                     df["timestamp"][-1], close[-1], "end")
+                self._close_position(
+                    position, direction, entry_equity, df["timestamp"][-1], close[-1], "end"
+                )
             )
 
         eq_series = pl.Series(equity, dtype=pl.Float64)
@@ -538,7 +540,7 @@ def run_portfolio_backtest(
         metrics = compute_metrics(
             pl.DataFrame({"portfolio_value": [initial_capital], "returns": [0.0], "signal": [0.0]})
         )
-        return PortfolioBacktestResult(empty, empty, empty, metrics)
+        return PortfolioBacktestResult(empty, empty, metrics)
 
     limits = portfolio_limits or PortfolioLimits()
     symbols = list(frames.keys())
@@ -565,7 +567,7 @@ def run_portfolio_backtest(
         metrics = compute_metrics(
             pl.DataFrame({"portfolio_value": [initial_capital], "returns": [0.0], "signal": [0.0]})
         )
-        return PortfolioBacktestResult(empty, empty, empty, metrics)
+        return PortfolioBacktestResult(empty, empty, metrics)
 
     close_map = {s: merged[f"close__{s}"].to_list() for s in symbols}
     signal_map = {s: merged[f"signal__{s}"].fill_nan(0).fill_null(0).to_list() for s in symbols}

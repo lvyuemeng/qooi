@@ -77,7 +77,7 @@ def add_regime_features(
 
     close = pl.col("close")
     atr = pl.col(atr_col).fill_nan(0).fill_null(0) if atr_col in df.columns else pl.lit(1.0)
-    ema_slow = close.ewm_mean(span=ema_slow_period, min_periods=ema_slow_period)
+    ema_slow = close.ewm_mean(span=ema_slow_period, min_samples=ema_slow_period)
     vol_ma = pl.col("vol").fill_nan(0).fill_null(0).rolling_mean(20)
 
     regime_score = ((close - ema_slow) / (atr * 3.0)).clip(-1.0, 1.0)
