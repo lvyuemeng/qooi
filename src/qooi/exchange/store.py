@@ -343,9 +343,9 @@ class CacheStore:
             df.sort("timestamp")
             .join_asof(funding, on="timestamp", strategy="backward")
             .with_columns(
-                (
-                    (pl.col("timestamp") - pl.col("funding_time")) / 3_600_000.0
-                ).alias("funding_age_hours")
+                ((pl.col("timestamp") - pl.col("funding_time")) / 3_600_000.0).alias(
+                    "funding_age_hours"
+                )
             )
         )
 

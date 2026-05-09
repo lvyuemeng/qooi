@@ -32,9 +32,55 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Protocol
 
 import polars as pl
+
+# ---------------------------------------------------------------------------
+# Protocols — contracts for backend providers
+# ---------------------------------------------------------------------------
+
+
+class OhlcvProvider(Protocol):
+    """Any backend that can fetch OHLCV candles."""
+
+    def fetch_ohlcv(
+        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+    ) -> list[list]: ...
+
+    def fetch_ohlcv_range(
+        self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
+    ) -> pl.DataFrame: ...
+
+
+class OrderBookProvider(Protocol):
+    """Any backend that can fetch order book snapshots and OHLCV (fallback)."""
+
+    def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot: ...
+
+    def fetch_ohlcv(
+        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+    ) -> list[list]: ...
+
+
+class StreamProvider(Protocol):
+    """Any backend that can stream order book via WebSocket."""
+
+    async def watch_ob(
+        self, symbol: str, limit: int = 25, params: dict[str, Any] | None = None
+    ) -> AsyncIterator[ObSnapshot]: ...
+
+    async def close(self) -> None: ...
+
+
+class FundingRateProvider(Protocol):
+    """Any backend that can fetch funding rate history."""
+
+    def funding_rate_history(
+        self, inst_id: str = "BTC-USDT-SWAP", limit: int = 100
+    ) -> pl.DataFrame: ...
+
 
 # ---------------------------------------------------------------------------
 # ObSnapshot — shared order-book model
@@ -115,7 +161,9 @@ class ExchangeBackend:
     def exchange_id(self) -> str:
         return self._exchange_id
 
-    def fetch_ohlcv(self, symbol: str, timeframe: str = "1d", limit: int = 500) -> list[list]:
+    def fetch_ohlcv(
+        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+    ) -> list[list]:
         raise NotImplementedError
 
     def fetch_ohlcv_range(
@@ -160,7 +208,12 @@ class ExchangeBackend:
 
 
 class CcxtBackend(ExchangeBackend):
-    """CCXT synchronous REST backend."""
+    """CCXT synchronous REST backend — lazy initialisation.
+
+    ``load_markets()`` is deferred until first use to avoid connection
+    errors at construction time (especially when CCXT is only a fallback
+    and the primary backend handles all operations).
+    """
 
     def __init__(self, exchange_id: str, proxy: str | None = None) -> None:
         super().__init__(exchange_id, proxy)
@@ -171,18 +224,26 @@ class CcxtBackend(ExchangeBackend):
         if proxy:
             config["proxies"] = {"https": proxy, "http": proxy}
         self._ex = klass(config)
+        self._markets_loaded = False
+
+    def _ensure_markets(self) -> None:
+        if self._markets_loaded:
+            return
         try:
             self._ex.load_markets()
+            self._markets_loaded = True
         except Exception as e:
-            msg = f"Cannot connect to {exchange_id}"
-            raise ConnectionError(msg + (f" via proxy {proxy}" if proxy else "")) from e
+            msg = f"Cannot connect to {self._exchange_id}"
+            raise ConnectionError(msg + (f" via proxy {self._proxy}" if self._proxy else "")) from e
 
     def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
     ) -> list[list]:
+        self._ensure_markets()
         return self._ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)  # type: ignore[no-any-return]
 
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot:
+        self._ensure_markets()
         raw = self._ex.fetch_order_book(symbol, limit=limit)
         return ObSnapshot.from_ccxt_book(raw)
 
@@ -195,39 +256,37 @@ class CcxtBackend(ExchangeBackend):
 class OkxSdkBackend(ExchangeBackend):
     """OKX native Python SDK backend.
 
-    Handles candles / funding rate via the synchronous Python SDK.
-    Order book comes from ccxt (OKX is always available).
+    OHLCV:   OKX SDK directly (fast, no CCXT).
+    Order book: OKX SDK first, falls back to provided OrderBookProvider.
+    Funding rate: OKX PublicData API.
     """
 
-    def __init__(self, proxy: str | None = None) -> None:
+    def __init__(
+        self, proxy: str | None = None, *, order_book: OrderBookProvider | None = None
+    ) -> None:
         super().__init__("okx", proxy)
         from okx.MarketData import MarketAPI
 
         self._api = MarketAPI(flag="1", debug=False)
-        self._ccxt: CcxtBackend | None = None  # lazy init — only needed for OB
-
-    def _ensure_ccxt(self) -> CcxtBackend:
-        if self._ccxt is None:
-            self._ccxt = CcxtBackend("okx", self._proxy)
-        return self._ccxt
+        # Composition: OB fallback passed explicitly, not lazily created.
+        self._ob_fallback: OrderBookProvider | None = order_book
 
     def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
     ) -> list[list]:
-        # Use OKX SDK directly for candles (fast, no CCXT connection needed)
         try:
             resp = self._api.get_candlesticks(instId=symbol, bar=timeframe, limit=str(limit))
             if resp.get("code") != "0":
                 raise RuntimeError(f"OKX SDK error: {resp.get('msg', resp)}")
-            data = []
-            for r in resp.get("data", []):
-                data.append(
-                    [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])]
-                )
-            return data
+            return [
+                [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])]
+                for r in resp.get("data", [])
+            ]
         except Exception:
             pass
-        return self._ensure_ccxt().fetch_ohlcv(symbol, timeframe, limit=limit)
+        if self._ob_fallback:
+            return self._ob_fallback.fetch_ohlcv(symbol, timeframe, limit=limit)
+        raise RuntimeError(f"OKX SDK failed for {symbol}, no fallback configured")
 
     def fetch_ohlcv_range(
         self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
@@ -281,7 +340,6 @@ class OkxSdkBackend(ExchangeBackend):
         return _parse_ohlcv(rows).filter(pl.col("timestamp") >= since_ms).tail(limit)
 
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot:
-        # Try OKX SDK natively first (no CCXT connection)
         try:
             resp = self._api.get_orderbook(instId=symbol, sz=str(limit))
             if resp.get("code") == "0" and resp.get("data"):
@@ -289,12 +347,10 @@ class OkxSdkBackend(ExchangeBackend):
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
                 timestamp = int(data.get("ts", "0"))
-                bid_price = float(bids[0][0]) if bids else 0.0
-                ask_price = float(asks[0][0]) if asks else 0.0
                 return ObSnapshot(
                     timestamp=timestamp,
-                    bid_price=bid_price,
-                    ask_price=ask_price,
+                    bid_price=float(bids[0][0]) if bids else 0.0,
+                    ask_price=float(asks[0][0]) if asks else 0.0,
                     bid_vol_depth_5=sum(float(b[1]) for b in bids[:5]),
                     ask_vol_depth_5=sum(float(a[1]) for a in asks[:5]),
                     bid_vol_depth_25=sum(float(b[1]) for b in bids[:25]),
@@ -302,12 +358,16 @@ class OkxSdkBackend(ExchangeBackend):
                 )
         except Exception:
             pass
-        # Fallback to CCXT (if available)
-        return self._ensure_ccxt().fetch_order_book(symbol, limit)
+        if self._ob_fallback:
+            return self._ob_fallback.fetch_order_book(symbol, limit)
+        raise RuntimeError(f"OKX SDK order book failed for {symbol}, no fallback")
 
     def close(self) -> None:
-        if self._ccxt:
-            self._ccxt.close()
+        if self._ob_fallback is not None:
+            try:
+                self._ob_fallback.close()
+            except AttributeError:
+                pass
 
     def funding_rate_history(
         self, inst_id: str = "BTC-USDT-SWAP", limit: int = 100
@@ -405,38 +465,69 @@ class CcxtProBackend:
 
 
 class MarketData:
-    """Unified market data — REST (sync) + WS (async) with same API.
+    """Unified market data — context manager for sync and async use.
 
     Usage — synchronous (backtesting / scripts)::
 
-        md = MarketData("lbank")
-        df = md.candles("BTC/USDT", "1d", limit=100)
-        snap = md.ob_snapshot("BTC/USDT", limit=25)   # ObSnapshot
+        with MarketData("lbank") as md:
+            df = md.candles("BTC/USDT", "1d", limit=100)
+            snap = md.ob_snapshot("BTC/USDT", limit=25)
 
     Usage — async with WebSocket (live / paper trading)::
 
-        md = await MarketData.async_("okx")
-        async for snap in md.ob_stream("BTC/USDT"):
-            print(snap.imbalance_5)
-        await md.close()
+        async with MarketData("okx") as md:
+            async for snap in md.ob_stream("BTC/USDT"):
+                print(snap.imbalance_5)
+
+    Backward-compatible API (without context manager)::
+
+        md = MarketData("okx")
+        df = md.candles("BTC-USDT-SWAP", "4h", limit=500)
     """
+
+    # Registry: exchange_id → backend factory.
+    # Add new exchanges here without touching __init__.
+    _registry: dict[str, type[ExchangeBackend]] = {
+        "okx": OkxSdkBackend,
+    }
+    _fallback: type[ExchangeBackend] = CcxtBackend
 
     def __init__(self, exchange_id: str = "okx", proxy: str | None = None) -> None:
         self._backend: ExchangeBackend
         self._async_backend: CcxtProBackend | None = None
         self._proxy = proxy
-        if exchange_id == "okx":
-            self._backend = OkxSdkBackend(proxy)
+
+        backend_cls = self._registry.get(exchange_id, self._fallback)
+        if backend_cls is OkxSdkBackend:
+            # OKX gets a CCXT fallback for order book via composition.
+            self._backend = OkxSdkBackend(proxy, order_book=CcxtBackend("okx", proxy))
         else:
-            self._backend = CcxtBackend(exchange_id, proxy)
+            self._backend = backend_cls(exchange_id, proxy)
         self._exchange_id = exchange_id
 
+    # -- context manager (sync) ------------------------------------------
+    def __enter__(self) -> MarketData:
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self._backend.close()
+
+    # -- async context manager (replaces async_ classmethod) -------------
+    async def __aenter__(self) -> MarketData:
+        self._async_backend = CcxtProBackend(self._exchange_id, self._proxy)
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        if self._async_backend:
+            await self._async_backend.close()
+        self._backend.close()
+
+    # -- compat: kept for existing callers, delegates to __aenter__ ------
     @classmethod
     async def async_(cls, exchange_id: str = "okx", proxy: str | None = None) -> MarketData:
-        """Create instance with async WS support."""
+        """Create instance with async WS support.  Prefer ``async with``."""
         md = cls(exchange_id, proxy)
-        md._async_backend = CcxtProBackend(exchange_id, proxy)
-        return md
+        return await md.__aenter__()
 
     @property
     def exchange_id(self) -> str:
@@ -449,8 +540,12 @@ class MarketData:
     # -- OHLCV -----------------------------------------------------------
 
     def candles(
-        self, symbol: str, timeframe: str = "1d", limit: int = 300,
-        since: int | None = None, cache: bool = False,
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 300,
+        since: int | None = None,
+        cache: bool = False,
     ) -> pl.DataFrame:
         raw = self._backend.fetch_ohlcv(
             symbol,
@@ -582,15 +677,8 @@ def _okx_timeframe(timeframe: str) -> str:
     return timeframe
 
 
-def _days_since(since: str) -> int:
-    return max(
-        1, (datetime.now(UTC) - datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC)).days
-    )
-
-
 def _cache_path(symbol: str, timeframe: str) -> Path:
     """Parquet cache path: data/cache/{S}_{T}.parquet"""
-    from pathlib import Path
     cache_dir = Path(__file__).resolve().parent.parent.parent.parent / "data" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     safe = symbol.replace("-", "_").replace("/", "_").upper()
