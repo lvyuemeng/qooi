@@ -13,6 +13,7 @@ build/
 .ruff_cache/
 .rumdl_cache/
 .mypy_cache/
+.pytest_cache/
 
 # IDE
 .vscode/
