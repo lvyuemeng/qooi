@@ -28,24 +28,24 @@ from qooi.exchange.trading import (
 TESTNET_PAIRS = [
     {"exec_symbol": "ETH-USDT-SWAP", "sig_symbol": "ETH-USDT", "tf": "4h",
      "capital": 500, "risk_pct": 0.50, "leverage": 2.0,
-     "ct_val": 0.1, "td_mode": "cross", "sig_threshold": 0.25},
+     "ct_val": 0.1, "td_mode": "isolated", "sig_threshold": 0.25},
     {"exec_symbol": "SOL-USDT-SWAP", "sig_symbol": "SOL-USDT", "tf": "4h",
      "capital": 200, "risk_pct": 0.50, "leverage": 3.0,
-     "ct_val": 1.0, "td_mode": "cross", "sig_threshold": 0.35},
+     "ct_val": 1.0, "td_mode": "isolated", "sig_threshold": 0.35},
     {"exec_symbol": "BTC-USDT-SWAP", "sig_symbol": "BTC-USDT", "tf": "4h",
      "capital": 1000, "risk_pct": 0.80, "leverage": 2.0,
-     "ct_val": 0.01, "td_mode": "cross", "sig_threshold": 0.25},
+     "ct_val": 0.01, "td_mode": "isolated", "sig_threshold": 0.25},
 ]
 LIVE_PAIRS = [
     {"exec_symbol": "ETH-USDT-SWAP", "sig_symbol": "ETH-USDT", "tf": "4h",
      "capital": 500, "risk_pct": 0.50, "leverage": 2.0,
-     "ct_val": 0.1, "td_mode": "cross", "sig_threshold": 0.25},
+     "ct_val": 0.1, "td_mode": "isolated", "sig_threshold": 0.25},
     {"exec_symbol": "SOL-USDT-SWAP", "sig_symbol": "SOL-USDT", "tf": "4h",
      "capital": 200, "risk_pct": 0.50, "leverage": 3.0,
-     "ct_val": 1.0, "td_mode": "cross", "sig_threshold": 0.35},
+     "ct_val": 1.0, "td_mode": "isolated", "sig_threshold": 0.35},
     {"exec_symbol": "BTC-USDT-SWAP", "sig_symbol": "BTC-USDT", "tf": "4h",
      "capital": 1000, "risk_pct": 0.80, "leverage": 2.0,
-     "ct_val": 0.01, "td_mode": "cross", "sig_threshold": 0.25},
+     "ct_val": 0.01, "td_mode": "isolated", "sig_threshold": 0.25},
 ]
 
 
