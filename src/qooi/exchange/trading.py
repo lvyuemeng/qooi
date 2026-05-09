@@ -7,6 +7,7 @@ Side-effectful operations (IO, network) are separated from pure data models.
 from __future__ import annotations
 
 import enum
+import io
 import json
 import os
 import sys
@@ -39,7 +40,7 @@ def load_okx_env(env_path: str | None = None) -> None:
         default = Path(".env")
         if default.exists():
             path = default
-    load_dotenv(path) if path else load_dotenv()
+    load_dotenv(path, override=True) if path else load_dotenv(override=True)
 
 
 LOG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "logs"
@@ -93,7 +94,8 @@ class TradingClient:
                 last_err = e
                 if attempt < attempts - 1:
                     time.sleep(TradingClient._RETRY_DELAY * (attempt + 1))
-        raise last_err  # type: ignore[misc]
+        if last_err is not None:
+            raise last_err
 
     def place(
         self,
@@ -112,8 +114,9 @@ class TradingClient:
     def cancel(self, inst_id: str, ord_id: str) -> dict:
         return self._okx(self._trade.cancel_order(instId=inst_id, ordId=ord_id))
 
-    def amend(self, inst_id: str, ord_id: str, new_sz: str | None = None,
-              new_px: str | None = None) -> dict:
+    def amend(
+        self, inst_id: str, ord_id: str, new_sz: str | None = None, new_px: str | None = None
+    ) -> dict:
         """Amend an unfilled limit order — change price and/or size."""
         params: dict = {"instId": inst_id, "ordId": ord_id}
         if new_sz is not None:
@@ -207,11 +210,52 @@ class OrderPayload(BaseModel):
 LogPayload = SignalPayload | OrderPayload | SkipPayload | CancelPayload | ErrorPayload
 
 
+# -- enums (must be before Decision which references them) ------------------
+
+
+class FillStatus(enum.StrEnum):
+    PLACED = "placed"
+    PARTIAL = "partial_fill"
+    FILLED = "filled"
+    SIMULATED = "simulated"
+
+
+class State(enum.StrEnum):
+    """Executor lifecycle — IDLE → PENDING → ACTIVE → IDLE."""
+
+    IDLE = "idle"
+    PENDING = "pending"
+    ACTIVE = "active"
+
+
+@dataclass
+class SyncFacts:
+    """Pure query result — no state mutation."""
+
+    position: dict | None = None  # exchange position data
+    order: dict | None = None  # newest exchange order
+    duplicates: list[dict] | None = None  # extra orders to cancel
+    log_order: dict | None = None  # log-recovered order
+    api_ok: bool = False
+
+
+@dataclass
+class FillFacts:
+    """Pure query result — no state mutation."""
+
+    filled: bool = False
+    partial: bool = False
+    missing: bool = False
+    filled_px: float = 0.0
+    filled_sz: float = 0.0
+
+
 @dataclass
 class Decision:
     """Pure output of the state machine — no side effects."""
 
     action: str  # "enter" | "exit" | "amend" | "skip"
+    new_state: State = State.IDLE  # next state — ALWAYS set
     side: str = ""
     sz: float = 0.0
     entry_px: float = 0.0
@@ -226,24 +270,39 @@ class Decision:
     amend_sz: float | None = None
 
     @classmethod
-    def exit(cls, reason: str, px: float) -> Decision:
-        return cls(action="exit", detail=reason, exit_px=px)
+    def exit(cls, reason: str, px: float, new_state: State = State.IDLE) -> Decision:
+        return cls(action="exit", new_state=new_state, detail=reason, exit_px=px)
 
     @classmethod
     def enter(cls, side: str, sz: float, entry_px: float) -> Decision:
-        return cls(action="enter", side=side, sz=sz, entry_px=entry_px)
+        return cls(action="enter", new_state=State.PENDING, side=side, sz=sz, entry_px=entry_px)
 
     @classmethod
-    def skip(cls, reason: str) -> Decision:
-        return cls(action="skip", detail=reason)
+    def skip(cls, reason: str, new_state: State = State.IDLE) -> Decision:
+        return cls(action="skip", new_state=new_state, detail=reason)
 
     @classmethod
-    def amend(cls, reason: str, *, new_stop: float | None = None,
-              new_target: float | None = None, scale_out_pct: float = 0.0,
-              amend_px: float | None = None, amend_sz: float | None = None) -> Decision:
-        return cls(action="amend", detail=reason, new_stop=new_stop,
-                   new_target=new_target, scale_out_pct=scale_out_pct,
-                   amend_px=amend_px, amend_sz=amend_sz)
+    def amend(
+        cls,
+        reason: str,
+        new_state: State = State.PENDING,
+        *,
+        new_stop: float | None = None,
+        new_target: float | None = None,
+        scale_out_pct: float = 0.0,
+        amend_px: float | None = None,
+        amend_sz: float | None = None,
+    ) -> Decision:
+        return cls(
+            action="amend",
+            new_state=new_state,
+            detail=reason,
+            new_stop=new_stop,
+            new_target=new_target,
+            scale_out_pct=scale_out_pct,
+            amend_px=amend_px,
+            amend_sz=amend_sz,
+        )
 
 
 class LogLine(BaseModel):
@@ -283,22 +342,6 @@ class LogLine(BaseModel):
 
 
 # -- position state --------------------------------------------------------
-
-
-class FillStatus(enum.StrEnum):
-    PLACED = "placed"
-    PARTIAL = "partial_fill"
-    FILLED = "filled"
-    SIMULATED = "simulated"
-
-
-class State(enum.StrEnum):
-    """Executor lifecycle — IDLE → PENDING → ACTIVE → EXITING → IDLE."""
-
-    IDLE = "idle"
-    PENDING = "pending"
-    ACTIVE = "active"
-    EXITING = "exiting"
 
 
 class PositionState(BaseModel):
@@ -406,10 +449,17 @@ class Summary(BaseModel):
                 avg_px = float(p.get("avgPx", 0))
                 mark_px = float(p.get("markPx", 0))
                 side = "long" if pos_sz > 0 else "short"
-                positions.append({
-                    "inst": inst, "side": side, "sz": abs(pos_sz),
-                    "avg_px": avg_px, "mark_px": mark_px, "upl": upl, "margin": margin,
-                })
+                positions.append(
+                    {
+                        "inst": inst,
+                        "side": side,
+                        "sz": abs(pos_sz),
+                        "avg_px": avg_px,
+                        "mark_px": mark_px,
+                        "upl": upl,
+                        "margin": margin,
+                    }
+                )
                 total_upl += upl
                 total_margin += margin
         except Exception:
@@ -421,16 +471,23 @@ class Summary(BaseModel):
         except Exception:
             post_usdt = 0.0
 
-        pairs = [(p["symbol"], p.get("tf", "4h")) for p in runner.config.pairs]
+        pairs = [
+            (p.get("exec_symbol", p.get("sig_symbol", "")), p.get("tf", "4h"))
+            for p in runner.config.pairs
+        ]
         return cls(
-            pre_usdt=pre_usdt, post_usdt=post_usdt,
+            pre_usdt=pre_usdt,
+            post_usdt=post_usdt,
             usdt_change=post_usdt - pre_usdt,
-            total_upl=total_upl, total_margin=total_margin,
+            total_upl=total_upl,
+            total_margin=total_margin,
             positions=positions,
             assets={s: asset_report(s, tf) for s, tf in pairs},
         )
 
-    def write_to(self, fh: object = sys.stdout, tc: TradingClient | None = None) -> None:
+    def write_to(self, fh: io.TextIOBase | None = None, tc: TradingClient | None = None) -> None:
+        if fh is None:
+            fh = sys.stdout
         fh.write("## qooi Portfolio\n\n")
 
         # --- total portfolio value ---
@@ -480,6 +537,7 @@ def default_signal_source(sig_threshold: float = 0.35) -> SignalSource:
     # Share a single MarketData instance across all calls to avoid
     # re-initializing ccxt for every symbol (3× ~10s → 1× ~12s).
     from qooi.exchange.market import MarketData
+
     _md = MarketData("okx")
 
     def _src(symbol: str, timeframe: str) -> SignalResult | None:
@@ -524,9 +582,9 @@ def default_signal_source(sig_threshold: float = 0.35) -> SignalSource:
 
 class LiveExecutor:
     # -- adaptive threshold defaults (scaled relative to asset threshold) -----
-    _ADAPTIVE_BASE_RATIO: float = 1.00   # base = threshold × ratio
-    _ADAPTIVE_MIN_RATIO: float = 0.625   # min  = threshold × ratio  (0.25/0.40)
-    _ADAPTIVE_MAX_RATIO: float = 1.75    # max  = threshold × ratio  (0.70/0.40)
+    _ADAPTIVE_BASE_RATIO: float = 1.00  # base = threshold × ratio
+    _ADAPTIVE_MIN_RATIO: float = 0.625  # min  = threshold × ratio  (0.25/0.40)
+    _ADAPTIVE_MAX_RATIO: float = 1.75  # max  = threshold × ratio  (0.70/0.40)
     _ADAPTIVE_LOOKBACK: int = 50
 
     def __init__(
@@ -576,51 +634,49 @@ class LiveExecutor:
 
     # -- public ---------------------------------------------------------------
 
-    def sync(self) -> None:
-        """Reconcile local state with exchange reality.
+    def sync(self) -> SyncFacts:
+        """Reconcile local state with exchange reality — pure query, no mutation.
 
-        Queries OKX (with retry) for pending orders and positions.
-        Cancels duplicates.  Falls back to log-file state if API fails.
+        Returns SyncFacts.  State changes happen in _decide().
+
+        When API returns 0 pending orders/positions, also reads the log.
+        This prevents duplicates when the testnet API hasn't propagated
+        an order from a previous run yet (API succeeds but order invisible).
         """
         if self._dry or not self._client:
-            return
-
-        symbol_orders: list[dict] = []
-        symbol_positions: list[dict] = []
-        api_ok = False
+            return SyncFacts()
 
         try:
             pending = TradingClient._retry(self._client.pending)
-            symbol_orders = [o for o in pending if o.get("instId") == self._symbol]
+            my_orders = [o for o in pending if o.get("instId") == self._symbol]
             positions = TradingClient._retry(self._client.positions)
-            symbol_positions = [p for p in positions if p.get("instId") == self._symbol]
-            api_ok = True
+            my_positions = [p for p in positions if p.get("instId") == self._symbol]
+            # When API shows nothing, also check the log for recent orders
+            log_order = None
+            if not my_positions and not my_orders:
+                log_order = self._read_log_order()
+            return SyncFacts(
+                position=my_positions[0] if my_positions else None,
+                order=my_orders[0] if my_orders else None,
+                duplicates=my_orders[1:] if len(my_orders) > 1 else None,
+                log_order=log_order,
+                api_ok=True,
+            )
         except Exception:
-            pass
+            return SyncFacts(log_order=self._read_log_order(), api_ok=False)
 
-        if api_ok:
-            if symbol_positions:
-                self._adopt_position(symbol_positions[0])
-            elif symbol_orders:
-                if len(symbol_orders) > 1:
-                    self._cancel_duplicates(symbol_orders)
-                self._adopt_order(symbol_orders[0])
-            # Futures positions persist on exchange — no log-based resume needed.
-        else:
-            self._resume_from_logs()
-
-    def step(self, signal_source: SignalSource | None = None,
-             signal: SignalResult | None = None) -> OrderPayload | None:
-        """Orchestrate one bar cycle: sync → fetch → decide → execute.
+    def step(
+        self, signal_source: SignalSource | None = None, signal: SignalResult | None = None
+    ) -> OrderPayload | None:
+        """One bar cycle: sync → fetch → decide → execute.
 
         If ``signal`` is provided (pre-computed), skips the fetch step.
         """
-        self.sync()
+        facts = self.sync()
         self._log("cycle_start")
         sr = signal if signal is not None else self._fetch_signal(signal_source)
         if not sr:
             return self._log_skip("no_signal")
-        # Update per-asset threshold from signal (ETH≈0.4, BTC≈0.03, etc.)
         if sr.threshold > 0:
             self._signal_threshold = sr.threshold
         bar_ms = {"1h": 3600000, "4h": 14400000, "1d": 86400000}.get(self._tf, 14400000)
@@ -628,89 +684,63 @@ class LiveExecutor:
             return self._log_skip("stale_signal")
 
         # Optimize: only fetch order book when we might actually trade.
-        # Skip OB for weak_signal (IDLE) — saves ~2s per symbol.
-        need_ob = (self._state != State.IDLE
-                   or abs(sr.signal) >= self._entry_threshold())
+        need_ob = self._state != State.IDLE or abs(sr.signal) >= self._entry_threshold()
         obi = self._md.ob_snapshot(self._symbol) if need_ob else None
-        if obi:
-            self._log(
-                "signal",
-                SignalPayload(signal=sr.signal, obi_5=round(obi.imbalance_5, 4), ofi_flow=sr.flow),
-            )
-        else:
-            self._log(
-                "signal",
-                SignalPayload(signal=sr.signal, obi_5=0, ofi_flow=sr.flow),
-            )
+        payload = SignalPayload(
+            signal=sr.signal,
+            obi_5=round(obi.imbalance_5, 4) if obi else 0,
+            ofi_flow=sr.flow,
+        )
+        self._log("signal", payload)
 
-        self._check_fill_status()
-        decision = self._decide(sr, obi)
+        fill = self.check_fill()
+        decision = self._decide(sr, obi, facts, fill)
+        return self._execute(decision, sr, obi)
 
-        # --- execute dynamic risk adjustments (amend) ---
-        if decision.action == "amend":
-            self._apply_amend(decision, sr.signal)
-            return None
+    # -- state machine (ALL state changes happen here) -------------------------
 
-        # --- execute exit ---
-        if decision.action == "exit":
-            if self._position and self._position.order.px > 0:
-                # For filled positions (futures), place a closing order.
-                if self._state == State.ACTIVE and self._position.fill_status == FillStatus.FILLED:
-                    exit_side = "sell" if self._position.order.side == "buy" else "buy"
-                    exit_px = decision.exit_px
-                    exit_sz = self._position.order.sz
-                    d = 1 if self._position.order.side == "buy" else -1
-                    pnl = d * (exit_px / self._position.order.px - 1)
-                    self._equity.append(self._equity[-1] * (1 + pnl))
-                    self._pnl_ema = self._ema_update(self._pnl_ema, pnl, self._ADAPTIVE_LOOKBACK)
-                    if pnl < 0: self._loss_streak += 1
-                    else: self._loss_streak = 0
-                    self._place(exit_side, exit_sz, exit_px,
-                                -self._position.order.signal, None, 0,
-                                force_market=True)
-                    self._state = State.IDLE
-                    return None
-                # For PENDING unfilled orders, just cancel.
-                d = 1 if self._position.order.side == "buy" else -1
-                pnl = d * (decision.exit_px / self._position.order.px - 1)
-                self._equity.append(self._equity[-1] * (1 + pnl))
-                self._pnl_ema = self._ema_update(self._pnl_ema, pnl, self._ADAPTIVE_LOOKBACK)
-                if pnl < 0: self._loss_streak += 1
-                else: self._loss_streak = 0
-            self._cancel(decision.detail)
+    def _decide(self, sr: SignalResult, obi, facts: SyncFacts, fill: FillFacts) -> Decision:
+        """Central state dispatch.  SyncFacts + FillFacts consumed here.
+        
+        ALL state transitions happen in this method.
+        """
+        # --- resolve sync facts → set state + position ---
+        if facts.position:
+            self._adopt_position(facts.position)
+            self._state = State.ACTIVE
+        elif facts.order:
+            self._adopt_order(facts.order)
+            self._state = State.PENDING
+        elif facts.log_order:
+            self._adopt_order(facts.log_order)
+            self._state = State.PENDING
+            self._log_skip("resumed_from_logs")
+        if facts.duplicates:
+            self._cancel_dupes(facts.duplicates)
+
+        # --- resolve fill facts → update fill_status ---
+        if fill.missing and self._position:
+            self._position = None
             self._state = State.IDLE
-            return None
+        elif fill.filled and self._position:
+            self._position.fill_status = FillStatus.FILLED
+            self._position.order.filled_sz = fill.filled_sz
+            self._position.order.filled_px = fill.filled_px
+            self._position.entry_price = fill.filled_px
+        elif fill.partial and self._position:
+            self._position.fill_status = FillStatus.PARTIAL
 
-        # --- execute enter ---
-        if decision.action == "enter":
-            result = self._place(
-                decision.side, decision.sz, decision.entry_px, sr.signal, obi, sr.flow
-            )
-            if result:
-                self._state = State.PENDING
-            return result
-
-        # --- log skip decisions ---
-        if decision.action == "skip":
-            self._log_skip(decision.detail)
-
-        return None
-
-    # -- state machine (pure functions) ---------------------------------------
-
-    def _decide(self, sr: SignalResult, obi) -> Decision:
-        """Pure state machine dispatch."""
+        # --- dispatch ---
         match self._state:
             case State.IDLE:
-                return self._decide_from_idle(sr, obi)
+                return self._decide_idle(sr, obi)
             case State.PENDING:
-                return self._decide_from_pending(sr, obi)
+                return self._decide_pending(sr, obi)
             case State.ACTIVE:
-                return self._decide_from_active(sr, obi)
-            case State.EXITING:
-                return self._decide_from_exiting(sr, obi)
+                return self._decide_active(sr, obi)
+        return Decision.skip("unknown_state")
 
-    def _decide_from_idle(self, sr: SignalResult, obi) -> Decision:
+    def _decide_idle(self, sr: SignalResult, obi) -> Decision:
         """IDLE: check if signal is strong enough to enter."""
         threshold = self._entry_threshold()
         if abs(sr.signal) < threshold:
@@ -724,59 +754,54 @@ class LiveExecutor:
         sz = self._compute_size(clipped, entry_px)
         if sz < 0.00001:
             return Decision.skip("size_too_small")
-        # Margin check: ensure free USDT covers required initial margin
         required = sz * self._ct_val * entry_px / max(self._leverage, 1)
         free = self._free_usdt()
         if free < required * 1.2:
             return Decision.skip(f"insufficient_margin (need ${required:.0f}, have ${free:.0f})")
         return Decision.enter(side, sz, entry_px)
 
-    def _decide_from_pending(self, sr: SignalResult, obi) -> Decision:
+    def _decide_pending(self, sr: SignalResult, obi) -> Decision:
         """PENDING: check if order filled, or if we should amend/cancel."""
         if not self._position:
-            self._state = State.IDLE
             return Decision.skip("position_lost")
 
-        # Did we fill?
         if self._position.fill_status == FillStatus.FILLED:
-            self._state = State.ACTIVE
             self._position.bars_held = 0
-            return Decision.amend("order_filled")
+            return Decision.amend("order_filled", new_state=State.ACTIVE)
         if self._position.fill_status == FillStatus.PARTIAL:
-            return Decision.skip("partial_fill")
+            return Decision.skip("partial_fill", new_state=State.PENDING)
 
         # --- dynamic risk: time decay ---
         age = time.time() - self._position.order.placed_at
         if age > self._timeout:
-            return Decision.exit("timeout", obi.bid_price if self._position.order.side == "buy"
-                                else obi.ask_price)
+            px = obi.bid_price if self._position.order.side == "buy" else obi.ask_price
+            return Decision.exit("timeout", px)
 
         # --- dynamic risk: signal decay ---
         entry_sig = self._position.order.signal
         if entry_sig and sr.signal * entry_sig < 0:
-            return Decision.exit("signal_flipped", obi.bid_price if self._position.order.side == "buy"
-                                else obi.ask_price)
+            px = obi.bid_price if self._position.order.side == "buy" else obi.ask_price
+            return Decision.exit("signal_flipped", px)
         if entry_sig and abs(sr.signal) < abs(entry_sig) * 0.5:
             new_sz = self._position.order.sz * 0.5
             if new_sz >= 0.00001:
                 return Decision.amend("signal_weakened", amend_sz=new_sz)
-            return Decision.exit("signal_weakened_to_zero", obi.bid_price if self._position.order.side == "buy"
-                                else obi.ask_price)
+            px = obi.bid_price if self._position.order.side == "buy" else obi.ask_price
+            return Decision.exit("signal_weakened_to_zero", px)
 
         # --- dynamic risk: price chasing ---
         is_buy = self._position.order.side == "buy"
         market_px = obi.ask_price if is_buy else obi.bid_price
         distance_pct = abs(market_px - self._position.order.px) / max(self._position.order.px, 1e-9)
-        if distance_pct > 0.005:  # market moved >0.5% away from limit price
+        if distance_pct > 0.005:
             new_px = round(market_px * (0.998 if is_buy else 1.002), 1)
             return Decision.amend("price_chase", amend_px=new_px)
 
-        return Decision.skip("order_outstanding")
+        return Decision.skip("order_outstanding", new_state=State.PENDING)
 
-    def _decide_from_active(self, sr: SignalResult, obi) -> Decision:
-        """ACTIVE: manage position risk — stops, targets, trails, scale-outs."""
+    def _decide_active(self, sr: SignalResult, obi) -> Decision:
+        """ACTIVE: manage position risk — stops, targets, trails."""
         if not self._position:
-            self._state = State.IDLE
             return Decision.skip("position_lost")
 
         self._position.bars_held += 1
@@ -784,30 +809,27 @@ class LiveExecutor:
         atr_est = obi.ask_price * 0.02
         d = 1 if self._position.order.side == "buy" else -1
 
-        # --- time-based exit: close after N bars in ACTIVE ---
         if self._risk.max_bars_held > 0 and self._position.bars_held >= self._risk.max_bars_held:
             return Decision.exit("time", cur_close)
 
-        # --- D1: signal-based exit (backtest parity) ---
+        # D1: signal-based exit
         if d * sr.signal < 0:
             return Decision.exit("signal_flipped", cur_close)
 
-        # --- check hard exits ---
+        # Hard exits (stop / target / trailing)
         reason = self._position.check_exit(cur_close, atr_est, self._risk)
         if reason:
             return Decision.exit(reason, cur_close)
 
-        # --- dynamic risk: breakeven stop ---
+        # Breakeven: move stop to entry once profit > 1×ATR
         unreal_pnl_pct = d * (cur_close / self._position.entry_price - 1)
         atr_pct = atr_est / max(self._position.entry_price, 1e-9)
         if unreal_pnl_pct > atr_pct and self._position.stop_price != self._position.entry_price:
-            return Decision.amend("breakeven_stop", new_stop=self._position.entry_price)
+            return Decision.amend("breakeven_stop", new_stop=self._position.entry_price,
+                                 new_state=State.ACTIVE)
 
-        # --- D2: trailing stop activation ---
-        activation_price = (
-            self._position.entry_price + d * self._risk.trailing_activation_mult * atr_est
-        )
-        if d * (cur_close - activation_price) > 0:
+        # Continuous trailing after breakeven (replaces old 2×ATR activation gap)
+        if self._position.stop_price == self._position.entry_price:
             trail_dist = self._risk.trailing_distance_mult * atr_est
             new_stop = cur_close - d * trail_dist
             if d * (new_stop - self._position.stop_price) > 0:
@@ -817,25 +839,60 @@ class LiveExecutor:
                 else:
                     self._position.trail_low = min(self._position.trail_low, cur_close)
 
-        # --- dynamic risk: scale-out at 50% target ---
+        # Scale-out at 50% of target
         if self._position.target_price > 0:
             halfway = self._position.entry_price + d * 0.5 * abs(
                 self._position.target_price - self._position.entry_price
             )
             if d * (cur_close - halfway) > 0:
-                return Decision.amend("scale_out_50pct", scale_out_pct=0.5)
+                return Decision.amend("scale_out_50pct", scale_out_pct=0.5,
+                                     new_state=State.ACTIVE)
 
-        return Decision.skip("holding")
+        return Decision.skip("holding", new_state=State.ACTIVE)
 
-    def _decide_from_exiting(self, sr: SignalResult, obi) -> Decision:
-        """EXITING: exit order placed, check if filled or if signal reversed."""
-        if not self._position:
-            self._state = State.IDLE
-            return Decision.skip("position_lost")
-        # For now, exiting uses market orders which fill instantly,
-        # so EXITING is transitory.  If limit exits are added later,
-        # handle cancel/amend here.
-        return Decision.skip("exiting_pending")
+    # -- execute (side effects only, no state mutation except d.new_state) ------
+
+    def _execute(self, d: Decision, sr: SignalResult, obi) -> OrderPayload | None:
+        """Apply the decision — side effects only.  State set from d.new_state."""
+        self._state = d.new_state
+
+        if d.action == "enter":
+            return self._place(d.side, d.sz, d.entry_px, sr.signal, obi, sr.flow)
+
+        if d.action == "exit":
+            if self._position and self._position.fill_status == FillStatus.FILLED:
+                exit_side = "sell" if self._position.order.side == "buy" else "buy"
+                d_sign = 1 if self._position.order.side == "buy" else -1
+                pnl = d_sign * (d.exit_px / self._position.order.px - 1)
+                self._equity.append(self._equity[-1] * (1 + pnl))
+                self._pnl_ema = self._ema_update(self._pnl_ema, pnl, self._ADAPTIVE_LOOKBACK)
+                if pnl < 0:
+                    self._loss_streak += 1
+                else:
+                    self._loss_streak = 0
+                self._place(exit_side, self._position.order.sz, d.exit_px,
+                            -self._position.order.signal, None, 0, force_market=True)
+            else:
+                d_sign = 1 if (self._position and self._position.order.side == "buy") else -1
+                if self._position and self._position.order.px > 0:
+                    pnl = d_sign * (d.exit_px / self._position.order.px - 1)
+                    self._equity.append(self._equity[-1] * (1 + pnl))
+                    self._pnl_ema = self._ema_update(self._pnl_ema, pnl, self._ADAPTIVE_LOOKBACK)
+                    if pnl < 0:
+                        self._loss_streak += 1
+                    else:
+                        self._loss_streak = 0
+            self._cancel(d.detail)
+            return None
+
+        if d.action == "amend":
+            self._apply_amend(d, sr.signal)
+            return None
+
+        if d.action == "skip":
+            self._log_skip(d.detail)
+
+        return None
 
     # -- adaptive threshold --------------------------------------------------
 
@@ -879,24 +936,23 @@ class LiveExecutor:
     # -- sync helpers ---------------------------------------------------------
 
     def _adopt_position(self, pos_data: dict) -> None:
-        """Resume tracking from an open exchange position."""
+        """Build PositionState from exchange position data — no state change."""
         side = "buy" if float(pos_data.get("pos", 0)) > 0 else "sell"
         px = float(pos_data.get("avgPx", 0))
         sz = abs(float(pos_data.get("pos", 0)))
-        self._position = PositionState(
-            order=OrderPayload(inst_id=self._symbol, side=side, sz=sz, px=px,
-                               status="filled", ord_id=""),
-            entry_price=px, fill_status=FillStatus.FILLED,
-            entry_ts=int(time.time() * 1000),
+        atr_est = px * 0.02
+        parent = PositionState.enter_long if side == "buy" else PositionState.enter_short
+        self._position = parent(px, atr_est, self._risk, int(time.time() * 1000))
+        self._position.order = OrderPayload(
+            inst_id=self._symbol, side=side, sz=sz, px=px, status="filled", ord_id=""
         )
-        self._state = State.ACTIVE
+        self._position.entry_price = px
+        self._position.fill_status = FillStatus.FILLED
 
     def _adopt_order(self, ord_data: dict) -> None:
-        """Resume tracking from an existing open order."""
-        # Use OKX cTime (ms) for accurate age tracking across runs
+        """Build PositionState from order data — no state change."""
         ctime_ms = float(ord_data.get("cTime", 0))
         placed_at = ctime_ms / 1000.0 if ctime_ms > 0 else time.time()
-        # Preserve entry signal for cross-run signal decay checks
         entry_sig = float(ord_data.get("signal", 0))
         self._position = PositionState(
             order=OrderPayload(
@@ -913,10 +969,9 @@ class LiveExecutor:
             entry_price=float(ord_data.get("px", 0)),
             entry_ts=int(placed_at * 1000),
         )
-        self._state = State.PENDING
 
-    def _cancel_duplicates(self, orders: list[dict]) -> None:
-        """Keep newest order, cancel the rest."""
+    def _cancel_dupes(self, orders: list[dict]) -> None:
+        """Cancel all but the newest order."""
         sorted_orders = sorted(orders, key=lambda o: float(o.get("cTime", 0)), reverse=True)
         for o in sorted_orders[1:]:
             oid = o.get("ordId", "")
@@ -927,17 +982,16 @@ class LiveExecutor:
             except Exception:
                 pass
 
-    def _resume_from_logs(self) -> None:
-        """Layer 2 fallback: reconstruct state from append-only log file."""
+    def _read_log_order(self) -> dict | None:
+        """Read last uncancelled order from log file — pure query."""
         log_path = LOG_DIR / f"exec_{self._symbol.replace('-', '_')}_{self._tf}.jsonl"
         if not log_path.exists():
-            return
+            return None
         try:
-            lines = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+            lines = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
         except Exception:
-            return
+            return None
 
-        # Collect cancelled order IDs for exact matching
         cancelled_ids: set[str] = set()
         last_order: dict | None = None
         for entry in lines:
@@ -951,28 +1005,26 @@ class LiveExecutor:
                     cancelled_ids.add(oid)
 
         if last_order is None:
-            return
-
+            return None
         p = last_order.get("payload", {})
         if not isinstance(p, dict):
-            return
+            return None
         ord_id = p.get("ord_id", "")
-        if not ord_id:
-            return
+        if not ord_id or ord_id in cancelled_ids:
+            return None
 
-        # Exact match: if this order was cancelled, stay IDLE
-        if ord_id in cancelled_ids:
-            return
+        orig_placed_at = float(p.get("placed_at", 0))
+        if orig_placed_at > 0 and (time.time() - orig_placed_at) > self._timeout:
+            return None
 
-        # Order still active — resume tracking
-        self._adopt_order({
+        return {
             "ordId": ord_id,
             "side": p.get("side", "buy"),
             "sz": str(p.get("sz", 0)),
             "px": str(p.get("px", 0)),
             "signal": str(p.get("signal", 0)),
-        })
-        self._log("skip", SkipPayload(reason="resumed_from_logs"))
+            "cTime": str(int(orig_placed_at * 1000)) if orig_placed_at > 0 else "",
+        }
 
     # -- execution ------------------------------------------------------------
 
@@ -990,9 +1042,14 @@ class LiveExecutor:
             try:
                 o = self._position.order
                 self._client.amend(
-                    o.inst_id, o.ord_id,
-                    new_sz=str(round(decision.amend_sz, 8)) if decision.amend_sz is not None else None,
-                    new_px=str(round(decision.amend_px, 1)) if decision.amend_px is not None else None,
+                    o.inst_id,
+                    o.ord_id,
+                    new_sz=str(round(decision.amend_sz, 8))
+                    if decision.amend_sz is not None
+                    else None,
+                    new_px=str(round(decision.amend_px, 1))
+                    if decision.amend_px is not None
+                    else None,
                 )
                 if decision.amend_sz is not None:
                     o.sz = decision.amend_sz
@@ -1010,7 +1067,7 @@ class LiveExecutor:
                     str(round(exit_sz, 8)),
                     ord_type="market",
                 )
-                self._position.order.sz *= (1 - decision.scale_out_pct)
+                self._position.order.sz *= 1 - decision.scale_out_pct
             except Exception as e:
                 self._log("order_error", ErrorPayload(error=str(e)))
         self._log("skip", SkipPayload(reason=decision.detail))
@@ -1039,26 +1096,30 @@ class LiveExecutor:
         contracts = max(1.0, notional / max(contract_notional, 1))
         return round(contracts)
 
-    def _check_fill_status(self) -> None:
-        """Query OKX for fill status of the active order."""
+    def check_fill(self) -> FillFacts:
+        """Query OKX for fill status — pure query, no mutation."""
         if not self._position or not self._client or self._dry:
-            return
+            return FillFacts()
         if self._position.fill_status not in (FillStatus.PLACED, FillStatus.PARTIAL):
-            return
+            return FillFacts()
         try:
             pending = self._client.pending()
             for p in pending:
                 if p.get("ordId") == self._position.order.ord_id:
                     filled_sz = float(p.get("fillSz", 0))
                     if filled_sz >= self._position.order.sz:
-                        self._position.fill_status = FillStatus.FILLED
-                        self._position.order.filled_sz = filled_sz
-                        self._position.order.filled_px = float(p.get("fillPx", 0))
-                        self._position.entry_price = float(p.get("fillPx", 0))
-                    elif filled_sz > 0:
-                        self._position.fill_status = FillStatus.PARTIAL
+                        return FillFacts(filled=True, filled_px=float(p.get("fillPx", 0)),
+                                         filled_sz=filled_sz)
+                    if filled_sz > 0:
+                        return FillFacts(partial=True)
+                    return FillFacts()
+            # Order not in pending + older than 5 min → missing
+            age = time.time() - self._position.order.placed_at
+            if age > 300:
+                return FillFacts(missing=True)
         except Exception:
             pass
+        return FillFacts()
 
     def status(self) -> dict:
         return {
@@ -1075,7 +1136,13 @@ class LiveExecutor:
     # -- internals ------------------------------------------------------------
 
     def _place(
-        self, side: str, sz: float, px: float, signal: float, obi, flow: float,
+        self,
+        side: str,
+        sz: float,
+        px: float,
+        signal: float,
+        obi,
+        flow: float,
         force_market: bool = False,
     ) -> OrderPayload | None:
         sz, px = round(sz, 8), round(px, 1)
@@ -1089,7 +1156,7 @@ class LiveExecutor:
             px=px,
             placed_at=time.time(),
             signal=signal,
-            obi=getattr(obi, 'imbalance_5', 0) if obi else 0,
+            obi=getattr(obi, "imbalance_5", 0) if obi else 0,
             ofi_flow=flow,
             status="placed",
         )
@@ -1106,11 +1173,20 @@ class LiveExecutor:
             return None
         try:
             # Entries: limit orders (signal verification).  Exits: market (risk guarantee).
-            otype = "market" if force_market else (self._ord_type or ("post_only" if self._post_only else "limit"))
+            otype = (
+                "market"
+                if force_market
+                else (self._ord_type or ("post_only" if self._post_only else "limit"))
+            )
+            assert self._client is not None, "_place called without client"
             if otype == "market":
-                resp = self._client.place(self._symbol, side, str(sz), ord_type=otype, td_mode=self._td_mode)
+                resp = self._client.place(
+                    self._symbol, side, str(sz), ord_type=otype, td_mode=self._td_mode
+                )
             else:
-                resp = self._client.place(self._symbol, side, str(sz), ord_type=otype, px=str(px), td_mode=self._td_mode)
+                resp = self._client.place(
+                    self._symbol, side, str(sz), ord_type=otype, px=str(px), td_mode=self._td_mode
+                )
             pos.order.ord_id = resp.get("ordId", "")
             self._position = pos
             self._trade_count += 1
@@ -1123,13 +1199,17 @@ class LiveExecutor:
             return None
 
     def _cancel(self, reason: str) -> None:
+        """Cancel current order.  Does NOT change state — caller handles that."""
         if not self._position:
             return
         oid = self._position.order.ord_id
         self._position.order.status, self._position.order.reason = "cancelled", reason
         self._log("cancel", CancelPayload(reason=reason, ord_id=oid))
         if not self._dry and self._client and oid:
-            self._client.cancel(self._symbol, oid)
+            try:
+                self._client.cancel(self._symbol, oid)
+            except Exception:
+                pass
         self._position = None
 
     def _log_order(self) -> None:
@@ -1172,9 +1252,11 @@ class PortfolioConfig(BaseModel):
 class PortfolioRunner:
     def __init__(self, config: PortfolioConfig) -> None:
         self.config = config  # public �?needed by Summary.from_runner
-        self._executors = {
-            f"{p['symbol']}_{p.get('tf', '4h')}": LiveExecutor(
-                symbol=p["symbol"],
+        self._executors = {}
+        for p in config.pairs:
+            sym = p.get("exec_symbol", p.get("sig_symbol", p.get("symbol", "")))
+            self._executors[f"{sym}_{p.get('tf', '4h')}"] = LiveExecutor(
+                symbol=sym,
                 timeframe=p.get("tf", "4h"),
                 initial_capital=p.get("capital", config.capital),
                 max_position_pct=p.get("risk_pct", config.risk_pct),
@@ -1186,12 +1268,13 @@ class PortfolioRunner:
                 limit_timeout_sec=config.limit_timeout_sec,
                 dry_run=config.dry_run,
             )
-            for p in config.pairs
-        }
 
-    def step(self, source: SignalSource | None = None,
-             signals: list[SignalResult] | None = None,
-             tc: TradingClient | None = None) -> dict:
+    def step(
+        self,
+        source: SignalSource | None = None,
+        signals: list[SignalResult] | None = None,
+        tc: TradingClient | None = None,
+    ) -> dict:
         """Run all executors.  If ``signals`` is provided (from
         ``compute_all_signals``), passes the matching SignalResult to
         each executor to avoid re-computation.
@@ -1235,26 +1318,32 @@ class PortfolioRunner:
         for p in self.config.pairs:
             th = p.get("sig_threshold", 0.35)
             src = default_signal_source(sig_threshold=th)
-            sym = p["symbol"]
+            # Use sig_symbol for signal (spot), exec_symbol for execution (swap)
+            sig_sym = p.get("sig_symbol", p.get("symbol", ""))
+            exec_sym = p.get("exec_symbol", p.get("symbol", ""))
             tf = p.get("tf", "4h")
             try:
-                s = src(sym, tf)
+                s = src(sig_sym, tf)
             except Exception as e:
                 # API down — try cached signal
-                sf = SIGNAL_DIR / f"{sym.replace('-', '_')}_{tf}.json"
+                sf = SIGNAL_DIR / f"{sig_sym.replace('-', '_')}_{tf}.json"
                 if sf.exists():
                     try:
                         s = SignalResult.model_validate(json.loads(sf.read_text()))
-                        print(f"  {sym:15s} sig={s.signal:+.4f} th={s.threshold:.3f} (cached)")
+                        s.symbol = exec_sym
+                        print(f"  {exec_sym:20s} sig={s.signal:+.4f} th={s.threshold:.3f} (cached)")
                         out.append(s)
                     except Exception:
-                        print(f"  {sym:15s} ERROR: API down, no cache")
+                        print(f"  {exec_sym:20s} ERROR: API down, no cache")
                 else:
-                    print(f"  {sym:15s} ERROR: API down, no cache ({e})")
+                    print(f"  {exec_sym:20s} ERROR: API down, no cache ({e})")
                 continue
             if s:
+                # Override symbol to exec_sym so signal_map lookup in step()
+                # matches executor keys (which use exec_symbol).
+                s.symbol = exec_sym
                 out.append(s)
-                print(f"  {sym:15s} sig={s.signal:+.4f} th={s.threshold:.3f}")
+                print(f"  {exec_sym:20s} sig={s.signal:+.4f} th={s.threshold:.3f}")
         return out
 
     def status(self) -> dict:
@@ -1306,31 +1395,42 @@ def asset_report(symbol: str = "ETH-USDT", timeframe: str = "4h") -> AssetReport
         elif p.side == "sell" and open_buys:
             entry = open_buys.pop(0)
             pnl = (p.px / entry.px - 1) if entry.px > 0 else 0.0
-            trades.append({
-                "entry_time": 0, "exit_time": 0,
-                "side": entry.side, "entry_price": entry.px,
-                "exit_price": p.px, "pnl": pnl, "reason": "sold",
-            })
+            trades.append(
+                {
+                    "entry_time": 0,
+                    "exit_time": 0,
+                    "side": entry.side,
+                    "entry_price": entry.px,
+                    "exit_price": p.px,
+                    "pnl": pnl,
+                    "reason": "sold",
+                }
+            )
 
-    n_total = len(ops)
     n_closed = len(trades)
     n_open = len(open_buys)
     if n_closed == 0 and n_open == 0:
-        return AssetReport(trades=0, win_rate_pct=0.0, sharpe=0.0,
-                           total_return_pct=0.0, max_drawdown_pct=0.0)
+        return AssetReport(
+            trades=0, win_rate_pct=0.0, sharpe=0.0, total_return_pct=0.0, max_drawdown_pct=0.0
+        )
 
     if n_closed == 0:
-        return AssetReport(trades=n_open, win_rate_pct=0.0, sharpe=0.0,
-                           total_return_pct=0.0, max_drawdown_pct=0.0,
-                           error=f"{n_open} open position{'s' if n_open>1 else ''}, no closed trades")
+        return AssetReport(
+            trades=n_open,
+            win_rate_pct=0.0,
+            sharpe=0.0,
+            total_return_pct=0.0,
+            max_drawdown_pct=0.0,
+            error=f"{n_open} open position{'s' if n_open > 1 else ''}, no closed trades",
+        )
 
     trade_df = pl.DataFrame(trades)
     initial = 1000.0
-    eq = pl.Series([initial] + [initial * (1.0 + float(t["pnl"])) for t in trades],
-                   dtype=pl.Float64)
+    eq = pl.Series(
+        [initial] + [initial * (1.0 + float(t["pnl"])) for t in trades], dtype=pl.Float64
+    )
     eq_df = pl.DataFrame({"portfolio_value": eq, "returns": eq.pct_change().fill_null(0.0)})
     m = compute_metrics(eq_df, trades=trade_df)
-    note = f" ({n_open} open)" if n_open > 0 else ""
     # Total trades = all orders placed (closed + open)
     return AssetReport(
         trades=n_closed + n_open,
