@@ -62,7 +62,9 @@ class TradingClient:
         from okx.Account import AccountAPI
         from okx.Trade import TradeAPI
 
-        if not os.getenv("OKX_API_KEY") and not os.getenv("OKX_API_KEY_TEST"):
+        if os.getenv("OKX_ENV"):
+            load_okx_env()
+        elif not os.getenv("OKX_API_KEY") and not os.getenv("OKX_API_KEY_TEST"):
             load_okx_env()
         flag = os.getenv("OKX_FLAG", "1")
         k = os.getenv("OKX_API_KEY") or os.getenv("OKX_API_KEY_TEST", "")
@@ -105,10 +107,13 @@ class TradingClient:
         ord_type: str = "post_only",
         px: str | None = None,
         td_mode: str = "isolated",
+        cl_ord_id: str = "",
     ) -> dict:
         params = {"instId": inst_id, "side": side, "ordType": ord_type, "sz": sz, "tdMode": td_mode}
         if px:
             params["px"] = px
+        if cl_ord_id:
+            params["clOrdId"] = cl_ord_id
         return self._okx(self._trade.place_order(**params))
 
     def cancel(self, inst_id: str, ord_id: str) -> dict:
@@ -127,6 +132,45 @@ class TradingClient:
 
     def pending(self) -> list:
         return self._okx(self._trade.get_order_list()).get("orders", [])
+
+    def order_by_cloid(self, inst_id, cl_ord_id):
+        try:
+            return self._okx(self._trade.get_order(instId=inst_id, clOrdId=cl_ord_id))
+        except RuntimeError as e:
+            if "51603" in str(e) or "order does not exist" in str(e).lower():
+                return None
+            raise
+
+    def place_algo(self, inst_id, side, sz, ord_type, td_mode="isolated", *,
+                   sl_trigger_px="", sl_ord_px="-1", tp_trigger_px="", tp_ord_px="-1"):
+        params = {"instId": inst_id, "tdMode": td_mode, "side": side, "sz": sz, "ordType": ord_type}
+        if sl_trigger_px:
+            params["slTriggerPx"] = sl_trigger_px
+            params["slOrdPx"] = sl_ord_px
+        if tp_trigger_px:
+            params["tpTriggerPx"] = tp_trigger_px
+            params["tpOrdPx"] = tp_ord_px
+        return self._okx(self._trade.place_algo_order(**params))
+
+    def cancel_algo(self, inst_id, algo_id):
+        return self._okx(self._trade.cancel_algo_order(instId=inst_id, algoId=algo_id))
+
+    def pending_algo(self, inst_id="", ord_type=""):
+        params = {}
+        if inst_id:
+            params["instId"] = inst_id
+        if ord_type:
+            params["ordType"] = ord_type
+        return self._okx(self._trade.get_algo_order_list(**params)).get("data", [])
+
+    def close_position(self, inst_id, mgn_mode="isolated"):
+        return self._okx(self._trade.close_position(instId=inst_id, mgnMode=mgn_mode))
+
+    def set_leverage(self, inst_id, lever, mgn_mode="isolated"):
+        return self._okx(self._account.set_leverage(instId=inst_id, lever=str(lever), mgnMode=mgn_mode))
+
+    def account_config(self):
+        return self._okx(self._account.get_account_config())
 
     def balance(self, ccy: str | None = None) -> list:
         p = {} if not ccy else {"ccy": ccy}
@@ -177,6 +221,7 @@ class SignalPayload(BaseModel):
     signal: float = 0.0
     obi_5: float = 0.0
     ofi_flow: float = 0.0
+    cl_ord_id: str = ""
 
 
 class CancelPayload(BaseModel):
@@ -205,6 +250,7 @@ class OrderPayload(BaseModel):
     signal: float = 0.0
     obi: float = 0.0
     ofi_flow: float = 0.0
+    cl_ord_id: str = ""
 
 
 LogPayload = SignalPayload | OrderPayload | SkipPayload | CancelPayload | ErrorPayload
@@ -631,6 +677,7 @@ class LiveExecutor:
         self._pnl_ema = 0.0
         self._error_streak = 0
         self._signal_threshold: float = 0.40  # default, overridden by signal
+        self._last_signal_ts: int = 0
 
     # -- public ---------------------------------------------------------------
 
@@ -679,6 +726,8 @@ class LiveExecutor:
             return self._log_skip("no_signal")
         if sr.threshold > 0:
             self._signal_threshold = sr.threshold
+        if sr.timestamp > 0:
+            self._last_signal_ts = sr.timestamp
         bar_ms = {"1h": 3600000, "4h": 14400000, "1d": 86400000}.get(self._tf, 14400000)
         if time.time() * 1000 - sr.timestamp > bar_ms * 1.5:
             return self._log_skip("stale_signal")
@@ -1159,6 +1208,7 @@ class LiveExecutor:
             obi=getattr(obi, "imbalance_5", 0) if obi else 0,
             ofi_flow=flow,
             status="placed",
+            cl_ord_id=str(self._last_signal_ts) if self._last_signal_ts else "",
         )
         if self._dry:
             pos.order.ord_id = "dry_" + str(int(time.time()))
