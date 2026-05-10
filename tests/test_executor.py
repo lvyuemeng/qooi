@@ -1,733 +1,432 @@
-"""Live executor tests — full branch coverage of state machine, sync, execute.
+"""Stateless executor tests — full state machine + normalization coverage.
 
-Covers every branch in:
-  sync()       — 6 branches
-  _decide()    — 10 branches
-  _decide_idle / _decide_pending / _decide_active  — all paths
-  _execute()   — 5 action branches
-  check_fill() — 5 branches
+Covers:
+  _reconstruct()   — IDLE PENDING ACTIVE partial-fill algo-recon
+  _decide()        — idle idle_sell pending pending_fill pending_timeout
+                     pending_flip pending_chase pending_outstanding
+                     active_flip active_time active_holding active_trail
+                     active_notrail
+  _execute()       — enter exit amend (dry-run only)
+  normalization    — stop/target ATR scaling, size calc, trail math
 """
 
-import json
+from __future__ import annotations
+
 import time
+from dataclasses import dataclass
 
 from qooi.exchange.backtest import RiskConfig
 from qooi.exchange.trading import (
+    AssetConfig,
     Decision,
-    FillFacts,
-    FillStatus,
-    LiveExecutor,
-    OrderPayload,
+    ExchangeSnapshot,
     PositionState,
+    ReconstructedState,
     SignalResult,
     State,
-    SyncFacts,
+    StatelessExecutor,
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _obi(ask=2500.0, bid=2498.0, imb=0.5):
-    class O:
-        ask_price = ask
-        bid_price = bid
-        imbalance_5 = imb
-    return O()
+@dataclass
+class _Obi:
+    ask_price: float = 2500.0
+    bid_price: float = 2498.0
 
 
-def _sig(signal=0.50, flow=0.50, threshold=0.25):
-    return SignalResult(
-        symbol="ETH-USDT-SWAP", timeframe="4h",
-        signal=signal, flow=flow, threshold=threshold,
-        timestamp=0, computed_at=0,
+def _obi(ask=2500.0, bid=2498.0):
+    return _Obi(ask_price=ask, bid_price=bid)
+
+
+def _sig(**kw) -> SignalResult:
+    d = dict(
+        symbol="ETH-USDT-SWAP",
+        timeframe="4h",
+        timestamp=int(time.time()),
+        signal=0.5,
+        flow=0.5,
+        threshold=0.25,
+        atr=50.0,
     )
+    d.update(kw)
+    return SignalResult(**d)
 
 
-def _pos(side="buy", sz=1, px=2500.0, signal=0.5, status=FillStatus.PLACED):
-    return PositionState(
-        order=OrderPayload(side=side, sz=sz, px=px, placed_at=time.time(), signal=signal),
-        fill_status=status,
-        entry_price=px,
+def _cfg(**kw) -> AssetConfig:
+    d = dict(
+        symbol="ETH-USDT-SWAP",
+        sig_symbol="ETH-USDT",
+        timeframe="4h",
+        capital=500,
+        max_risk_pct=0.50,
+        leverage=2.0,
+        ct_val=0.1,
+        atr_stop_mult=2.0,
+        atr_target_mult=3.0,
+        trail_activation_mult=2.0,
+        trail_distance_mult=1.0,
+        signal_threshold=0.25,
+        ord_type="post_only",
+        td_mode="isolated",
     )
+    d.update(kw)
+    return AssetConfig(**d)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# sync — order detection
-# ══════════════════════════════════════════════════════════════════════════════
+def _snap(**kw) -> ExchangeSnapshot:
+    d = dict(orders=[], positions=[], algo_orders=[], usdt_balance=10000.0, usdt_frozen=0.0)
+    d.update(kw)
+    return ExchangeSnapshot(**d)
 
 
-class TestSyncOrderDetection:
-    """sync() must detect orders from BOTH exchange API and local log."""
+def _rs(state: State = State.IDLE, **kw) -> ReconstructedState:
+    d = dict(state=state, symbol="ETH-USDT-SWAP", signal=0.5, flow=0.5, atr_estimate=50.0)
+    d.update(kw)
+    return ReconstructedState(**d)
 
-    def test_sync_api_position_adopted(self):
-        """API returns a position → SyncFacts.position is set."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        # Patch _client to return mock data
-        class FakeClient:
-            def pending(self): return []
-            def positions(self): return [{"instId": "ETH-USDT-SWAP", "pos": "1", "avgPx": "2500"}]
-        exe._client = FakeClient()
-        exe._dry = False
-        facts = exe.sync()
-        assert facts.position is not None
-        assert facts.position["instId"] == "ETH-USDT-SWAP"
-        assert facts.api_ok
 
-    def test_sync_api_order_found(self):
-        """API returns pending order → SyncFacts.order is set."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        class FakeClient:
-            def pending(self): return [{"instId": "ETH-USDT-SWAP", "ordId": "oid1", "side": "sell", "sz": "1", "px": "2276"}]
-            def positions(self): return []
-        exe._client = FakeClient()
-        exe._dry = False
-        facts = exe.sync()
-        assert facts.order is not None
-        assert facts.order["ordId"] == "oid1"
-        assert facts.api_ok
+def _rs_pending(**kw):
+    d: dict = dict(
+        state=State.PENDING,
+        ord_id="123",
+        cl_ord_id="abc",
+        side="buy",
+        sz="10",
+        acc_fill_sz="0",
+        ord_px="2500",
+        ord_state="live",
+        ord_ctime=str(int(time.time() * 1000) - 60000),
+        age_sec=60.0,
+    )
+    d.update(kw)
+    return _rs(**d)
 
-    def test_sync_api_duplicates_detected(self):
-        """API returns multiple pending orders → duplicates captured."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        class FakeClient:
-            def pending(self): return [
-                {"instId": "ETH-USDT-SWAP", "ordId": "oid1", "cTime": "1000"},
-                {"instId": "ETH-USDT-SWAP", "ordId": "oid2", "cTime": "2000"},
+
+def _rs_active(**kw):
+    d: dict = dict(
+        state=State.ACTIVE,
+        side="buy",
+        sz="10",
+        pos_id="p1",
+        pos_side="long",
+        pos_sz="10",
+        avg_px="2500",
+        mark_px="2550",
+        upl="50",
+        margin="500",
+        sl_trigger_px="2400",
+        sl_ord_px="2400",
+        tp_trigger_px="2700",
+        tp_ord_px="2700",
+    )
+    d.update(kw)
+    return _rs(**d)
+
+
+# ── state reconstruction ─────────────────────────────────────────────────────
+
+
+class TestReconstruct:
+    def test_empty_snap_is_idle(self):
+        s = StatelessExecutor(_cfg())._reconstruct(_snap(), _sig(), _obi())
+        assert s.state == State.IDLE
+        assert s.signal == 0.5
+
+    def test_pending_order_reconstructed(self):
+        now = int(time.time() * 1000)
+        snap = _snap(
+            orders=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "123",
+                    "side": "buy",
+                    "sz": "10",
+                    "px": "2500",
+                    "state": "live",
+                    "cTime": str(now - 120000),
+                    "accFillSz": "0",
+                }
             ]
-            def positions(self): return []
-        exe._client = FakeClient()
-        exe._dry = False
-        facts = exe.sync()
-        assert facts.order is not None
-        assert facts.duplicates is not None
-        assert len(facts.duplicates) == 1
+        )
+        s = StatelessExecutor(_cfg())._reconstruct(snap, _sig(), _obi())
+        assert s.state == State.PENDING
+        assert s.ord_id == "123"
+        assert s.age_sec == 120.0
 
-    def test_sync_api_empty_log_recovery(self, tmp_path, monkeypatch):
-        """Bug 1 grill: API returns OK with 0 pending — sync MUST read log."""
-        import qooi.exchange.trading as tmod
-        monkeypatch.setattr(tmod, "LOG_DIR", tmp_path)
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        # No API orders
-        class FakeClient:
-            def pending(self): return []
-            def positions(self): return []
-        exe._client = FakeClient()
-        exe._dry = False
-        # Write a recent uncancelled order to the log
-        log_file = tmp_path / "exec_ETH_USDT_SWAP_4h.jsonl"
-        log_file.write_text(json.dumps({
-            "ts": int(time.time() * 1000) - 10000,
-            "event": "order",
-            "symbol": "ETH-USDT-SWAP", "tf": "4h",
-            "payload": {"ord_id": "log_oid", "side": "sell", "sz": 1.0,
-                        "px": 2276.0, "placed_at": time.time() - 5, "signal": -0.319},
-        }) + "\n")
-        facts = exe.sync()
-        assert facts.order is None, "API returned no order"
-        assert facts.log_order is not None, "Log recovery MUST find the recent order"
-        assert facts.log_order["ordId"] == "log_oid"
-        assert facts.api_ok
+    def test_filled_order_with_position_is_active(self):
+        snap = _snap(
+            orders=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "123",
+                    "side": "buy",
+                    "sz": "10",
+                    "px": "2500",
+                    "state": "filled",
+                    "cTime": "1000",
+                    "accFillSz": "10",
+                }
+            ],
+            positions=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "p1",
+                    "posSide": "long",
+                    "pos": "10",
+                    "avgPx": "2500",
+                    "markPx": "2550",
+                    "upl": "50",
+                }
+            ],
+        )
+        s = StatelessExecutor(_cfg())._reconstruct(snap, _sig(), _obi())
+        assert s.state == State.ACTIVE
+        assert s.pos_id == "p1"
 
-    def test_sync_api_fail_falls_back_to_log(self, tmp_path, monkeypatch):
-        """API fails → log recovery only."""
-        import qooi.exchange.trading as tmod
-        monkeypatch.setattr(tmod, "LOG_DIR", tmp_path)
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        class FakeClient:
-            def pending(self): raise ConnectionError("down")
-            def positions(self): raise ConnectionError("down")
-        exe._client = FakeClient()
-        exe._dry = False
-        # Write a recent order
-        log_file = tmp_path / "exec_ETH_USDT_SWAP_4h.jsonl"
-        log_file.write_text(json.dumps({
-            "ts": int(time.time() * 1000) - 10000,
-            "event": "order",
-            "symbol": "ETH-USDT-SWAP", "tf": "4h",
-            "payload": {"ord_id": "fail_oid", "side": "buy", "sz": 1.0,
-                        "px": 2500.0, "placed_at": time.time() - 5, "signal": 0.5},
-        }) + "\n")
-        facts = exe.sync()
-        assert not facts.api_ok
-        assert facts.log_order is not None
-        assert facts.log_order["ordId"] == "fail_oid"
+    def test_position_without_order_is_active(self):
+        snap = _snap(
+            positions=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "p1",
+                    "posSide": "long",
+                    "pos": "10",
+                    "avgPx": "2500",
+                    "markPx": "2550",
+                    "upl": "50",
+                    "cTime": str(int(time.time() * 1000) - 7200000),
+                }
+            ]
+        )
+        s = StatelessExecutor(_cfg())._reconstruct(snap, _sig(), _obi())
+        assert s.state == State.ACTIVE
+        assert s.side == "buy"
+        assert s.age_sec == 7200.0
 
-    def test_sync_dry_run_returns_empty(self):
-        """dry_run with no client → empty SyncFacts."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        facts = exe.sync()
-        assert not facts.api_ok
-        assert facts.order is None
-        assert facts.position is None
+    def test_partially_filled_stays_pending(self):
+        snap = _snap(
+            orders=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "123",
+                    "side": "buy",
+                    "sz": "10",
+                    "px": "2500",
+                    "state": "partially_filled",
+                    "cTime": "1000",
+                    "accFillSz": "3",
+                }
+            ]
+        )
+        s = StatelessExecutor(_cfg())._reconstruct(snap, _sig(), _obi())
+        assert s.state == State.PENDING
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _decide — dispatch
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestDecideDispatch:
-    def test_idle_dispatches_to_idle_method(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.IDLE
-        d = exe._decide(_sig(0.1), _obi(), SyncFacts(), FillFacts())
-        assert "weak_signal" in d.detail
-
-    def test_pending_dispatches_to_pending_method(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING
-        exe._position = _pos()
-        d = exe._decide(_sig(0.5), _obi(), SyncFacts(), FillFacts())
-        assert d.action != "enter"
-        assert d.action in ("skip", "amend", "exit")
-
-    def test_active_dispatches_to_active_method(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.ACTIVE
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        exe._position = pos
-        d = exe._decide(_sig(0.5), _obi(), SyncFacts(), FillFacts())
-        assert d.action in ("skip", "amend", "exit")
-
-    def test_sync_position_adopts_to_active(self):
-        """facts.position → state=ACTIVE."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        facts = SyncFacts(position={"instId": "ETH-USDT-SWAP", "pos": "1", "avgPx": "2500"})
-        d = exe._decide(_sig(0.5), _obi(), facts, FillFacts())
-        assert exe._state == State.ACTIVE
-
-    def test_sync_order_adopts_to_pending(self):
-        """facts.order → state=PENDING."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        facts = SyncFacts(order={"instId": "ETH-USDT-SWAP", "ordId": "o1", "side": "buy", "sz": "1", "px": "2500"})
-        d = exe._decide(_sig(0.5), _obi(), facts, FillFacts())
-        assert exe._state == State.PENDING
-
-    def test_sync_log_order_adopts_to_pending(self):
-        """facts.log_order → state=PENDING (Bug 1 fix)."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        facts = SyncFacts(log_order={"instId": "ETH-USDT-SWAP", "ordId": "log1", "side": "sell", "sz": "1", "px": "2276"}, api_ok=True)
-        d = exe._decide(_sig(-0.4), _obi(imb=-0.5), facts, FillFacts())
-        assert exe._state == State.PENDING, f"Log order must be adopted, got {exe._state}"
-
-    def test_fill_missing_clears_position_to_idle(self):
-        """fill.missing → _position=None, state=IDLE."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING
-        exe._position = _pos()
-        d = exe._decide(_sig(0.5), _obi(), SyncFacts(), FillFacts(missing=True))
-        assert exe._position is None, "Missing fill must clear position"
-        assert exe._state == State.IDLE
-
-    def test_fill_filled_updates_status(self):
-        """fill.filled → fill_status=FILLED, entry_price updated."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING
-        exe._position = _pos()
-        d = exe._decide(_sig(0.5), _obi(), SyncFacts(), FillFacts(filled=True, filled_px=2510.0, filled_sz=1.0))
-        assert exe._position.fill_status == FillStatus.FILLED
-        assert exe._position.entry_price == 2510.0
-
-    def test_fill_partial_updates_status(self):
-        """fill.partial → fill_status=PARTIAL."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING
-        exe._position = _pos()
-        d = exe._decide(_sig(0.5), _obi(), SyncFacts(), FillFacts(partial=True))
-        assert exe._position.fill_status == FillStatus.PARTIAL
+    def test_algo_sl_tp_picked_up(self):
+        snap = _snap(
+            algo_orders=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "algoId": "a1",
+                    "slTriggerPx": "2400",
+                    "slOrdPx": "2400",
+                    "tpTriggerPx": "2700",
+                    "tpOrdPx": "2700",
+                }
+            ]
+        )
+        s = StatelessExecutor(_cfg())._reconstruct(snap, _sig(), _obi())
+        assert s.algo_sl_id == "a1"
+        assert s.sl_trigger_px == "2400"
+        assert s.algo_tp_id == "a1"
+        assert s.tp_trigger_px == "2700"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _decide_idle — entry gate
-# ══════════════════════════════════════════════════════════════════════════════
+# ── normalization ────────────────────────────────────────────────────────────
 
 
-class TestDecideIdle:
-    def test_weak_signal_below_threshold(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._signal_threshold = 0.25
-        d = exe._decide_idle(_sig(0.10), _obi())
+class TestNormalization:
+    def test_stop_distance_scales_with_atr(self):
+        exe = StatelessExecutor(_cfg(atr_stop_mult=2.0))
+        s_lo = _rs(state=State.IDLE, atr_estimate=25.0, signal=0.5)
+        s_hi = _rs(state=State.IDLE, atr_estimate=100.0, signal=0.5)
+        d_lo = exe._decide(s_lo, _obi(ask=2500, bid=2498))
+        d_hi = exe._decide(s_hi, _obi(ask=2500, bid=2498))
+        assert d_lo.stop_px == 2500.0 - 2.0 * 25.0
+        assert d_hi.stop_px == 2500.0 - 2.0 * 100.0
+
+    def test_target_distance_scales_with_atr(self):
+        exe = StatelessExecutor(_cfg(atr_target_mult=3.0))
+        s = _rs(state=State.IDLE, atr_estimate=50.0, signal=0.5)
+        d = exe._decide(s, _obi(ask=2500, bid=2498))
+        assert d.target_px == 2500.0 + 3.0 * 50.0
+
+    def test_size_derived_from_risk_and_stop_distance(self):
+        exe = StatelessExecutor(
+            _cfg(capital=1000, max_risk_pct=0.20, ct_val=0.1, atr_stop_mult=2.0)
+        )
+        s = _rs(state=State.IDLE, atr_estimate=50.0, signal=0.5)
+        d = exe._decide(s, _obi(ask=2500, bid=2498))
+        risk_per_ct = abs(2500 - (2500 - 100)) * 0.1
+        risk_sz = max(1, int(200 / risk_per_ct))  # 20
+        margin_sz = int((1000 * 2.0) / (0.1 * 2500))  # 8
+        assert d.sz == min(risk_sz, margin_sz)
+
+    def test_trail_activation_requires_profit_atr(self):
+        exe = StatelessExecutor(_cfg(trail_activation_mult=2.0, trail_distance_mult=1.0))
+        s = _rs_active(mark_px="2580", sl_trigger_px="2400", avg_px="2500", atr_estimate=50.0)
+        d = exe._decide(s, _obi(ask=2580, bid=2578))
+        assert d.detail == "holding"
+
+    def test_trail_triggers_when_profit_exceeds_activation(self):
+        exe = StatelessExecutor(_cfg(trail_activation_mult=2.0, trail_distance_mult=1.0))
+        s = _rs_active(mark_px="2650", sl_trigger_px="2400", avg_px="2500", atr_estimate=50.0)
+        d = exe._decide(s, _obi(ask=2650, bid=2648))
+        assert d.action == "amend"
+        assert d.detail == "trail_update"
+        assert d.amend_sl_trigger_px == "2600.0"
+
+    def test_trail_does_not_loosen_stop(self):
+        exe = StatelessExecutor(_cfg(trail_activation_mult=2.0, trail_distance_mult=1.0))
+        s = _rs_active(
+            mark_px="2600",
+            sl_trigger_px="2450",
+            avg_px="2500",
+            atr_estimate=50.0,
+            side="sell",
+            pos_side="short",
+            signal=-0.5,
+        )
+        d = exe._decide(s, _obi(ask=2602, bid=2600))
+        assert d.detail == "holding"
+
+
+# ── decision dispatch ────────────────────────────────────────────────────────
+
+
+class TestDecide:
+    def test_idle_skips_weak_signal(self):
+        d = StatelessExecutor(_cfg(signal_threshold=0.25))._decide(
+            _rs(State.IDLE, signal=0.1), _obi()
+        )
         assert d.action == "skip"
-        assert "weak_signal" in d.detail
+        assert d.detail == "weak_signal"
 
-    def test_clipped_to_zero_max_leverage_zero(self):
-        r = RiskConfig(max_leverage=0.0)
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, risk=r)
-        exe._signal_threshold = 0.25
-        d = exe._decide_idle(_sig(0.50), _obi())
-        assert d.action == "skip"
-        assert "clipped_to_zero" in d.detail
-
-    def test_strong_signal_buy(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=10000, max_position_pct=0.5, leverage=2.0)
-        exe._signal_threshold = 0.25
-        d = exe._decide_idle(_sig(0.50), _obi())
+    def test_idle_enters_long_on_strong_signal(self):
+        d = StatelessExecutor(_cfg(signal_threshold=0.25))._decide(
+            _rs(State.IDLE, signal=0.5, atr_estimate=50.0), _obi(ask=2500, bid=2498)
+        )
         assert d.action == "enter"
         assert d.side == "buy"
-        assert d.sz > 0
+        assert d.stop_px == 2400.0
+        assert d.target_px == 2650.0
 
-    def test_strong_signal_sell(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=10000, max_position_pct=0.5, leverage=2.0)
-        exe._signal_threshold = 0.25
-        d = exe._decide_idle(_sig(-0.50), _obi())
+    def test_idle_enters_short_on_negative_signal(self):
+        d = StatelessExecutor(_cfg(signal_threshold=0.25))._decide(
+            _rs(State.IDLE, signal=-0.5, atr_estimate=50.0), _obi(ask=2500, bid=2498)
+        )
         assert d.action == "enter"
         assert d.side == "sell"
+        assert d.stop_px == 2598.0
 
-    def test_insufficient_margin(self, monkeypatch):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=500, max_position_pct=0.5, leverage=2.0, ct_val=0.1)
-        exe._signal_threshold = 0.25
-        monkeypatch.setattr(exe, "_free_usdt", lambda: 0.0)
-        d = exe._decide_idle(_sig(0.50), _obi())
+    def test_pending_filled_transitions_to_active(self):
+        s = _rs_pending(acc_fill_sz="10", ord_state="filled")
+        s.state = State.PENDING
+        d = StatelessExecutor(_cfg())._decide(s, _obi())
         assert d.action == "skip"
-        assert "insufficient_margin" in d.detail
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _decide_pending — while order is live
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestDecidePending:
-    def test_position_lost(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING  # no _position set
-        d = exe._decide_pending(_sig(0.5), _obi())
-        assert d.action == "skip"
-        assert "position_lost" in d.detail
-
-    def test_filled_transitions_to_active(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING
-        exe._position = _pos(status=FillStatus.FILLED)
-        d = exe._decide_pending(_sig(0.5), _obi())
-        assert d.action == "amend"
         assert d.detail == "order_filled"
         assert d.new_state == State.ACTIVE
 
-    def test_partial_fill_skips(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING
-        exe._position = _pos(status=FillStatus.PARTIAL)
-        d = exe._decide_pending(_sig(0.5), _obi())
-        assert d.action == "skip"
-        assert "partial_fill" in d.detail
-        assert d.new_state == State.PENDING
-
-    def test_timeout(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, limit_timeout_sec=0)
-        exe._state = State.PENDING
-        old = 999999.0  # placed far in the past
-        exe._position = PositionState(
-            order=OrderPayload(side="buy", sz=1, px=2500, placed_at=old, signal=0.5),
-            fill_status=FillStatus.PLACED, entry_price=2500,
+    def test_pending_timeout_exits(self):
+        d = StatelessExecutor(_cfg(limit_timeout_sec=10))._decide(
+            _rs_pending(age_sec=100.0), _obi()
         )
-        d = exe._decide_pending(_sig(0.5), _obi())
         assert d.action == "exit"
-        assert "timeout" in d.detail
+        assert d.detail == "timeout"
 
-    def test_signal_flipped(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, limit_timeout_sec=99999)
-        exe._state = State.PENDING
-        exe._position = _pos(side="buy", signal=0.5)
-        # Signal flips from +0.5 to -0.4
-        d = exe._decide_pending(_sig(-0.4), _obi(imb=-0.5))
+    def test_pending_signal_flip_exits(self):
+        d = StatelessExecutor(_cfg())._decide(_rs_pending(signal=-0.5, side="buy"), _obi())
         assert d.action == "exit"
-        assert "signal_flipped" in d.detail
+        assert d.detail == "signal_flipped"
 
-    def test_signal_weakened_reduce_size(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, limit_timeout_sec=99999)
-        exe._state = State.PENDING
-        exe._position = _pos(side="buy", signal=0.5)
-        # Signal weakens to 0.2 (less than 50% of 0.5)
-        d = exe._decide_pending(_sig(0.2), _obi())
-        assert d.action == "amend"
-        assert "signal_weakened" in d.detail
-        assert d.amend_sz is not None
-
-    def test_signal_weakened_to_zero_exits(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, limit_timeout_sec=99999)
-        exe._state = State.PENDING
-        exe._position = _pos(side="buy", sz=0.000001, signal=0.5)
-        # Signal weakens below zero after halving → exit
-        d = exe._decide_pending(_sig(0.01), _obi())
-        assert d.action == "exit"
-        assert "signal_weakened" in d.detail
-
-    def test_price_chase(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, limit_timeout_sec=99999)
-        exe._state = State.PENDING
-        exe._position = _pos(side="buy", px=2500.0)
-        # Market moved >0.5% away
-        d = exe._decide_pending(_sig(0.5), _obi(ask=2520.0))
-        assert d.action == "amend"
-        assert d.amend_px is not None
-
-    def test_order_outstanding(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, limit_timeout_sec=99999)
-        exe._state = State.PENDING
-        exe._position = _pos()
-        d = exe._decide_pending(_sig(0.5), _obi())
+    def test_pending_outstanding_holds(self):
+        d = StatelessExecutor(_cfg(limit_timeout_sec=99999))._decide(
+            _rs_pending(ord_px="2500", signal=0.5, side="buy", age_sec=10), _obi(ask=2502, bid=2500)
+        )
         assert d.action == "skip"
-        assert "order_outstanding" in d.detail
-        assert d.new_state == State.PENDING
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _decide_active — risk management
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestDecideActive:
-    def test_position_lost(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.ACTIVE  # no _position
-        d = exe._decide_active(_sig(0.5), _obi())
-        assert "position_lost" in d.detail
-
-    def test_signal_flip_exit(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        exe._position = pos; exe._state = State.ACTIVE
-        d = exe._decide_active(_sig(-0.4), _obi())
-        assert d.action == "exit"
-        assert "signal_flipped" in d.detail
-
-    def test_time_exit(self):
-        r = RiskConfig(max_bars_held=5)
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, risk=r)
-        pos = PositionState.enter_long(2500.0, 50.0, r, 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        pos.bars_held = 10
-        exe._position = pos; exe._state = State.ACTIVE
-        d = exe._decide_active(_sig(0.5), _obi())
-        assert d.action == "exit"
-        assert "time" in d.detail
-
-    def test_stop_exit(self):
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._position = pos; exe._state = State.ACTIVE
-        d = exe._decide_active(_sig(0.5), _obi(ask=2390.0))
-        assert d.action == "exit"
-        assert d.detail == "stop"
-
-    def test_target_exit(self):
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._position = pos; exe._state = State.ACTIVE
-        d = exe._decide_active(_sig(0.5), _obi(ask=2660.0))
-        assert d.action == "exit"
-        assert d.detail == "target"
-
-    def test_breakeven(self):
-        r = RiskConfig(atr_stop_mult=2.0)
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, risk=r)
-        pos = PositionState.enter_long(2500.0, 50.0, r, 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        pos.stop_price = 2400.0  # not yet at breakeven
-        exe._position = pos; exe._state = State.ACTIVE
-        # Price up 5%, ATR ~2%, profit > ATR
-        d = exe._decide_active(_sig(0.5), _obi(ask=2625.0))
+    def test_pending_price_chases(self):
+        d = StatelessExecutor(_cfg(limit_timeout_sec=99999))._decide(
+            _rs_pending(ord_px="2500", signal=0.5, side="buy", age_sec=10), _obi(ask=2530, bid=2528)
+        )
         assert d.action == "amend"
-        assert d.detail == "breakeven_stop"
-        assert d.new_stop == 2500.0
-        assert d.new_state == State.ACTIVE
+        assert d.detail == "price_chase"
 
-    def test_holding(self):
-        r = RiskConfig(max_bars_held=0)
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, risk=r)
-        pos = PositionState.enter_long(2500.0, 50.0, r, 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        pos.stop_price = 2500.0  # already at breakeven
-        exe._position = pos; exe._state = State.ACTIVE
-        d = exe._decide_active(_sig(0.5), _obi(ask=2520.0))
-        assert d.action == "skip"
-        assert d.detail == "holding"
-        assert d.new_state == State.ACTIVE
+    def test_active_signal_flip_exits(self):
+        d = StatelessExecutor(_cfg())._decide(
+            _rs_active(signal=-0.5, side="buy", pos_side="long"), _obi()
+        )
+        assert d.action == "exit"
+
+    def test_active_max_bars_exits(self):
+        d = StatelessExecutor(_cfg(max_bars_held=5))._decide(
+            _rs_active(mark_px="2550", bars_held=6), _obi()
+        )
+        assert d.action == "exit"
+        assert d.detail == "time"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _execute — side effects
-# ══════════════════════════════════════════════════════════════════════════════
+# ── execution (dry-run) ──────────────────────────────────────────────────────
 
 
 class TestExecute:
-    def test_enter_executes_dry_placement(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=10000, max_position_pct=0.5, leverage=2.0)
-        exe._signal_threshold = 0.25
-        exe._state = State.IDLE
-        d = Decision.enter("buy", 1, 2500.0)
-        result = exe._execute(d, _sig(0.5), _obi())
-        assert result is not None
-        assert exe._state == State.PENDING
-        assert exe._position is not None
-        assert "dry_" in exe._position.order.ord_id
+    def test_enter_no_client_is_noop(self):
+        d = Decision.enter("buy", 10, 2500, stop_px=2400, target_px=2700)
+        StatelessExecutor(_cfg())._execute(d, _rs(State.IDLE), _obi(), None)
 
-    def test_exit_filled_places_market_close(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "buy"; pos.fill_status = FillStatus.FILLED; pos.entry_price = 2500.0
-        pos.order.px = 2500.0; pos.order.sz = 1; pos.order.signal = 0.5
-        exe._position = pos; exe._state = State.ACTIVE
-        d = Decision.exit("stop", 2400.0)
-        exe._execute(d, _sig(0.5), _obi())
-        assert exe._state == State.IDLE
-
-    def test_exit_pending_cancels(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        pos = _pos()
-        exe._position = pos; exe._state = State.PENDING
-        d = Decision.exit("timeout", 2490.0)
-        exe._execute(d, _sig(0.5), _obi())
-        assert exe._position is None
-        assert exe._state == State.IDLE
-
-    def test_amend_applies_new_stop(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        pos = _pos()
-        exe._position = pos; exe._state = State.ACTIVE
-        d = Decision.amend("breakeven", new_stop=2500.0, new_state=State.ACTIVE)
-        exe._execute(d, _sig(0.5), _obi())
-        assert exe._position.stop_price == 2500.0
-        assert exe._state == State.ACTIVE
-
-    def test_skip_logs_and_stays(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        d = Decision.skip("holding", new_state=State.ACTIVE)
-        exe._state = State.ACTIVE
-        exe._execute(d, _sig(0.5), _obi())
-        assert exe._state == State.ACTIVE
+    def test_exit_no_client_is_noop(self):
+        d = Decision.exit("signal_flipped")
+        StatelessExecutor(_cfg())._execute(d, _rs_pending(ord_id="123"), _obi(), None)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# check_fill — fill status detection
-# ══════════════════════════════════════════════════════════════════════════════
+# ── PositionState backtest-compat ────────────────────────────────────────────
 
 
-class TestCheckFill:
-    def test_no_position_returns_empty(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        f = exe.check_fill()
-        assert not f.filled and not f.partial and not f.missing
+class TestPositionState:
+    def test_enter_long_stop_target(self):
+        risk = RiskConfig(atr_stop_mult=2.0, atr_target_mult=3.0)
+        pos = PositionState.enter_long(2500, 50, risk, int(time.time() * 1000))
+        assert pos.stop_price == 2400.0
+        assert pos.target_price == 2650.0
 
-    def test_already_filled_returns_empty(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._position = _pos(status=FillStatus.FILLED)
-        f = exe.check_fill()
-        assert not f.filled and not f.partial and not f.missing
+    def test_enter_short_stop_target(self):
+        risk = RiskConfig(atr_stop_mult=2.0, atr_target_mult=3.0)
+        pos = PositionState.enter_short(2500, 50, risk, int(time.time() * 1000))
+        assert pos.stop_price == 2600.0
+        assert pos.target_price == 2350.0
 
-    def test_dry_run_returns_empty(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._position = _pos()
-        f = exe.check_fill()
-        assert not f.filled
-
-    def test_order_not_in_pending_becomes_missing(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        class FakeClient:
-            def pending(self): return []
-        exe._client = FakeClient()
-        exe._dry = False
-        old = time.time() - 400  # > 5 min ago
-        exe._position = PositionState(
-            order=OrderPayload(side="buy", sz=1, px=2500, placed_at=old, signal=0.5, ord_id="old"),
-            fill_status=FillStatus.PLACED, entry_price=2500,
-        )
-        f = exe.check_fill()
-        assert f.missing, "Order absent from pending >5 min must be marked missing"
-
-    def test_order_found_filled(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        class FakeClient:
-            def pending(self): return [{"ordId": "oid1", "fillSz": "1.0", "fillPx": "2510"}]
-        exe._client = FakeClient()
-        exe._dry = False
-        exe._position = PositionState(
-            order=OrderPayload(side="buy", sz=1, px=2500, placed_at=time.time(), signal=0.5, ord_id="oid1"),
-            fill_status=FillStatus.PLACED, entry_price=2500,
-        )
-        f = exe.check_fill()
-        assert f.filled
-        assert f.filled_px == 2510.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# check_exit — stop/target
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestCheckExit:
-    def test_long_stop(self):
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
+    def test_check_exit_stop_target_trailing(self):
+        risk = RiskConfig(atr_stop_mult=2.0, atr_target_mult=3.0, trailing_distance_mult=1.0)
+        pos = PositionState.enter_long(2500, 50, risk, 0)
         pos.order.side = "buy"
-        assert pos.check_exit(2399.0, 50.0, RiskConfig()) == "stop"
-
-    def test_long_target(self):
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "buy"
-        assert pos.check_exit(2651.0, 50.0, RiskConfig()) == "target"
-
-    def test_long_no_exit(self):
-        pos = PositionState.enter_long(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "buy"
-        assert pos.check_exit(2520.0, 50.0, RiskConfig()) is None
-
-    def test_short_stop(self):
-        pos = PositionState.enter_short(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "sell"
-        assert pos.check_exit(2601.0, 50.0, RiskConfig()) == "stop"
-
-    def test_short_target(self):
-        pos = PositionState.enter_short(2500.0, 50.0, RiskConfig(), 0)
-        pos.order.side = "sell"
-        assert pos.check_exit(2349.0, 50.0, RiskConfig()) == "target"
-
-    def test_target_disabled_when_negative(self):
-        """target_price=-1 means no target set."""
-        pos = PositionState(entry_price=2500, stop_price=2400, target_price=-1, order=OrderPayload(side="buy"))
-        assert pos.check_exit(3000.0, 50.0, RiskConfig()) is None
-
-    def test_stop_disabled_when_negative(self):
-        """stop_price=-1 means no stop set."""
-        pos = PositionState(entry_price=2500, stop_price=-1, target_price=2650, order=OrderPayload(side="buy"))
-        assert pos.check_exit(10.0, 50.0, RiskConfig()) is None
+        assert pos.check_exit(2390, 50, risk) == "stop"
+        assert pos.check_exit(2650, 50, risk) == "target"
+        pos.trail_high = 2600.0
+        assert pos.check_exit(2540, 50, risk) == "trailing_stop"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _read_log_order — log parsing
-# ══════════════════════════════════════════════════════════════════════════════
+# ── ExchangeSnapshot query ───────────────────────────────────────────────────
 
 
-class TestReadLogOrder:
-    def test_no_log_file(self, tmp_path, monkeypatch):
-        import qooi.exchange.trading as tmod
-        monkeypatch.setattr(tmod, "LOG_DIR", tmp_path)
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        assert exe._read_log_order() is None
-
-    def test_cancelled_order_not_returned(self, tmp_path, monkeypatch):
-        import qooi.exchange.trading as tmod
-        monkeypatch.setattr(tmod, "LOG_DIR", tmp_path)
-        log_file = tmp_path / "exec_ETH_USDT_SWAP_4h.jsonl"
-        log_file.write_text(
-            json.dumps({"ts": 1, "event": "order", "payload": {"ord_id": "oid1", "side": "buy", "sz": 1, "px": 2500, "placed_at": time.time() - 5, "signal": 0.5}}) + "\n" +
-            json.dumps({"ts": 2, "event": "cancel", "payload": {"ord_id": "oid1", "reason": "timeout"}}) + "\n"
+class TestExchangeSnapshot:
+    def test_snapshot_queries_by_symbol(self):
+        snap = _snap(
+            orders=[{"instId": "ETH-USDT-SWAP", "ordId": "123"}],
+            positions=[{"instId": "ETH-USDT-SWAP", "posId": "p1"}],
+            algo_orders=[{"instId": "ETH-USDT-SWAP", "algoId": "a1"}],
         )
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        assert exe._read_log_order() is None, "Cancelled orders must not be returned"
-
-    def test_stale_order_not_returned(self, tmp_path, monkeypatch):
-        import qooi.exchange.trading as tmod
-        monkeypatch.setattr(tmod, "LOG_DIR", tmp_path)
-        log_file = tmp_path / "exec_ETH_USDT_SWAP_4h.jsonl"
-        old = time.time() - 100000  # very old
-        log_file.write_text(json.dumps({
-            "ts": 1, "event": "order",
-            "payload": {"ord_id": "stale", "side": "buy", "sz": 1, "px": 2500,
-                        "placed_at": old, "signal": 0.5},
-        }) + "\n")
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        assert exe._read_log_order() is None, "Stale orders (past timeout) must not be returned"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Duplicate prevention — end-to-end
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestDuplicatePrevention:
-    def test_pending_state_prevents_duplicate_entry(self):
-        """In PENDING state, _decide dispatches to _decide_pending, never enter."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._state = State.PENDING
-        exe._position = _pos()
-        d = exe._decide(_sig(0.6), _obi(), SyncFacts(), FillFacts())
-        assert d.action != "enter", f"PENDING must not enter, got {d.action}"
-
-    def test_sync_empty_with_log_order_prevents_duplicate(self, tmp_path, monkeypatch):
-        """Bug 1 end-to-end: API empty, log has order → PENDING → skip, not enter."""
-        import qooi.exchange.trading as tmod
-        monkeypatch.setattr(tmod, "LOG_DIR", tmp_path)
-        log_file = tmp_path / "exec_ETH_USDT_SWAP_4h.jsonl"
-        log_file.write_text(json.dumps({
-            "ts": int(time.time() * 1000) - 10000,
-            "event": "order",
-            "symbol": "ETH-USDT-SWAP", "tf": "4h",
-            "payload": {"ord_id": "dup_oid", "side": "sell", "sz": 1.0,
-                        "px": 2276.0, "placed_at": time.time() - 5, "signal": -0.319},
-        }) + "\n")
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        class FakeClient:
-            def pending(self): return []
-            def positions(self): return []
-        exe._client = FakeClient()
-        exe._dry = False
-        # This simulates what step() does:
-        facts = exe.sync()
-        sr = _sig(-0.4, threshold=0.25)
-        d = exe._decide(sr, _obi(imb=-0.5), facts, FillFacts())
-        assert d.action != "enter", f"Duplicate prevented: got {d.action} (log order should cause PENDING → skip)"
-
-    def test_phantom_cancel_allows_reentry(self):
-        """Bug 2: After cancel clears position to IDLE, strong signal re-enters."""
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=10000, max_position_pct=0.5, leverage=2.0)
-        exe._state = State.PENDING
-        exe._position = _pos()
-        # Simulate fill.missing → position=None, state=IDLE
-        d = exe._decide(_sig(0.5), _obi(), SyncFacts(), FillFacts(missing=True))
-        assert exe._state == State.IDLE, "After missing fill, state must be IDLE"
-        assert exe._position is None
-        # Next cycle: strong signal → should enter
-        d2 = exe._decide(_sig(0.5), _obi(), SyncFacts(), FillFacts())
-        assert d2.action == "enter", f"After phantom cancel, strong signal must re-enter, got {d2.action}: {d2.detail}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Adaptive threshold
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestAdaptiveThreshold:
-    def test_min_when_ema_zero(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._signal_threshold = 0.25; exe._pnl_ema = 0.0
-        assert abs(exe._entry_threshold() - 0.15625) < 0.01
-
-    def test_positive_ema_lowers(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._signal_threshold = 0.25; exe._pnl_ema = 0.01
-        assert exe._entry_threshold() < 0.25
-
-    def test_negative_ema_raises(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True)
-        exe._signal_threshold = 0.25; exe._pnl_ema = -0.03
-        assert exe._entry_threshold() > 0.25
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Position sizing
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestPositionSizing:
-    def test_contract_sizing_min_one(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=500, max_position_pct=0.50, leverage=2.0, ct_val=0.1)
-        exe._equity = [500]
-        assert exe._compute_size(0.3, 2500.0) == 1
-
-    def test_small_notional_returns_zero(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=1, max_position_pct=0.01, leverage=1.0, ct_val=1.0)
-        exe._equity = [1]
-        assert exe._compute_size(0.5, 2500.0) == 0
-
-    def test_drawdown_halves_leverage(self):
-        exe = LiveExecutor(symbol="ETH-USDT-SWAP", dry_run=True, initial_capital=10000, max_position_pct=0.5, leverage=2.0, ct_val=1.0)
-        exe._equity = [10000, 8000]  # 20% drawdown from peak
-        sz_normal = exe._compute_size(0.5, 100.0)
-        exe._equity = [10000]
-        sz_full = exe._compute_size(0.5, 100.0)
-        assert sz_normal < sz_full, "Drawdown should reduce position size"
+        assert snap.order_for_symbol("ETH-USDT-SWAP")["ordId"] == "123"
+        assert snap.position_for_symbol("ETH-USDT-SWAP")["posId"] == "p1"
+        assert snap.algos_for_symbol("ETH-USDT-SWAP")[0]["algoId"] == "a1"
+        assert snap.order_for_symbol("BTC-USDT-SWAP") is None
