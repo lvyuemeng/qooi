@@ -11,8 +11,6 @@ Covers every branch in:
 import json
 import time
 
-import pytest
-
 from qooi.exchange.backtest import RiskConfig
 from qooi.exchange.trading import (
     Decision,
@@ -22,7 +20,6 @@ from qooi.exchange.trading import (
     OrderPayload,
     PositionState,
     SignalResult,
-    SkipPayload,
     State,
     SyncFacts,
 )
