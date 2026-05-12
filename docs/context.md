@@ -24,21 +24,52 @@ Instruments: SPOT, SWAP (perp), FUTURES, OPTION.
 - `CacheStore` in `src/qooi/exchange/store.py` auto-paginates; call `refresh(days=1000, min_bars=2000)` for deep history
 - CCXT backend via `CcxtBackend` supports LBank, Gate, KuCoin for 2000+ bars
 
-## Current Strategy: OFI Flow (Spot-sourced, Swap-executed)
+## Current Strategies: 1H Dual-Strategy Ensemble
 
-Signal is computed from spot candles (clean volume data) and executed on perpetual swaps
-(positions persist, margin efficient).  Prices are 99.9% correlated between spot and swap.
+Two complementary strategies running on different assets, both at 1H timeframe.
+TP/SL handled by OKX Signal Bot server-side. Client sends ENTER (sub-order) or
+CLOSE (close-position) signals only.
+
+### Momentum Burst (ETH-USDT-SWAP)
 
 ```
-spot OHLCV → add_indicators → add_regime_features → add_ofi_flow_columns
-           → magnitude filter (|OFI| ≥ sig_threshold) → signal
-           → execute on SWAP (limit entry, market exit)
+1H OHLCV → add_indicators → momentum_1h_signal
+         → 6-bar return > 0.3%, EMA50>EMA200, ADX>20, volume > 1.5× avg
+         → session filter 08-22 UTC, trend maturity ≥20 bars
+         → signal = 1 (long) / -1 (short) / 0 (flat)
 ```
+
+Trend-following strategy: enters in the direction of established momentum,
+backed by ADX trend strength and volume confirmation. Exits via OKX server-side
+TP/SL or client-side trend-flip detection.
+
+### RSI Reversion (SOL-USDT-SWAP)
+
+```
+1H OHLCV → add_indicators → rsi_reversion_signal
+         → RSI(14) < 30 → bounce > 25 with confirmation bar
+         → EMA50>EMA200, ADX>20, session 08-22 UTC
+         → signal = 1 (long) / 0 (flat)  [long only]
+```
+
+Mean-reversion strategy: buys oversold bounces within confirmed uptrends.
+The confirmation bar rule prevents entries into continuing sell-offs.
+Exits via OKX server-side TP/SL or client-side RSI > 50 / trend-flip.
+
+### Why Two Strategies?
+
+Backtest evidence (93 trades over 83 days):
+- Momentum burst wins during trend accelerations (ETH, 67% WR)
+- RSI reversion wins during sharp oversold bounces (SOL, 78% WR)
+- They are complementary (uncorrelated entry triggers) and produce a
+  smoother combined equity curve than either alone.
 
 Key files:
-- `src/qooi/strategies/flow_pipeline.py` — OFI flow, regime features, regime gate
-- `src/qooi/exchange/trading.py` — LiveExecutor, PortfolioRunner, TradingClient
-- `scripts/trade.py` — entry point (testnet, live, backtest)
+- `src/qooi/strategies/momentum_1h.py` — 1H momentum burst state-machine with tiered exits
+- `src/qooi/strategies/rsi_reversion.py` — 1H RSI mean-reversion state-machine
+- `src/qooi/core/signal.py` — `compute_momentum_1h()`, `compute_rsi_reversion_1h()`
+- `src/qooi/exchange/trading.py` — TradingClient + signal bot endpoints
+- `scripts/trade.py` — live trading entry point (testnet, live)
 
 ## Glossary
 
@@ -49,9 +80,14 @@ Key files:
 | SWAP | Perpetual swap (no expiry, funding rate) |
 | ct_val | Contract value in base currency (ETH=0.1, SOL=1, BTC=0.01) |
 | ATR | Average True Range — volatility measure |
+| ADX | Average Directional Index — trend strength (0-100, >20 = trending) |
 | OFI | Order Flow Imbalance — directional volume fraction |
 | IC | Information Coefficient — rank correlation of signal with forward returns |
-| sig_threshold | Per-asset magnitude filter for OFI flow signals |
+| momentum burst | 6-bar directional persistence signal with volume and session filters |
+| RSI reversion | Oversold bounce in confirmed uptrend, long-only, with confirmation bar |
+| circuit breaker | 2 consecutive losses → suspend asset until 20-bar high/low break |
+| trend maturity | EMA50/200 direction must persist for ≥20 consecutive bars before entry |
+| signal bot | OKX server-driven execution engine — handles TP/SL autonomously |
 
 ## Data depth notes
 

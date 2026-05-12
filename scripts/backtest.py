@@ -34,7 +34,8 @@ def run_report(symbol: str, cache_path: str) -> None:
     nz_thresh = ofi.filter(ofi.abs() >= threshold).len()
     print(f"=== {symbol} — {df.height} bars ===")
     print(
-        f"  |OFI| stats: mean={ofi.mean():.4f} std={ofi.std():.4f} min={ofi.min():.4f} max={ofi.max():.4f}"
+        f"  |OFI| stats: mean={ofi.mean():.4f} std={ofi.std():.4f} "
+        f"min={ofi.min():.4f} max={ofi.max():.4f}"
     )
     print(f"  threshold: {threshold:.4f}  signals above: {nz_thresh} / {nz_all} non-zero")
     print(f"  Current |OFI|: {ofi[-1]:+.4f}  (above threshold: {abs(ofi[-1]) >= threshold})")

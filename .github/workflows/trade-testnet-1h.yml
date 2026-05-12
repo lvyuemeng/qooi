@@ -1,8 +1,8 @@
-name: qooi-testnet-4h
+name: qooi-testnet-1h
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 jobs:

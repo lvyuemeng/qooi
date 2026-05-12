@@ -107,6 +107,7 @@ class RiskConfig:
     trailing_distance_mult: float = 1.0
     max_bars_held: int = 0  # 0 = hold indefinitely; N = exit after N bars in ACTIVE
     atr_col: str = "atr_14"
+    ct_val: float = 1.0  # contract multiplier — 0.01 for BTC, 0.1 for ETH, 100 for XRP
 
 
 @dataclass
@@ -132,6 +133,8 @@ class Backtest:
     risk: RiskConfig = field(default_factory=RiskConfig)
     threshold: float | None = None  # per-asset threshold; None=use old 0.40/0.25/0.70
     ord_type: str = "limit"  # "limit" or "market"
+    exit_mode: str = "signal_flip_only"
+    # for stateful signals (ema_pullback*); "with_sl_tp" for flow_pipeline
 
     def run(self) -> BacktestResult:
         df = self.data.sort("timestamp").with_columns(self.signal_expr.alias("signal"))
@@ -163,7 +166,7 @@ class Backtest:
             capital=self.initial_capital,
             max_risk_pct=self.risk.max_risk_pct,
             leverage=self.risk.max_leverage,
-            ct_val=1.0,
+            ct_val=self.risk.ct_val,
             signal_threshold=self.threshold or 0.25,
         )
 
@@ -174,7 +177,6 @@ class Backtest:
         entry_px = 0.0
         sz = 0
         entry_ts = 0
-        entry_eq = self.initial_capital
 
         for i in range(1, n):
             prev_eq = equity[-1]
@@ -205,9 +207,14 @@ class Backtest:
                     entry_ts = int(timestamp_col[i - 1])
                     prev_eq *= 1.0 - self.cost.total_per_side
             else:
-                # ACTIVE — use decide_active with SL/TP enabled
+                # ACTIVE — use decide_active with configured exit_mode
                 d = decide_active(
-                    sr, pos_side, cfg, entry_px=entry_px, mark_px=cur_close, exit_mode="with_sl_tp"
+                    sr,
+                    pos_side,
+                    cfg,
+                    entry_px=entry_px,
+                    mark_px=cur_close,
+                    exit_mode=self.exit_mode,
                 )
                 if d.action.value == "exit":
                     d_sign = 1 if pos_side == "buy" else -1

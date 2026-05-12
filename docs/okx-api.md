@@ -180,3 +180,58 @@ market_data_api.get_tickers(instType=None)
 market_data_api.get_trades(instId, limit=None)
 market_data_api.get_trades_history(instId, after, before, limit)
 ```
+
+---
+
+## Signal Bot (tradingBot)
+
+The OKX Signal Bot is a server-driven execution engine. TP/SL are handled
+autonomously by OKX — the client only sends entry signals and close-position
+requests. This is the execution layer for qooi's 1H strategies.
+
+### Setup (one-time, see `scripts/setup_signal.py`)
+
+1. `POST /api/v5/tradingBot/signal/create-signal`
+   - Creates a signal channel → returns `signalChanId` + token
+
+2. `POST /api/v5/tradingBot/signal/order-algo`
+   - Creates a signal strategy with entry params and exit TP/SL
+   - `entryType: "3"` (fixed contracts), `subOrdType: "9"` (TradingView signal)
+   - `exitSettingParam.tpSlType: "price"` — TP/SL as % price change from entry
+   - Returns `algoId`
+
+### Trading (per bar, see `scripts/trade.py`)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `GET /signal/positions` | GET | Query current position: `pos` field (+N = long, -N = short, "0" = flat) |
+| `POST /signal/sub-order` | POST | Push an entry order (side, sz, px, ordType) — TP/SL NOT attached (set at creation) |
+| `POST /signal/close-position` | POST | Close all positions for this instrument |
+| `GET /signal/orders-algo-details` | GET | Bot-level P&L, config, frozen balance (not position state) |
+
+### Key differences from regular OKX trading
+
+- **TP/SL are set at strategy creation**, not per-order. The server handles them
+  autonomously — no trailing stop, no time stop, no client-side risk management
+  needed for basic stop/target.
+- **`signal/positions`** is the server-side source of truth for position state.
+  It tells you quantity, average price, P&L per instrument. This is what qooi
+  uses instead of file-persisted `_last_side` (stateless GitHub Actions fix).
+- **`sub-order` pushes a signal event**, not a direct order. The signal bot
+  translates the signal into orders based on the strategy config (entryType,
+  contract sizing, etc.).
+- **Signal channels** are webhook endpoints that can also receive TradingView
+  alerts. qooi uses them programmatically via the REST API (not webhooks).
+
+### Python SDK
+
+qooi wraps these in `TradingClient` (`src/qooi/exchange/trading.py`):
+
+```python
+tc.signal_create(name, desc)                    → signalChanId
+tc.signal_create_order_algo(chan_id, ...)       → algoId
+tc.signal_get_positions(algo_id)                → [{instId, pos, avgPx, ...}]
+tc.signal_push_sub_order(algo_id, ...)          → enter
+tc.signal_close_position(algo_id, ...)          → exit
+tc.signal_stop(algo_id, chan_id)                → cancel algo
+```

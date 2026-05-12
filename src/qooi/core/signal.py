@@ -1,9 +1,13 @@
 """Shared signal pipeline — identical for live trading and backtesting.
 
-Live:     signal = compute(symbol, timeframe, threshold)
-Backtest: df = compute_all(df, threshold) → adds "signal" column
+Live:     signal = compute_single(symbol, timeframe, threshold)
+Backtest: df = compute_dataframe(df, threshold) → adds "signal" column
 
 Both paths call the same subroutines in the same order.
+
+1H strategies: compute_momentum_1h() / compute_rsi_reversion_1h() re-run
+the full state-machine on each invocation, matching backtest behaviour
+exactly.
 """
 
 from __future__ import annotations
@@ -75,4 +79,76 @@ def compute_single(
         regime_strength=round(float(df["regime_strength"][-1] or 0.0), 3),
         mom_fast=round(float(df["regime_mom_fast"][-1] or 0.0), 3),
         vol_conf=round(float(df["regime_vol_conf"][-1] or 0.5), 3),
+    )
+
+
+def compute_momentum_1h(symbol: str, *, limit: int = 500) -> SignalResult | None:
+    """Compute 1H momentum burst signal for live trading.
+
+    Re-runs the full momentum_1h_signal state-machine on cached candles
+    (up to ``limit`` bars), returning the last bar's signal value.
+    Match the backtest behaviour exactly.
+    """
+    from qooi.exchange.market import MarketData
+    from qooi.strategies.momentum_1h import momentum_1h_signal
+
+    md = MarketData("okx")
+    df = md.candles(symbol, timeframe="1H", limit=limit, cache=True)
+    if df.is_empty():
+        return None
+    df = add_indicators(df)
+    df = momentum_1h_signal(
+        df,
+        mom_bars=6,
+        mom_threshold=0.003,
+        stop_mult=1.8,
+        target_mult=1.2,
+        max_bars_held=6,
+    )
+
+    sig = float(df["signal"][-1])
+    return SignalResult(
+        symbol=symbol,
+        timeframe="1h",
+        timestamp=int(df["timestamp"][-1]),
+        signal=sig,
+        threshold=0.01,
+        atr=round(float(df["atr_14"][-1] or 0.0), 2),
+    )
+
+
+def compute_rsi_reversion_1h(symbol: str, *, limit: int = 500) -> SignalResult | None:
+    """Compute 1H RSI reversion signal for live trading.
+
+    Re-runs the full rsi_reversion_signal state-machine on cached candles
+    (up to ``limit`` bars), returning the last bar's signal value.
+    Match the backtest behaviour exactly.
+    """
+    from qooi.exchange.market import MarketData
+    from qooi.strategies.rsi_reversion import rsi_reversion_signal
+
+    md = MarketData("okx")
+    df = md.candles(symbol, timeframe="1H", limit=limit, cache=True)
+    if df.is_empty():
+        return None
+    df = add_indicators(df)
+    df = rsi_reversion_signal(
+        df,
+        rsi_oversold=30,
+        rsi_bounce=25,
+        rsi_exit=50,
+        rsi_confirmation=20,
+        stop_mult=1.5,
+        target_mult=1.5,
+        max_bars_held=12,
+    )
+
+    sig = float(df["signal"][-1])
+    return SignalResult(
+        symbol=symbol,
+        timeframe="1h",
+        timestamp=int(df["timestamp"][-1]),
+        signal=sig,
+        threshold=0.01,
+        atr=round(float(df["atr_14"][-1] or 0.0), 2),
     )

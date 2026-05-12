@@ -21,9 +21,9 @@ from qooi.exchange.market import (
     OrderBookProvider,
     StreamProvider,
 )
+from qooi.exchange.trading import TradingClient
 
 __all__ = [
-    "SyncMarketData",
     "MarketData",
     "TradingClient",
     "ObSnapshot",

@@ -198,6 +198,22 @@ class TradingClient:
             )
         )
 
+    def signal_get_pending(self) -> dict:
+        return self._retry(
+            lambda: self._signal_api(
+                "GET", "signal/orders-algo-pending", {"algoOrdType": "contract"}
+            )
+        )
+
+    def signal_get_positions(self, algo_id: str) -> dict:
+        return self._retry(
+            lambda: self._signal_api(
+                "GET",
+                "signal/positions",
+                {"algoId": algo_id, "algoOrdType": "contract"},
+            )
+        )
+
     def signal_stop(self, algo_id: str, signal_chan_id: str) -> dict:
         return self._retry(
             lambda: self._signal_api(
@@ -221,14 +237,6 @@ class TradingClient:
         return resp
 
 
-from qooi.exchange.types import (  # noqa: F401
-    FillStatus,
-    OrderPayload,
-    PositionState,
-    State,
-)
-
-
 # ============================================================================
-# 2. Backtest data models — re-exports from qooi.exchange.types
+# 2. Backtest data models
 # ============================================================================

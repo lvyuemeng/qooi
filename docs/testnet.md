@@ -6,105 +6,113 @@ Perpetual swaps require a margin-enabled account.
 
 1. **OKX testnet/demo** → Settings → Account Mode → switch to **"Single-currency margin"**
 2. Transfer USDT from spot sub-account to swap sub-account
-3. Verify: `uv run python scripts/trade.py testnet` should not show error 51010
+3. Set up `.env.test`:
+   ```ini
+   OKX_API_KEY_TEST=your_key
+   OKX_SECRET_KEY_TEST=your_secret
+   OKX_PASSPHRASE_TEST=your_passphrase
+   OKX_FLAG=1
+   ```
+4. Create OKX signal channels + strategies:
+   ```bash
+   uv run python scripts/setup_signal.py testnet
+   ```
+5. Verify: `uv run python scripts/trade.py testnet` should show signal decisions without errors
 
 ## Daily Routine
-
-### Check state
 
 ```bash
 uv run python scripts/trade.py testnet
 ```
 
-This does everything: computes signals, syncs with exchange, manages risk, places/closes orders, prints a portfolio summary.
+This does everything: fetches 1H candles, runs the strategy state-machine,
+queries OKX position state, decides, and pushes orders to the signal bot.
 
 ### What the output means
 
 ```
-=== pre-flight ===
-  USDT   avail=4932.04 frozen=0      ← your swap margin balance
-  positions: 1 open                    ← open futures positions
-  pending orders: 0                    ← unfilled limit orders
-==================
+  ETH-USDT-SWAP        strategy=momentum_1h sig=+1 atr=42.5 pos=flat action=enter
+    ORDER buy sz=2 px=2320.50 sl=2250.0 tp=2367.0
 
-  SOL-USDT-SWAP   sig=+0.403 th=0.350  ← signal above threshold → entry
+  SOL-USDT-SWAP        strategy=rsi_reversion sig=0 atr=3.8 pos=flat action=hold (weak_signal)
 ```
 
-Possible outcomes:
+Action labels:
 
 | Output | Meaning |
 |--------|---------|
-| `ORDER buy sz=1 px=88.2 id=...` | Limit order placed — waiting for fill |
-| `skip (weak_signal)` | Signal below threshold — nothing to do |
-| `skip (order_filled)` | Previous order filled — now ACTIVE, managing risk |
-| `skip (holding)` | Position active — stops/targets/trails updated |
-| `ORDER sell sz=1 px=89.5` | Exit triggered — closing position |
-| `ERROR [51010]` | Account mode is "simple" — switch to margin mode |
-| `ERROR [51020]` | Order below minimum — increase capital or leverage |
+| `action=enter` | Signal fired — pushing order to OKX signal bot. Server handles TP/SL. |
+| `action=hold (weak_signal)` | No signal this bar — nothing to do |
+| `action=hold (holding)` | Position active — signal hasn't flipped |
+| `action=exit (signal_flipped)` | Signal reversed direction — closing position via signal bot |
+| `ORDER FAILED` | API error — check account mode, balance, or signal bot state |
 
-### Portfolio summary
+Position state is queried from `GET /signal/positions` (server-side truth).
+`pos=flat` means no position. `pos=buy` or `pos=sell` means holding.
 
-```
-## qooi Portfolio
+### What the strategies are doing
 
-Total: $5,001.30 (+0.03% since inception)
-  USDT free:   $4,932.04
-  USDT margin: $80.00
-
-  Positions:
-    SOL-USDT-SWAP   long  1ct @ $88.20 → $89.50  upl=+$1.30 (+1.6%)
-
-**ETH-USDT-SWAP**: T=0 | no trades
-**SOL-USDT-SWAP**: T=1 | 1 open @ $88.20
-```
-
-- **Total**: free USDT + margin + unrealized PnL
-- **upl**: unrealized profit/loss on open positions
-- **T**: number of orders placed this session
+| Strategy | Asset | What to expect |
+|----------|-------|---------------|
+| `momentum_1h` | ETH | Enters on strong 1H directional bursts (6-bar return > 0.3%) with volume confirmation. Signal stays at ±1 until trend flips. Frequent signals during trending markets, quiet during chop. |
+| `rsi_reversion` | SOL | Enters only on oversold bounces in uptrends (RSI < 30 then recovers). Long-only. Less frequent than momentum — expect 2-4 signals per week. |
 
 ## Fast Validation (Local)
 
-Run twice, 2-3 minutes apart, to observe the fill lifecycle:
+Run multiple times to observe different signal states:
 
 ```bash
-# Run 1 — place orders
+# See current signal state
 uv run python scripts/trade.py testnet
 
-# Wait 2-3 min for OKX to process fills...
+# Wait 1 hour for next bar...
 
-# Run 2 — check fill status, manage risk
+# See updated state (new candle, new signal)
 uv run python scripts/trade.py testnet
 ```
 
-If signals are strong enough (> threshold), you'll see:
-1. Run 1: `ORDER buy` → limit order placed
-2. Run 2: `skip (order_filled)` → position active → `skip (holding)` → risk managed
+If a strategy has a signal, you'll see `action=enter` and an `ORDER ...` line.
 
 ## GitHub Actions
 
-The system also runs automatically every 4 hours via GitHub Actions (`.github/workflows/trade-testnet-4h.yml`). Logs are uploaded as artifacts and retained for 90 days.
+The system runs automatically **every 1 hour** via GitHub Actions
+(`.github/workflows/trade-testnet-1h.yml`). Logs are uploaded as artifacts
+and retained for 90 days.
 
-Manual trigger: GitHub → Actions → `qooi-testnet-4h` → Run workflow.
+Manual trigger: GitHub → Actions → `qooi-testnet-1h` → Run workflow.
 
-On the Actions runner, orders persist because it's a Linux environment with stable network. The 4h cycle matches the signal's bar frequency.
+On the Actions runner, orders execute on the OKX testnet (server-side),
+so position state persists across GitHub Actions invocations. The strategy
+re-runs the full state-machine on each invocation (matching backtest).
 
 ## Cancel Stale Orders
 
 If orders accumulate from rapid local testing:
 
 ```bash
-uv run python scripts/_cleanup.py
+uv run python -c "
+from qooi.exchange.trading import TradingClient, load_okx_env
+import os
+os.environ['OKX_ENV'] = 'test'
+load_okx_env()
+tc = TradingClient()
+# Use signal_stop to cancel an algo
+"
 ```
-
-This cancels all pending orders and prints the clean state.
 
 ## FAQ
 
-**Q: Why no orders placed even with strong signal?**
-A: Check if swap sub-account has USDT. The margin gate requires `free_usdt >= 1.2 × required_margin`.
+**Q: Why no orders placed even with signal?**
+A: Check if swap sub-account has USDT. The signal bot needs available balance.
 
 **Q: Error 51010 "account mode"?**
 A: Account is in "simple" mode. Switch to "single-currency margin" in OKX settings.
 
-**Q: Why does the Summary say "no trades yet" even though I placed orders?**
-A: The reporting needs at least one completed buy→sell pair to compute PnL. Single buys show as "N open positions, no closed trades."
+**Q: Why is pos=flat after a previous ORDER?**
+A: The order may still be pending (limit order not filled yet). Check the OKX
+web interface to see if the order is filled or pending.
+
+**Q: Why does the signal change from 1 to 0 and back to 1 without a trade?**
+A: If the signal was 1 (long) and then the position was closed by OKX server-side
+TP/SL, the signal needs to flip to 0 before re-entering. The state-machine
+tracks EMA trend state — re-entry requires the full entry condition set again.
