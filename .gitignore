@@ -40,3 +40,4 @@ data/logs/
 # Logs
 *.log
 logs/
+nul
