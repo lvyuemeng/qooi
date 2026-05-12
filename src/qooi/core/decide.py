@@ -116,8 +116,42 @@ def decide_active(
     signal: SignalResult,
     pos_side: str,
     cfg: AssetConfig,
+    entry_px: float = 0.0,
+    mark_px: float = 0.0,
+    exit_mode: str = "signal_flip_only",
 ) -> Decision:
+    """Check if position should be exited.
+
+    exit_mode:
+      - signal_flip_only: only exit on direction reversal (live signal-bot)
+      - with_sl_tp: exit on signal flip, stop, or target breach (backtest)
+      - full: signal flip, stop, target, trailing stop (backtest + future)
+    """
     d = 1 if pos_side == "buy" else -1
+
     if signal.signal * d < 0:
         return Decision(action=Action.EXIT, side=pos_side, detail="signal_flipped")
+
+    if exit_mode in ("with_sl_tp", "full") and entry_px > 0 and mark_px > 0:
+        atr = signal.atr if signal.atr > 0 else 50.0
+        stop_m, target_m = compute_stop_target(pos_side, entry_px, atr, cfg, signal.regime_strength)
+        stop_px = entry_px - d * stop_m * atr if exit_mode else entry_px
+        target_px = entry_px + d * target_m * atr if exit_mode else entry_px
+        if d * (stop_px - mark_px) >= 0:
+            return Decision(
+                action=Action.EXIT,
+                side=pos_side,
+                detail="stop",
+                stop_px=stop_px,
+                target_px=target_px,
+            )
+        if d * (mark_px - target_px) >= 0:
+            return Decision(
+                action=Action.EXIT,
+                side=pos_side,
+                detail="target",
+                stop_px=stop_px,
+                target_px=target_px,
+            )
+
     return Decision(action=Action.HOLD, detail="holding")

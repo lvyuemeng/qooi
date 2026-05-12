@@ -205,21 +205,12 @@ class Backtest:
                     entry_ts = int(timestamp_col[i - 1])
                     prev_eq *= 1.0 - self.cost.total_per_side
             else:
-                # ACTIVE — use decide_active + SL/TP check
-                d = decide_active(sr, pos_side, cfg)
-                d_sign = 1 if pos_side == "buy" else -1
-                exit_reason = ""
-                if self.risk.atr_stop_mult > 0 and atr[i - 1] > 0:
-                    stop_px = entry_px - d_sign * self.risk.atr_stop_mult * atr[i - 1]
-                    target_px = entry_px + d_sign * self.risk.atr_target_mult * atr[i - 1]
-                    if d_sign * (stop_px - cur_close) >= 0:
-                        exit_reason = "stop"
-                    elif d_sign * (cur_close - target_px) >= 0:
-                        exit_reason = "target"
+                # ACTIVE — use decide_active with SL/TP enabled
+                d = decide_active(
+                    sr, pos_side, cfg, entry_px=entry_px, mark_px=cur_close, exit_mode="with_sl_tp"
+                )
                 if d.action.value == "exit":
-                    exit_reason = exit_reason or d.detail
-
-                if exit_reason:
+                    d_sign = 1 if pos_side == "buy" else -1
                     exit_px = cur_close * (1.0 - d_sign * self.cost.total_per_side)
                     pnl_pct = d_sign * (exit_px / entry_px - 1) if entry_px > 0 else 0.0
                     notional = sz * cfg.ct_val * entry_px
@@ -232,7 +223,7 @@ class Backtest:
                             "entry_price": entry_px,
                             "exit_price": exit_px,
                             "pnl": pnl_usd,
-                            "reason": exit_reason,
+                            "reason": d.detail,
                         }
                     )
                     prev_eq += pnl_usd
