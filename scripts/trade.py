@@ -1,232 +1,209 @@
-"""Trading script — single invocation for GitHub Actions workflows.
+"""Trading script — single invocation for GitHub Actions.
+
+Sends one signal per invocation to OKX Signal Bot.  OKX manages
+order lifecycle, TP/SL, position tracking — no Python state machine.
 
 Usage::
 
     uv run python scripts/trade.py testnet
     uv run python scripts/trade.py live [dry]
     uv run python scripts/trade.py backtest
+
+Pre-requisite: run scripts/setup_signal.py once per environment
+to create signal channels and strategies on OKX.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from pathlib import Path
 
-# ==========================================================================
-# Pair configs — single source of truth for all environments.
-# ==========================================================================
-TESTNET_PAIRS = [
+import polars as pl
+
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "data" / "signal_bot_config.json"
+
+PAIRS_CONFIG = [
     {
-        "exec_symbol": "ETH-USDT-SWAP",
+        "symbol": "ETH-USDT-SWAP",
         "sig_symbol": "ETH-USDT",
         "tf": "4h",
         "capital": 500,
-        "risk_pct": 0.50,
         "leverage": 2.0,
         "ct_val": 0.1,
-        "td_mode": "isolated",
         "sig_threshold": 0.25,
-        "ord_type": "limit",
     },
     {
-        "exec_symbol": "SOL-USDT-SWAP",
+        "symbol": "SOL-USDT-SWAP",
         "sig_symbol": "SOL-USDT",
         "tf": "4h",
         "capital": 200,
-        "risk_pct": 0.50,
         "leverage": 3.0,
         "ct_val": 1.0,
-        "td_mode": "isolated",
         "sig_threshold": 0.35,
-        "ord_type": "limit",
     },
     {
-        "exec_symbol": "BTC-USDT-SWAP",
+        "symbol": "BTC-USDT-SWAP",
         "sig_symbol": "BTC-USDT",
         "tf": "4h",
         "capital": 1000,
-        "risk_pct": 0.80,
         "leverage": 2.0,
         "ct_val": 0.01,
-        "td_mode": "isolated",
         "sig_threshold": 0.25,
-        "ord_type": "limit",
-    },
-]
-LIVE_PAIRS = [
-    {
-        "exec_symbol": "ETH-USDT-SWAP",
-        "sig_symbol": "ETH-USDT",
-        "tf": "4h",
-        "capital": 500,
-        "risk_pct": 0.50,
-        "leverage": 2.0,
-        "ct_val": 0.1,
-        "td_mode": "isolated",
-        "sig_threshold": 0.25,
-        "ord_type": "post_only",
-    },
-    {
-        "exec_symbol": "SOL-USDT-SWAP",
-        "sig_symbol": "SOL-USDT",
-        "tf": "4h",
-        "capital": 200,
-        "risk_pct": 0.50,
-        "leverage": 3.0,
-        "ct_val": 1.0,
-        "td_mode": "isolated",
-        "sig_threshold": 0.35,
-        "ord_type": "post_only",
-    },
-    {
-        "exec_symbol": "BTC-USDT-SWAP",
-        "sig_symbol": "BTC-USDT",
-        "tf": "4h",
-        "capital": 1000,
-        "risk_pct": 0.80,
-        "leverage": 2.0,
-        "ct_val": 0.01,
-        "td_mode": "isolated",
-        "sig_threshold": 0.25,
-        "ord_type": "post_only",
     },
 ]
 
 
-def _run(pairs: list[dict], dry_run: bool, env: str) -> None:
-    """Run portfolio step — single invocation, all state from OKX."""
-    os.environ["OKX_ENV"] = env
-    from qooi.exchange.trading import (
-        AssetConfig,
-        ExchangeSnapshot,
-        State,
-        StatelessExecutor,
-        Summary,
-        TradingClient,
-        default_signal_source,
-        load_okx_env,
-    )
-
-    load_okx_env()
-
-    tc = TradingClient()
-
-    # --- 0. Set leverage (sticky, call once) ---
-    for p in pairs:
-        try:
-            tc.set_leverage(p["exec_symbol"], int(p["leverage"]))
-        except Exception:
-            pass
-
-    # --- 1. Exchange snapshot ---
-    snap = tc.snapshot()
-    pre_usdt = snap.usdt_balance
-    pre_pos = len(snap.positions)
-
-    print("=== pre-flight ===")
-    print(f"  USDT avail={snap.usdt_balance:.2f}  frozen={snap.usdt_frozen:.2f}")
-    print(f"  positions: {pre_pos}  orders: {len(snap.orders)}  algos: {len(snap.algo_orders)}")
-    print("==================\n")
-
-    # --- 2. Signals ---
-    signals: dict[str, SignalResult] = {}  # noqa: F821
-    from qooi.exchange.trading import SignalResult
-
-    for p in pairs:
-        th = p["sig_threshold"]
-        src = default_signal_source(sig_threshold=th)
-        sig_sym = p["sig_symbol"]
-        exec_sym = p["exec_symbol"]
-        tf = p["tf"]
-        try:
-            s = src(sig_sym, tf)
-            if s is None:
-                raise RuntimeError("empty signal")
-        except Exception:
-            # API down — skip, no local fallback
-            print(f"  {exec_sym:20s}  skip (signal_unavailable)")
-            continue
-        s.symbol = exec_sym
-        signals[exec_sym] = s
-        print(f"  {exec_sym:20s} sig={s.signal:+.4f} flow={s.flow:+.4f} th={s.threshold:.3f}")
-
-    # --- 3. Frozen-capital gate ---
-    total_balance = snap.usdt_frozen + snap.usdt_balance
-    max_frozen_pct = 0.95 if env == "test" else 0.50
-    skip_idle = (snap.usdt_frozen / total_balance) >= max_frozen_pct if total_balance > 0 else False
-
-    # --- 4. Execute ---
+def _compute_signal(symbol: str, timeframe: str, threshold: float):
+    from qooi.exchange.indicator import add_indicators
     from qooi.exchange.market import MarketData
+    from qooi.exchange.trading import SignalResult
+    from qooi.strategies.flow_pipeline import (
+        add_ofi_flow_columns,
+        add_regime_features,
+        apply_regime_gate,
+    )
 
     md = MarketData("okx")
+    df = md.candles(symbol, timeframe=timeframe, limit=500, cache=True)
+    if df.is_empty():
+        return None
+    df = add_indicators(df)
+    df = add_regime_features(df)
+    df = add_ofi_flow_columns(df)
+    df = apply_regime_gate(df, signal_col="ofi_flow_score")
 
-    print(f"\n{'=' * 70}")
-    print(f"{'QOOI ' + env.upper():^70}")
-    print(f"{'=' * 70}")
-    print(f"  USDT: {snap.usdt_balance:>10.2f}  Positions: {pre_pos}  Orders: {len(snap.orders)}")
-    print(f"{'-' * 70}")
+    ofi = float(df["ofi_flow_score"][-1])
+    sig = round(ofi, 4) if abs(ofi) >= threshold else 0.0
+    atr = round(float(df["atr_14"][-1] or 0.0), 2)
+    regime = round(float(df["regime_strength"][-1] or 0.0), 3)
+    mom = round(float(df["regime_mom_fast"][-1] or 0.0), 3)
+    vol = round(float(df["regime_vol_conf"][-1] or 0.5), 3)
 
-    for p in pairs:
-        exec_sym = p["exec_symbol"]
-        config = AssetConfig(
-            symbol=exec_sym,
-            sig_symbol=p["sig_symbol"],
-            timeframe=p["tf"],
-            capital=p["capital"],
-            max_risk_pct=p["risk_pct"],
-            leverage=p["leverage"],
-            ct_val=p["ct_val"],
-            signal_threshold=p["sig_threshold"],
-            td_mode=p["td_mode"],
-            ord_type=p.get("ord_type", "limit"),
-        )
-        exe = StatelessExecutor(config)
-
-        sr = signals.get(exec_sym)
-        if sr is None:
-            print(f"  {exec_sym:20s}  skip (no_signal)")
-            continue
-
-        dummy = exe._reconstruct(snap, sr, None)
-        if skip_idle and dummy.state == State.IDLE:
-            print(f"  {exec_sym:20s}  skip (frozen_gate)")
-            continue
-
-        obi = None
-        if dummy.state in (State.IDLE, State.PENDING):
-            try:
-                obi = md.ob_snapshot(exec_sym, limit=5)
-            except Exception:
-                pass
-
-        decision, state = exe.step(snap, sr, obi, None if dry_run else tc)
-
-    # --- 5. Post-step summary ---
-    post_positions = tc.positions()
-    usdt_details = tc.balance("USDT")
-    post_usdt = float(usdt_details[0].get("availBal", 0)) if usdt_details else snap.usdt_balance
-    snap2 = ExchangeSnapshot(
-        orders=[], positions=post_positions, algo_orders=[], usdt_balance=post_usdt
+    return SignalResult(
+        symbol=symbol,
+        timeframe=timeframe,
+        timestamp=int(df["timestamp"][-1]),
+        signal=sig,
+        flow=round(ofi, 4),
+        threshold=threshold,
+        atr=atr,
+        regime_strength=regime,
+        mom_fast=mom,
+        vol_conf=vol,
     )
-    summary = Summary.from_snapshot(snap2, pre_usdt, [(p["exec_symbol"], p["tf"]) for p in pairs])
-    print(f"{'-' * 70}")
-    total = snap2.usdt_balance
-    for pos in snap2.positions:
-        total += float(pos.get("upl", 0))
-    print(f"  Total: {total:>10.2f}  USDT free: {snap2.usdt_balance:>8.2f}")
-    for pos in snap2.positions:
-        print(
-            f"  {pos['instId']:20s} {pos['posSide']:6s} sz={pos['pos']:>6s} "
-            f"upl={float(pos.get('upl', 0)):>+8.2f}"
-        )
-    print(f"{'=' * 70}\n")
-    summary.write_to()
+
+
+def _run(dry_run: bool, env: str) -> None:
+    os.environ["OKX_ENV"] = env
+    from qooi.exchange.trading import TradingClient, load_okx_env
+
+    load_okx_env()
+    tc = TradingClient()
+
+    configs = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+
+    for p in PAIRS_CONFIG:
+        sym = p["symbol"]
+        cfg = configs.get(sym)
+        if not cfg:
+            print(f"  {sym:20s}  skip (no signal bot config)")
+            continue
+
+        # 1. Compute signal
+        sr = _compute_signal(p["sig_symbol"], p["tf"], p["sig_threshold"])
+        if sr is None:
+            print(f"  {sym:20s}  skip (no_signal)")
+            continue
+        print(f"  {sym:20s} signal={sr.signal:+.4f} atr={sr.atr} regime={sr.regime_strength}")
+
+        # 2. Query strategy state from OKX signal bot
+        details = tc.signal_get_details(cfg["algo_id"])
+        bot_state = details if isinstance(details, dict) else {}
+        if isinstance(bot_state.get("data"), list) and bot_state["data"]:
+            bot_state = bot_state["data"][0]
+        frozen = float(bot_state.get("frozenBal", "0"))
+        float_pnl = float(bot_state.get("floatPnl", "0"))
+        has_position = frozen > 0 or abs(float_pnl) > 1
+
+        # 3. Decide
+        abs_sig = abs(sr.signal)
+        action = None
+        detail = ""
+
+        if not has_position:
+            if abs_sig < p["sig_threshold"]:
+                detail = "weak_signal"
+            else:
+                action = "enter"
+        else:
+            if sr.signal * (1 if float_pnl >= 0 else -1) < 0:
+                action = "exit"
+                detail = "signal_flipped"
+            else:
+                detail = "holding"
+
+        if dry_run:
+            label = f"[{action}] {detail}" if action else f"skip ({detail})"
+            print(f"  {sym:20s} {label}")
+            continue
+
+        # 4. Execute via signal bot
+        if action == "enter":
+            side = "buy" if sr.signal > 0 else "sell"
+            atr = sr.atr if sr.atr > 0 else 50.0
+            risk_per_ct = atr * 2.0 * p["ct_val"]
+            max_risk = p["capital"] * 0.50
+            sz = max(1, int(max_risk / risk_per_ct))
+            entry_px = 2300.0  # approximate; signal bot uses limit
+            notional_per_ct = p["ct_val"] * entry_px
+            max_sz = int(p["capital"] * p["leverage"] / max(notional_per_ct, 1))
+            sz = max(1, min(sz, max_sz))
+
+            d = 1 if side == "buy" else -1
+            stop_px = round(entry_px - d * 2.0 * atr, 2)
+            target_px = round(entry_px + d * 3.0 * atr, 2)
+
+            try:
+                tc.signal_push_sub_order(
+                    algo_id=cfg["algo_id"],
+                    signal_chan_id=cfg["signal_chan_id"],
+                    inst_id=sym,
+                    side=side,
+                    sz=str(int(sz)),
+                    ord_type="limit",
+                    px=str(entry_px),
+                    attach_algo_ords=[
+                        {
+                            "slTriggerPx": str(stop_px),
+                            "slOrdPx": "-1",
+                            "tpTriggerPx": str(target_px),
+                            "tpOrdPx": "-1",
+                            "cxlOnClosePos": "true",
+                        }
+                    ],
+                )
+                print(f"  {sym:20s} ORDER {side} sz={sz} sl={stop_px} tp={target_px}")
+            except Exception as e:
+                print(f"  {sym:20s} ORDER FAILED: {e}")
+
+        elif action == "exit":
+            try:
+                tc.signal_close_position(
+                    algo_id=cfg["algo_id"],
+                    signal_chan_id=cfg["signal_chan_id"],
+                    inst_id=sym,
+                )
+                print(f"  {sym:20s} CLOSE ({detail})")
+            except Exception as e:
+                print(f"  {sym:20s} CLOSE FAILED: {e}")
+
+        else:
+            print(f"  {sym:20s} skip ({detail})")
 
 
 def _backtest() -> None:
-    """Run backtest on cached data."""
-    import polars as pl
-
     from qooi.exchange.backtest import Backtest, CostModel
     from qooi.exchange.backtest import RiskConfig as BtRisk
     from qooi.exchange.indicator import add_indicators
@@ -234,8 +211,7 @@ def _backtest() -> None:
 
     cost = CostModel(commission_pct=0.00005)
 
-    for p in TESTNET_PAIRS:
-        exec_sym = p["exec_symbol"]
+    for p in PAIRS_CONFIG:
         sig_sym = p["sig_symbol"]
         tf = p["tf"]
         th = p["sig_threshold"]
@@ -244,7 +220,7 @@ def _backtest() -> None:
         try:
             df = pl.read_parquet(cache_path)
         except Exception:
-            print(f"**{exec_sym}**: no cache")
+            print(f"**{p['symbol']}**: no cache")
             continue
 
         df = add_indicators(df)
@@ -265,36 +241,21 @@ def _backtest() -> None:
         r = bt.run()
         m = r.metrics
         t = r.trades
-        print(f"\n=== {exec_sym} — {df.height} bars, th={th:.2f}, lev={lev:.1f} ===")
+        print(f"\n=== {p['symbol']} — {df.height} bars, th={th:.2f} ===")
         if t.height == 0:
             print("  No trades")
             continue
-        pnl = t["pnl"]
         print(f"  Trades: {t.height}  WR={m.win_rate_pct:.0f}%  Sharpe={m.sharpe_ratio:+.2f}")
         print(f"  Return: {m.total_return_pct:+.1f}%  DD: {m.max_drawdown_pct:.1f}%")
-        print(
-            f"  PnL: sum={pnl.sum():+.2f} avg={pnl.mean():+.3f} "
-            f"best={pnl.max():+.2f} worst={pnl.min():+.2f}"
-        )
-        n_long = t.filter(pl.col("side") == "long").height
-        print(f"  Sides: long={n_long} short={t.filter(pl.col('side') == 'short').height}")
-        vc = t["reason"].value_counts()
-        reasons = dict(zip(vc["reason"], vc["count"]))
-        print(
-            f"  Exits: stop={reasons.get('stop', 0)} "
-            f"target={reasons.get('target', 0)} "
-            f"trail={reasons.get('trailing_stop', 0)} "
-            f"signal={reasons.get('signal', 0)}"
-        )
 
 
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "testnet"
     if cmd == "testnet":
-        _run(TESTNET_PAIRS, dry_run=False, env="test")
+        _run(dry_run=False, env="test")
     elif cmd == "live":
         dry = sys.argv[2] != "live" if len(sys.argv) > 2 else True
-        _run(LIVE_PAIRS, dry_run=dry, env="live")
+        _run(dry_run=dry, env="live")
     elif cmd == "backtest":
         _backtest()
     else:
