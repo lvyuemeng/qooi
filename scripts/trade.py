@@ -1,16 +1,16 @@
-"""Trading script — single invocation for GitHub Actions.
+"""Live trading entry point — GitHub Actions single invocation.
 
-Sends one signal per invocation to OKX Signal Bot.  OKX manages
-order lifecycle, TP/SL, position tracking — no Python state machine.
+Uses shared signal pipeline (qooi.core.signal) and decision engine
+(qooi.core.decide) so backtest and live trade identically.
+
+Workflow:
+  1. Load signal bot config (created once by setup_signal.py)
+  2. For each pair: compute signal, query OKX state, decide, push
 
 Usage::
 
     uv run python scripts/trade.py testnet
     uv run python scripts/trade.py live [dry]
-    uv run python scripts/trade.py backtest
-
-Pre-requisite: run scripts/setup_signal.py once per environment
-to create signal channels and strategies on OKX.
 """
 
 from __future__ import annotations
@@ -20,11 +20,9 @@ import os
 import sys
 from pathlib import Path
 
-import polars as pl
-
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "data" / "signal_bot_config.json"
 
-PAIRS_CONFIG = [
+PAIRS = [
     {
         "symbol": "ETH-USDT-SWAP",
         "sig_symbol": "ETH-USDT",
@@ -55,164 +53,100 @@ PAIRS_CONFIG = [
 ]
 
 
-def _compute_signal(symbol: str, timeframe: str, threshold: float):
-    from qooi.exchange.indicator import add_indicators
-    from qooi.exchange.market import MarketData
-    from qooi.exchange.trading import SignalResult
-    from qooi.strategies.flow_pipeline import (
-        add_ofi_flow_columns,
-        add_regime_features,
-        apply_regime_gate,
-    )
-
-    md = MarketData("okx")
-    df = md.candles(symbol, timeframe=timeframe, limit=500, cache=True)
-    if df.is_empty():
-        return None
-    df = add_indicators(df)
-    df = add_regime_features(df)
-    df = add_ofi_flow_columns(df)
-    df = apply_regime_gate(df, signal_col="ofi_flow_score")
-
-    ofi = float(df["ofi_flow_score"][-1])
-    sig = round(ofi, 4) if abs(ofi) >= threshold else 0.0
-    atr = round(float(df["atr_14"][-1] or 0.0), 2)
-    regime = round(float(df["regime_strength"][-1] or 0.0), 3)
-    mom = round(float(df["regime_mom_fast"][-1] or 0.0), 3)
-    vol = round(float(df["regime_vol_conf"][-1] or 0.5), 3)
-
-    return SignalResult(
-        symbol=symbol,
-        timeframe=timeframe,
-        timestamp=int(df["timestamp"][-1]),
-        signal=sig,
-        flow=round(ofi, 4),
-        threshold=threshold,
-        atr=atr,
-        regime_strength=regime,
-        mom_fast=mom,
-        vol_conf=vol,
-    )
-
-
 def _run(dry_run: bool, env: str) -> None:
     os.environ["OKX_ENV"] = env
+    from qooi.core.decide import AssetConfig, decide_active, decide_idle
+    from qooi.core.signal import compute_single
+    from qooi.exchange.market import MarketData
     from qooi.exchange.trading import TradingClient, load_okx_env
 
     load_okx_env()
     tc = TradingClient()
-
+    md = MarketData("okx")
     configs = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
 
-    for p in PAIRS_CONFIG:
+    for p in PAIRS:
         sym = p["symbol"]
         cfg = configs.get(sym)
         if not cfg:
             print(f"  {sym:20s}  skip (no signal bot config)")
             continue
 
-        # 1. Compute signal
-        sr = _compute_signal(p["sig_symbol"], p["tf"], p["sig_threshold"])
-        if sr is None:
+        # 1. Shared signal pipeline
+        signal = compute_single(p["sig_symbol"], p["tf"], p["sig_threshold"])
+        if signal is None:
             print(f"  {sym:20s}  skip (no_signal)")
             continue
-        print(f"  {sym:20s} signal={sr.signal:+.4f} atr={sr.atr} regime={sr.regime_strength}")
 
-        # 2. Query strategy state from OKX signal bot
+        # 2. Query OKX signal bot state
         details = tc.signal_get_details(cfg["algo_id"])
-        bot_state = details if isinstance(details, dict) else {}
-        if isinstance(bot_state.get("data"), list) and bot_state["data"]:
-            bot_state = bot_state["data"][0]
-
-        frozen = float(bot_state.get("frozenBal", "0"))
-        float_pnl = float(bot_state.get("floatPnl", "0"))
+        bot = details if isinstance(details, dict) else {}
+        if isinstance(bot.get("data"), list) and bot["data"]:
+            bot = bot["data"][0]
+        frozen = float(bot.get("frozenBal", "0"))
         pos_side = cfg.get("_last_side", "")
-        has_position = (frozen > 0) and bool(pos_side) and abs(float_pnl) > 1
+        has_position = bool(pos_side) and frozen > 0
 
-        # 3. Decide — use config-persisted side for direction check
-        abs_sig = abs(sr.signal)
-        action = None
-        detail = ""
+        # 3. Decide (same functions as backtest)
+        asset_cfg = AssetConfig(
+            symbol=sym,
+            sig_symbol=p["sig_symbol"],
+            timeframe=p["tf"],
+            capital=p["capital"],
+            leverage=p["leverage"],
+            ct_val=p["ct_val"],
+            signal_threshold=p["sig_threshold"],
+            ord_type=p.get("ord_type", "limit"),
+        )
 
         if not has_position:
-            if abs_sig < p["sig_threshold"]:
-                detail = "weak_signal"
-            # Momentum confirmation
-            elif abs(sr.mom_fast) > 0.3 and sr.signal * sr.mom_fast < 0:
-                detail = "momentum_opposing"
-            # Volume drought
-            elif sr.vol_conf < 0.3:
-                detail = "low_volume"
-            else:
-                action = "enter"
+            obi = md.ob_snapshot(sym, limit=1)
+            entry_px = obi.ask_price if obi else 0
+            side = "buy" if signal.signal > 0 else "sell"
+            if side == "sell" and obi:
+                entry_px = obi.bid_price
+            d = decide_idle(signal, entry_px, side, asset_cfg)
         else:
-            # pos_side is "buy" (long) or "sell" (short)
-            d = 1 if pos_side == "buy" else -1
-            if sr.signal * d < 0:
-                action = "exit"
-                detail = "signal_flipped"
-            else:
-                detail = "holding"
+            d = decide_active(signal, pos_side, asset_cfg)
+
+        print(
+            f"  {sym:20s} sig={signal.signal:+.4f} atr={signal.atr} "
+            f"action={d.action.value} {d.detail}"
+        )
 
         if dry_run:
-            label = f"[{action}] {detail}" if action else f"skip ({detail})"
-            print(f"  {sym:20s} {label}")
             continue
 
-        # 4. Execute via signal bot
-        if action == "enter":
-            side = "buy" if sr.signal > 0 else "sell"
-            atr = sr.atr if sr.atr > 0 else 50.0
-
-            # Fetch real entry price from order book
-            from qooi.exchange.market import MarketData
-
-            md = MarketData("okx")
-            obi = md.ob_snapshot(p.get("exec_symbol", sym), limit=1)
-            if obi:
-                entry_px = obi.ask_price if side == "buy" else obi.bid_price
-            else:
-                entry_px = 2300.0  # fallback
-            entry_px = round(entry_px, 2)
-
-            risk_per_ct = atr * 2.0 * p["ct_val"]
-            max_risk = p["capital"] * 0.50
-            sz = max(1, int(max_risk / risk_per_ct))
-            notional_per_ct = p["ct_val"] * entry_px
-            max_sz = int(p["capital"] * p["leverage"] / max(notional_per_ct, 1))
-            sz = max(1, min(sz, max_sz))
-
-            d = 1 if side == "buy" else -1
-            stop_px = round(entry_px - d * 2.0 * atr, 2)
-            target_px = round(entry_px + d * 3.0 * atr, 2)
-
+        # 4. Execute
+        if d.action.value == "enter":
             try:
                 tc.signal_push_sub_order(
                     algo_id=cfg["algo_id"],
                     signal_chan_id=cfg["signal_chan_id"],
                     inst_id=sym,
-                    side=side,
-                    sz=str(int(sz)),
-                    ord_type="limit",
-                    px=str(entry_px),
+                    side=d.side,
+                    sz=str(int(d.sz)),
+                    ord_type=asset_cfg.ord_type,
+                    px=str(d.entry_px),
                     attach_algo_ords=[
                         {
-                            "slTriggerPx": str(stop_px),
+                            "slTriggerPx": str(d.stop_px),
                             "slOrdPx": "-1",
-                            "tpTriggerPx": str(target_px),
+                            "tpTriggerPx": str(d.target_px),
                             "tpOrdPx": "-1",
                             "cxlOnClosePos": "true",
                         }
                     ],
                 )
-                # Persist side to config for next invocation
-                configs[sym]["_last_side"] = side
+                configs[sym]["_last_side"] = d.side
                 CONFIG_PATH.write_text(json.dumps(configs, indent=2))
-                print(f"  {sym:20s} ORDER {side} sz={sz} px={entry_px} sl={stop_px} tp={target_px}")
+                print(
+                    f"    ORDER {d.side} sz={d.sz} px={d.entry_px} sl={d.stop_px} tp={d.target_px}"
+                )
             except Exception as e:
-                print(f"  {sym:20s} ORDER FAILED: {e}")
+                print(f"    ORDER FAILED: {e}")
 
-        elif action == "exit":
+        elif d.action.value == "exit":
             try:
                 tc.signal_close_position(
                     algo_id=cfg["algo_id"],
@@ -221,71 +155,18 @@ def _run(dry_run: bool, env: str) -> None:
                 )
                 configs[sym]["_last_side"] = ""
                 CONFIG_PATH.write_text(json.dumps(configs, indent=2))
-                print(f"  {sym:20s} CLOSE ({detail})")
+                print(f"    CLOSE ({d.detail})")
             except Exception as e:
-                print(f"  {sym:20s} CLOSE FAILED: {e}")
-
-        else:
-            print(f"  {sym:20s} skip ({detail})")
-
-
-def _backtest() -> None:
-    from qooi.exchange.backtest import Backtest, CostModel
-    from qooi.exchange.backtest import RiskConfig as BtRisk
-    from qooi.exchange.indicator import add_indicators
-    from qooi.strategies.flow_pipeline import add_ofi_flow_columns, add_regime_features
-
-    cost = CostModel(commission_pct=0.00005)
-
-    for p in PAIRS_CONFIG:
-        sig_sym = p["sig_symbol"]
-        tf = p["tf"]
-        th = p["sig_threshold"]
-        lev = p["leverage"]
-        cache_path = f"data/cache/{sig_sym.replace('-', '_')}_{tf.replace(' ', '').upper()}.parquet"
-        try:
-            df = pl.read_parquet(cache_path)
-        except Exception:
-            print(f"**{p['symbol']}**: no cache")
-            continue
-
-        df = add_indicators(df)
-        df = add_regime_features(df)
-        df = add_ofi_flow_columns(df)
-        ofi = df["ofi_flow_score"]
-        sig = pl.when(ofi.abs() >= th).then(ofi).otherwise(0.0)
-        df = df.with_columns(sig.alias("signal"))
-
-        risk = BtRisk(
-            atr_stop_mult=2.0,
-            atr_target_mult=3.0,
-            max_leverage=min(lev, 0.4),
-            trailing_activation_mult=2.0,
-            trailing_distance_mult=1.0,
-        )
-        bt = Backtest(df, pl.col("signal"), cost=cost, risk=risk, threshold=th, ord_type="market")
-        r = bt.run()
-        m = r.metrics
-        t = r.trades
-        print(f"\n=== {p['symbol']} — {df.height} bars, th={th:.2f} ===")
-        if t.height == 0:
-            print("  No trades")
-            continue
-        print(f"  Trades: {t.height}  WR={m.win_rate_pct:.0f}%  Sharpe={m.sharpe_ratio:+.2f}")
-        print(f"  Return: {m.total_return_pct:+.1f}%  DD: {m.max_drawdown_pct:.1f}%")
+                print(f"    CLOSE FAILED: {e}")
 
 
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "testnet"
-    if cmd == "testnet":
-        _run(dry_run=False, env="test")
-    elif cmd == "live":
-        dry = sys.argv[2] != "live" if len(sys.argv) > 2 else True
-        _run(dry_run=dry, env="live")
-    elif cmd == "backtest":
-        _backtest()
+    if cmd in ("testnet", "live"):
+        dry = cmd == "live" and (len(sys.argv) <= 2 or sys.argv[2] != "live")
+        _run(dry_run=dry, env="test" if cmd == "testnet" else "live")
     else:
-        print("Usage: uv run python scripts/trade.py testnet|live|backtest [dry]")
+        print("Usage: uv run python scripts/trade.py testnet|live [dry]")
         sys.exit(1)
 
 

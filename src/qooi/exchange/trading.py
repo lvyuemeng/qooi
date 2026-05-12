@@ -1,19 +1,13 @@
-"""OKX trading — orders, signals, execution, portfolio management.
+"""OKX trading client — thin SDK wrapper + signal bot endpoints.
 
-Typed data layer using pydantic — no raw dicts in public-facing API.
-Side-effectful operations (IO, network) are separated from pure data models.
+All strategy logic lives in qooi.core.  This file is pure I/O.
 """
 
 from __future__ import annotations
 
 import enum
-import io
-import json
 import os
-import sys
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -43,14 +37,8 @@ def load_okx_env(env_path: str | None = None) -> None:
     load_dotenv(path, override=True) if path else load_dotenv(override=True)
 
 
-LOG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-SIGNAL_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "signals"
-SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
-
-
 # ============================================================================
-# 1. Trading client — thin SDK wrapper
+# 1. Trading client
 # ============================================================================
 
 
@@ -98,42 +86,6 @@ class TradingClient:
         if last_err is not None:
             raise last_err
 
-    # -- single-asset snapshot (replaces 4 separate REST calls) -----------------
-
-    def snapshot(self) -> ExchangeSnapshot:
-        """Query all exchange state in one go."""
-
-        def _list(fn, *args, **kwargs):
-            resp = fn(*args, **kwargs)
-            if int(resp.get("code", -1)) != 0:
-                raise RuntimeError(
-                    f"OKX error [{resp.get('code')}]: {resp.get('msg')} data={resp.get('data')}"
-                )
-            return resp.get("data", []) or []
-
-        orders = self._retry(lambda: _list(self._trade.get_order_list))
-        positions = self._retry(lambda: _list(self._account.get_positions))
-        balance_data = self._retry(lambda: _list(self._account.get_account_balance))
-        algos = self._retry(lambda: _list(self._trade.order_algos_list, ordType="conditional,oco"))
-
-        details = balance_data[0].get("details", []) if balance_data else []
-
-        usdt_avail = 0.0
-        usdt_frozen = 0.0
-        for d in details:
-            if d.get("ccy") == "USDT":
-                usdt_avail = float(d.get("availBal", 0))
-                usdt_frozen = float(d.get("frozenBal", 0))
-                break
-
-        return ExchangeSnapshot(
-            orders=orders,
-            positions=positions or [],
-            algo_orders=algos or [],
-            usdt_balance=usdt_avail,
-            usdt_frozen=usdt_frozen,
-        )
-
     # -- order operations -------------------------------------------------------
 
     def place(
@@ -159,44 +111,6 @@ class TradingClient:
     def cancel(self, inst_id: str, ord_id: str) -> dict:
         return self._okx(self._trade.cancel_order(instId=inst_id, ordId=ord_id))
 
-    def amend(
-        self, inst_id: str, ord_id: str, new_sz: str | None = None, new_px: str | None = None
-    ) -> dict:
-        params: dict = {"instId": inst_id, "ordId": ord_id}
-        if new_sz is not None:
-            params["newSz"] = new_sz
-        if new_px is not None:
-            params["newPx"] = new_px
-        return self._okx(self._trade.amend_order(**params))
-
-    def cancel_algo(self, inst_id, algo_id):
-        return self._okx(self._trade.cancel_algo_order(instId=inst_id, algoId=algo_id))
-
-    def amend_algo(
-        self,
-        inst_id: str,
-        algo_id: str,
-        new_sl_trigger_px: str = "",
-        new_sl_ord_px: str = "",
-        new_tp_trigger_px: str = "",
-        new_tp_ord_px: str = "",
-    ) -> dict:
-        params: dict = {"instId": inst_id, "algoId": algo_id}
-        if new_sl_trigger_px:
-            params["newSlTriggerPx"] = new_sl_trigger_px
-        if new_sl_ord_px:
-            params["newSlOrdPx"] = new_sl_ord_px
-        if new_tp_trigger_px:
-            params["newTpTriggerPx"] = new_tp_trigger_px
-        if new_tp_ord_px:
-            params["newTpOrdPx"] = new_tp_ord_px
-        return self._okx(self._trade.amend_algo_order(**params))
-
-    # -- position / account -----------------------------------------------------
-
-    def close_position(self, inst_id, mgn_mode="isolated"):
-        return self._okx(self._trade.close_positions(instId=inst_id, mgnMode=mgn_mode))
-
     def set_leverage(self, inst_id, lever, mgn_mode="isolated"):
         return self._okx(
             self._account.set_leverage(instId=inst_id, lever=str(lever), mgnMode=mgn_mode)
@@ -206,13 +120,9 @@ class TradingClient:
         p = {} if not ccy else {"ccy": ccy}
         return self._okx(self._account.get_account_balance(**p)).get("details", [])
 
-    def positions(self) -> list:
-        return self._okx(self._account.get_positions()).get("posData", [])
-
-    # -- signal bot (tradingBot endpoints, not in SDK) --------------------------
+    # -- signal bot (tradingBot endpoints, not in python-okx SDK) ---------------
 
     def signal_create(self, signal_chan_name: str, signal_chan_desc: str = "") -> dict:
-        """POST /api/v5/tradingBot/signal/create-signal"""
         params = {"signalChanName": signal_chan_name}
         if signal_chan_desc:
             params["signalChanDesc"] = signal_chan_desc
@@ -232,7 +142,6 @@ class TradingClient:
         allow_multiple_entry: bool = False,
         algo_cl_ord_id: str = "",
     ) -> dict:
-        """POST /api/v5/tradingBot/signal/order-algo"""
         params: dict = {
             "signalChanId": signal_chan_id,
             "instIds": inst_ids,
@@ -244,11 +153,7 @@ class TradingClient:
                 "entryType": entry_type,
                 "amt": amt or "",
             },
-            "exitSettingParam": {
-                "tpSlType": "price",
-                "tpPct": tp_pct,
-                "slPct": sl_pct,
-            },
+            "exitSettingParam": {"tpSlType": "price", "tpPct": tp_pct, "slPct": sl_pct},
         }
         if invest_amt:
             params["investAmt"] = invest_amt
@@ -267,7 +172,6 @@ class TradingClient:
         px: str = "",
         attach_algo_ords: list[dict] | None = None,
     ) -> dict:
-        """POST /api/v5/tradingBot/signal/sub-order"""
         params: dict = {
             "algoId": algo_id,
             "signalChanId": signal_chan_id,
@@ -283,70 +187,33 @@ class TradingClient:
         return self._retry(lambda: self._signal_api("POST", "signal/sub-order", params))
 
     def signal_get_details(self, algo_id: str) -> dict:
-        """GET /api/v5/tradingBot/signal/orders-algo-details"""
         return self._retry(
             lambda: self._signal_api(
-                "GET",
-                "signal/orders-algo-details",
-                {"algoId": algo_id, "algoOrdType": "contract"},
-            )
-        )
-
-    def signal_get_active(self) -> list[dict]:
-        """GET /api/v5/tradingBot/signal/active-orders"""
-        result = self._retry(
-            lambda: self._signal_api("GET", "signal/active-orders", {"algoOrdType": "contract"})
-        )
-        if isinstance(result, dict):
-            data = result.get("data", result)
-            return data if isinstance(data, list) else [result]
-        return result or []
-
-    def signal_stop(self, algo_id: str, signal_chan_id: str) -> dict:
-        """POST /api/v5/tradingBot/signal/cancel-algo"""
-        return self._retry(
-            lambda: self._signal_api(
-                "POST",
-                "signal/cancel-algo",
-                {
-                    "algoId": algo_id,
-                    "signalChanId": signal_chan_id,
-                },
+                "GET", "signal/orders-algo-details", {"algoId": algo_id, "algoOrdType": "contract"}
             )
         )
 
     def signal_close_position(self, algo_id: str, signal_chan_id: str, inst_id: str) -> dict:
-        """POST /api/v5/tradingBot/signal/close-position"""
         return self._retry(
             lambda: self._signal_api(
                 "POST",
                 "signal/close-position",
-                {
-                    "algoId": algo_id,
-                    "signalChanId": signal_chan_id,
-                    "instId": inst_id,
-                },
+                {"algoId": algo_id, "signalChanId": signal_chan_id, "instId": inst_id},
             )
         )
 
-    def signal_amend_tpsl(
-        self, algo_id: str, signal_chan_id: str, tp_pct: str = "", sl_pct: str = ""
-    ) -> dict:
-        """POST /api/v5/tradingBot/signal/amend-tpsl"""
-        params: dict = {"algoId": algo_id, "signalChanId": signal_chan_id}
-        if tp_pct:
-            params["tpPct"] = tp_pct
-        if sl_pct:
-            params["slPct"] = sl_pct
-        return self._retry(lambda: self._signal_api("POST", "signal/amend-tpsl", params))
+    def signal_stop(self, algo_id: str, signal_chan_id: str) -> dict:
+        return self._retry(
+            lambda: self._signal_api(
+                "POST", "signal/cancel-algo", {"algoId": algo_id, "signalChanId": signal_chan_id}
+            )
+        )
 
     def _signal_api(self, method: str, path: str, params: dict) -> dict:
-        """Call tradingBot endpoint using SDK's internal HTTP client."""
         url = f"/api/v5/tradingBot/{path}"
         if method == "GET":
             resp = self._trade.get(url=url, params=params)
         else:
-            # SDK's _request_with_params expects body in "params" kwarg for POST
             resp = self._trade._request_with_params("POST", url, params)
         if isinstance(resp, dict):
             code = resp.get("code", -1)
@@ -357,141 +224,23 @@ class TradingClient:
                 )
         return resp
 
-    def _get_trading_bot(self, path: str, params: dict) -> dict:
-        """Raw GET to tradingBot endpoint."""
-        import base64
-        import hashlib
-        import hmac
-
-        import requests as _requests
-
-        flag = os.getenv("OKX_FLAG", "1")
-        k = self._trade.api_key
-        s = self._trade.secret_key
-        p = self._trade.passphrase
-        base_url = "https://www.okx.com" if flag == "1" else "https://www.okx.com"
-        timestamp = str(int(time.time()))
-        query = "&".join(f"{key}={val}" for key, val in params.items())
-        sign_msg = timestamp + "GET" + "/api/v5/tradingBot/" + path + "?" + query
-        sign = base64.b64encode(
-            hmac.new(s.encode(), sign_msg.encode(), hashlib.sha256).digest()
-        ).decode()
-        headers = {
-            "OK-ACCESS-KEY": k,
-            "OK-ACCESS-SIGN": sign,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": p,
-            "Content-Type": "application/json",
-        }
-        if os.getenv("OKX_ENV") == "test":
-            headers["x-simulated-trading"] = "1"
-        resp = _requests.get(
-            f"{base_url}/api/v5/tradingBot/{path}",
-            headers=headers,
-            params=params,
-            timeout=10,
-        )
-        return resp.json()
-
 
 # ============================================================================
-# 2. Exchange snapshot — full state from OKX (zero local data)
+# 2. Backtest data models — used by backtest.py only
 # ============================================================================
 
 
-@dataclass
-class ExchangeSnapshot:
-    """Full exchange state queried at invocation start — single source of truth.
-
-    Replaces 4 separate REST calls (pending + positions + balance + algos).
-    No local persistence — everything comes from OKX.
-    """
-
-    orders: list[dict]  # GET /trade/orders-pending
-    positions: list[dict]  # GET /account/positions
-    algo_orders: list[dict]  # GET /trade/orders-algo-pending
-    usdt_balance: float  # USDT availBal from GET /account/balance
-    usdt_frozen: float = 0.0  # USDT frozenBal from GET /account/balance
-
-    def order_for_symbol(self, inst_id: str) -> dict | None:
-        for o in self.orders:
-            if o.get("instId") == inst_id:
-                return o
-        return None
-
-    def position_for_symbol(self, inst_id: str) -> dict | None:
-        for p in self.positions:
-            if p.get("instId") == inst_id:
-                return p
-        return None
-
-    def algos_for_symbol(self, inst_id: str) -> list[dict]:
-        return [a for a in self.algo_orders if a.get("instId") == inst_id]
+class FillStatus(enum.StrEnum):
+    PLACED = "placed"
+    PARTIAL = "partial_fill"
+    FILLED = "filled"
+    SIMULATED = "simulated"
 
 
-# ============================================================================
-# 3. Pure data models — all pydantic, zero side-effects
-# ============================================================================
-
-# -- signals ---------------------------------------------------------------
-
-
-class SignalResult(BaseModel):
-    symbol: str
-    timeframe: str
-    timestamp: int
-    signal: float
-    flow: float = 0.0
-    threshold: float = 0.0
-    atr: float = 0.0
-    regime_strength: float = 0.0
-    mom_fast: float = 0.0
-    vol_conf: float = 0.5
-    computed_at: int = 0
-
-    @classmethod
-    def from_dataframe(cls, symbol: str, timeframe: str, df) -> SignalResult:
-        sv = float(df["signal"][-1] or 0.0)
-        fv = float(df["ofi_flow_score"][-1] or 0.0) if "ofi_flow_score" in df.columns else 0.0
-        atr_val = float(df["atr_14"][-1] or 0.0) if "atr_14" in df.columns else 0.0
-        rs = float(df["regime_strength"][-1] or 0.0) if "regime_strength" in df.columns else 0.0
-        mf = float(df["regime_mom_fast"][-1] or 0.0) if "regime_mom_fast" in df.columns else 0.0
-        vc = float(df["regime_vol_conf"][-1] or 0.5) if "regime_vol_conf" in df.columns else 0.5
-        return cls(
-            symbol=symbol,
-            timeframe=timeframe,
-            timestamp=int(df["timestamp"][-1]),
-            signal=round(sv, 4),
-            flow=round(fv, 4),
-            atr=round(atr_val, 2),
-            regime_strength=round(rs, 3),
-            mom_fast=round(mf, 3),
-            vol_conf=round(vc, 3),
-            computed_at=int(time.time()),
-        )
-
-
-# -- log payloads ----------------------------------------------------------
-
-
-class SkipPayload(BaseModel):
-    reason: str = ""
-
-
-class SignalPayload(BaseModel):
-    signal: float = 0.0
-    obi_5: float = 0.0
-    ofi_flow: float = 0.0
-    cl_ord_id: str = ""
-
-
-class CancelPayload(BaseModel):
-    reason: str = ""
-    ord_id: str = ""
-
-
-class ErrorPayload(BaseModel):
-    error: str = ""
+class State(enum.StrEnum):
+    IDLE = "idle"
+    PENDING = "pending"
+    ACTIVE = "active"
 
 
 class OrderPayload(BaseModel):
@@ -511,33 +260,7 @@ class OrderPayload(BaseModel):
     cl_ord_id: str = ""
 
 
-LogPayload = SignalPayload | OrderPayload | SkipPayload | CancelPayload | ErrorPayload
-
-
-# -- enums -----------------------------------------------------------------
-
-
-class FillStatus(enum.StrEnum):
-    PLACED = "placed"
-    PARTIAL = "partial_fill"
-    FILLED = "filled"
-    SIMULATED = "simulated"
-
-
-class State(enum.StrEnum):
-    IDLE = "idle"
-    PENDING = "pending"
-    ACTIVE = "active"
-
-
-# -- position state (preserved for backtest.py compatibility) --------------
-
-
 class PositionState(BaseModel):
-    """Bundles active order + risk management into one state object.
-
-    Used by both live executor and backtest engine."""
-
     order: OrderPayload = OrderPayload()
     stop_price: float = -1.0
     target_price: float = -1.0
@@ -599,857 +322,3 @@ class PositionState(BaseModel):
                 if cur_close - self.trail_low >= risk.trailing_distance_mult * atr:
                     return "trailing_stop"
         return None
-
-
-# -- decision (pure output of state machine) -------------------------------
-
-
-@dataclass
-class Decision:
-    action: str  # "enter" | "exit" | "amend" | "skip"
-    new_state: State = State.IDLE
-    side: str = ""
-    sz: float = 0.0
-    entry_px: float = 0.0
-    exit_px: float = 0.0
-    detail: str = ""
-
-    # risk parameters set at entry
-    stop_px: float | None = None
-    target_px: float | None = None
-
-    # amendments
-    new_stop: float | None = None
-    new_target: float | None = None
-    scale_out_pct: float = 0.0
-    amend_px: float | None = None
-    amend_sz: float | None = None
-
-    # algo trailing
-    amend_sl_trigger_px: str = ""
-    amend_sl_ord_px: str = ""
-
-    @classmethod
-    def exit(cls, reason: str, px: float = 0.0, new_state: State = State.IDLE) -> Decision:
-        return cls(action="exit", new_state=new_state, detail=reason, exit_px=px)
-
-    @classmethod
-    def enter(
-        cls,
-        side: str,
-        sz: float,
-        entry_px: float,
-        *,
-        stop_px: float | None = None,
-        target_px: float | None = None,
-    ) -> Decision:
-        return cls(
-            action="enter",
-            new_state=State.PENDING,
-            side=side,
-            sz=sz,
-            entry_px=entry_px,
-            stop_px=stop_px,
-            target_px=target_px,
-        )
-
-    @classmethod
-    def skip(cls, reason: str, new_state: State = State.IDLE) -> Decision:
-        return cls(action="skip", new_state=new_state, detail=reason)
-
-    @classmethod
-    def amend(
-        cls,
-        reason: str,
-        new_state: State = State.PENDING,
-        *,
-        new_stop: float | None = None,
-        new_target: float | None = None,
-        scale_out_pct: float = 0.0,
-        amend_px: float | None = None,
-        amend_sz: float | None = None,
-        amend_sl_trigger_px: str = "",
-        amend_sl_ord_px: str = "",
-    ) -> Decision:
-        return cls(
-            action="amend",
-            new_state=new_state,
-            detail=reason,
-            new_stop=new_stop,
-            new_target=new_target,
-            scale_out_pct=scale_out_pct,
-            amend_px=amend_px,
-            amend_sz=amend_sz,
-            amend_sl_trigger_px=amend_sl_trigger_px,
-            amend_sl_ord_px=amend_sl_ord_px,
-        )
-
-
-# -- log line --------------------------------------------------------------
-
-
-class LogLine(BaseModel):
-    ts: int = 0
-    event: str = ""
-    symbol: str = ""
-    tf: str = ""
-    payload: LogPayload = SkipPayload()
-
-    def __str__(self) -> str:
-        t = time.strftime("%H:%M:%S", time.localtime(self.ts / 1000))
-        s, tf = self.symbol, self.tf
-        p = self.payload
-        match self.event:
-            case "cycle_start":
-                return f"[{t}] {s} {tf} -- cycle start"
-            case "skip":
-                return f"[{t}] {s} {tf} skip ({getattr(p, 'reason', '?')})"
-            case "signal":
-                sig = getattr(p, "signal", 0)
-                obi = getattr(p, "obi_5", 0)
-                flow = getattr(p, "ofi_flow", 0)
-                return f"[{t}] {s} {tf} | sig={sig:+.3f} obi={obi:+.3f} flow={flow:+.3f}"
-            case "order":
-                sd = getattr(p, "side", "?")
-                zz = getattr(p, "sz", 0)
-                xx = getattr(p, "px", 0)
-                oid = getattr(p, "ord_id", "?")
-                return f"[{t}] {s} {tf} | ORDER {sd:4s} sz={zz:.6f} px={xx:.1f} id={oid}"
-            case "cancel":
-                oid = getattr(p, "ord_id", "")
-                return f"[{t}] {s} {tf} | CANCEL {getattr(p, 'reason', '?')} id={oid}"
-            case "order_error" | "error":
-                return f"[{t}] {s} {tf} | ERROR {getattr(p, 'error', '?')}"
-            case _:
-                return p.model_dump_json()
-
-
-# -- reporting -------------------------------------------------------------
-
-
-class AssetReport(BaseModel):
-    error: str | None = None
-    trades: int = 0
-    win_rate_pct: float = 0.0
-    sharpe: float = 0.0
-    total_return_pct: float = 0.0
-    max_drawdown_pct: float = 0.0
-
-
-class Summary(BaseModel):
-    pre_usdt: float = 0.0
-    post_usdt: float = 0.0
-    usdt_change: float = 0.0
-    total_upl: float = 0.0
-    total_margin: float = 0.0
-    positions: list[dict] = []
-    assets: dict[str, AssetReport] = {}
-
-    @classmethod
-    def from_snapshot(
-        cls, snap: ExchangeSnapshot, pre_usdt: float, pairs: list[tuple[str, str]]
-    ) -> Summary:
-        positions: list[dict] = []
-        total_upl = 0.0
-        total_margin = 0.0
-        for p in snap.positions:
-            inst = p.get("instId", "?")
-            pos_sz = float(p.get("pos", 0))
-            upl = float(p.get("upl", 0))
-            margin = float(p.get("margin", 0))
-            avg_px = float(p.get("avgPx", 0))
-            mark_px = float(p.get("markPx", 0))
-            side = "long" if pos_sz > 0 else "short"
-            positions.append(
-                dict(
-                    inst=inst,
-                    side=side,
-                    sz=abs(pos_sz),
-                    avg_px=avg_px,
-                    mark_px=mark_px,
-                    upl=upl,
-                    margin=margin,
-                )
-            )
-            total_upl += upl
-            total_margin += margin
-        return cls(
-            pre_usdt=pre_usdt,
-            post_usdt=snap.usdt_balance,
-            usdt_change=snap.usdt_balance - pre_usdt,
-            total_upl=total_upl,
-            total_margin=total_margin,
-            positions=positions,
-            assets={s: asset_report(s, tf) for s, tf in pairs},
-        )
-
-    def write_to(self, fh: io.TextIOBase | None = None) -> None:
-        if fh is None:
-            fh = sys.stdout
-        fh.write("## qooi Portfolio\n\n")
-        total_value = self.post_usdt + self.total_margin + self.total_upl
-        yield_pct = (total_value / self.pre_usdt - 1) * 100 if self.pre_usdt > 0 else 0.0
-        fh.write(f"Total: ${total_value:,.2f} ({yield_pct:+.2f}% since inception)\n")
-        fh.write(f"  USDT free:   ${self.post_usdt:,.2f}\n")
-        fh.write(f"  USDT margin: ${self.total_margin:,.2f}\n")
-        if self.positions:
-            fh.write("\n  Positions:\n")
-            for p in self.positions:
-                pnl_pct = (p["upl"] / p["margin"] * 100) if p["margin"] > 0 else 0.0
-                fh.write(
-                    f"    {p['inst']:20s} {p['side']:5s} "
-                    f"{p['sz']}ct @ {p['avg_px']:,.1f} -> {p['mark_px']:,.1f}  "
-                    f"upl=${p['upl']:+,.2f} ({pnl_pct:+.1f}%)\n"
-                )
-        fh.write("\n")
-        for sym, rpt in self.assets.items():
-            if rpt.error:
-                fh.write(f"**{sym}**: {rpt.error}\n")
-            else:
-                fh.write(
-                    f"**{sym}**: T={rpt.trades} WR={rpt.win_rate_pct:.0f}% "
-                    f"Shp={rpt.sharpe:.2f} Ret={rpt.total_return_pct:.1f}% "
-                    f"DD={rpt.max_drawdown_pct:.1f}%\n"
-                )
-        fh.write("\n> Full logs in artifact.\n")
-
-
-# ============================================================================
-# 4. Signal source
-# ============================================================================
-
-SignalSource = Callable[[str, str], SignalResult | None]
-
-
-def default_signal_source(sig_threshold: float = 0.35) -> SignalSource:
-    from qooi.exchange.market import MarketData
-
-    _md = MarketData("okx")
-
-    def _src(symbol: str, timeframe: str) -> SignalResult | None:
-        from qooi.exchange.indicator import add_indicators
-        from qooi.strategies.flow_pipeline import (
-            add_ofi_flow_columns,
-            add_regime_features,
-            apply_regime_gate,
-        )
-
-        df = _md.candles(symbol, timeframe=timeframe, limit=500, cache=True)
-        if df.is_empty():
-            return None
-        df = add_indicators(df)
-        df = add_regime_features(df)
-        df = add_ofi_flow_columns(df)
-        df = apply_regime_gate(df, signal_col="ofi_flow_score")  # zero signal in strong trends
-
-        ofi_col = df["ofi_flow_score"]
-        threshold = sig_threshold
-        ofi = float(ofi_col[-1])
-        sig_val = round(ofi, 4) if abs(ofi) >= threshold else 0.0
-
-        return SignalResult(
-            symbol=symbol,
-            timeframe=timeframe,
-            timestamp=int(df["timestamp"][-1]),
-            signal=sig_val,
-            flow=round(ofi, 4),
-            threshold=round(threshold, 4),
-            atr=round(float(df["atr_14"][-1] or 0.0), 2),
-            regime_strength=round(float(df["regime_strength"][-1] or 0.0), 3),
-            mom_fast=round(float(df["regime_mom_fast"][-1] or 0.0), 3),
-            vol_conf=round(float(df["regime_vol_conf"][-1] or 0.5), 3),
-            computed_at=int(time.time()),
-        )
-
-    return _src
-
-
-# ============================================================================
-# 5. Stateless executor — single-step, zero local state
-# ============================================================================
-
-
-@dataclass
-class AssetConfig:
-    """Immutable per-asset configuration."""
-
-    symbol: str  # exec symbol: "ETH-USDT-SWAP"
-    sig_symbol: str = ""  # signal symbol: "ETH-USDT"
-    timeframe: str = "4h"
-    capital: float = 500.0
-    max_risk_pct: float = 0.50
-    leverage: float = 2.0
-    ct_val: float = 0.1
-    atr_stop_mult: float = 2.0
-    atr_target_mult: float = 3.0
-    trail_activation_mult: float = 2.0
-    trail_distance_mult: float = 1.0
-    max_bars_held: int = 0
-    signal_threshold: float = 0.25
-    ord_type: str = "post_only"
-    td_mode: str = "isolated"
-    limit_timeout_sec: int = 0
-
-
-@dataclass
-class ReconstructedState:
-    """Full state reconstructed from ExchangeSnapshot + SignalResult.
-
-    This is the ONLY state. Nothing persists across invocations.
-    """
-
-    state: State = State.IDLE
-    symbol: str = ""
-
-    # order
-    ord_id: str = ""
-    cl_ord_id: str = ""
-    side: str = ""
-    sz: str = ""
-    acc_fill_sz: str = ""
-    ord_px: str = ""
-    ord_type: str = ""
-    ord_state: str = ""
-    ord_ctime: str = ""
-
-    # position
-    pos_id: str = ""
-    pos_side: str = ""
-    pos_sz: str = ""
-    avg_px: str = ""
-    mark_px: str = ""
-    upl: str = ""
-    margin: str = ""
-
-    # attached algo orders
-    algo_sl_id: str = ""
-    algo_tp_id: str = ""
-    sl_trigger_px: str = ""
-    sl_ord_px: str = ""
-    tp_trigger_px: str = ""
-    tp_ord_px: str = ""
-
-    # signal
-    signal: float = 0.0
-    flow: float = 0.0
-    atr_estimate: float = 0.0
-    regime_strength: float = 0.0
-    mom_fast: float = 0.0
-    vol_conf: float = 0.5
-
-    age_sec: float = 0.0
-    bars_held: int = 0
-
-    @property
-    def side_dir(self) -> int:
-        if self.has_position:
-            if self.pos_side == "net":
-                return 1 if float(self.pos_sz or "0") > 0 else -1
-            return 1 if self.pos_side == "long" else -1
-        return 1 if self.side == "buy" else (-1 if self.side == "sell" else 0)
-
-    @property
-    def has_order(self) -> bool:
-        return bool(self.ord_id and self.ord_state in ("live", "partially_filled"))
-
-    @property
-    def has_position(self) -> bool:
-        return bool(self.pos_id and self.pos_sz and float(self.pos_sz) > 0)
-
-    @property
-    def is_filled(self) -> bool:
-        return self.ord_state == "filled" or (
-            self.has_position and self.acc_fill_sz and float(self.acc_fill_sz) >= float(self.sz) > 0
-        )
-
-    @property
-    def entry_price(self) -> float:
-        px = self.avg_px or self.ord_px
-        return float(px) if px else 0.0
-
-
-class StatelessExecutor:
-    """Single-step decision engine. Reads exchange state, decides, executes.
-
-    Invariants:
-    1. One order per asset — state machine IDLE->PENDING->ACTIVE->IDLE
-    2. Stop-loss + take-profit via OKX algo orders at placement time
-    3. Trailing stop via algo order amendments
-    4. Zero local state — everything from ExchangeSnapshot + SignalResult
-    """
-
-    def __init__(self, config: AssetConfig):
-        self.cfg = config
-
-    # -- public entry point -------------------------------------------------
-
-    def step(
-        self, snap: ExchangeSnapshot, signal: SignalResult, obi, tc: TradingClient | None
-    ) -> tuple[Decision, ReconstructedState]:
-        """Main entry point. Called once per GitHub Actions invocation."""
-        state = self._reconstruct(snap, signal, obi)
-        decision = self._decide(state, obi)
-        self._execute(decision, state, obi, tc)
-        self._log(state, decision)
-        return decision, state
-
-    # -- state reconstruction -----------------------------------------------
-
-    def _reconstruct(self, snap: ExchangeSnapshot, signal: SignalResult, obi) -> ReconstructedState:
-        order = snap.order_for_symbol(self.cfg.symbol)
-        position = snap.position_for_symbol(self.cfg.symbol)
-        algos = snap.algos_for_symbol(self.cfg.symbol)
-
-        now_ms = int(time.time() * 1000)
-        s = ReconstructedState(
-            symbol=self.cfg.symbol,
-            state=State.IDLE,
-            signal=signal.signal,
-            flow=signal.flow,
-            atr_estimate=signal.atr if signal.atr > 0 else (obi.ask_price * 0.02 if obi else 0.0),
-            regime_strength=signal.regime_strength,
-            mom_fast=signal.mom_fast,
-            vol_conf=signal.vol_conf,
-        )
-
-        if order:
-            s.state = State.PENDING
-            s.ord_id = order.get("ordId", "")
-            s.cl_ord_id = order.get("clOrdId", "")
-            s.side = order.get("side", "")
-            s.sz = order.get("sz", "0")
-            s.acc_fill_sz = order.get("accFillSz", "0")
-            s.ord_px = order.get("px", "0")
-            s.ord_type = order.get("ordType", "")
-            s.ord_state = order.get("state", "")
-            s.ord_ctime = order.get("cTime", "")
-            ctime = int(order.get("cTime", now_ms))
-            s.age_sec = max(0, (now_ms - ctime) / 1000)
-
-        if position:
-            s.pos_id = position.get("posId", "")
-            s.pos_side = position.get("posSide", "")
-            s.pos_sz = position.get("pos", "0")
-            s.avg_px = position.get("avgPx", "0")
-            s.mark_px = position.get("markPx", "0")
-            s.upl = position.get("upl", "0")
-            s.margin = position.get("margin", "0")
-            # Derive age from position creation time when no pending order
-            if not order:
-                p_ctime = int(position.get("cTime", now_ms))
-                s.age_sec = max(0, (now_ms - p_ctime) / 1000)
-
-        if s.has_position and not s.has_order:
-            s.state = State.ACTIVE
-            if not s.side and position:
-                ps = position.get("posSide", "")
-                if ps == "long":
-                    s.side = "buy"
-                elif ps == "short":
-                    s.side = "sell"
-                elif ps == "net":
-                    s.side = "buy" if float(position.get("pos", "0")) > 0 else "sell"
-                else:
-                    s.side = "buy" if float(position.get("pos", "0")) > 0 else "sell"
-
-        if s.ord_state == "filled" or s.is_filled:
-            s.state = State.ACTIVE
-
-        if s.ord_state == "partially_filled":
-            s.state = State.PENDING
-
-        for a in algos:
-            sl = a.get("slTriggerPx", "")
-            tp = a.get("tpTriggerPx", "")
-            aid = a.get("algoId", "")
-            if sl:
-                s.algo_sl_id = aid
-                s.sl_trigger_px = sl
-                s.sl_ord_px = a.get("slOrdPx", "")
-            if tp:
-                s.algo_tp_id = aid
-                s.tp_trigger_px = tp
-                s.tp_ord_px = a.get("tpOrdPx", "")
-
-        bar_sec = {"1h": 3600, "4h": 14400, "1d": 86400}.get(self.cfg.timeframe.lower(), 14400)
-        if s.age_sec > 0 and s.has_position:
-            s.bars_held = max(0, int(s.age_sec / bar_sec))
-
-        return s
-
-    # -- decision engine (pure function, no side effects) -------------------
-
-    def _decide(self, s: ReconstructedState, obi) -> Decision:
-        abs_sig = abs(s.signal)
-
-        if s.state == State.IDLE:
-            return self._decide_idle(s, obi, abs_sig)
-        if s.state == State.PENDING:
-            return self._decide_pending(s, obi)
-        if s.state == State.ACTIVE:
-            return self._decide_active(s, obi)
-        return Decision.skip("unknown_state")
-
-    def _decide_idle(self, s: ReconstructedState, obi, abs_sig: float) -> Decision:
-        if abs_sig < self.cfg.signal_threshold:
-            return Decision.skip("weak_signal")
-
-        # Momentum confirmation: skip if 24h momentum opposes signal direction
-        if abs(s.mom_fast) > 0.3 and s.signal * s.mom_fast < 0:
-            return Decision.skip("momentum_opposing")
-
-        # Volume drought: skip if volume confidence too low
-        if s.vol_conf < 0.3:
-            return Decision.skip("low_volume")
-
-        side = "buy" if s.signal > 0 else "sell"
-        d = 1 if side == "buy" else -1
-        atr = s.atr_estimate
-
-        # Adaptive stop/target distance based on regime strength
-        rs = s.regime_strength
-        if rs > 0.7:
-            # Strong trend: tight stop, let winners run
-            stop_mult = self.cfg.atr_stop_mult * 0.5
-            target_mult = self.cfg.atr_target_mult * 0.8
-        elif rs > 0.3:
-            # Trending: moderate stop, wider target
-            stop_mult = self.cfg.atr_stop_mult * 0.75
-            target_mult = self.cfg.atr_target_mult * 1.2
-        else:
-            # Sideways/choppy: wider stop, take quick profits
-            stop_mult = self.cfg.atr_stop_mult * 1.25
-            target_mult = self.cfg.atr_target_mult * 0.6
-
-        # Entry price: skew 0.05% inside market for faster fill
-        entry_px_raw = obi.ask_price if side == "buy" else obi.bid_price if obi else 0.0
-        entry_px = (
-            round(entry_px_raw * (0.9995 if side == "buy" else 1.0005), 2) if entry_px_raw else 0.0
-        )
-
-        stop_px = round(entry_px - d * stop_mult * atr, 2)
-        target_px = round(entry_px + d * target_mult * atr, 2)
-
-        risk_per_ct = abs(entry_px - stop_px) * self.cfg.ct_val
-        if risk_per_ct <= 0:
-            return Decision.skip("zero_risk")
-
-        max_risk = self.cfg.capital * self.cfg.max_risk_pct
-        sz = max(1, int(max_risk / risk_per_ct))
-
-        notional_per_ct = self.cfg.ct_val * entry_px
-        max_notional = self.cfg.capital * self.cfg.leverage
-        max_sz = int(max_notional / max(notional_per_ct, 1e-9))
-        if max_sz < 1:
-            return Decision.skip("insufficient_margin")
-        sz = max(1, min(sz, max_sz))
-
-        return Decision.enter(
-            side=side, sz=float(sz), entry_px=entry_px, stop_px=stop_px, target_px=target_px
-        )
-
-        stop_px = round(entry_px - d * stop_mult * atr, 2)
-        target_px = round(entry_px + d * target_mult * atr, 2)
-
-        risk_per_ct = abs(entry_px - stop_px) * self.cfg.ct_val
-        if risk_per_ct <= 0:
-            return Decision.skip("zero_risk")
-
-        max_risk = self.cfg.capital * self.cfg.max_risk_pct
-        sz = max(1, int(max_risk / risk_per_ct))
-
-        notional_per_ct = self.cfg.ct_val * entry_px
-        max_notional = self.cfg.capital * self.cfg.leverage
-        max_sz = int(max_notional / max(notional_per_ct, 1e-9))
-        if max_sz < 1:
-            return Decision.skip("insufficient_margin")
-        sz = max(1, min(sz, max_sz))
-
-        return Decision.enter(
-            side=side, sz=float(sz), entry_px=entry_px, stop_px=stop_px, target_px=target_px
-        )
-
-    def _decide_pending(self, s: ReconstructedState, obi) -> Decision:
-        # Timeout: 1 bar duration (not 2) for faster cycle
-        timeout = self.cfg.limit_timeout_sec or {
-            "1h": 3600,
-            "4h": 14400,
-            "1d": 86400,
-        }.get(self.cfg.timeframe.lower(), 14400)
-
-        if s.is_filled:
-            return Decision.skip("order_filled", new_state=State.ACTIVE)
-
-        if s.age_sec > timeout:
-            px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
-            return Decision.exit("timeout", px=px)
-
-        if s.signal * s.side_dir < 0:
-            px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
-            return Decision.exit("signal_flipped", px=px)
-
-        # Signal decay: exit if signal weakened more than 40% since entry
-        # (entry signal stored via flow field convention)
-        if s.flow > 0.10 and abs(s.signal) < s.flow * 0.6:
-            px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
-            return Decision.exit("signal_decayed", px=px)
-
-        if obi and s.ord_px:
-            current = obi.ask_price if s.side_dir > 0 else obi.bid_price
-            px = float(s.ord_px)
-            if px > 0:
-                gap_pct = abs(current - px) / px
-                if gap_pct > 0.02:
-                    # Larger than 2% gap: cancel, let next bar re-enter at better price
-                    return Decision.exit("market_gapped", px=current)
-                if gap_pct > 0.003:
-                    # 0.3-2% gap: aggressively chase 60% of the gap (was 20%)
-                    new_px = round(px + s.side_dir * (current - px) * 0.6, 2)
-                    return Decision.amend("price_chase", amend_px=new_px, new_state=State.PENDING)
-
-        return Decision.skip("order_outstanding", new_state=State.PENDING)
-
-    def _decide_active(self, s: ReconstructedState, obi) -> Decision:
-        if self.cfg.max_bars_held > 0 and s.bars_held >= self.cfg.max_bars_held:
-            px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
-            return Decision.exit("time", px=px)
-
-        if s.signal * s.side_dir < 0:
-            px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
-            return Decision.exit("signal_flipped", px=px)
-
-        mark = float(s.mark_px) if s.mark_px else 0.0
-        if mark > 0:
-            sl = float(s.sl_trigger_px) if s.sl_trigger_px else 0.0
-            d = s.side_dir
-            atr = s.atr_estimate
-            entry = s.entry_price
-
-            if entry > 0 and atr > 0 and sl > 0:
-                profit_atr = d * (mark - entry) / atr
-                if profit_atr >= self.cfg.trail_activation_mult:
-                    new_sl = round(mark - d * self.cfg.trail_distance_mult * atr, 2)
-                    if d * (new_sl - sl) > 0:
-                        new_sl_s = str(new_sl)
-                        return Decision.amend(
-                            "trail_update",
-                            new_state=State.ACTIVE,
-                            amend_sl_trigger_px=new_sl_s,
-                            amend_sl_ord_px=new_sl_s,
-                        )
-
-        return Decision.skip("holding", new_state=State.ACTIVE)
-
-        return Decision.skip("holding", new_state=State.ACTIVE)
-
-    # -- execution (side effects only) --------------------------------------
-
-    def _execute(self, d: Decision, s: ReconstructedState, obi, tc: TradingClient | None) -> None:
-        if tc is None:
-            return
-
-        if d.action == "enter":
-            self._execute_enter(d, tc)
-        elif d.action == "exit":
-            self._execute_exit(d, s, tc)
-        elif d.action == "amend":
-            self._execute_amend(d, s, tc)
-
-    def _execute_enter(self, d: Decision, tc: TradingClient) -> None:
-        sz = str(int(d.sz))
-        px = str(d.entry_px) if self.cfg.ord_type != "market" else ""
-        side = d.side
-
-        attach = []
-        if d.stop_px is not None and d.target_px is not None:
-            attach = [
-                {
-                    "slTriggerPx": str(d.stop_px),
-                    "slOrdPx": "-1",
-                    "tpTriggerPx": str(d.target_px),
-                    "tpOrdPx": "-1",
-                    "cxlOnClosePos": "true",
-                }
-            ]
-
-        try:
-            resp = tc.place(
-                inst_id=self.cfg.symbol,
-                side=side,
-                sz=sz,
-                ord_type=self.cfg.ord_type,
-                px=px,
-                td_mode=self.cfg.td_mode,
-                attach_algo_ords=attach if attach else None,
-            )
-            print(
-                f"  ORDER {side} sz={sz} px={px} id={resp.get('ordId', '?')} "
-                f"sl={d.stop_px} tp={d.target_px}"
-            )
-        except Exception as e:
-            print(f"  ORDER FAILED: {e}")
-
-    def _execute_exit(self, d: Decision, s: ReconstructedState, tc: TradingClient) -> None:
-        if s.has_order:
-            # PENDING exit: cancel limit order. Per OKX API, attached TP/SL are
-            # auto-discarded when parent is cancelled before any fill.
-            try:
-                tc.cancel(self.cfg.symbol, s.ord_id)
-                print(f"  CANCEL {s.ord_id} reason={d.detail}")
-            except Exception:
-                pass
-            # Partial fill: cancel un-filled portion, then close the filled part.
-            if not s.has_position:
-                return
-
-        # ACTIVE exit (or PENDING-exit after partial fill): close position
-        # at market, then clean up any remaining algo orders.
-        if s.has_position:
-            try:
-                tc.close_position(self.cfg.symbol)
-                print(f"  CLOSE {s.pos_side} sz={s.pos_sz} reason={d.detail}")
-            except Exception as e:
-                print(f"  CLOSE FAILED: {e}")
-
-        # Clean up algos — they should already be cxlOnClosePos=true, but be safe.
-        if s.algo_sl_id and s.algo_sl_id != s.algo_tp_id:
-            try:
-                tc.cancel_algo(self.cfg.symbol, s.algo_sl_id)
-            except Exception:
-                pass
-        if s.algo_tp_id:
-            try:
-                tc.cancel_algo(self.cfg.symbol, s.algo_tp_id)
-            except Exception:
-                pass
-
-    def _execute_amend(self, d: Decision, s: ReconstructedState, tc: TradingClient) -> None:
-        if (d.amend_px is not None or d.amend_sz is not None) and s.has_order:
-            try:
-                tc.amend(
-                    self.cfg.symbol,
-                    s.ord_id,
-                    new_px=str(d.amend_px) if d.amend_px else "",
-                    new_sz=str(int(d.amend_sz)) if d.amend_sz else "",
-                )
-                print(f"  AMEND ord={s.ord_id} px={d.amend_px} sz={d.amend_sz} reason={d.detail}")
-            except Exception as e:
-                print(f"  AMEND FAILED: {e}")
-
-        if d.amend_sl_trigger_px and s.algo_sl_id:
-            try:
-                tc.amend_algo(
-                    self.cfg.symbol,
-                    s.algo_sl_id,
-                    new_sl_trigger_px=d.amend_sl_trigger_px,
-                    new_sl_ord_px=d.amend_sl_ord_px or d.amend_sl_trigger_px,
-                )
-                print(f"  TRAIL SL={d.amend_sl_trigger_px}")
-            except Exception as e:
-                print(f"  TRAIL FAILED: {e}")
-
-        if d.new_stop is not None or d.new_target is not None:
-            pass
-
-    # -- logging ------------------------------------------------------------
-
-    def _log(self, s: ReconstructedState, d: Decision) -> None:
-        log_path = LOG_DIR / f"exec_{self.cfg.symbol.replace('-', '_')}_{self.cfg.timeframe}.jsonl"
-        icon = {"enter": "ORDER", "exit": "EXIT", "amend": "AMEND", "skip": "skip"}
-        params = [f"state={s.state.value}", f"act={icon.get(d.action, d.action)}"]
-        if d.detail:
-            params.append(f"({d.detail})")
-        if s.has_position:
-            params.append(f"upl={s.upl}")
-        line = LogLine(
-            ts=int(time.time() * 1000),
-            event=d.action,
-            symbol=self.cfg.symbol,
-            tf=self.cfg.timeframe,
-            payload=SkipPayload(reason=d.detail),
-        )
-        log_path.open("a").write(line.model_dump_json() + "\n")
-        print(f"  {self.cfg.symbol:20s} {' '.join(params)}")
-
-
-# ============================================================================
-# 6. Reporting
-# ============================================================================
-
-
-def asset_report(symbol: str = "ETH-USDT", timeframe: str = "4h") -> AssetReport:
-    import polars as pl
-
-    from qooi.exchange.eval import compute_metrics
-
-    fname = LOG_DIR / f"exec_{symbol.replace('-', '_')}_{timeframe}.jsonl"
-    if not fname.exists():
-        return AssetReport(error="no log file")
-    try:
-        raw = [json.loads(line) for line in fname.read_text().splitlines() if line.strip()]
-    except Exception:
-        return AssetReport(error="log file corrupted")
-    orders = [LogLine.model_validate(o) for o in raw if o.get("event") == "order"]
-    if not orders:
-        return AssetReport(error="no trades yet")
-
-    ops: list[OrderPayload] = []
-    for o in orders:
-        p = o.payload
-        if isinstance(p, OrderPayload):
-            ops.append(p)
-    if not ops:
-        return AssetReport(error="no trades yet")
-
-    trades = []
-    open_buys: list[OrderPayload] = []
-    for p in ops:
-        if p.side == "buy":
-            open_buys.append(p)
-        elif p.side == "sell" and open_buys:
-            entry = open_buys.pop(0)
-            pnl = (p.px / entry.px - 1) if entry.px > 0 else 0.0
-            trades.append(
-                dict(
-                    entry_time=0,
-                    exit_time=0,
-                    side=entry.side,
-                    entry_price=entry.px,
-                    exit_price=p.px,
-                    pnl=pnl,
-                    reason="sold",
-                )
-            )
-
-    n_closed = len(trades)
-    n_open = len(open_buys)
-    if n_closed == 0 and n_open == 0:
-        return AssetReport(
-            trades=0, win_rate_pct=0.0, sharpe=0.0, total_return_pct=0.0, max_drawdown_pct=0.0
-        )
-
-    if n_closed == 0:
-        return AssetReport(
-            trades=n_open,
-            win_rate_pct=0.0,
-            sharpe=0.0,
-            total_return_pct=0.0,
-            max_drawdown_pct=0.0,
-            error=f"{n_open} open position{'s' if n_open > 1 else ''}, no closed trades",
-        )
-
-    trade_df = pl.DataFrame(trades)
-    initial = 1000.0
-    eq = pl.Series(
-        [initial] + [initial * (1.0 + float(t["pnl"])) for t in trades], dtype=pl.Float64
-    )
-    eq_df = pl.DataFrame({"portfolio_value": eq, "returns": eq.pct_change().fill_null(0.0)})
-    m = compute_metrics(eq_df, trades=trade_df)
-    return AssetReport(
-        trades=n_closed + n_open,
-        win_rate_pct=m.win_rate_pct,
-        sharpe=round(m.sharpe_ratio, 2),
-        total_return_pct=round(m.total_return_pct, 1),
-        max_drawdown_pct=round(m.max_drawdown_pct, 1),
-        error=f"closed={n_closed} open={n_open}" if n_open > 0 else None,
-    )
