@@ -216,7 +216,7 @@ class TradingClient:
         params = {"signalChanName": signal_chan_name}
         if signal_chan_desc:
             params["signalChanDesc"] = signal_chan_desc
-        return self._retry(lambda: self._post_trading_bot("signal/create-signal", params))
+        return self._retry(lambda: self._signal_api("POST", "signal/create-signal", params))
 
     def signal_create_order_algo(
         self,
@@ -254,7 +254,7 @@ class TradingClient:
             params["investAmt"] = invest_amt
         if algo_cl_ord_id:
             params["algoClOrdId"] = algo_cl_ord_id
-        return self._retry(lambda: self._post_trading_bot("signal/order-algo", params))
+        return self._retry(lambda: self._signal_api("POST", "signal/order-algo", params))
 
     def signal_push_sub_order(
         self,
@@ -280,12 +280,13 @@ class TradingClient:
             params["px"] = px
         if attach_algo_ords:
             params["attachAlgoOrds"] = attach_algo_ords
-        return self._retry(lambda: self._post_trading_bot("signal/sub-order", params))
+        return self._retry(lambda: self._signal_api("POST", "signal/sub-order", params))
 
     def signal_get_details(self, algo_id: str) -> dict:
         """GET /api/v5/tradingBot/signal/orders-algo-details"""
         return self._retry(
-            lambda: self._get_trading_bot(
+            lambda: self._signal_api(
+                "GET",
                 "signal/orders-algo-details",
                 {"algoId": algo_id, "algoOrdType": "contract"},
             )
@@ -294,16 +295,18 @@ class TradingClient:
     def signal_get_active(self) -> list[dict]:
         """GET /api/v5/tradingBot/signal/active-orders"""
         result = self._retry(
-            lambda: self._get_trading_bot("signal/active-orders", {"algoOrdType": "contract"})
+            lambda: self._signal_api("GET", "signal/active-orders", {"algoOrdType": "contract"})
         )
         if isinstance(result, dict):
-            return result.get("data", result) if isinstance(result.get("data"), list) else [result]
+            data = result.get("data", result)
+            return data if isinstance(data, list) else [result]
         return result or []
 
     def signal_stop(self, algo_id: str, signal_chan_id: str) -> dict:
         """POST /api/v5/tradingBot/signal/cancel-algo"""
         return self._retry(
-            lambda: self._post_trading_bot(
+            lambda: self._signal_api(
+                "POST",
                 "signal/cancel-algo",
                 {
                     "algoId": algo_id,
@@ -315,7 +318,8 @@ class TradingClient:
     def signal_close_position(self, algo_id: str, signal_chan_id: str, inst_id: str) -> dict:
         """POST /api/v5/tradingBot/signal/close-position"""
         return self._retry(
-            lambda: self._post_trading_bot(
+            lambda: self._signal_api(
+                "POST",
                 "signal/close-position",
                 {
                     "algoId": algo_id,
@@ -334,43 +338,24 @@ class TradingClient:
             params["tpPct"] = tp_pct
         if sl_pct:
             params["slPct"] = sl_pct
-        return self._retry(lambda: self._post_trading_bot("signal/amend-tpsl", params))
+        return self._retry(lambda: self._signal_api("POST", "signal/amend-tpsl", params))
 
-    def _post_trading_bot(self, path: str, params: dict) -> dict:
-        """Raw POST to tradingBot endpoint (not in OKX Python SDK)."""
-        import base64
-        import hashlib
-        import hmac
-
-        import requests as _requests
-
-        flag = os.getenv("OKX_FLAG", "1")
-        k = self._trade.api_key
-        s = self._trade.secret_key
-        p = self._trade.passphrase
-        base_url = "https://www.okx.com" if flag == "1" else "https://www.okx.com"
-        timestamp = str(int(time.time()))
-        body = json.dumps(params)
-        sign_msg = timestamp + "POST" + "/api/v5/tradingBot/" + path + body
-        sign = base64.b64encode(
-            hmac.new(s.encode(), sign_msg.encode(), hashlib.sha256).digest()
-        ).decode()
-        headers = {
-            "OK-ACCESS-KEY": k,
-            "OK-ACCESS-SIGN": sign,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": p,
-            "Content-Type": "application/json",
-        }
-        if os.getenv("OKX_ENV") == "test":
-            headers["x-simulated-trading"] = "1"
-        resp = _requests.post(
-            f"{base_url}/api/v5/tradingBot/{path}",
-            headers=headers,
-            data=body,
-            timeout=10,
-        )
-        return resp.json()
+    def _signal_api(self, method: str, path: str, params: dict) -> dict:
+        """Call tradingBot endpoint using SDK's internal HTTP client."""
+        url = f"/api/v5/tradingBot/{path}"
+        if method == "GET":
+            resp = self._trade.get(url=url, params=params)
+        else:
+            # SDK's _request_with_params expects body in "params" kwarg for POST
+            resp = self._trade._request_with_params("POST", url, params)
+        if isinstance(resp, dict):
+            code = resp.get("code", -1)
+            if str(code) != "0":
+                raise RuntimeError(
+                    f"OKX signal bot error [{code}]: {resp.get('msg', '')}"
+                    f" data={resp.get('data', [])}"
+                )
+        return resp
 
     def _get_trading_bot(self, path: str, params: dict) -> dict:
         """Raw GET to tradingBot endpoint."""

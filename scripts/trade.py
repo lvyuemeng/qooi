@@ -123,11 +123,13 @@ def _run(dry_run: bool, env: str) -> None:
         bot_state = details if isinstance(details, dict) else {}
         if isinstance(bot_state.get("data"), list) and bot_state["data"]:
             bot_state = bot_state["data"][0]
+
         frozen = float(bot_state.get("frozenBal", "0"))
         float_pnl = float(bot_state.get("floatPnl", "0"))
-        has_position = frozen > 0 or abs(float_pnl) > 1
+        pos_side = cfg.get("_last_side", "")
+        has_position = (frozen > 0) and bool(pos_side) and abs(float_pnl) > 1
 
-        # 3. Decide
+        # 3. Decide — use config-persisted side for direction check
         abs_sig = abs(sr.signal)
         action = None
         detail = ""
@@ -135,10 +137,18 @@ def _run(dry_run: bool, env: str) -> None:
         if not has_position:
             if abs_sig < p["sig_threshold"]:
                 detail = "weak_signal"
+            # Momentum confirmation
+            elif abs(sr.mom_fast) > 0.3 and sr.signal * sr.mom_fast < 0:
+                detail = "momentum_opposing"
+            # Volume drought
+            elif sr.vol_conf < 0.3:
+                detail = "low_volume"
             else:
                 action = "enter"
         else:
-            if sr.signal * (1 if float_pnl >= 0 else -1) < 0:
+            # pos_side is "buy" (long) or "sell" (short)
+            d = 1 if pos_side == "buy" else -1
+            if sr.signal * d < 0:
                 action = "exit"
                 detail = "signal_flipped"
             else:
@@ -153,10 +163,21 @@ def _run(dry_run: bool, env: str) -> None:
         if action == "enter":
             side = "buy" if sr.signal > 0 else "sell"
             atr = sr.atr if sr.atr > 0 else 50.0
+
+            # Fetch real entry price from order book
+            from qooi.exchange.market import MarketData
+
+            md = MarketData("okx")
+            obi = md.ob_snapshot(p.get("exec_symbol", sym), limit=1)
+            if obi:
+                entry_px = obi.ask_price if side == "buy" else obi.bid_price
+            else:
+                entry_px = 2300.0  # fallback
+            entry_px = round(entry_px, 2)
+
             risk_per_ct = atr * 2.0 * p["ct_val"]
             max_risk = p["capital"] * 0.50
             sz = max(1, int(max_risk / risk_per_ct))
-            entry_px = 2300.0  # approximate; signal bot uses limit
             notional_per_ct = p["ct_val"] * entry_px
             max_sz = int(p["capital"] * p["leverage"] / max(notional_per_ct, 1))
             sz = max(1, min(sz, max_sz))
@@ -184,7 +205,10 @@ def _run(dry_run: bool, env: str) -> None:
                         }
                     ],
                 )
-                print(f"  {sym:20s} ORDER {side} sz={sz} sl={stop_px} tp={target_px}")
+                # Persist side to config for next invocation
+                configs[sym]["_last_side"] = side
+                CONFIG_PATH.write_text(json.dumps(configs, indent=2))
+                print(f"  {sym:20s} ORDER {side} sz={sz} px={entry_px} sl={stop_px} tp={target_px}")
             except Exception as e:
                 print(f"  {sym:20s} ORDER FAILED: {e}")
 
@@ -195,6 +219,8 @@ def _run(dry_run: bool, env: str) -> None:
                     signal_chan_id=cfg["signal_chan_id"],
                     inst_id=sym,
                 )
+                configs[sym]["_last_side"] = ""
+                CONFIG_PATH.write_text(json.dumps(configs, indent=2))
                 print(f"  {sym:20s} CLOSE ({detail})")
             except Exception as e:
                 print(f"  {sym:20s} CLOSE FAILED: {e}")
