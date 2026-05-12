@@ -253,14 +253,16 @@ class TestNormalization:
         s_hi = _rs(state=State.IDLE, atr_estimate=100.0, signal=0.5)
         d_lo = exe._decide(s_lo, _obi(ask=2500, bid=2498))
         d_hi = exe._decide(s_hi, _obi(ask=2500, bid=2498))
-        assert d_lo.stop_px == 2500.0 - 2.0 * 25.0
-        assert d_hi.stop_px == 2500.0 - 2.0 * 100.0
+        # entry_px = ask * 0.9995 with skew; regime_strength=0 -> 1.25x stop_mult
+        assert d_lo.stop_px == round(2500 * 0.9995 - 2.0 * 1.25 * 25.0, 2)
+        assert d_hi.stop_px == round(2500 * 0.9995 - 2.0 * 1.25 * 100.0, 2)
 
     def test_target_distance_scales_with_atr(self):
         exe = StatelessExecutor(_cfg(atr_target_mult=3.0))
         s = _rs(state=State.IDLE, atr_estimate=50.0, signal=0.5)
         d = exe._decide(s, _obi(ask=2500, bid=2498))
-        assert d.target_px == 2500.0 + 3.0 * 50.0
+        # regime_strength=0 -> 0.6x target_mult
+        assert d.target_px == round(2500 * 0.9995 + 3.0 * 0.6 * 50.0, 2)
 
     def test_size_derived_from_risk_and_stop_distance(self):
         exe = StatelessExecutor(
@@ -319,8 +321,9 @@ class TestDecide:
         )
         assert d.action == "enter"
         assert d.side == "buy"
-        assert d.stop_px == 2400.0
-        assert d.target_px == 2650.0
+        assert d.entry_px == round(2500 * 0.9995, 2)
+        assert d.stop_px == round(d.entry_px - 2.0 * 1.25 * 50.0, 2)
+        assert d.target_px == round(d.entry_px + 3.0 * 0.6 * 50.0, 2)
 
     def test_idle_enters_short_on_negative_signal(self):
         d = StatelessExecutor(_cfg(signal_threshold=0.25))._decide(
@@ -328,7 +331,8 @@ class TestDecide:
         )
         assert d.action == "enter"
         assert d.side == "sell"
-        assert d.stop_px == 2598.0
+        assert d.entry_px == round(2498 * 1.0005, 2)
+        assert d.stop_px == round(d.entry_px + 2.0 * 1.25 * 50.0, 2)
 
     def test_pending_filled_transitions_to_active(self):
         s = _rs_pending(acc_fill_sz="10", ord_state="filled")

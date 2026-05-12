@@ -260,6 +260,9 @@ class SignalResult(BaseModel):
     flow: float = 0.0
     threshold: float = 0.0
     atr: float = 0.0
+    regime_strength: float = 0.0
+    mom_fast: float = 0.0
+    vol_conf: float = 0.5
     computed_at: int = 0
 
     @classmethod
@@ -267,6 +270,9 @@ class SignalResult(BaseModel):
         sv = float(df["signal"][-1] or 0.0)
         fv = float(df["ofi_flow_score"][-1] or 0.0) if "ofi_flow_score" in df.columns else 0.0
         atr_val = float(df["atr_14"][-1] or 0.0) if "atr_14" in df.columns else 0.0
+        rs = float(df["regime_strength"][-1] or 0.0) if "regime_strength" in df.columns else 0.0
+        mf = float(df["regime_mom_fast"][-1] or 0.0) if "regime_mom_fast" in df.columns else 0.0
+        vc = float(df["regime_vol_conf"][-1] or 0.5) if "regime_vol_conf" in df.columns else 0.5
         return cls(
             symbol=symbol,
             timeframe=timeframe,
@@ -274,6 +280,9 @@ class SignalResult(BaseModel):
             signal=round(sv, 4),
             flow=round(fv, 4),
             atr=round(atr_val, 2),
+            regime_strength=round(rs, 3),
+            mom_fast=round(mf, 3),
+            vol_conf=round(vc, 3),
             computed_at=int(time.time()),
         )
 
@@ -662,6 +671,9 @@ def default_signal_source(sig_threshold: float = 0.35) -> SignalSource:
             flow=round(ofi, 4),
             threshold=round(threshold, 4),
             atr=round(float(df["atr_14"][-1] or 0.0), 2),
+            regime_strength=round(float(df["regime_strength"][-1] or 0.0), 3),
+            mom_fast=round(float(df["regime_mom_fast"][-1] or 0.0), 3),
+            vol_conf=round(float(df["regime_vol_conf"][-1] or 0.5), 3),
             computed_at=int(time.time()),
         )
 
@@ -737,6 +749,9 @@ class ReconstructedState:
     signal: float = 0.0
     flow: float = 0.0
     atr_estimate: float = 0.0
+    regime_strength: float = 0.0
+    mom_fast: float = 0.0
+    vol_conf: float = 0.5
 
     age_sec: float = 0.0
     bars_held: int = 0
@@ -808,6 +823,9 @@ class StatelessExecutor:
             signal=signal.signal,
             flow=signal.flow,
             atr_estimate=signal.atr if signal.atr > 0 else (obi.ask_price * 0.02 if obi else 0.0),
+            regime_strength=signal.regime_strength,
+            mom_fast=signal.mom_fast,
+            vol_conf=signal.vol_conf,
         )
 
         if order:
@@ -892,13 +910,41 @@ class StatelessExecutor:
         if abs_sig < self.cfg.signal_threshold:
             return Decision.skip("weak_signal")
 
+        # Momentum confirmation: skip if 24h momentum opposes signal direction
+        if abs(s.mom_fast) > 0.3 and s.signal * s.mom_fast < 0:
+            return Decision.skip("momentum_opposing")
+
+        # Volume drought: skip if volume confidence too low
+        if s.vol_conf < 0.3:
+            return Decision.skip("low_volume")
+
         side = "buy" if s.signal > 0 else "sell"
-        entry_px = obi.ask_price if side == "buy" else obi.bid_price if obi else 0.0
         d = 1 if side == "buy" else -1
         atr = s.atr_estimate
 
-        stop_px = round(entry_px - d * self.cfg.atr_stop_mult * atr, 2)
-        target_px = round(entry_px + d * self.cfg.atr_target_mult * atr, 2)
+        # Adaptive stop/target distance based on regime strength
+        rs = s.regime_strength
+        if rs > 0.7:
+            # Strong trend: tight stop, let winners run
+            stop_mult = self.cfg.atr_stop_mult * 0.5
+            target_mult = self.cfg.atr_target_mult * 0.8
+        elif rs > 0.3:
+            # Trending: moderate stop, wider target
+            stop_mult = self.cfg.atr_stop_mult * 0.75
+            target_mult = self.cfg.atr_target_mult * 1.2
+        else:
+            # Sideways/choppy: wider stop, take quick profits
+            stop_mult = self.cfg.atr_stop_mult * 1.25
+            target_mult = self.cfg.atr_target_mult * 0.6
+
+        # Entry price: skew 0.05% inside market for faster fill
+        entry_px_raw = obi.ask_price if side == "buy" else obi.bid_price if obi else 0.0
+        entry_px = (
+            round(entry_px_raw * (0.9995 if side == "buy" else 1.0005), 2) if entry_px_raw else 0.0
+        )
+
+        stop_px = round(entry_px - d * stop_mult * atr, 2)
+        target_px = round(entry_px + d * target_mult * atr, 2)
 
         risk_per_ct = abs(entry_px - stop_px) * self.cfg.ct_val
         if risk_per_ct <= 0:
@@ -907,26 +953,45 @@ class StatelessExecutor:
         max_risk = self.cfg.capital * self.cfg.max_risk_pct
         sz = max(1, int(max_risk / risk_per_ct))
 
-        # Margin constraint: ensure notional won't exceed available capital × leverage.
-        # notional = sz × ct_val × entry_px / leverage
         notional_per_ct = self.cfg.ct_val * entry_px
         max_notional = self.cfg.capital * self.cfg.leverage
         max_sz = int(max_notional / max(notional_per_ct, 1e-9))
         if max_sz < 1:
             return Decision.skip("insufficient_margin")
-        sz = min(sz, max_sz)
-        sz = max(1, sz)
+        sz = max(1, min(sz, max_sz))
+
+        return Decision.enter(
+            side=side, sz=float(sz), entry_px=entry_px, stop_px=stop_px, target_px=target_px
+        )
+
+        stop_px = round(entry_px - d * stop_mult * atr, 2)
+        target_px = round(entry_px + d * target_mult * atr, 2)
+
+        risk_per_ct = abs(entry_px - stop_px) * self.cfg.ct_val
+        if risk_per_ct <= 0:
+            return Decision.skip("zero_risk")
+
+        max_risk = self.cfg.capital * self.cfg.max_risk_pct
+        sz = max(1, int(max_risk / risk_per_ct))
+
+        notional_per_ct = self.cfg.ct_val * entry_px
+        max_notional = self.cfg.capital * self.cfg.leverage
+        max_sz = int(max_notional / max(notional_per_ct, 1e-9))
+        if max_sz < 1:
+            return Decision.skip("insufficient_margin")
+        sz = max(1, min(sz, max_sz))
 
         return Decision.enter(
             side=side, sz=float(sz), entry_px=entry_px, stop_px=stop_px, target_px=target_px
         )
 
     def _decide_pending(self, s: ReconstructedState, obi) -> Decision:
+        # Timeout: 1 bar duration (not 2) for faster cycle
         timeout = self.cfg.limit_timeout_sec or {
-            "1h": 7200,
-            "4h": 28800,
-            "1d": 172800,
-        }.get(self.cfg.timeframe.lower(), 28800)
+            "1h": 3600,
+            "4h": 14400,
+            "1d": 86400,
+        }.get(self.cfg.timeframe.lower(), 14400)
 
         if s.is_filled:
             return Decision.skip("order_filled", new_state=State.ACTIVE)
@@ -939,12 +1004,24 @@ class StatelessExecutor:
             px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
             return Decision.exit("signal_flipped", px=px)
 
+        # Signal decay: exit if signal weakened more than 40% since entry
+        # (entry signal stored via flow field convention)
+        if s.flow > 0.10 and abs(s.signal) < s.flow * 0.6:
+            px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
+            return Decision.exit("signal_decayed", px=px)
+
         if obi and s.ord_px:
             current = obi.ask_price if s.side_dir > 0 else obi.bid_price
             px = float(s.ord_px)
-            if px > 0 and abs(current - px) / px > 0.005:
-                new_px = round(px + s.side_dir * (current - px) * 0.2, 2)
-                return Decision.amend("price_chase", amend_px=new_px, new_state=State.PENDING)
+            if px > 0:
+                gap_pct = abs(current - px) / px
+                if gap_pct > 0.02:
+                    # Larger than 2% gap: cancel, let next bar re-enter at better price
+                    return Decision.exit("market_gapped", px=current)
+                if gap_pct > 0.003:
+                    # 0.3-2% gap: aggressively chase 60% of the gap (was 20%)
+                    new_px = round(px + s.side_dir * (current - px) * 0.6, 2)
+                    return Decision.amend("price_chase", amend_px=new_px, new_state=State.PENDING)
 
         return Decision.skip("order_outstanding", new_state=State.PENDING)
 
@@ -956,9 +1033,6 @@ class StatelessExecutor:
         if s.signal * s.side_dir < 0:
             px = obi.bid_price if s.side_dir > 0 else obi.ask_price if obi else 0.0
             return Decision.exit("signal_flipped", px=px)
-
-        # SL/TP are managed by OKX attached algo orders — no need to duplicate checks.
-        # Only manage trailing stop via algo amendments.
 
         mark = float(s.mark_px) if s.mark_px else 0.0
         if mark > 0:
@@ -979,6 +1053,8 @@ class StatelessExecutor:
                             amend_sl_trigger_px=new_sl_s,
                             amend_sl_ord_px=new_sl_s,
                         )
+
+        return Decision.skip("holding", new_state=State.ACTIVE)
 
         return Decision.skip("holding", new_state=State.ACTIVE)
 
