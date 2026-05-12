@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.core.signal import compute_dataframe
 from qooi.core.decide import AssetConfig, decide_active, decide_idle
-from qooi.core.signal import SignalResult
+from qooi.core.signal import SignalResult, compute_dataframe
 from qooi.exchange.indicator import add_indicators
 from qooi.strategies.flow_pipeline import (
     add_ofi_flow_columns,

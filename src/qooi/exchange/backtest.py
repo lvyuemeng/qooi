@@ -119,27 +119,6 @@ class WalkForwardConfig:
 
 
 # ======================================================================
-# Adaptive threshold helpers (shared with live executor logic)
-# ======================================================================
-
-
-def _thresh(pnl_ema: float, base: float, lo: float, hi: float) -> float:
-    """Adaptive entry threshold from PnL history."""
-    if abs(pnl_ema) < 0.001 or pnl_ema > 0.02:
-        return lo
-    if pnl_ema > 0.005:
-        return base - (pnl_ema - 0.005) / 0.015 * (base - lo)
-    if pnl_ema > -0.005:
-        return base
-    return max(lo, min(hi, base + (abs(pnl_ema) - 0.005) / 0.02 * (hi - base)))
-
-
-def _ema_update(prev: float, cur: float, period: int) -> float:
-    alpha = 2.0 / (period + 1)
-    return alpha * cur + (1 - alpha) * prev
-
-
-# ======================================================================
 # 1. Single-asset backtest
 # ======================================================================
 
@@ -157,139 +136,112 @@ class Backtest:
     def run(self) -> BacktestResult:
         df = self.data.sort("timestamp").with_columns(self.signal_expr.alias("signal"))
         df = df.with_columns(pl.col("signal").forward_fill().fill_null(0.0))
-        return self._run_single(df)
+        return self._run_shared(df)
 
-    def _run_single(self, df: pl.DataFrame) -> BacktestResult:
-        # Lazy import to avoid circular dependency (trading.py imports RiskConfig)
-        from qooi.exchange.trading import FillStatus, PositionState, State
+    def _run_shared(self, df: pl.DataFrame) -> BacktestResult:
+        """Backtest using qooi.core.decide — same decisions as live trading."""
+        from qooi.core.decide import AssetConfig, decide_active, decide_idle
+        from qooi.core.signal import SignalResult
 
         n = len(df)
         close = df["close"].to_list()
-        signal = df["signal"].to_list()
-        high = df["high"].to_list() if "high" in df.columns else close
-        low = df["low"].to_list() if "low" in df.columns else close
-        atr = self._clean_atr(df, n)
-        r = self.risk
+        atr_col = self.risk.atr_col
+        atr = df[atr_col].fill_nan(0).fill_null(0).to_list() if atr_col in df.columns else [1.0] * n
+        atr = [v if v > 0 else 1.0 for v in atr]
+        signal_col = df["signal"].to_list()
+        regime_col = (
+            df["regime_strength"].to_list() if "regime_strength" in df.columns else [0.0] * n
+        )
+        mom_col = df["regime_mom_fast"].to_list() if "regime_mom_fast" in df.columns else [0.0] * n
+        vol_col = df["regime_vol_conf"].to_list() if "regime_vol_conf" in df.columns else [0.5] * n
+        timestamp_col = df["timestamp"].to_list()
 
-        # B3: limit-order simulation — max bars before order expires
-        max_bars_pending = 2  # 2 bars for 4h = 8h timeout (matches live)
-
-        # B4: adaptive threshold (scaled per-asset if threshold provided)
-        t = self.threshold
-        if t is not None and t > 0:
-            adp_base, adp_min, adp_max = t, t * 0.625, t * 1.75
-        else:
-            adp_base, adp_min, adp_max = 0.40, 0.25, 0.70
-        adp_lookback = 50
-        pnl_ema = 0.0
+        cfg = AssetConfig(
+            symbol="BACKTEST",
+            sig_symbol="BACKTEST",
+            timeframe="4h",
+            capital=self.initial_capital,
+            max_risk_pct=self.risk.max_risk_pct,
+            leverage=self.risk.max_leverage,
+            ct_val=1.0,
+            signal_threshold=self.threshold or 0.25,
+        )
 
         equity = [self.initial_capital]
-        trade_log: list[dict] = []
         pos = [0.0]
-        bstate: State = State.IDLE
-        position: PositionState | None = None
-        order_px: float = 0.0
-        bars_pending: int = 0
-        entry_equity = self.initial_capital
-        size = 0.0
-        direction = 0  # 1=long, -1=short, 0=none
+        trades: list[dict] = []
+        pos_side = ""
+        entry_px = 0.0
+        sz = 0
+        entry_ts = 0
+        entry_eq = self.initial_capital
 
         for i in range(1, n):
-            p_prev = pos[-1]
             prev_eq = equity[-1]
-            atr_i = atr[i - 1] if atr[i - 1] > 0 else atr[i] if atr[i] > 0 else 1.0
-            p = self._clipped_signal(signal[i - 1])
             cur_close = close[i - 1]
-            cur_low = low[i - 1]
-            cur_high = high[i - 1]
 
-            # --- PENDING: check if limit order filled this bar ---
-            if bstate == State.PENDING and position is not None:
-                bars_pending += 1
-                is_buy = position.order.side == "buy"
-                filled = (is_buy and cur_low <= order_px) or (not is_buy and cur_high >= order_px)
-                if filled:
-                    fill_px = order_px  # filled at limit price
-                    position.fill_status = FillStatus.FILLED
-                    position.entry_price = fill_px
-                    bstate = State.ACTIVE
-                    direction = 1 if is_buy else -1
-                    size = position.order.sz
-                elif bars_pending >= max_bars_pending:
-                    # Timeout — cancel order
-                    position = None
-                    direction = 0
-                    bstate = State.IDLE
-                    size = 0.0
-                    bars_pending = 0
-
-            # --- ACTIVE: check exits ---
-            exit_reason: str | None = None
-            if bstate == State.ACTIVE and position is not None:
-                position.bars_held += 1
-                # Time-based exit: close after N bars in ACTIVE
-                if r.max_bars_held > 0 and position.bars_held >= r.max_bars_held:
-                    exit_reason = "time"
-                else:
-                    exit_reason = position.check_exit(cur_close, atr_i, r)
-
-            if exit_reason:
-                p = 0.0
-            sign_flip = p_prev != 0 and p != 0 and (p_prev * p < 0)
-            if bstate == State.ACTIVE and (exit_reason or (p == 0 and p_prev != 0) or sign_flip):
-                reason = exit_reason or "signal"
-                pnl = direction * (cur_close / position.entry_price - 1) if position else 0.0
-                pnl_ema = _ema_update(pnl_ema, pnl, adp_lookback)
-                trade_log.append(
-                    self._close_position(
-                        position, direction, entry_equity, df["timestamp"][i - 1], cur_close, reason
-                    )
-                )
-                position = None
-                direction = 0
-                bstate = State.IDLE
-                size = 0.0
-
-            turnover = abs(p - p_prev)
-            if turnover > 0:
-                prev_eq *= max(
-                    0.0, 1.0 - turnover * (self.cost.total_per_side + self.cost.market_impact_pct)
-                )
-
-            # --- IDLE: check if signal triggers entry ---
-            if bstate == State.IDLE and abs(signal[i - 1]) > 0:
-                # B4: adaptive threshold gate — check against raw signal
-                threshold = _thresh(pnl_ema, adp_base, adp_min, adp_max)
-                if abs(signal[i - 1]) >= threshold:
-                    entry_px = cur_close
-                    position, size = self._enter_position_state(
-                        p, entry_px, prev_eq, atr_i, r, df["timestamp"][i - 1]
-                    )
-                    if position is not None and size > 0:
-                        entry_equity = prev_eq
-                        direction = 1 if p > 0 else -1
-                        if self.ord_type == "market":
-                            # Market order: instant fill at bar close
-                            position.fill_status = FillStatus.FILLED
-                            position.entry_price = entry_px
-                            bstate = State.ACTIVE
-                        else:
-                            # Limit order: PENDING until bar touches price
-                            order_px = entry_px
-                            bars_pending = 0
-                            bstate = State.PENDING
-
-            pos_current = size * direction if direction != 0 else 0.0
-            daily_ret = self._bar_return(close[i], cur_close, pos_current)
-            equity.append(prev_eq * (1.0 + daily_ret))
-            pos.append(pos_current)
-
-        if bstate == State.ACTIVE and position is not None:
-            trade_log.append(
-                self._close_position(
-                    position, direction, entry_equity, df["timestamp"][-1], close[-1], "end"
-                )
+            sig_val = signal_col[i - 1]
+            sr = SignalResult(
+                symbol="BACKTEST",
+                timeframe="4h",
+                timestamp=int(timestamp_col[i - 1]),
+                signal=sig_val,
+                flow=sig_val,
+                threshold=cfg.signal_threshold,
+                atr=atr[i - 1],
+                regime_strength=regime_col[i - 1],
+                mom_fast=mom_col[i - 1],
+                vol_conf=vol_col[i - 1],
             )
+
+            if not pos_side:
+                # IDLE — use decide_idle
+                side = "buy" if sig_val > 0 else "sell"
+                d = decide_idle(sr, cur_close, side, cfg)
+                if d.action.value == "enter":
+                    pos_side = d.side
+                    entry_px = d.entry_px
+                    sz = d.sz
+                    entry_ts = int(timestamp_col[i - 1])
+                    prev_eq *= 1.0 - self.cost.total_per_side
+            else:
+                # ACTIVE — use decide_active + SL/TP check
+                d = decide_active(sr, pos_side, cfg)
+                d_sign = 1 if pos_side == "buy" else -1
+                exit_reason = ""
+                if self.risk.atr_stop_mult > 0 and atr[i - 1] > 0:
+                    stop_px = entry_px - d_sign * self.risk.atr_stop_mult * atr[i - 1]
+                    target_px = entry_px + d_sign * self.risk.atr_target_mult * atr[i - 1]
+                    if d_sign * (stop_px - cur_close) >= 0:
+                        exit_reason = "stop"
+                    elif d_sign * (cur_close - target_px) >= 0:
+                        exit_reason = "target"
+                if d.action.value == "exit":
+                    exit_reason = exit_reason or d.detail
+
+                if exit_reason:
+                    exit_px = cur_close * (1.0 - d_sign * self.cost.total_per_side)
+                    pnl_pct = d_sign * (exit_px / entry_px - 1) if entry_px > 0 else 0.0
+                    notional = sz * cfg.ct_val * entry_px
+                    pnl_usd = pnl_pct * notional * cfg.leverage
+                    trades.append(
+                        {
+                            "entry_time": entry_ts,
+                            "exit_time": int(timestamp_col[i - 1]),
+                            "side": "long" if d_sign > 0 else "short",
+                            "entry_price": entry_px,
+                            "exit_price": exit_px,
+                            "pnl": pnl_usd,
+                            "reason": exit_reason,
+                        }
+                    )
+                    prev_eq += pnl_usd
+                    pos_side = ""
+                    sz = 0
+
+            pos_current = sz * (1 if pos_side == "buy" else -1) if pos_side else 0.0
+            equity.append(prev_eq)
+            pos.append(pos_current)
 
         eq_series = pl.Series(equity, dtype=pl.Float64)
         result_df = df.select(["timestamp", "close", "signal"]).with_columns(
@@ -300,82 +252,12 @@ class Backtest:
             ]
         )
         return BacktestResult(
-            trades=pl.DataFrame(trade_log) if trade_log else pl.DataFrame(),
+            trades=pl.DataFrame(trades) if trades else pl.DataFrame(),
             equity_curve=result_df,
             metrics=compute_metrics(
-                result_df, trades=pl.DataFrame(trade_log) if trade_log else pl.DataFrame()
+                result_df, trades=pl.DataFrame(trades) if trades else pl.DataFrame()
             ),
         )
-
-    def _enter_position_state(self, p, entry_px, prev_eq, atr_i, r, ts):
-        """Create a PositionState using the same sizing as before."""
-        from qooi.exchange.trading import PositionState
-
-        if p > 0:
-            entry_px *= 1.0 + self.cost.total_per_side
-            parent = PositionState.enter_long
-        else:
-            entry_px *= 1.0 - self.cost.total_per_side
-            parent = PositionState.enter_short
-
-        if r.position_sizing == "atr" and atr_i > 0:
-            sz = r.max_risk_pct * prev_eq / (atr_i * r.atr_stop_mult)
-            sz = min(sz, r.max_leverage)
-        else:
-            sz = min(abs(p), r.max_leverage) if r.max_leverage > 0 else 1.0
-        sz = max(sz, 0.0)
-        if sz <= 0:
-            return None, 0.0
-
-        position = parent(entry_px, atr_i, r, int(ts))
-        position.order.sz = sz
-        return position, sz
-
-    def _close_position(self, position, direction, entry_equity, exit_ts, exit_price, reason):
-        """Extract trade log entry from PositionState."""
-        if position is None:
-            return {}
-        net_price = (
-            exit_price * (1.0 - self.cost.total_per_side)
-            if direction > 0
-            else exit_price * (1.0 + self.cost.total_per_side)
-        )
-        sz = position.order.sz if position.order.sz > 0 else 1.0
-        pnl = (net_price / position.entry_price - 1) * sz * entry_equity
-        return {
-            "entry_time": position.entry_ts,
-            "exit_time": exit_ts,
-            "side": "long" if direction > 0 else "short",
-            "entry_price": position.entry_price,
-            "exit_price": net_price,
-            "pnl": pnl,
-            "reason": reason,
-        }
-
-    def _clean_atr(self, df: pl.DataFrame, n: int) -> list[float]:
-        col = self.risk.atr_col
-        raw = (
-            df.get_column(col).fill_nan(0.0).fill_null(0.0)
-            if col in df.columns
-            else pl.Series([1.0] * n)
-        )
-        vals = raw.to_list()
-        first = next((v for v in vals if v > 0), 1.0)
-        return [v if v > 0 else first for v in vals]
-
-    def _clipped_signal(self, raw: float) -> float:
-        r = self.risk
-        if r.max_leverage <= 0:
-            return 0.0
-        return max(-r.max_leverage, min(r.max_leverage, raw))
-
-    def _bar_return(self, cur_close, prev_close, pos_current):
-        if pos_current == 0:
-            return 0.0
-        ret = (cur_close / prev_close - 1) * pos_current
-        if pos_current < 0:
-            ret -= self.cost.short_borrow_rate
-        return ret
 
 
 # ======================================================================
@@ -716,7 +598,7 @@ class WalkForwardBacktest:
         window_bars = w.rebalance_bars
         n_windows = total_bars // window_bars
         if n_windows < window_total + 1:
-            last = self._backtest._run_single(df)
+            last = self._backtest._run_shared(df)
             return WalkForwardResult(
                 windows=[],
                 combined_oos_metrics=last.metrics,
@@ -739,7 +621,7 @@ class WalkForwardBacktest:
                 seg = df.slice(lo, hi - lo)
                 if seg.height < 2:
                     continue
-                result = self._backtest._run_single(seg)
+                result = self._backtest._run_shared(seg)
                 win = WindowResult(
                     label=label,
                     start=lo,
@@ -759,7 +641,7 @@ class WalkForwardBacktest:
             )
             combined_oos_metrics = compute_metrics(oos_eq)
         else:
-            last = self._backtest._run_single(df)
+            last = self._backtest._run_shared(df)
             combined_oos_metrics = last.metrics
 
         stability = _compute_stability_metrics(windows)
