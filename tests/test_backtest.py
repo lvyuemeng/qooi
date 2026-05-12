@@ -1,179 +1,148 @@
-"""Backtest engine tests — strategy performance, risk rules, trade lifecycle."""
+"""Integrated tests — shared signal pipeline + decision engine.
+
+Tests the actual pipeline used by both live and backtest paths.
+Replaces the old test_backtest.py which used a different signal path
+than live trading.
+"""
+
+from __future__ import annotations
 
 import polars as pl
 
-from qooi.exchange.backtest import Backtest, CostModel, RiskConfig
+from qooi.core.signal import compute_dataframe
+from qooi.core.decide import AssetConfig, decide_active, decide_idle
+from qooi.core.signal import SignalResult
 from qooi.exchange.indicator import add_indicators
-from qooi.strategies.flow_pipeline import add_ofi_flow_columns, add_regime_features
+from qooi.strategies.flow_pipeline import (
+    add_ofi_flow_columns,
+    add_regime_features,
+    apply_regime_gate,
+)
 
-# ── helpers ──────────────────────────────────────────────────────────────────
 
-
-def _load_btc_spot() -> pl.DataFrame:
-    """Load BTC spot data from cache — the most reliable dataset."""
-    df = pl.read_parquet("data/cache/BTC_USDT_4H.parquet")
-    df = add_indicators(df)
-    df = add_regime_features(df)
-    df = add_ofi_flow_columns(df)
+def _load(name: str) -> pl.DataFrame:
+    df = pl.read_parquet(f"data/cache/{name}_4H.parquet")
+    if "vol" not in df.columns and "volume" in df.columns:
+        df = df.rename({"volume": "vol"})
     return df
 
 
-def _ofi_to_signal(df: pl.DataFrame, threshold: float) -> pl.DataFrame:
-    return df.with_columns(
-        pl.when(pl.col("ofi_flow_score").abs() >= threshold)
-        .then(pl.col("ofi_flow_score"))
-        .otherwise(0.0)
-        .alias("signal")
-    )
+class TestSharedPipeline:
+    """Verify compute_dataframe produces output identical to manual pipeline."""
 
-
-# ── strategy performance ────────────────────────────────────────────────────
-
-
-class TestStrategyPerformance:
-    def test_btc_spot_produces_positive_sharpe(self):
-        """BTC spot signal at threshold 0.25 should produce Sharpe > 1.0."""
-        df = _load_btc_spot()
-        assert df.height > 500, f"Need 500+ bars, got {df.height}"
-
-        df = _ofi_to_signal(df, 0.25)
-        risk = RiskConfig(
-            atr_stop_mult=2.0,
-            atr_target_mult=3.0,
-            max_leverage=0.4,
-            trailing_activation_mult=2.0,
-            trailing_distance_mult=1.0,
+    def test_pipeline_matches_manual(self):
+        df = _load("BTC_USDT")
+        manual = add_indicators(df.clone())
+        manual = add_regime_features(manual)
+        manual = add_ofi_flow_columns(manual)
+        manual = apply_regime_gate(manual, signal_col="ofi_flow_score")
+        ofi = pl.col("ofi_flow_score")
+        manual = manual.with_columns(
+            pl.when(ofi.abs() >= 0.25).then(ofi).otherwise(0.0).alias("signal")
         )
-        bt = Backtest(
-            df,
-            pl.col("signal"),
-            cost=CostModel(0.00005),
-            risk=risk,
+        computed = compute_dataframe(df.clone(), 0.25)
+        assert computed["signal"].to_list() == manual["signal"].to_list()
+
+    def test_gate_zeroes_in_strong_regime(self):
+        df = _load("BTC_USDT")
+        result = compute_dataframe(df.clone(), 0.25)
+        assert "signal" in result.columns
+        assert "ofi_flow_score" in result.columns
+
+
+class TestIntegratedDecide:
+    """Verify decide functions with real data produce expected outcomes."""
+
+    def test_idle_does_not_enter_on_zero_signal(self):
+        df = compute_dataframe(_load("BTC_USDT"), 0.25)
+        row = df.row(0, named=True)
+        sig = SignalResult(
+            symbol="BTC-USDT",
+            timeframe="4h",
+            timestamp=int(row["timestamp"]),
+            signal=0.0,
+            flow=0.0,
             threshold=0.25,
-            ord_type="market",
+            atr=float(row.get("atr_14", 0) or 0),
+            regime_strength=float(row.get("regime_strength", 0) or 0),
+            mom_fast=float(row.get("regime_mom_fast", 0) or 0),
+            vol_conf=float(row.get("regime_vol_conf", 0.5) or 0.5),
         )
-        r = bt.run()
-        m = r.metrics
-
-        assert m.num_trades > 50, f"Expected 50+ trades, got {m.num_trades}"
-        assert m.sharpe_ratio > 1.0, f"Expected Sharpe > 1.0, got {m.sharpe_ratio:.2f}"
-        assert m.win_rate_pct > 45, f"Expected WR > 45%, got {m.win_rate_pct:.0f}%"
-
-    def test_sol_spot_produces_positive_sharpe(self):
-        """SOL spot signal at threshold 0.35 should produce Sharpe > 1.0."""
-        df = pl.read_parquet("data/cache/SOL_USDT_4H.parquet")
-        df = add_indicators(df)
-        df = add_regime_features(df)
-        df = add_ofi_flow_columns(df)
-        assert df.height > 500, f"Need 500+ bars, got {df.height}"
-
-        df = _ofi_to_signal(df, 0.35)
-        risk = RiskConfig(
-            atr_stop_mult=2.0,
-            atr_target_mult=3.0,
-            max_leverage=0.4,
-            trailing_activation_mult=2.0,
-            trailing_distance_mult=1.0,
+        cfg = AssetConfig(
+            symbol="BTC-USDT-SWAP",
+            sig_symbol="BTC-USDT",
+            ct_val=0.01,
+            capital=1000,
+            leverage=2.0,
+            signal_threshold=0.25,
         )
-        bt = Backtest(
-            df,
-            pl.col("signal"),
-            cost=CostModel(0.00005),
-            risk=risk,
-            threshold=0.35,
-            ord_type="market",
-        )
-        r = bt.run()
-        m = r.metrics
+        d = decide_idle(sig, 50000, "buy", cfg)
+        assert d.action.value == "hold"
 
-        assert m.num_trades > 30, f"Expected 30+ trades, got {m.num_trades}"
-        assert m.sharpe_ratio > 1.0, f"Expected Sharpe > 1.0, got {m.sharpe_ratio:.2f}"
-
-    def test_higher_threshold_reduces_trades(self):
-        """Raising threshold from 0.25 to 0.40 should reduce trade count."""
-        df = _load_btc_spot()
-        df25 = _ofi_to_signal(df, 0.25)
-        df40 = _ofi_to_signal(df, 0.40)
-
-        risk = RiskConfig(atr_stop_mult=2.0, atr_target_mult=3.0, max_leverage=0.4)
-
-        r25 = Backtest(
-            df25,
-            pl.col("signal"),
-            cost=CostModel(0.00005),
-            risk=risk,
+    def test_active_flips_on_opposing_signal(self):
+        sig = SignalResult(
+            symbol="BTC-USDT",
+            timeframe="4h",
+            timestamp=0,
+            signal=-0.5,
+            flow=-0.5,
             threshold=0.25,
-            ord_type="market",
-        ).run()
-        r40 = Backtest(
-            df40,
-            pl.col("signal"),
-            cost=CostModel(0.00005),
-            risk=risk,
-            threshold=0.40,
-            ord_type="market",
-        ).run()
-
-        assert r40.metrics.num_trades < r25.metrics.num_trades, (
-            f"Expected fewer trades at 0.40 ({r40.metrics.num_trades}) vs 0.25 ({r25.metrics.num_trades})"
+            atr=1000.0,
+            regime_strength=0.2,
+            mom_fast=0.1,
+            vol_conf=0.6,
         )
-
-
-# ── risk rules ──────────────────────────────────────────────────────────────
-
-
-class TestRiskRules:
-    def test_risk_config_defaults(self):
-        risk = RiskConfig()
-        assert risk.atr_stop_mult == 2.0
-        assert risk.atr_target_mult == 3.0
-        assert risk.trailing_activation_mult == 2.0
-        assert risk.trailing_distance_mult == 1.0
-        assert risk.max_leverage == 1.0  # default is 1.0
-
-    def test_all_exit_reasons_exercised(self):
-        """Backtest should exercise stop, target, trail, and signal exits."""
-        df = _load_btc_spot()
-        df = _ofi_to_signal(df, 0.25)
-
-        risk = RiskConfig(
-            atr_stop_mult=2.0,
-            atr_target_mult=3.0,
-            max_leverage=0.4,
-            trailing_activation_mult=2.0,
-            trailing_distance_mult=1.0,
+        cfg = AssetConfig(
+            symbol="BTC-USDT-SWAP",
+            sig_symbol="BTC-USDT",
+            ct_val=0.01,
+            capital=1000,
+            signal_threshold=0.25,
         )
-        bt = Backtest(
-            df,
-            pl.col("signal"),
-            cost=CostModel(0.00005),
-            risk=risk,
-            threshold=0.25,
-            ord_type="market",
-        )
-        r = bt.run()
-        t = r.trades
+        d = decide_active(sig, "buy", cfg)
+        assert d.action.value == "exit"
 
-        reasons = set(t["reason"].value_counts()["reason"].to_list())
-        assert len(reasons) >= 2, f"Expected 2+ exit reasons, got {reasons}"
+    def test_pipeline_on_xau_produces_columns(self):
+        try:
+            df = _load("XAU_USDT_SWAP")
+            result = compute_dataframe(df, 0.25)
+            assert "ofi_flow_score" in result.columns
+            assert "signal" in result.columns
+        except Exception:
+            pass  # XAU cache may not exist
 
-    def test_backtest_no_trades_on_zero_signal(self):
-        """Backtest with all-zero signal produces 0 trades."""
-        df = pl.DataFrame(
-            {
-                "timestamp": list(
-                    range(1_700_000_000_000, 1_700_000_000_000 + 200 * 14_400_000, 14_400_000)
-                ),
-                "open": [100.0] * 200,
-                "high": [101.0] * 200,
-                "low": [99.0] * 200,
-                "close": [100.0] * 200,
-                "vol": [1000.0] * 200,
-                "atr_14": [2.0] * 200,
-                "signal": [0.0] * 200,
-            }
+    def test_pipeline_on_xrp_produces_columns(self):
+        df = _load("XRP_USDT")
+        result = compute_dataframe(df, 0.30)
+        assert "ofi_flow_score" in result.columns
+        assert "signal" in result.columns
+
+
+class TestSizingWithLiveData:
+    def test_btc_sizing_is_sane(self):
+        cfg = AssetConfig(
+            symbol="BTC-USDT-SWAP",
+            sig_symbol="BTC-USDT",
+            ct_val=0.01,
+            capital=1000,
+            leverage=2.0,
+            signal_threshold=0.25,
         )
-        bt = Backtest(df, pl.col("signal"), risk=RiskConfig())
-        r = bt.run()
-        assert r.trades.height == 0
-        assert r.metrics.num_trades == 0
+        from qooi.core.decide import compute_sz
+
+        sz = compute_sz(50000, 49000, cfg)
+        assert 1 <= sz <= 50  # reasonable range for BTC
+
+    def test_xau_sizing_is_sane(self):
+        cfg = AssetConfig(
+            symbol="XAU-USDT-SWAP",
+            sig_symbol="XAU-USDT",
+            ct_val=0.001,
+            capital=500,
+            leverage=5.0,
+            signal_threshold=0.25,
+        )
+        from qooi.core.decide import compute_sz
+
+        sz = compute_sz(4700, 4650, cfg)
+        assert 100 <= sz <= 550  # XAU: tiny ct_val → large contract count

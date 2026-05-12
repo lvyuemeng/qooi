@@ -36,6 +36,8 @@ class SignalResult:
 
 def compute_dataframe(df: pl.DataFrame, threshold: float) -> pl.DataFrame:
     """Full pipeline on cached data — for backtesting."""
+    if "volume" in df.columns and "vol" not in df.columns:
+        df = df.rename({"volume": "vol"})
     df = add_indicators(df)
     df = add_regime_features(df)
     df = add_ofi_flow_columns(df)
