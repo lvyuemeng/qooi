@@ -24,7 +24,7 @@ class ExitConfig:
 @dataclass
 class TrailTracker:
     trail_high: float = 0.0
-    trail_low: float = 0.0
+    trail_low: float = float("inf")
     target_hit: bool = False
 
     def update(self, high: float, low: float) -> None:

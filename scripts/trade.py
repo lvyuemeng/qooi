@@ -3,6 +3,10 @@
 Four-layer architecture: Signal → Basket → Recovery → Exits → Executor.
 Same pipeline used by backtest and live trading.
 
+State management: loads soft accumulators from data/state/baskets.json
+on startup, queries OKX for hard position/order truth, saves state after
+execution.
+
 Usage::
 
     uv run python scripts/trade.py test
@@ -14,7 +18,6 @@ from __future__ import annotations
 import os
 import sys
 
-from qooi.core.basket import Basket
 from qooi.core.config import PAIRS
 from qooi.core.executor import LiveExecutor
 from qooi.core.pipeline import process_bar
@@ -29,7 +32,7 @@ def _run(dry_run: bool, env: str) -> None:
     tc = TradingClient()
     md = MarketData("okx")
     executor = LiveExecutor(tc, md)
-    baskets: list[Basket] = []
+    baskets = executor.load_state(PAIRS)
 
     for p in PAIRS:
         sym = p.asset.symbol
@@ -53,6 +56,8 @@ def _run(dry_run: bool, env: str) -> None:
             print(f"  {sym:20s} {a.action:10s} {a.side:5s} {a.reason}")
 
         executor.execute(actions, dry_run=dry_run)
+
+    executor.save_state(baskets)
 
 
 def main() -> None:

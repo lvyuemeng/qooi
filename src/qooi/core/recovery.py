@@ -60,6 +60,8 @@ def _grid(
 ) -> BasketAction | None:
     if level >= config.max_levels:
         return None
+    if basket.current_sz <= 0:
+        return None
 
     target_px = basket.entry_px - d * config.zone_atr * atr * (level + 1)
     if d * (bar_close - target_px) <= 0:

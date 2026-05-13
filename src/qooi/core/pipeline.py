@@ -93,7 +93,7 @@ def process_bar(
             if r_action.action == "add_grid":
                 basket.recovery_level += 1
                 basket.recovery_activated = True
-            elif r_action.action == "martingale_reverse":
+            elif r_action.reason == "martingale_reverse":
                 mgr.remove(basket)
             return actions
 
