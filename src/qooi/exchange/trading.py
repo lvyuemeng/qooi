@@ -259,7 +259,7 @@ class TradingClient:
                 sl_pct=pair.okx.sl_pct,
                 sub_ord_type="9",
                 allow_multiple_entry=False,
-                algo_cl_ord_id=f"qooi-{pair.asset.symbol}-v1",
+                algo_cl_ord_id=f"qooi{pair.asset.symbol.replace('-', '')}v1",
             )
         except RuntimeError:
             bot = self._signal_resolve_bot(pair)
