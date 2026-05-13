@@ -1,12 +1,10 @@
 """Live trading entry point — GitHub Actions single invocation.
 
+Auto-creates OKX signal bot on first run (idempotent), then computes
+signal, decides, and pushes orders on every subsequent run.
+
 Uses shared signal pipeline (qooi.core.signal) and decision engine
 (qooi.core.decide) so backtest and live trade identically.
-
-Workflow:
-  1. Load canonical PAIRS from shared config
-  2. Resolve each pair to its OKX bot identity (orders-algo-pending)
-  3. For each pair: compute signal, query position state, decide, push
 
 1H strategies:
   - momentum_1h → ETH (6-bar momentum burst + ADX + session filter)
@@ -16,7 +14,7 @@ Position state: queried from OKX GET /signal/positions (server-side truth).
 
 Usage::
 
-    uv run python scripts/trade.py testnet
+    uv run python scripts/trade.py test
     uv run python scripts/trade.py live [dry]
 """
 
@@ -25,7 +23,7 @@ from __future__ import annotations
 import os
 import sys
 
-from qooi.core.config import PAIRS, query_position, resolve_bot
+from qooi.core.config import PAIRS
 
 
 def _run(dry_run: bool, env: str) -> None:
@@ -43,10 +41,10 @@ def _run(dry_run: bool, env: str) -> None:
         sym = p.asset.symbol
         strat = p.okx.strategy
 
-        # 0. Resolve OKX bot identity from running bots
-        bot = resolve_bot(tc, p)
+        # 0. Ensure bot exists (creates channel + order-algo if missing)
+        bot = tc.signal_ensure_bot(p)
         if not bot:
-            print(f"  {sym:20s}  skip (no signal bot — run setup_signal.py)")
+            print(f"  {sym:20s}  skip (failed to ensure bot)")
             continue
 
         # 1. Compute signal via strategy-specific function
@@ -63,7 +61,7 @@ def _run(dry_run: bool, env: str) -> None:
             continue
 
         # 2. Query OKX position state — server-side source of truth
-        pos = query_position(tc, bot, p)
+        pos = tc.signal_query_position(bot, p)
 
         # 3. Decide (same functions as backtest)
         cfg = p.asset
@@ -104,12 +102,12 @@ def _run(dry_run: bool, env: str) -> None:
 
 
 def main() -> None:
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "testnet"
-    if cmd in ("testnet", "live"):
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "test"
+    if cmd in ("test", "live"):
         dry = cmd == "live" and (len(sys.argv) <= 2 or sys.argv[2] != "live")
-        _run(dry_run=dry, env="test" if cmd == "testnet" else "live")
+        _run(dry_run=dry, env=cmd)
     else:
-        print("Usage: uv run python scripts/trade.py testnet|live [dry]")
+        print("Usage: uv run python scripts/trade.py test|live [dry]")
         sys.exit(1)
 
 

@@ -1,4 +1,4 @@
-name: qooi-testnet-1h
+name: qooi-test-1h
 
 on:
   schedule:
@@ -14,7 +14,7 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - run: uv sync
       - name: Run
-        run: uv run python scripts/trade.py testnet
+        run: uv run python scripts/trade.py test
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY_TEST }}
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY_TEST }}
@@ -24,6 +24,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: testnet-logs-${{ github.run_id }}
+          name: test-logs-${{ github.run_id }}
           path: data/logs/
           retention-days: 90

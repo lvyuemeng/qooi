@@ -1,10 +1,10 @@
-# Testnet Validation
+# Test Validation
 
 ## Setup (One-Time)
 
 Perpetual swaps require a margin-enabled account.
 
-1. **OKX testnet/demo** → Settings → Account Mode → switch to **"Single-currency margin"**
+1. **OKX test/demo** → Settings → Account Mode → switch to **"Single-currency margin"**
 2. Transfer USDT from spot sub-account to swap sub-account
 3. Set up `.env.test`:
 
@@ -15,18 +15,16 @@ Perpetual swaps require a margin-enabled account.
    OKX_FLAG=1
    ```
 
-4. Create OKX signal channels + strategies:
+4. Run trade.py — auto-creates signal bot on first run, then trades:
 
    ```bash
-   uv run python scripts/setup_signal.py testnet
+   uv run python scripts/trade.py test
    ```
-
-5. Verify: `uv run python scripts/trade.py testnet` should show signal decisions without errors
 
 ## Daily Routine
 
 ```bash
-uv run python scripts/trade.py testnet
+uv run python scripts/trade.py test
 ```
 
 This does everything: fetches 1H candles, runs the strategy state-machine,
@@ -67,12 +65,12 @@ Run multiple times to observe different signal states:
 
 ```bash
 # See current signal state
-uv run python scripts/trade.py testnet
+uv run python scripts/trade.py test
 
 # Wait 1 hour for next bar...
 
 # See updated state (new candle, new signal)
-uv run python scripts/trade.py testnet
+uv run python scripts/trade.py test
 ```
 
 If a strategy has a signal, you'll see `action=enter` and an `ORDER ...` line.
@@ -80,12 +78,12 @@ If a strategy has a signal, you'll see `action=enter` and an `ORDER ...` line.
 ## GitHub Actions
 
 The system runs automatically **every 1 hour** via GitHub Actions
-(`.github/workflows/trade-testnet-1h.yml`). Logs are uploaded as artifacts
+(`.github/workflows/trade-test-1h.yml`). Logs are uploaded as artifacts
 and retained for 90 days.
 
-Manual trigger: GitHub → Actions → `qooi-testnet-1h` → Run workflow.
+Manual trigger: GitHub → Actions → `qooi-test-1h` → Run workflow.
 
-On the Actions runner, orders execute on the OKX testnet (server-side),
+On the Actions runner, orders execute on the OKX test environment (server-side),
 so position state persists across GitHub Actions invocations. The strategy
 re-runs the full state-machine on each invocation (matching backtest).
 

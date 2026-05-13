@@ -69,14 +69,11 @@ tested strategies and timeframes. XAU-USDT had insufficient data (34 days).
 ## Running
 
 ```bash
-# One-time setup
-uv run python scripts/setup_signal.py testnet
+# Auto-creates bots on first run, then trades
+uv run python scripts/trade.py test
 
 # Backtest (all cached data)
 uv run python scripts/backtest.py
-
-# Live trading — testnet
-uv run python scripts/trade.py testnet
 
 # Live trading — production
 uv run python scripts/trade.py live dry    # dry run
@@ -91,5 +88,5 @@ mode. Error `51010` means the account is in "simple" mode — switch in OKX sett
 For the signal bot, ensure:
 
 1. `.env.test` has `OKX_API_KEY_TEST`, `OKX_SECRET_KEY_TEST`, `OKX_PASSPHRASE_TEST`
-2. `OKX_FLAG=1` for testnet, `OKX_FLAG=0` for live
-3. Run `setup_signal.py testnet` to create signal channels and strategies on OKX
+2. `OKX_FLAG=1` for test, `OKX_FLAG=0` for live
+3. Run `uv run python scripts/trade.py test` — auto-creates signal bot on first run

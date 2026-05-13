@@ -212,6 +212,80 @@ class TradingClient:
             inst_id=inst_id,
         )
 
+    def signal_ensure_bot(self, pair):
+        """Find or create the OKX signal bot for this pair.  Idempotent.
+
+        Returns ``BotIdentity`` or ``None`` on failure.
+        """
+        from qooi.core.config import BotIdentity
+
+        bot = self._signal_resolve_bot(pair)
+        if bot:
+            return bot
+
+        name = pair.chan_name
+        desc = f"{pair.okx.strategy} signal for {pair.asset.symbol} {pair.asset.timeframe}"
+        chan = self.signal_create(name, desc)
+        chan_id = (
+            chan.get("signalChanId", chan.get("data", [{}])[0].get("signalChanId", ""))
+            if isinstance(chan, dict)
+            else ""
+        )
+        if not chan_id:
+            print(f"    WARNING: failed to create signal channel for {pair.chan_name}")
+            return None
+
+        algo = self.signal_create_order_algo(
+            signal_chan_id=chan_id,
+            inst_ids=[pair.asset.symbol],
+            lever=str(int(pair.asset.leverage)),
+            invest_amt=str(int(pair.asset.capital)),
+            entry_type="3",
+            amt="",
+            tp_pct=pair.okx.tp_pct,
+            sl_pct=pair.okx.sl_pct,
+            sub_ord_type="9",
+            allow_multiple_entry=False,
+        )
+        algo_data = algo if isinstance(algo, dict) else {}
+        algo_id = algo_data.get("algoId", algo_data.get("data", [{}])[0].get("algoId", ""))
+        return BotIdentity(algo_id=algo_id, signal_chan_id=chan_id)
+
+    def signal_query_position(self, bot, pair):
+        """Query current position from OKX signal/positions."""
+        from qooi.core.config import PositionState
+
+        try:
+            resp = self.signal_get_positions(bot.algo_id)
+            for pos in resp.get("data", []) if isinstance(resp, dict) else []:
+                if pos.get("instId") == pair.asset.symbol:
+                    qty = str(pos.get("pos", "0"))
+                    if qty != "0" and qty not in ("", "nan", "None"):
+                        p = float(qty)
+                        if p > 0:
+                            return PositionState(has_position=True, side="buy")
+                        elif p < 0:
+                            return PositionState(has_position=True, side="sell")
+        except Exception:
+            pass
+        return PositionState()
+
+    def _signal_resolve_bot(self, pair):
+        """Find existing bot by channel name from orders-algo-pending."""
+        from qooi.core.config import BotIdentity
+
+        try:
+            resp = self.signal_get_pending()
+            for bot in resp.get("data", []) if isinstance(resp, dict) else []:
+                if bot.get("signalChanName") == pair.chan_name:
+                    return BotIdentity(
+                        algo_id=bot.get("algoId", ""),
+                        signal_chan_id=bot.get("signalChanId", ""),
+                    )
+        except Exception:
+            pass
+        return None
+
     def signal_close_position(self, algo_id: str, signal_chan_id: str, inst_id: str) -> dict:
         return self._retry(
             lambda: self._signal_api(

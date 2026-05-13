@@ -56,11 +56,8 @@ The client only sends **ENTER** and **CLOSE** signals.
 ## Usage
 
 ```bash
-# One-time setup: create OKX signal channels + strategies
-uv run python scripts/setup_signal.py testnet
-
-# Every 1H: compute signals, decide, push to OKX
-uv run python scripts/trade.py testnet
+# Auto-creates signal bot on first run, then trades every 1H
+uv run python scripts/trade.py test
 
 # Backtest a strategy on cached data
 uv run python scripts/backtest.py
@@ -68,20 +65,18 @@ uv run python scripts/backtest.py
 # Custom backtest:
 uv run python -c "
 from qooi.exchange.backtest import Backtest, RiskConfig
-from qooi.core.signal import compute_dataframe
 import polars as pl
 
 df = pl.read_parquet('data/cache/ETH_USDT_1H.parquet')
-# compute_dataframe runs indicators + strategy signal
 bt = Backtest(data=df, signal_expr=pl.col('signal'), initial_capital=500,
                risk=RiskConfig(max_leverage=2.0, max_risk_pct=0.50, ct_val=0.1))
 result = bt.run()
 print(f'Sharpe={result.metrics.sharpe_ratio:.2f}  WR={result.metrics.win_rate_pct:.0f}%')
 "
 
-# Switch between testnet / live API keys:
-export OKX_ENV=test && uv run python scripts/trade.py testnet
-export OKX_ENV=live && uv run python scripts/trade.py live dry
+# Switch between test / live:
+uv run python scripts/trade.py test
+uv run python scripts/trade.py live dry
 ```
 
 ## Environment
@@ -89,7 +84,7 @@ export OKX_ENV=live && uv run python scripts/trade.py live dry
 - **Python 3.12** via `uv`
 - **Polars** DataFrame library
 - **python-okx** SDK for trading
-- GitHub Actions: 1H cron schedule on testnet
+- GitHub Actions: 1H cron schedule on test environment
 
 ## Project structure
 
@@ -101,20 +96,19 @@ src/qooi/
                        ema_pullback.py, ema_pullback_v2.py, flow_pipeline.py,
                        portfolio.py
 scripts/
-  setup_signal.py    ← one-time OKX signal channel + strategy creation
-  trade.py           ← live trading entry point (GitHub Actions or manual)
+  trade.py           ← live trading entry point (auto-creates bot on first run)
   backtest.py        ← CLI backtest runner
 docs/
   okx-api.md         ← OKX API reference
-  testnet.md         ← testnet validation workflow
+  testnet.md         ← test validation workflow
   context.md         ← domain context & glossary
   tests.md           ← instrument config & backtest results
 ```
 
 ## Live Deployment
 
-1. Create OKX API keys with trade permissions on your testnet account
-2. Set up testnet `.env.test`:
+1. Create OKX API keys with trade permissions on your test account
+2. Set up `.env.test`:
 
    ```ini
    OKX_API_KEY_TEST=your_key
@@ -123,14 +117,17 @@ docs/
    OKX_FLAG=1
    ```
 
-3. One-time: `uv run python scripts/setup_signal.py testnet`
-4. Every hour: `uv run python scripts/trade.py testnet`
-5. After observing 1-2 weeks of paper-trading results, switch to live.
+3. Run trade.py — auto-creates signal bot on first run, then trades every hour:
+
+   ```bash
+   uv run python scripts/trade.py test
+   ```
+
+4. After observing 1-2 weeks of paper-trading results, switch to live.
 
 For production, copy `.env.test` → `.env.live` with live credentials and run:
 
 ```bash
-uv run python scripts/setup_signal.py live
 uv run python scripts/trade.py live dry    # dry run first
 uv run python scripts/trade.py live live   # real orders
 ```

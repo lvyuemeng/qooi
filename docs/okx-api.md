@@ -189,7 +189,7 @@ The OKX Signal Bot is a server-driven execution engine. TP/SL are handled
 autonomously by OKX — the client only sends entry signals and close-position
 requests. This is the execution layer for qooi's 1H strategies.
 
-### Setup (one-time, see `scripts/setup_signal.py`)
+### Setup (auto on first run, see `TradingClient.signal_ensure_bot`)
 
 1. `POST /api/v5/tradingBot/signal/create-signal`
    - Creates a signal channel → returns `signalChanId` + token
@@ -228,10 +228,10 @@ requests. This is the execution layer for qooi's 1H strategies.
 qooi wraps these in `TradingClient` (`src/qooi/exchange/trading.py`):
 
 ```python
-tc.signal_create(name, desc)                    → signalChanId
-tc.signal_create_order_algo(chan_id, ...)       → algoId
-tc.signal_get_positions(algo_id)                → [{instId, pos, avgPx, ...}]
-tc.signal_push_sub_order(algo_id, ...)          → enter
+tc.signal_ensure_bot(pair)                      → BotIdentity (find or create, idempotent)
+tc.signal_query_position(bot, pair)             → PositionState
+tc.signal_execute_enter(decision, ...)          → enter
+tc.signal_execute_exit(algo_id, ...)            → exit
 tc.signal_close_position(algo_id, ...)          → exit
 tc.signal_stop(algo_id, chan_id)                → cancel algo
 ```

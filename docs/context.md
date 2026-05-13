@@ -71,7 +71,7 @@ Key files:
 - `src/qooi/strategies/rsi_reversion.py` — 1H RSI mean-reversion state-machine
 - `src/qooi/core/signal.py` — `compute_momentum_1h()`, `compute_rsi_reversion_1h()`
 - `src/qooi/exchange/trading.py` — TradingClient + signal bot endpoints
-- `scripts/trade.py` — live trading entry point (testnet, live)
+- `scripts/trade.py` — live trading entry point (test, live)
 
 ## Glossary
 
