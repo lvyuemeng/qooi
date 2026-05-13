@@ -4,16 +4,15 @@ Uses shared signal pipeline (qooi.core.signal) and decision engine
 (qooi.core.decide) so backtest and live trade identically.
 
 Workflow:
-  1. Query OKX signal/orders-algo-pending for existing bot configs
-  2. Match to hardcoded PAIRS by inst_id
+  1. Load canonical PAIRS from shared config
+  2. Resolve each pair to its OKX bot identity (orders-algo-pending)
   3. For each pair: compute signal, query position state, decide, push
 
 1H strategies:
   - momentum_1h → ETH (6-bar momentum burst + ADX + session filter)
   - rsi_reversion → SOL (oversold bounce in uptrend with RSI confirmation)
 
-Position state: queried from OKX GET /signal/positions (server-side truth),
-NOT from file-persisted _last_side (stateless GitHub Actions fix).
+Position state: queried from OKX GET /signal/positions (server-side truth).
 
 Usage::
 
@@ -26,89 +25,12 @@ from __future__ import annotations
 import os
 import sys
 
-PAIRS = [
-    {
-        "symbol": "ETH-USDT-SWAP",
-        "sig_symbol": "ETH-USDT",
-        "strategy": "momentum_1h",
-        "tf": "1H",
-        "capital": 500,
-        "leverage": 2.0,
-        "ct_val": 0.1,
-        "sig_threshold": 0.01,
-    },
-    {
-        "symbol": "SOL-USDT-SWAP",
-        "sig_symbol": "SOL-USDT",
-        "strategy": "rsi_reversion",
-        "tf": "1H",
-        "capital": 200,
-        "leverage": 3.0,
-        "ct_val": 1.0,
-        "sig_threshold": 0.01,
-    },
-]
-
-
-def _get_position_state(tc, algo_id: str, inst_id: str) -> tuple[bool, str]:
-    """Query OKX for current position: (has_position, pos_side).
-
-    Uses GET /signal/positions — the server-side source of truth.
-    pos > 0 → long, pos < 0 → short, pos == "0" → flat.
-    """
-    try:
-        resp = tc.signal_get_positions(algo_id)
-        data = resp.get("data", []) if isinstance(resp, dict) else []
-        for pos in data:
-            if pos.get("instId") == inst_id:
-                qty = str(pos.get("pos", "0"))
-                if qty != "0" and qty not in ("", "nan", "None"):
-                    p = float(qty)
-                    if p > 0:
-                        return (True, "buy")
-                    elif p < 0:
-                        return (True, "sell")
-        return (False, "")
-    except Exception:
-        return (False, "")
-
-
-def _chan_name(symbol: str) -> str:
-    """Derive OKX signal channel name from instrument symbol.
-
-    Must match the naming convention used by setup_signal.py::
-
-        f"qooi-{sym.replace('-', '_')}"
-    """
-    return f"qooi-{symbol.replace('-', '_')}"
-
-
-def _bot_configs(tc) -> dict[str, dict]:
-    """Query OKX for active signal bots, keyed by signalChanName.
-
-    Returns dict like::
-
-        {"qooi-ETH_USDT_SWAP": {"algo_id": "...", "signal_chan_id": "..."}, ...}
-    """
-    result: dict[str, dict] = {}
-    try:
-        resp = tc.signal_get_pending()
-        bots = resp.get("data", []) if isinstance(resp, dict) else []
-        for bot in bots:
-            name = bot.get("signalChanName", "")
-            if name:
-                result[name] = {
-                    "algo_id": bot.get("algoId", ""),
-                    "signal_chan_id": bot.get("signalChanId", ""),
-                }
-    except Exception as e:
-        print(f"    WARNING: signal_get_pending failed: {e}")
-    return result
+from qooi.core.config import PAIRS, query_position, resolve_bot
 
 
 def _run(dry_run: bool, env: str) -> None:
     os.environ["OKX_ENV"] = env
-    from qooi.core.decide import AssetConfig, decide_active, decide_idle
+    from qooi.core.decide import decide_active, decide_idle
     from qooi.core.signal import compute_momentum_1h, compute_rsi_reversion_1h
     from qooi.exchange.market import MarketData
     from qooi.exchange.trading import TradingClient, load_okx_env
@@ -117,23 +39,23 @@ def _run(dry_run: bool, env: str) -> None:
     tc = TradingClient()
     md = MarketData("okx")
 
-    configs = _bot_configs(tc)
-
     for p in PAIRS:
-        sym = p["symbol"]
-        strategy = p["strategy"]
-        cfg = configs.get(_chan_name(sym))
-        if not cfg:
+        sym = p.asset.symbol
+        strat = p.okx.strategy
+
+        # 0. Resolve OKX bot identity from running bots
+        bot = resolve_bot(tc, p)
+        if not bot:
             print(f"  {sym:20s}  skip (no signal bot — run setup_signal.py)")
             continue
 
         # 1. Compute signal via strategy-specific function
-        if strategy == "momentum_1h":
-            signal = compute_momentum_1h(p["sig_symbol"])
-        elif strategy == "rsi_reversion":
-            signal = compute_rsi_reversion_1h(p["sig_symbol"])
+        if strat == "momentum_1h":
+            signal = compute_momentum_1h(p.asset.sig_symbol)
+        elif strat == "rsi_reversion":
+            signal = compute_rsi_reversion_1h(p.asset.sig_symbol)
         else:
-            print(f"  {sym:20s}  skip (unknown strategy: {strategy})")
+            print(f"  {sym:20s}  skip (unknown strategy: {strat})")
             continue
 
         if signal is None:
@@ -141,34 +63,23 @@ def _run(dry_run: bool, env: str) -> None:
             continue
 
         # 2. Query OKX position state — server-side source of truth
-        has_position, pos_side = _get_position_state(tc, cfg["algo_id"], sym)
+        pos = query_position(tc, bot, p)
 
         # 3. Decide (same functions as backtest)
-        asset_cfg = AssetConfig(
-            symbol=sym,
-            sig_symbol=p["sig_symbol"],
-            timeframe=p["tf"],
-            capital=p["capital"],
-            max_risk_pct=p.get("risk_pct", 0.50),
-            leverage=p["leverage"],
-            ct_val=p["ct_val"],
-            signal_threshold=p["sig_threshold"],
-            ord_type=p.get("ord_type", "limit"),
-        )
-
-        if not has_position:
+        cfg = p.asset
+        if not pos.has_position:
             obi = md.ob_snapshot(sym, limit=1)
             entry_px = obi.ask_price if obi else 0
             side = "buy" if signal.signal > 0 else "sell"
             if side == "sell" and obi:
                 entry_px = obi.bid_price
-            d = decide_idle(signal, entry_px, side, asset_cfg)
+            d = decide_idle(signal, entry_px, side, cfg)
         else:
-            d = decide_active(signal, pos_side, asset_cfg)
+            d = decide_active(signal, pos.side, cfg)
 
         print(
-            f"  {sym:20s} strategy={strategy} sig={signal.signal:+.0f} atr={signal.atr} "
-            f"pos={pos_side if has_position else 'flat'} action={d.action.value} {d.detail}"
+            f"  {sym:20s} strategy={strat} sig={signal.signal:+.0f} atr={signal.atr} "
+            f"pos={pos.side if pos.has_position else 'flat'} action={d.action.value} {d.detail}"
         )
 
         if dry_run:
@@ -177,7 +88,7 @@ def _run(dry_run: bool, env: str) -> None:
         # 4. Execute
         if d.action.value == "enter":
             try:
-                tc.signal_execute_enter(d, cfg["algo_id"], cfg["signal_chan_id"], sym)
+                tc.signal_execute_enter(d, bot.algo_id, bot.signal_chan_id, sym)
                 print(
                     f"    ORDER {d.side} sz={d.sz} px={d.entry_px} sl={d.stop_px} tp={d.target_px}"
                 )
@@ -186,7 +97,7 @@ def _run(dry_run: bool, env: str) -> None:
 
         elif d.action.value == "exit":
             try:
-                tc.signal_execute_exit(cfg["algo_id"], cfg["signal_chan_id"], sym)
+                tc.signal_execute_exit(bot.algo_id, bot.signal_chan_id, sym)
                 print(f"    CLOSE ({d.detail})")
             except Exception as e:
                 print(f"    CLOSE FAILED: {e}")
