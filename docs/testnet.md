@@ -7,16 +7,20 @@ Perpetual swaps require a margin-enabled account.
 1. **OKX testnet/demo** → Settings → Account Mode → switch to **"Single-currency margin"**
 2. Transfer USDT from spot sub-account to swap sub-account
 3. Set up `.env.test`:
+
    ```ini
    OKX_API_KEY_TEST=your_key
    OKX_SECRET_KEY_TEST=your_secret
    OKX_PASSPHRASE_TEST=your_passphrase
    OKX_FLAG=1
    ```
+
 4. Create OKX signal channels + strategies:
+
    ```bash
    uv run python scripts/setup_signal.py testnet
    ```
+
 5. Verify: `uv run python scripts/trade.py testnet` should show signal decisions without errors
 
 ## Daily Routine
@@ -30,7 +34,7 @@ queries OKX position state, decides, and pushes orders to the signal bot.
 
 ### What the output means
 
-```
+```text
   ETH-USDT-SWAP        strategy=momentum_1h sig=+1 atr=42.5 pos=flat action=enter
     ORDER buy sz=2 px=2320.50 sl=2250.0 tp=2367.0
 

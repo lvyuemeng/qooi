@@ -101,8 +101,8 @@ def _bot_configs(tc) -> dict[str, dict]:
                     "algo_id": bot.get("algoId", ""),
                     "signal_chan_id": bot.get("signalChanId", ""),
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"    WARNING: signal_get_pending failed: {e}")
     return result
 
 
@@ -177,15 +177,7 @@ def _run(dry_run: bool, env: str) -> None:
         # 4. Execute
         if d.action.value == "enter":
             try:
-                tc.signal_push_sub_order(
-                    algo_id=cfg["algo_id"],
-                    signal_chan_id=cfg["signal_chan_id"],
-                    inst_id=sym,
-                    side=d.side,
-                    sz=str(int(d.sz)),
-                    ord_type=asset_cfg.ord_type,
-                    px=str(d.entry_px),
-                )
+                tc.signal_execute_enter(d, cfg["algo_id"], cfg["signal_chan_id"], sym)
                 print(
                     f"    ORDER {d.side} sz={d.sz} px={d.entry_px} sl={d.stop_px} tp={d.target_px}"
                 )
@@ -194,11 +186,7 @@ def _run(dry_run: bool, env: str) -> None:
 
         elif d.action.value == "exit":
             try:
-                tc.signal_close_position(
-                    algo_id=cfg["algo_id"],
-                    signal_chan_id=cfg["signal_chan_id"],
-                    inst_id=sym,
-                )
+                tc.signal_execute_exit(cfg["algo_id"], cfg["signal_chan_id"], sym)
                 print(f"    CLOSE ({d.detail})")
             except Exception as e:
                 print(f"    CLOSE FAILED: {e}")

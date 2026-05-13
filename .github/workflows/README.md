@@ -27,7 +27,7 @@ cat data/logs/exec_ETH_USDT_4h.jsonl | jq 'select(.event=="order")'
 
 ## How leverage + position size works
 
-```
+```text
 sz = capital × max_position_pct × |signal| × leverage / entry_px
 ```
 
@@ -44,6 +44,7 @@ Example: `capital=100, risk_pct=0.03, leverage=1.0, signal=0.5, entry_px=2000`
 ## Initial capital
 
 Set in workflow YAML `capital` field. Current defaults:
+
 - ETH: 100 USDT
 - SOL: 50 USDT
 

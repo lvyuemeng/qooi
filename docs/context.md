@@ -32,7 +32,7 @@ CLOSE (close-position) signals only.
 
 ### Momentum Burst (ETH-USDT-SWAP)
 
-```
+```text
 1H OHLCV → add_indicators → momentum_1h_signal
          → 6-bar return > 0.3%, EMA50>EMA200, ADX>20, volume > 1.5× avg
          → session filter 08-22 UTC, trend maturity ≥20 bars
@@ -45,7 +45,7 @@ TP/SL or client-side trend-flip detection.
 
 ### RSI Reversion (SOL-USDT-SWAP)
 
-```
+```text
 1H OHLCV → add_indicators → rsi_reversion_signal
          → RSI(14) < 30 → bounce > 25 with confirmation bar
          → EMA50>EMA200, ADX>20, session 08-22 UTC
@@ -59,12 +59,14 @@ Exits via OKX server-side TP/SL or client-side RSI > 50 / trend-flip.
 ### Why Two Strategies?
 
 Backtest evidence (93 trades over 83 days):
+
 - Momentum burst wins during trend accelerations (ETH, 67% WR)
 - RSI reversion wins during sharp oversold bounces (SOL, 78% WR)
 - They are complementary (uncorrelated entry triggers) and produce a
   smoother combined equity curve than either alone.
 
 Key files:
+
 - `src/qooi/strategies/momentum_1h.py` — 1H momentum burst state-machine with tiered exits
 - `src/qooi/strategies/rsi_reversion.py` — 1H RSI mean-reversion state-machine
 - `src/qooi/core/signal.py` — `compute_momentum_1h()`, `compute_rsi_reversion_1h()`

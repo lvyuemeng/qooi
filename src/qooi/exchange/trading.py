@@ -189,6 +189,29 @@ class TradingClient:
             )
         )
 
+    def signal_execute_enter(self, d, algo_id: str, signal_chan_id: str, inst_id: str) -> None:
+        """Push an enter signal from a Decision object.
+
+        Encapsulates the arg decomposition so callers don't scatter it.
+        """
+        self.signal_push_sub_order(
+            algo_id=algo_id,
+            signal_chan_id=signal_chan_id,
+            inst_id=inst_id,
+            side=d.side,
+            sz=str(int(d.sz)),
+            ord_type="limit",
+            px=str(d.entry_px),
+        )
+
+    def signal_execute_exit(self, algo_id: str, signal_chan_id: str, inst_id: str) -> None:
+        """Close position via signal bot."""
+        self.signal_close_position(
+            algo_id=algo_id,
+            signal_chan_id=signal_chan_id,
+            inst_id=inst_id,
+        )
+
     def signal_close_position(self, algo_id: str, signal_chan_id: str, inst_id: str) -> dict:
         return self._retry(
             lambda: self._signal_api(
@@ -223,10 +246,7 @@ class TradingClient:
 
     def _signal_api(self, method: str, path: str, params: dict) -> dict:
         url = f"/api/v5/tradingBot/{path}"
-        if method == "GET":
-            resp = self._trade.get(url=url, params=params)
-        else:
-            resp = self._trade._request_with_params("POST", url, params)
+        resp = self._trade._request(method, url, params)
         if isinstance(resp, dict):
             code = resp.get("code", -1)
             if str(code) != "0":

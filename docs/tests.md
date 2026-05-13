@@ -12,7 +12,8 @@ All trading is on OKX perpetual swaps via the OKX Signal Bot (server-driven TP/S
 ## Signal Pipelines
 
 ### Momentum Burst (ETH)
-```
+
+```text
 1H OHLCV → add_indicators → momentum_1h_signal
          → 6-bar return > 0.3%, EMA50>EMA200, ADX>20, volume > 1.5× avg
          → session 08-22 UTC, trend maturity ≥20 bars
@@ -20,7 +21,8 @@ All trading is on OKX perpetual swaps via the OKX Signal Bot (server-driven TP/S
 ```
 
 ### RSI Reversion (SOL)
-```
+
+```text
 1H OHLCV → add_indicators → rsi_reversion_signal
          → RSI(14) < 30 → bounce > 25 with confirmation
          → EMA50>EMA200, ADX>20, session 08-22 UTC
@@ -38,7 +40,7 @@ All trading is on OKX perpetual swaps via the OKX Signal Bot (server-driven TP/S
 | **Ensemble** | **all** | **93** | **+0.21%** | **53%** | **1.32** | **+0.14** |
 
 BTC excluded from live trading due to persistent negative expectancy across all
-tested strategies and timeframes.  XAU-USDT had insufficient data (34 days).
+tested strategies and timeframes. XAU-USDT had insufficient data (34 days).
 
 ## Backtest ↔ Live Parity
 
@@ -87,6 +89,7 @@ Perpetual swaps require OKX account in "single-currency margin" or "multi-curren
 mode. Error `51010` means the account is in "simple" mode — switch in OKX settings.
 
 For the signal bot, ensure:
+
 1. `.env.test` has `OKX_API_KEY_TEST`, `OKX_SECRET_KEY_TEST`, `OKX_PASSPHRASE_TEST`
 2. `OKX_FLAG=1` for testnet, `OKX_FLAG=0` for live
 3. Run `setup_signal.py testnet` to create signal channels and strategies on OKX

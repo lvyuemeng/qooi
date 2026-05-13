@@ -10,7 +10,7 @@ uv run python scripts/trade.py testnet
 
 ## Architecture
 
-```
+```text
 OKX REST API (public, no auth)
     ↓ MarketData.candles(cache=True)    ← 1H OHLCV, auto-cached to Parquet
     ↓ add_indicators()                  ← SMA, EMA, RSI, ATR, ADX, Bollinger Bands
@@ -93,7 +93,7 @@ export OKX_ENV=live && uv run python scripts/trade.py live dry
 
 ## Project structure
 
-```
+```text
 src/qooi/
   core/              ← signal.py (compute_*_1h), decide.py (decision engine)
   exchange/          ← market.py, trading.py, backtest.py, eval.py, indicator.py
@@ -115,17 +115,20 @@ docs/
 
 1. Create OKX API keys with trade permissions on your testnet account
 2. Set up testnet `.env.test`:
+
    ```ini
    OKX_API_KEY_TEST=your_key
    OKX_SECRET_KEY_TEST=your_secret
    OKX_PASSPHRASE_TEST=your_passphrase
    OKX_FLAG=1
    ```
+
 3. One-time: `uv run python scripts/setup_signal.py testnet`
 4. Every hour: `uv run python scripts/trade.py testnet`
 5. After observing 1-2 weeks of paper-trading results, switch to live.
 
 For production, copy `.env.test` → `.env.live` with live credentials and run:
+
 ```bash
 uv run python scripts/setup_signal.py live
 uv run python scripts/trade.py live dry    # dry run first

@@ -556,13 +556,13 @@ class MarketData:
         df = _parse_ohlcv(raw)
 
         if cache and not df.is_empty():
-            # Merge with existing cache: keep the larger of (cached, fetched).
-            # This allows the cache to grow over time as different calls
-            # fetch different date ranges.
             cache_path = _cache_path(symbol, timeframe)
             if cache_path.exists():
                 cached = pl.read_parquet(cache_path)
-                # Merge, drop duplicate timestamps, sort
+                for col in cached.columns:
+                    if col not in df.columns:
+                        df = df.with_columns(pl.lit(None).cast(cached[col].dtype).alias(col))
+                df = df.select(cached.columns)
                 merged = pl.concat([cached, df]).unique(subset=["timestamp"]).sort("timestamp")
                 merged.write_parquet(cache_path)
             else:
