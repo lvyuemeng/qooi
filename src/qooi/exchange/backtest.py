@@ -144,7 +144,7 @@ class Backtest:
     def _run_shared(self, df: pl.DataFrame) -> BacktestResult:
         """Backtest using qooi.core.decide — same decisions as live trading."""
         from qooi.core.decide import AssetConfig, decide_active, decide_idle
-        from qooi.core.signal import SignalResult
+        from qooi.core.indicators import SignalResult
 
         n = len(df)
         close = df["close"].to_list()

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from qooi.core.signal import SignalResult
+from qooi.core.indicators import SignalResult
 
 
 class Action(StrEnum):

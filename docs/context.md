@@ -24,33 +24,62 @@ Instruments: SPOT, SWAP (perp), FUTURES, OPTION.
 - `CacheStore` in `src/qooi/exchange/store.py` auto-paginates; call `refresh(days=1000, min_bars=2000)` for deep history
 - CCXT backend via `CcxtBackend` supports LBank, Gate, KuCoin for 2000+ bars
 
-## Current Strategies: 1H Dual-Strategy Ensemble
+## Architecture: Four-Layer Pipeline
 
-Two complementary strategies running on different assets, both at 1H timeframe.
-TP/SL handled by OKX Signal Bot server-side. Client sends ENTER (sub-order) or
-CLOSE (close-position) signals only.
-
-### Momentum Burst (ETH-USDT-SWAP)
-
-```text
-1H OHLCV → add_indicators → momentum_1h_signal
-         → 6-bar return > 0.3%, EMA50>EMA200, ADX>20, volume > 1.5× avg
-         → session filter 08-22 UTC, trend maturity ≥20 bars
-         → signal = 1 (long) / -1 (short) / 0 (flat)
+```
+┌──────────────────────────────────────────────────┐
+│           4. Exits — Stop / Target / Trail / Time │
+├──────────────────────────────────────────────────┤
+│           3. Recovery — Grid / Martingale / Hedge │
+├──────────────────────────────────────────────────┤
+│           2. Basket — Dedup / Exposure / Limit   │
+├──────────────────────────────────────────────────┤
+│           1. Signal — Registry → Strategy Dispatch│
+└──────────────────────────────────────────────────┘
 ```
 
-Trend-following strategy: enters in the direction of established momentum,
-backed by ADX trend strength and volume confirmation. Exits via OKX server-side
-TP/SL or client-side trend-flip detection.
+Data flow: OHLCV → add_indicators → pipeline.process_bar() → list[BasketAction] → Executor.
 
-### RSI Reversion (SOL-USDT-SWAP)
+Same pipeline for backtest (BacktestExecutor.simulate) and live (LiveExecutor.execute).
 
-```text
-1H OHLCV → add_indicators → rsi_reversion_signal
-         → RSI(14) < 30 → bounce > 25 with confirmation bar
-         → EMA50>EMA200, ADX>20, session 08-22 UTC
-         → signal = 1 (long) / 0 (flat)  [long only]
-```
+### Layer 1: Signal (`core/registry.py`, `core/indicators.py`)
+
+Strategy registry maps names (`momentum_1h`, `rsi_reversion`) to signal functions.
+`indicators.py` provides `compute_momentum_1h()`, `compute_rsi_reversion_1h()` —
+full state-machine pipelines that re-run on each invocation (matches backtest exactly).
+
+### Layer 2: Basket (`core/basket.py`)
+
+`BasketManager` isolates parallel signals per instrument. Each Basket tracks
+entry price, size, position state, recovery level, and trail data.
+`BasketAction` is the unified action type consumed by all executors.
+
+### Layer 3: Recovery (`core/recovery.py`)
+
+Grid, martingale reversal, and hedge strategies for drawdown recovery.
+Activated when a basket exceeds loss thresholds. Produces BasketActions
+for grid adds, direction reversals, and opposing hedges.
+
+### Layer 4: Exits (`core/exits.py`)
+
+Tiered exit evaluation in priority order: hard stop → trailing stop →
+breakeven → target → time. `TrailTracker` maintains highest/lowest since
+entry for trailing stop calculation.
+
+### Executor (`core/executor.py`)
+
+Two executors consume the same `list[BasketAction]`:
+- `LiveExecutor` — `place_order``, ``cancel_order`, ``amend_order` via direct OKX TradeAPI
+- `BacktestExecutor` — simulate fills against OHLCV bars, track equity curve
+
+### Current Strategies
+
+| Strategy | Asset | Signal | Recovery | Exit |
+|----------|-------|--------|----------|------|
+| `momentum_1h` | ETH | 6-bar return > 0.3%, ADX>20, vol>1.5× | none | stop/target/trail/time |
+| `rsi_reversion` | SOL | RSI(14)<30 bounce, uptrend | none | stop/target/RSI exit/time |
+
+Both via `process_bar()` in `core/pipeline.py` — same entry point for backtest and live.
 
 Mean-reversion strategy: buys oversold bounces within confirmed uptrends.
 The confirmation bar rule prevents entries into continuing sell-offs.

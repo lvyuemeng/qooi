@@ -9,7 +9,7 @@ from qooi.core.decide import (
     decide_active,
     decide_idle,
 )
-from qooi.core.signal import SignalResult
+from qooi.core.indicators import SignalResult
 
 
 def _sig(**kw) -> SignalResult:

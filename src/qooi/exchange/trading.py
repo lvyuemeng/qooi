@@ -116,6 +116,22 @@ class TradingClient:
         p = {} if not ccy else {"ccy": ccy}
         return self._okx(self._account.get_account_balance(**p)).get("details", [])
 
+    def orders(self, inst_id: str, inst_type: str = "SWAP") -> list:
+        return self._okx(self._trade.get_order_list(instType=inst_type, instId=inst_id)).get(
+            "data", []
+        )
+
+    def amend(self, inst_id: str, ord_id: str, new_sz: str = "", new_px: str = "") -> dict:
+        params = {"instId": inst_id, "ordId": ord_id}
+        if new_sz:
+            params["newSz"] = new_sz
+        if new_px:
+            params["newPx"] = new_px
+        return self._okx(self._trade.amend_order(**params))
+
+    def positions(self, inst_type: str = "SWAP") -> list:
+        return self._okx(self._account.get_positions(instType=inst_type)).get("data", [])
+
     # -- signal bot (tradingBot endpoints, not in python-okx SDK) ---------------
 
     def signal_create(self, signal_chan_name: str, signal_chan_desc: str = "") -> dict:
