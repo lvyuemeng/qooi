@@ -232,7 +232,13 @@ class TradingClient:
 
         name = pair.chan_name
         desc = f"{pair.okx.strategy} signal for {pair.asset.symbol} {pair.asset.timeframe}"
-        chan = self.signal_create(name, desc)
+        try:
+            chan = self.signal_create(name, desc)
+        except RuntimeError:
+            chan = self._signal_find_channel(name)
+            if not chan:
+                print(f"    WARNING: channel exists but failed to find {pair.chan_name}")
+                return None
         chan_id = (
             chan.get("signalChanId", chan.get("data", [{}])[0].get("signalChanId", ""))
             if isinstance(chan, dict)
@@ -284,6 +290,23 @@ class TradingClient:
         except Exception:
             pass
         return PositionState()
+
+    def _signal_find_channel(self, chan_name: str) -> dict | None:
+        """Find channel by name from signal/signals.
+
+        Used when signal_create hits 60083 (name already in use) because
+        a stale channel exists without an algo attached.
+        """
+        try:
+            resp = self._retry(
+                lambda: self._signal_api("GET", "signal/signals", {"signalSourceType": "1"})
+            )
+            for ch in resp.get("data", []) if isinstance(resp, dict) else []:
+                if ch.get("signalChanName") == chan_name:
+                    return ch
+        except Exception:
+            pass
+        return None
 
     def _signal_resolve_bot(self, pair):
         """Find existing bot by channel name from orders-algo-pending.
