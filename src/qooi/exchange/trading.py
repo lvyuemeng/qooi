@@ -215,25 +215,45 @@ class TradingClient:
     def signal_ensure_bot(self, pair):
         """Find or create the OKX signal bot for this pair.  Idempotent.
 
-        Returns ``BotIdentity`` or ``None`` on failure.
+        Three tiers:
+          1. Full bot exists (channel + algo) → return BotIdentity
+          2. Channel exists but no algo → create algo only
+          3. Neither exists → create channel, then algo
+
+        Returns ``BotIdentity`` or ``None`` on unrecoverable failure.
         """
         from qooi.core.config import BotIdentity
 
         bot = self._signal_resolve_bot(pair)
-        if bot:
+        if bot is None:
+            print(f"    WARNING: signal_get_pending failed for {pair.chan_name}")
+            return None
+
+        if bot.algo_id:
             return bot
 
-        name = pair.chan_name
-        desc = f"{pair.okx.strategy} signal for {pair.asset.symbol} {pair.asset.timeframe}"
-        chan = self.signal_create(name, desc)
-        chan_id = (
-            chan.get("signalChanId", chan.get("data", [{}])[0].get("signalChanId", ""))
-            if isinstance(chan, dict)
-            else ""
-        )
+        chan_id = bot.signal_chan_id
         if not chan_id:
-            print(f"    WARNING: failed to create signal channel for {pair.chan_name}")
-            return None
+            name = pair.chan_name
+            desc = f"{pair.okx.strategy} signal for {pair.asset.symbol} {pair.asset.timeframe}"
+            try:
+                chan = self.signal_create(name, desc)
+            except Exception:
+                bot = self._signal_resolve_bot(pair)
+                if bot and bot.signal_chan_id:
+                    chan_id = bot.signal_chan_id
+                if not chan_id:
+                    print(f"    WARNING: failed to create channel for {pair.chan_name}")
+                    return None
+            else:
+                chan_id = (
+                    chan.get("signalChanId", chan.get("data", [{}])[0].get("signalChanId", ""))
+                    if isinstance(chan, dict)
+                    else ""
+                )
+            if not chan_id:
+                print(f"    WARNING: failed to get chan_id for {pair.chan_name}")
+                return None
 
         algo = self.signal_create_order_algo(
             signal_chan_id=chan_id,
@@ -270,7 +290,14 @@ class TradingClient:
         return PositionState()
 
     def _signal_resolve_bot(self, pair):
-        """Find existing bot by channel name from orders-algo-pending."""
+        """Find existing bot by channel name from orders-algo-pending.
+
+        Returns:
+          - ``BotIdentity(algo_id=..., signal_chan_id=...)`` if found with algo
+          - ``BotIdentity(signal_chan_id=...)`` if channel found without algo
+          - ``BotIdentity()`` if no channel exists at all
+          - ``None`` on network failure (caller should not attempt creation)
+        """
         from qooi.core.config import BotIdentity
 
         try:
@@ -281,9 +308,10 @@ class TradingClient:
                         algo_id=bot.get("algoId", ""),
                         signal_chan_id=bot.get("signalChanId", ""),
                     )
-        except Exception:
-            pass
-        return None
+            return BotIdentity()
+        except Exception as e:
+            print(f"    WARNING: signal_get_pending failed: {e}")
+            return None
 
     def signal_close_position(self, algo_id: str, signal_chan_id: str, inst_id: str) -> dict:
         return self._retry(
