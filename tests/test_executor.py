@@ -1,6 +1,6 @@
 """AssetConfig and SignalResult smoke tests."""
 
-from qooi.core.decide import AssetConfig
+from qooi.core.config import AssetConfig
 from qooi.core.indicators import SignalResult
 
 

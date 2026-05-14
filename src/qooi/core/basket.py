@@ -55,6 +55,8 @@ class Basket:
     positions: list[Position] = field(default_factory=list)
     entry_px: float = 0.0
     current_sz: float = 0.0
+    stop_px: float = 0.0
+    target_px: float = 0.0
     entry_bar: int = 0
     bars_in_pos: int = 0
     loss_streak: int = 0
@@ -78,6 +80,13 @@ class Basket:
     @property
     def is_suspended(self) -> bool:
         return self.state == BasketState.SUSPENDED
+
+    def add_to_position(self, sz: float, px: float) -> None:
+        """Add to existing position, updating avg entry price."""
+        total_sz = self.current_sz + sz
+        if total_sz > 0:
+            self.entry_px = (self.entry_px * self.current_sz + px * sz) / total_sz
+        self.current_sz = total_sz
 
 
 @dataclass
@@ -118,7 +127,11 @@ class TrailTracker:
 
 
 class BasketManager:
-    """Creates, deduplicates, and limits baskets per instrument."""
+    """Creates, deduplicates, and limits baskets per instrument.
+
+    Owns sizing and stop/target computation — the full Basket is
+    initialized at creation with no post-hoc caller mutation.
+    """
 
     def __init__(self, max_baskets: int = 5, max_per_symbol: int = 1):
         self.max_baskets = max_baskets
@@ -130,7 +143,16 @@ class BasketManager:
         symbol_count = sum(1 for b in active if b.symbol == symbol)
         return symbol_count < self.max_per_symbol
 
-    def create(self, symbol: str, strategy: str, side: str, entry_px: float) -> Basket:
+    def create(
+        self,
+        symbol: str,
+        strategy: str,
+        side: str,
+        entry_px: float,
+        sz: float,
+        stop_px: float,
+        target_px: float,
+    ) -> Basket:
         return Basket(
             basket_id=f"{symbol}-{strategy}",
             symbol=symbol,
@@ -138,12 +160,33 @@ class BasketManager:
             side=side,
             state=BasketState.ACTIVE,
             entry_px=entry_px,
-            current_sz=0.0,
+            current_sz=sz,
+            stop_px=stop_px,
+            target_px=target_px,
         )
 
     def remove(self, basket: Basket) -> None:
         basket.state = BasketState.IDLE
         basket.positions.clear()
+
+    @staticmethod
+    def size_position(entry_px: float, stop_px: float, cfg) -> int:
+        risk_per_ct = abs(entry_px - stop_px) * cfg.ct_val
+        if risk_per_ct <= 0:
+            return 0
+        max_risk = cfg.capital * cfg.max_risk_pct
+        sz = max(1, int(max_risk / risk_per_ct))
+        notional_per_ct = cfg.ct_val * entry_px
+        max_sz = int(cfg.capital * cfg.leverage / max(notional_per_ct, 1e-9))
+        return max(1, min(sz, max_sz))
+
+    @staticmethod
+    def compute_stop_target(side: str, entry_px: float, atr: float, cfg) -> tuple[float, float]:
+        d = 1 if side == "buy" else -1
+        return (
+            round(entry_px - d * cfg.atr_stop_mult * atr, 2),
+            round(entry_px + d * cfg.atr_target_mult * atr, 2),
+        )
 
 
 def evaluate_exits(

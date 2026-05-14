@@ -1,7 +1,7 @@
 """Canonical pair configuration — single source of truth for all scripts.
 
 Orthogonal layers:
-  - AssetConfig (decide.py) — compute-time: sizing, stop/target, decision
+  - AssetConfig — compute-time: sizing, stop/target, capital, leverage
   - OkxSignalConfig — OKX signal bot execution: TP/SL, strategy dispatch
 
 Composition: PairConfig = AssetConfig + OkxSignalConfig.
@@ -16,8 +16,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from qooi.core.decide import AssetConfig
 from qooi.core.indicators import SignalResult
+
+
+@dataclass
+class AssetConfig:
+    symbol: str
+    sig_symbol: str = ""
+    timeframe: str = "4h"
+    capital: float = 500.0
+    max_risk_pct: float = 0.50
+    leverage: float = 2.0
+    ct_val: float = 0.1
+    atr_stop_mult: float = 2.0
+    atr_target_mult: float = 3.0
+    signal_threshold: float = 0.25
+    ord_type: str = "limit"
+
 
 StrategyName = Literal["momentum_1h", "rsi_reversion", "flow_pipeline"]
 

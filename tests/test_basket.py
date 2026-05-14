@@ -5,18 +5,20 @@ from qooi.core.basket import ActionKind, Basket, BasketAction, BasketManager, Ba
 
 def test_create_basket():
     mgr = BasketManager(max_baskets=3, max_per_symbol=1)
-    b = mgr.create("ETH-USDT-SWAP", "momentum_1h", "buy", 3000.0)
+    b = mgr.create(
+        "ETH-USDT-SWAP", "momentum_1h", "buy", 3000.0, sz=2.0, stop_px=2950.0, target_px=3060.0
+    )
     assert b.basket_id == "ETH-USDT-SWAP-momentum_1h"
     assert b.state == BasketState.ACTIVE
     assert b.side == "buy"
     assert b.entry_px == 3000.0
-    assert b.current_sz == 0.0
+    assert b.current_sz == 2.0
 
 
 def test_manager_dedup_per_symbol():
     mgr = BasketManager(max_baskets=5, max_per_symbol=1)
     active: list[Basket] = []
-    b1 = mgr.create("ETH-USDT-SWAP", "m1", "buy", 100.0)
+    b1 = mgr.create("ETH-USDT-SWAP", "m1", "buy", 100.0, sz=1.0, stop_px=95.0, target_px=105.0)
     active.append(b1)
     assert mgr.can_open("ETH-USDT-SWAP", active) is False
     assert mgr.can_open("SOL-USDT-SWAP", active) is True

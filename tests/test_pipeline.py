@@ -8,8 +8,7 @@ import polars as pl
 
 from qooi.core import process_bar
 from qooi.core.basket import Basket, ExitConfig
-from qooi.core.config import OkxSignalConfig, PairConfig
-from qooi.core.decide import AssetConfig
+from qooi.core.config import AssetConfig, OkxSignalConfig, PairConfig
 from qooi.core.recovery import RecoveryConfig, RecoveryKind
 
 

@@ -59,15 +59,19 @@ def process_bar(
     if basket is None or basket.is_idle:
         if sig_val != 0 and mgr.can_open(sym, baskets):
             side = "buy" if sig_val > 0 else "sell"
-            basket = mgr.create(sym, pair.okx.strategy, side, close)
+            stop_px, target_px = mgr.compute_stop_target(side, close, atr, pair.asset)
+            sz = mgr.size_position(close, stop_px, pair.asset)
+            basket = mgr.create(sym, pair.okx.strategy, side, close, sz, stop_px, target_px)
             baskets.append(basket)
             actions.append(
                 BasketAction(
                     basket_id=basket.basket_id,
                     action=ActionKind.ENTER,
                     side=side,
-                    sz=0,
+                    sz=sz,
                     px=close,
+                    stop_px=stop_px,
+                    target_px=target_px,
                     reason=ExitReason.SIGNAL_ENTRY.value,
                 )
             )
@@ -97,6 +101,7 @@ def process_bar(
         if r_action:
             actions.append(r_action)
             if r_action.action == ActionKind.ADD_GRID:
+                basket.add_to_position(r_action.sz, r_action.px)
                 basket.recovery_level += 1
                 basket.recovery_activated = True
             elif r_action.reason == ExitReason.MARTINGALE.value:

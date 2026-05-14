@@ -142,9 +142,96 @@ class Backtest:
         return self._run_shared(df)
 
     def _run_shared(self, df: pl.DataFrame) -> BacktestResult:
-        """Backtest using qooi.core.decide — same decisions as live trading."""
-        from qooi.core.decide import AssetConfig, decide_active, decide_idle
+        """Backtest using legacy decide loop — OFI flow pipeline path."""
+        from dataclasses import dataclass
+        from enum import StrEnum
+
+        from qooi.core.config import AssetConfig
         from qooi.core.indicators import SignalResult
+
+        class _Action(StrEnum):
+            ENTER = "enter"
+            EXIT = "exit"
+            HOLD = "hold"
+
+        @dataclass
+        class _Decision:
+            action: _Action
+            side: str = ""
+            sz: int = 0
+            entry_px: float = 0.0
+            stop_px: float = 0.0
+            target_px: float = 0.0
+            detail: str = ""
+
+        def _compute_sz(entry_px, stop_px, cfg):
+            risk_per_ct = abs(entry_px - stop_px) * cfg.ct_val
+            if risk_per_ct <= 0:
+                return 0
+            max_risk = cfg.capital * cfg.max_risk_pct
+            sz = max(1, int(max_risk / risk_per_ct))
+            notional_per_ct = cfg.ct_val * entry_px
+            max_sz = int(cfg.capital * cfg.leverage / max(notional_per_ct, 1e-9))
+            return max(1, min(sz, max_sz))
+
+        def _compute_stop_target(side, entry_px, atr_val, cfg, regime_strength=0.0):
+            d = 1 if side == "buy" else -1
+            if regime_strength > 0.7:
+                sm = cfg.atr_stop_mult * 0.5
+                tm = cfg.atr_target_mult * 0.8
+            elif regime_strength > 0.3:
+                sm = cfg.atr_stop_mult * 0.75
+                tm = cfg.atr_target_mult * 1.2
+            else:
+                sm = cfg.atr_stop_mult * 1.25
+                tm = cfg.atr_target_mult * 0.6
+            return (
+                round(entry_px - d * sm * atr_val, 2),
+                round(entry_px + d * tm * atr_val, 2),
+            )
+
+        def _decide_idle(signal, entry_px, side, cfg):
+            if abs(signal.signal) < cfg.signal_threshold:
+                return _Decision(action=_Action.HOLD, detail="weak_signal")
+            if abs(signal.mom_fast) > 0.3 and signal.signal * signal.mom_fast < 0:
+                return _Decision(action=_Action.HOLD, detail="momentum_opposing")
+            if signal.vol_conf < 0.3:
+                return _Decision(action=_Action.HOLD, detail="low_volume")
+            sp, tp = _compute_stop_target(side, entry_px, signal.atr, cfg, signal.regime_strength)
+            sz = _compute_sz(entry_px, sp, cfg)
+            if sz < 1:
+                return _Decision(action=_Action.HOLD, detail="insufficient_margin")
+            return _Decision(
+                action=_Action.ENTER,
+                side=side,
+                sz=sz,
+                entry_px=round(entry_px, 2),
+                stop_px=sp,
+                target_px=tp,
+            )
+
+        def _decide_active(signal, pos_side, cfg, entry_px=0.0, mark_px=0.0, exit_mode=""):
+            d = 1 if pos_side == "buy" else -1
+            if signal.signal * d < 0:
+                return _Decision(action=_Action.EXIT, side=pos_side, detail="signal_flipped")
+            if exit_mode in ("with_sl_tp", "full") and entry_px > 0 and mark_px > 0:
+                a = signal.atr if signal.atr > 0 else 50.0
+                sm, tm = _compute_stop_target(pos_side, entry_px, a, cfg, signal.regime_strength)
+                st = entry_px - d * sm * a
+                tg = entry_px + d * tm * a
+                if d * (st - mark_px) >= 0:
+                    return _Decision(
+                        action=_Action.EXIT, side=pos_side, detail="stop", stop_px=st, target_px=tg
+                    )
+                if d * (mark_px - tg) >= 0:
+                    return _Decision(
+                        action=_Action.EXIT,
+                        side=pos_side,
+                        detail="target",
+                        stop_px=st,
+                        target_px=tg,
+                    )
+            return _Decision(action=_Action.HOLD, detail="holding")
 
         n = len(df)
         close = df["close"].to_list()
@@ -197,9 +284,8 @@ class Backtest:
             )
 
             if not pos_side:
-                # IDLE — use decide_idle
                 side = "buy" if sig_val > 0 else "sell"
-                d = decide_idle(sr, cur_close, side, cfg)
+                d = _decide_idle(sr, cur_close, side, cfg)
                 if d.action.value == "enter":
                     pos_side = d.side
                     entry_px = d.entry_px
@@ -207,8 +293,7 @@ class Backtest:
                     entry_ts = int(timestamp_col[i - 1])
                     prev_eq *= 1.0 - self.cost.total_per_side
             else:
-                # ACTIVE — use decide_active with configured exit_mode
-                d = decide_active(
+                d = _decide_active(
                     sr,
                     pos_side,
                     cfg,

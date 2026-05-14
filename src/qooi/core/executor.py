@@ -137,18 +137,78 @@ class LiveExecutor:
 
 
 class BacktestExecutor:
-    """Simulate BasketActions against OHLCV bars for backtesting."""
+    """Simulate BasketActions against OHLCV bars for backtesting.
 
-    def __init__(self):
-        self.trades: list[dict] = []
-        self.equity: list[float] = [10000.0]
+    Loops process_bar() over all bars and computes equity/PnL from
+    the BasketAction stream — no decide_idle/decide_active needed.
+    """
 
-    def simulate(self, actions: list[BasketAction], bar: dict) -> None:
-        for a in actions:
-            if a.action == ActionKind.ENTER:
-                pass
-            elif a.action == ActionKind.EXIT:
-                pass
+    def __init__(self, initial_capital: float = 10000.0, cost_pct: float = 0.00005):
+        self._initial_capital = initial_capital
+        self._cost = cost_pct
+
+    def run(self, df, pair, exit_cfg=None, recovery_cfg=None) -> tuple[list[dict], list[float]]:
+        from qooi.core import process_bar
+        from qooi.exchange.indicator import add_indicators
+
+        df = add_indicators(df)
+        if "vol" not in df.columns and "volume" in df.columns:
+            df = df.rename({"volume": "vol"})
+
+        baskets: list[Basket] = []
+        trades: list[dict] = []
+        equity = [self._initial_capital]
+
+        for i in range(1, df.height):
+            bar_df = df.slice(i, 1)
+            actions = process_bar(bar_df, baskets, pair, exit_cfg, recovery_cfg)
+            close = float(df["close"][i])
+            prev_eq = equity[-1]
+
+            for a in actions:
+                basket = next((b for b in baskets if b.basket_id == a.basket_id), None)
+
+                if a.action == ActionKind.ENTER:
+                    prev_eq *= 1.0 - self._cost
+
+                elif a.action == ActionKind.EXIT:
+                    if basket:
+                        d = 1 if basket.side == "buy" else -1
+                        pnl_pct = d * (close / basket.entry_px - 1) if basket.entry_px > 0 else 0.0
+                        notional = basket.current_sz * pair.asset.ct_val * basket.entry_px
+                        pnl_usd = pnl_pct * notional * pair.asset.leverage
+                        trades.append(
+                            {
+                                "side": basket.side,
+                                "entry_px": basket.entry_px,
+                                "exit_px": close,
+                                "pnl": pnl_usd,
+                                "reason": a.reason,
+                            }
+                        )
+                        prev_eq += pnl_usd
+
+                elif a.action == ActionKind.ADD_GRID:
+                    if basket:
+                        basket.add_to_position(a.sz, a.px)
+                    prev_eq *= 1.0 - self._cost
+
+                elif a.action == ActionKind.HEDGE:
+                    new_basket = Basket(
+                        basket_id=f"{a.basket_id}_hedge",
+                        symbol=pair.asset.symbol,
+                        strategy=pair.okx.strategy,
+                        side=a.side,
+                        state=BasketState.ACTIVE,
+                        entry_px=a.px,
+                        current_sz=a.sz,
+                    )
+                    baskets.append(new_basket)
+                    prev_eq *= 1.0 - self._cost
+
+            equity.append(prev_eq)
+
+        return trades, equity
 
 
 def _read_state() -> dict[str, dict]:
