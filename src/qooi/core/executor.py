@@ -243,33 +243,11 @@ class BacktestExecutor:
 
         return trades, equity
 
-    def run_report(self, df, pair, exit_cfg=None, recovery_cfg=None) -> str:
-        from qooi.exchange.eval import compute_metrics
+    def run_report(self, df, pair, exit_cfg=None, recovery_cfg=None):
+        from qooi.core.evaluate import Report
 
         trades, equity = self.run(df, pair, exit_cfg, recovery_cfg)
-        if not trades:
-            return f"{pair.asset.symbol}: 0 trades"
-
-        eq_s = equity
-        n = len(eq_s)
-        eq_df = __import__("polars").DataFrame(
-            {
-                "portfolio_value": eq_s,
-                "returns": [0.0] + [(eq_s[i] / eq_s[i - 1] - 1) for i in range(1, n)],
-            }
-        )
-        t_df = __import__("polars").DataFrame(trades) if trades else None
-        m = compute_metrics(eq_df, trades=t_df)
-        wins = len([t for t in trades if t["pnl"] > 0])
-        wr = wins / len(trades) * 100 if trades else 0
-        total_ret = (equity[-1] / equity[0] - 1) * 100
-
-        lines = [
-            f"  {pair.asset.symbol}: {len(trades)} trades, final equity=${equity[-1]:.0f}",
-            f"  Ret={total_ret:+.1f}%  Sharpe={m.sharpe_ratio:+.2f}  DD={m.max_drawdown_pct:.1f}%",
-            f"  WR={wr:.0f}%  PL={m.profit_factor:.2f}  IC={m.ic_mean:.4f}",
-        ]
-        return "\n".join(lines)
+        return Report.from_raw(trades, equity, pair)
 
 
 def _read_state() -> dict[str, dict]:

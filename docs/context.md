@@ -90,7 +90,32 @@ HEDGE_DRAWDOWN, GRID_LEVEL, GLOBAL_LOSS_LIMIT.
 
 Two executors consume the same `list[BasketAction]`:
 - `LiveExecutor` — `place()`, `cancel()`, `close_position()`, `amend()` via direct OKX TradeAPI. State persists to `data/state/baskets.json`.
-- `BacktestExecutor.run()` — loops `process_bar()` with pre-computed signal column. Computes PnL from BasketAction stream. Tracks portfolio drawdown (5% stop). `run_report()` chains through `compute_metrics()`.
+- `BacktestExecutor.run()` — loops `process_bar()` with pre-computed signal column. Computes PnL from BasketAction stream. Tracks portfolio drawdown (5% stop). `run_report()` returns a `Report`.
+
+### Backtest Styles (`core/styles.py`) — strategy-independent
+
+Backtest styles run a `trades_fn` (any function producing `(trades, equity)`)
+repeatedly under different slicing regimes. Pure functions, zero strategy imports.
+
+| Style | Function | Description |
+|-------|----------|-------------|
+| walk-forward | `walk_forward(trades_fn, df, train, test, step)` | Slide train→test windows, report OOS metrics |
+| rolling window | `rolling_window(trades_fn, df, lookback, step)` | Fixed lookback window, slide forward |
+| cross-validate | `cross_validate(trades_fn, df, folds)` | K-fold cross-validation across time segments |
+
+All return `StyleResult` with `WindowSlice` list, combined OOS metrics, and stability stats.
+
+### Evaluation (`core/evaluate.py`) — strategy-independent
+
+Takes raw trades + equity and produces formatted output.
+
+| Component | Description |
+|-----------|-------------|
+| `Report.from_raw(trades, equity, pair)` | Build from `BacktestExecutor.run()` output |
+| `report.summary()` | Terse one-liner: trades, ret%, WR%, PL, Sharpe |
+| `report.table()` | Multi-line aligned metrics block |
+| `compare(*reports)` | Side-by-side ensemble comparison table |
+| `format_table(headers, rows)` | Generic aligned-column formatter |
 
 ### Current Strategies
 

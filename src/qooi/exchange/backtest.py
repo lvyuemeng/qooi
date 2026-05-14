@@ -1,11 +1,11 @@
-"""Unified backtester — single-asset, pair-spread, and multi-asset portfolio.
+"""Backtest result types, cost model, pair-spread and portfolio backtests.
 
-All engines share the same CostModel, EvalMetrics, and equity curve format.
+Single-asset pipeline backtest: use BacktestExecutor from qooi.core.executor.
+Styles (walk-forward, rolling-window): use qooi.core.styles.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import polars as pl
@@ -16,13 +16,6 @@ from qooi.strategies.portfolio import (
     PortfolioLimits,
     allocate_portfolio_weights,
 )
-
-SignalExpr = pl.Expr
-
-
-# ======================================================================
-# Shared result types
-# ======================================================================
 
 
 @dataclass
@@ -46,44 +39,6 @@ class PortfolioBacktestResult(BacktestResult):
 
 
 @dataclass
-class WindowResult:
-    label: str
-    start: int
-    end: int
-    equity_curve: pl.DataFrame
-    trades: pl.DataFrame
-    metrics: EvalMetrics
-
-    def __str__(self) -> str:
-        return (
-            f"  [{self.label:>7}]  Ret={self.metrics.total_return_pct:>7.2f}%  "
-            f"Sharpe={self.metrics.sharpe_ratio:.2f}  DD={self.metrics.max_drawdown_pct:.1f}%  "
-            f"Trades={self.metrics.num_trades}"
-        )
-
-
-@dataclass
-class WalkForwardResult:
-    windows: list[WindowResult]
-    combined_oos_metrics: EvalMetrics
-    stability_metrics: dict
-
-    def __str__(self) -> str:
-        parts = [str(self.combined_oos_metrics)]
-        parts.append(f"  Combined OOS Sharpe:  {self.combined_oos_metrics.sharpe_ratio}")
-        parts.append(f"  Stability:            {self.stability_metrics}")
-        if self.windows:
-            parts.append("\n  Walk-forward segments:")
-            parts.extend(str(w) for w in self.windows)
-        return "\n".join(parts)
-
-
-# ======================================================================
-# Cost / Risk / Config
-# ======================================================================
-
-
-@dataclass
 class CostModel:
     slippage_pct: float = 0.0
     spread_pct: float = 0.0
@@ -96,255 +51,8 @@ class CostModel:
         return self.slippage_pct + self.spread_pct + self.commission_pct
 
 
-@dataclass
-class RiskConfig:
-    max_leverage: float = 1.0
-    position_sizing: str = "fixed"
-    max_risk_pct: float = 0.02
-    atr_stop_mult: float = 2.0
-    atr_target_mult: float = 3.0
-    trailing_activation_mult: float = 2.0
-    trailing_distance_mult: float = 1.0
-    max_bars_held: int = 0  # 0 = hold indefinitely; N = exit after N bars in ACTIVE
-    atr_col: str = "atr_14"
-    ct_val: float = 1.0  # contract multiplier — 0.01 for BTC, 0.1 for ETH, 100 for XRP
-
-
-@dataclass
-class WalkForwardConfig:
-    train_windows: int = 3
-    test_window: int = 1
-    holdout_window: int = 1
-    step: int = 1
-    rebalance_bars: int = 20
-
-
 # ======================================================================
-# 1. Single-asset backtest
-# ======================================================================
-
-
-@dataclass
-class Backtest:
-    data: pl.DataFrame
-    signal_expr: SignalExpr
-    initial_capital: float = 10_000.0
-    cost: CostModel = field(default_factory=CostModel)
-    risk: RiskConfig = field(default_factory=RiskConfig)
-    threshold: float | None = None  # per-asset threshold; None=use old 0.40/0.25/0.70
-    ord_type: str = "limit"  # "limit" or "market"
-    exit_mode: str = "signal_flip_only"
-    # for stateful signals (ema_pullback*); "with_sl_tp" for flow_pipeline
-
-    def run(self) -> BacktestResult:
-        df = self.data.sort("timestamp").with_columns(self.signal_expr.alias("signal"))
-        df = df.with_columns(pl.col("signal").forward_fill().fill_null(0.0))
-        return self._run_shared(df)
-
-    def _run_shared(self, df: pl.DataFrame) -> BacktestResult:
-        """Backtest using legacy decide loop — OFI flow pipeline path."""
-        from dataclasses import dataclass
-        from enum import StrEnum
-
-        from qooi.core.config import AssetConfig
-        from qooi.core.indicators import SignalResult
-
-        class _Action(StrEnum):
-            ENTER = "enter"
-            EXIT = "exit"
-            HOLD = "hold"
-
-        @dataclass
-        class _Decision:
-            action: _Action
-            side: str = ""
-            sz: int = 0
-            entry_px: float = 0.0
-            stop_px: float = 0.0
-            target_px: float = 0.0
-            detail: str = ""
-
-        def _compute_sz(entry_px, stop_px, cfg):
-            risk_per_ct = abs(entry_px - stop_px) * cfg.ct_val
-            if risk_per_ct <= 0:
-                return 0
-            max_risk = cfg.capital * cfg.max_risk_pct
-            sz = max(1, int(max_risk / risk_per_ct))
-            notional_per_ct = cfg.ct_val * entry_px
-            max_sz = int(cfg.capital * cfg.leverage / max(notional_per_ct, 1e-9))
-            return max(1, min(sz, max_sz))
-
-        def _compute_stop_target(side, entry_px, atr_val, cfg, regime_strength=0.0):
-            d = 1 if side == "buy" else -1
-            if regime_strength > 0.7:
-                sm = cfg.atr_stop_mult * 0.5
-                tm = cfg.atr_target_mult * 0.8
-            elif regime_strength > 0.3:
-                sm = cfg.atr_stop_mult * 0.75
-                tm = cfg.atr_target_mult * 1.2
-            else:
-                sm = cfg.atr_stop_mult * 1.25
-                tm = cfg.atr_target_mult * 0.6
-            return (
-                round(entry_px - d * sm * atr_val, 2),
-                round(entry_px + d * tm * atr_val, 2),
-            )
-
-        def _decide_idle(signal, entry_px, side, cfg):
-            if abs(signal.signal) < cfg.signal_threshold:
-                return _Decision(action=_Action.HOLD, detail="weak_signal")
-            if abs(signal.mom_fast) > 0.3 and signal.signal * signal.mom_fast < 0:
-                return _Decision(action=_Action.HOLD, detail="momentum_opposing")
-            if signal.vol_conf < 0.3:
-                return _Decision(action=_Action.HOLD, detail="low_volume")
-            sp, tp = _compute_stop_target(side, entry_px, signal.atr, cfg, signal.regime_strength)
-            sz = _compute_sz(entry_px, sp, cfg)
-            if sz < 1:
-                return _Decision(action=_Action.HOLD, detail="insufficient_margin")
-            return _Decision(
-                action=_Action.ENTER,
-                side=side,
-                sz=sz,
-                entry_px=round(entry_px, 2),
-                stop_px=sp,
-                target_px=tp,
-            )
-
-        def _decide_active(signal, pos_side, cfg, entry_px=0.0, mark_px=0.0, exit_mode=""):
-            d = 1 if pos_side == "buy" else -1
-            if signal.signal * d < 0:
-                return _Decision(action=_Action.EXIT, side=pos_side, detail="signal_flipped")
-            if exit_mode in ("with_sl_tp", "full") and entry_px > 0 and mark_px > 0:
-                a = signal.atr if signal.atr > 0 else 50.0
-                sm, tm = _compute_stop_target(pos_side, entry_px, a, cfg, signal.regime_strength)
-                st = entry_px - d * sm * a
-                tg = entry_px + d * tm * a
-                if d * (st - mark_px) >= 0:
-                    return _Decision(
-                        action=_Action.EXIT, side=pos_side, detail="stop", stop_px=st, target_px=tg
-                    )
-                if d * (mark_px - tg) >= 0:
-                    return _Decision(
-                        action=_Action.EXIT,
-                        side=pos_side,
-                        detail="target",
-                        stop_px=st,
-                        target_px=tg,
-                    )
-            return _Decision(action=_Action.HOLD, detail="holding")
-
-        n = len(df)
-        close = df["close"].to_list()
-        atr_col = self.risk.atr_col
-        atr = df[atr_col].fill_nan(0).fill_null(0).to_list() if atr_col in df.columns else [1.0] * n
-        atr = [v if v > 0 else 1.0 for v in atr]
-        signal_col = df["signal"].to_list()
-        regime_col = (
-            df["regime_strength"].to_list() if "regime_strength" in df.columns else [0.0] * n
-        )
-        mom_col = df["regime_mom_fast"].to_list() if "regime_mom_fast" in df.columns else [0.0] * n
-        vol_col = df["regime_vol_conf"].to_list() if "regime_vol_conf" in df.columns else [0.5] * n
-        timestamp_col = df["timestamp"].to_list()
-
-        cfg = AssetConfig(
-            symbol="BACKTEST",
-            sig_symbol="BACKTEST",
-            timeframe="4h",
-            capital=self.initial_capital,
-            max_risk_pct=self.risk.max_risk_pct,
-            leverage=self.risk.max_leverage,
-            ct_val=self.risk.ct_val,
-            signal_threshold=self.threshold or 0.25,
-        )
-
-        equity = [self.initial_capital]
-        pos = [0.0]
-        trades: list[dict] = []
-        pos_side = ""
-        entry_px = 0.0
-        sz = 0
-        entry_ts = 0
-
-        for i in range(1, n):
-            prev_eq = equity[-1]
-            cur_close = close[i - 1]
-
-            sig_val = signal_col[i - 1]
-            sr = SignalResult(
-                symbol="BACKTEST",
-                timeframe="4h",
-                timestamp=int(timestamp_col[i - 1]),
-                signal=sig_val,
-                flow=sig_val,
-                threshold=cfg.signal_threshold,
-                atr=atr[i - 1],
-                regime_strength=regime_col[i - 1],
-                mom_fast=mom_col[i - 1],
-                vol_conf=vol_col[i - 1],
-            )
-
-            if not pos_side:
-                side = "buy" if sig_val > 0 else "sell"
-                d = _decide_idle(sr, cur_close, side, cfg)
-                if d.action.value == "enter":
-                    pos_side = d.side
-                    entry_px = d.entry_px
-                    sz = d.sz
-                    entry_ts = int(timestamp_col[i - 1])
-                    prev_eq *= 1.0 - self.cost.total_per_side
-            else:
-                d = _decide_active(
-                    sr,
-                    pos_side,
-                    cfg,
-                    entry_px=entry_px,
-                    mark_px=cur_close,
-                    exit_mode=self.exit_mode,
-                )
-                if d.action.value == "exit":
-                    d_sign = 1 if pos_side == "buy" else -1
-                    exit_px = cur_close * (1.0 - d_sign * self.cost.total_per_side)
-                    pnl_pct = d_sign * (exit_px / entry_px - 1) if entry_px > 0 else 0.0
-                    notional = sz * cfg.ct_val * entry_px
-                    pnl_usd = pnl_pct * notional * cfg.leverage
-                    trades.append(
-                        {
-                            "entry_time": entry_ts,
-                            "exit_time": int(timestamp_col[i - 1]),
-                            "side": "long" if d_sign > 0 else "short",
-                            "entry_price": entry_px,
-                            "exit_price": exit_px,
-                            "pnl": pnl_usd,
-                            "reason": d.detail,
-                        }
-                    )
-                    prev_eq += pnl_usd
-                    pos_side = ""
-                    sz = 0
-
-            pos_current = sz * (1 if pos_side == "buy" else -1) if pos_side else 0.0
-            equity.append(prev_eq)
-            pos.append(pos_current)
-
-        eq_series = pl.Series(equity, dtype=pl.Float64)
-        result_df = df.select(["timestamp", "close", "signal"]).with_columns(
-            [
-                pl.Series(pos).alias("position"),
-                eq_series.alias("portfolio_value"),
-                eq_series.pct_change().fill_null(0.0).alias("returns"),
-            ]
-        )
-        return BacktestResult(
-            trades=pl.DataFrame(trades) if trades else pl.DataFrame(),
-            equity_curve=result_df,
-            metrics=compute_metrics(
-                result_df, trades=pl.DataFrame(trades) if trades else pl.DataFrame()
-            ),
-        )
-
-
-# ======================================================================
-# 2. Pair-spread backtest (two-leg, hedge ratio aware)
+# Pair-spread backtest (two-leg, hedge ratio aware)
 # ======================================================================
 
 
@@ -478,7 +186,7 @@ def run_pair_backtest(
 
 
 # ======================================================================
-# 3. Multi-asset portfolio backtest
+# Multi-asset portfolio backtest
 # ======================================================================
 
 
@@ -563,7 +271,6 @@ def run_portfolio_backtest(
 
     for i in range(1, merged.height):
         prev_eq = equity[-1]
-
         states = []
         for s in symbols:
             vol = atr_map[s][i] / max(close_map[s][i], 1e-9)
@@ -657,115 +364,3 @@ def run_portfolio_backtest(
         weights=pl.DataFrame(weight_rows) if weight_rows else pl.DataFrame(),
         metrics=compute_metrics(eq_c, trades=pl.DataFrame(trades) if trades else pl.DataFrame()),
     )
-
-
-# ======================================================================
-# Walk-forward backtest
-# ======================================================================
-
-
-class WalkForwardBacktest:
-    def __init__(self, config: WalkForwardConfig, backtest: Backtest) -> None:
-        self._config = config
-        self._backtest = backtest
-
-    def run(self) -> WalkForwardResult:
-        w = self._config
-        df = self._backtest.data.sort("timestamp").with_columns(
-            self._backtest.signal_expr.alias("signal")
-        )
-        df = df.with_columns(pl.col("signal").forward_fill().fill_null(0.0))
-
-        window_total = w.train_windows + w.test_window + w.holdout_window
-        total_bars = len(df)
-        window_bars = w.rebalance_bars
-        n_windows = total_bars // window_bars
-        if n_windows < window_total + 1:
-            last = self._backtest._run_shared(df)
-            return WalkForwardResult(
-                windows=[],
-                combined_oos_metrics=last.metrics,
-                stability_metrics={"insufficient_windows": True},
-            )
-
-        windows: list[WindowResult] = []
-        oos_returns: list[float] = []
-        oos_timestamps: list[int] = []
-
-        for start_win in range(0, n_windows - window_total + 1, w.step):
-            train_end = (start_win + w.train_windows) * window_bars
-            test_end = (start_win + w.train_windows + w.test_window) * window_bars
-            holdout_end = (start_win + window_total) * window_bars
-            for label, (lo, hi) in [
-                ("train", (start_win * window_bars, train_end)),
-                ("test", (train_end, test_end)),
-                ("holdout", (test_end, holdout_end)),
-            ]:
-                seg = df.slice(lo, hi - lo)
-                if seg.height < 2:
-                    continue
-                result = self._backtest._run_shared(seg)
-                win = WindowResult(
-                    label=label,
-                    start=lo,
-                    end=hi,
-                    equity_curve=result.equity_curve,
-                    trades=result.trades,
-                    metrics=result.metrics,
-                )
-                windows.append(win)
-                if label == "test":
-                    oos_returns.extend(result.equity_curve["returns"].to_list())
-                    oos_timestamps.extend(result.equity_curve["timestamp"].to_list())
-
-        if oos_returns:
-            oos_eq = _returns_to_equity(
-                oos_returns, self._backtest.initial_capital, timestamps=oos_timestamps
-            )
-            combined_oos_metrics = compute_metrics(oos_eq)
-        else:
-            last = self._backtest._run_shared(df)
-            combined_oos_metrics = last.metrics
-
-        stability = _compute_stability_metrics(windows)
-        return WalkForwardResult(
-            windows=windows, combined_oos_metrics=combined_oos_metrics, stability_metrics=stability
-        )
-
-
-def _returns_to_equity(returns, initial_capital=10000.0, timestamps=None):
-    eq, current = [], initial_capital
-    for idx, ret in enumerate(returns):
-        if idx:
-            current *= 1.0 + ret
-        eq.append(current)
-    n = len(eq)
-    data = {
-        "portfolio_value": pl.Series(eq, dtype=pl.Float64),
-        "returns": pl.Series(returns, dtype=pl.Float64)
-        if returns
-        else pl.Series([], dtype=pl.Float64),
-        "position": pl.Series([0.0] * n, dtype=pl.Float64),
-        "signal": pl.Series([0.0] * n, dtype=pl.Float64),
-    }
-    if timestamps is not None and len(timestamps) == n:
-        data["timestamp"] = pl.Series(timestamps, dtype=pl.Int64)
-    return pl.DataFrame(data)
-
-
-def _compute_stability_metrics(windows):
-    import statistics
-
-    test_sharpes = [w.metrics.sharpe_ratio for w in windows if w.label == "test"]
-    train_sharpes = [w.metrics.sharpe_ratio for w in windows if w.label == "train"]
-    if not test_sharpes:
-        return {}
-    mean_test = statistics.mean(test_sharpes)
-    var_test = statistics.variance(test_sharpes) if len(test_sharpes) > 1 else 0.0
-    overfit_count = sum(1 for t, v in zip(train_sharpes, test_sharpes) if t > v)
-    total = min(len(train_sharpes), len(test_sharpes))
-    return {
-        "mean_test_sharpe": round(mean_test, 4),
-        "std_test_sharpe": round(math.sqrt(var_test), 4) if var_test > 0 else 0.0,
-        "overfit_ratio": round(overfit_count / total, 4) if total > 0 else 0.0,
-    }
