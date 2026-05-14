@@ -1,13 +1,39 @@
-"""Basket management — isolate parallel signals, dedup, portfolio exposure.
+"""Basket management + exit engine — isolates signals, manages positions, evaluates exits.
 
-Each Basket is a container that holds one or more Positions for a single
-instrument + strategy + direction.  Baskets are identified by basket_id
-(derived from signal_chan_name) and tracked per bar.
+Each Basket holds one or more Positions for a single instrument + strategy + direction.
+Exit logic is integrated because exits read Basket state directly (entry_px, bars_in_pos,
+trail_high, trail_low, target_hit).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
+
+
+class ActionKind(StrEnum):
+    ENTER = "enter"
+    EXIT = "exit"
+    ADD_GRID = "add_grid"
+    HEDGE = "hedge"
+
+
+class BasketState(StrEnum):
+    IDLE = "idle"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+
+
+class ExitReason(StrEnum):
+    STOP = "stop"
+    TRAILING = "trailing_stop"
+    BREAKEVEN = "breakeven"
+    TIME = "time"
+    SIGNAL_ENTRY = "signal_entry"
+    SIGNAL_FLIP = "signal_flip"
+    MARTINGALE = "martingale_reverse"
+    HEDGE_DRAWDOWN = "hedge_on_drawdown"
+    GRID_LEVEL = "grid_level"
 
 
 @dataclass
@@ -25,7 +51,7 @@ class Basket:
     symbol: str
     strategy: str
     side: str
-    state: str = "idle"
+    state: BasketState = BasketState.IDLE
     positions: list[Position] = field(default_factory=list)
     entry_px: float = 0.0
     current_sz: float = 0.0
@@ -33,7 +59,7 @@ class Basket:
     bars_in_pos: int = 0
     loss_streak: int = 0
     trail_high: float = 0.0
-    trail_low: float = 0.0
+    trail_low: float = float("inf")
     target_hit: bool = False
     recovery_activated: bool = False
     recovery_level: int = 0
@@ -43,21 +69,21 @@ class Basket:
 
     @property
     def is_idle(self) -> bool:
-        return self.state == "idle"
+        return self.state == BasketState.IDLE
 
     @property
     def is_active(self) -> bool:
-        return self.state == "active"
+        return self.state == BasketState.ACTIVE
 
     @property
     def is_suspended(self) -> bool:
-        return self.state == "suspended"
+        return self.state == BasketState.SUSPENDED
 
 
 @dataclass
 class BasketAction:
     basket_id: str
-    action: str
+    action: ActionKind
     side: str = ""
     sz: float = 0.0
     px: float = 0.0
@@ -66,6 +92,29 @@ class BasketAction:
     fraction: float = 1.0
     reason: str = ""
     order_type: str = "limit"
+
+
+@dataclass
+class ExitConfig:
+    stop_mult: float = 1.5
+    target_mult: float = 1.3
+    trail_mult: float = 2.0
+    max_bars: int = 10
+    breakeven_after_target: bool = False
+    session_end_utc: int = 22
+
+
+@dataclass
+class TrailTracker:
+    trail_high: float = 0.0
+    trail_low: float = float("inf")
+    target_hit: bool = False
+
+    def update(self, high: float, low: float) -> None:
+        if high > self.trail_high:
+            self.trail_high = high
+        if low < self.trail_low:
+            self.trail_low = low
 
 
 class BasketManager:
@@ -87,11 +136,101 @@ class BasketManager:
             symbol=symbol,
             strategy=strategy,
             side=side,
-            state="active",
+            state=BasketState.ACTIVE,
             entry_px=entry_px,
             current_sz=0.0,
         )
 
     def remove(self, basket: Basket) -> None:
-        basket.state = "idle"
+        basket.state = BasketState.IDLE
         basket.positions.clear()
+
+
+def evaluate_exits(
+    basket: Basket,
+    bar_close: float,
+    bar_high: float,
+    bar_low: float,
+    atr: float,
+    trail: TrailTracker,
+    config: ExitConfig,
+) -> BasketAction | None:
+    bars = basket.bars_in_pos
+    entry = basket.entry_px
+    d = 1 if basket.side == "buy" else -1
+
+    trail.update(bar_high, bar_low)
+
+    stop_px = entry - d * config.stop_mult * atr
+    target_px = entry + d * config.target_mult * atr
+
+    if not trail.target_hit:
+        if d * (stop_px - bar_close) >= 0:
+            return BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.EXIT,
+                side=basket.side,
+                reason=ExitReason.STOP.value,
+                px=bar_close,
+                fraction=1.0,
+            )
+
+    if trail.target_hit:
+        trail_stop = (
+            trail.trail_high - config.trail_mult * atr
+            if d > 0
+            else trail.trail_low + config.trail_mult * atr
+        )
+        if d > 0 and bar_close <= trail_stop:
+            return BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.EXIT,
+                side=basket.side,
+                reason=ExitReason.TRAILING.value,
+                px=bar_close,
+                fraction=1.0,
+            )
+        elif d < 0 and bar_close >= trail_stop:
+            return BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.EXIT,
+                side=basket.side,
+                reason=ExitReason.TRAILING.value,
+                px=bar_close,
+                fraction=1.0,
+            )
+
+    if config.breakeven_after_target and trail.target_hit:
+        if d > 0 and bar_close <= entry:
+            return BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.EXIT,
+                side=basket.side,
+                reason=ExitReason.BREAKEVEN.value,
+                px=bar_close,
+                fraction=1.0,
+            )
+        elif d < 0 and bar_close >= entry:
+            return BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.EXIT,
+                side=basket.side,
+                reason=ExitReason.BREAKEVEN.value,
+                px=bar_close,
+                fraction=1.0,
+            )
+
+    if not trail.target_hit and d * (bar_close - target_px) >= 0:
+        trail.target_hit = True
+
+    if not trail.target_hit and bars >= config.max_bars:
+        return BasketAction(
+            basket_id=basket.basket_id,
+            action=ActionKind.EXIT,
+            side=basket.side,
+            reason=ExitReason.TIME.value,
+            px=bar_close,
+            fraction=1.0,
+        )
+
+    return None

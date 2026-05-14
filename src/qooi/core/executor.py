@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from qooi.core.basket import Basket, BasketAction, Position
+from qooi.core.basket import ActionKind, Basket, BasketAction, BasketState, Position
 
 STATE_DIR = Path("data") / "state"
 STATE_PATH = STATE_DIR / "baskets.json"
@@ -53,7 +53,7 @@ class LiveExecutor:
                     symbol=sym,
                     strategy=p.okx.strategy,
                     side="buy" if qty > 0 else "sell",
-                    state="active",
+                    state=BasketState.ACTIVE,
                     entry_px=float(pos.get("avgPx", 0)),
                     current_sz=abs(qty),
                     recovery_level=saved.get("recovery_level", 0),
@@ -80,7 +80,7 @@ class LiveExecutor:
                 if saved.get("recovery_level", 0) > 0:
                     basket.recovery_activated = True
             else:
-                basket = Basket(basket_id=bid, symbol=sym, strategy=p.okx.strategy)
+                basket = Basket(basket_id=bid, symbol=sym, strategy=p.okx.strategy, side="")
 
             baskets.append(basket)
         return baskets
@@ -99,19 +99,19 @@ class LiveExecutor:
                 print(f"    EXEC FAILED [{a.action}]: {e}")
 
     def _dispatch(self, a: BasketAction) -> None:
-        if a.action == "enter":
+        if a.action == ActionKind.ENTER:
             px = a.px or self._entry_px(a.side, a.basket_id)
             sz = int(a.sz) if a.sz > 0 else 1
             print(f"    ORDER {a.side} sz={sz} px={px} ({a.reason})")
 
-        elif a.action == "exit":
+        elif a.action == ActionKind.EXIT:
             print(f"    CLOSE {a.side} ({a.reason})")
 
-        elif a.action == "add_grid":
+        elif a.action == ActionKind.ADD_GRID:
             px = a.px or self._entry_px(a.side, a.basket_id)
             print(f"    GRID ADD {a.side} sz={a.sz} px={px} ({a.reason})")
 
-        elif a.action == "hedge":
+        elif a.action == ActionKind.HEDGE:
             print(f"    HEDGE {a.side} sz={a.sz} ({a.reason})")
 
     def _entry_px(self, side: str, symbol: str) -> float:
@@ -145,9 +145,9 @@ class BacktestExecutor:
 
     def simulate(self, actions: list[BasketAction], bar: dict) -> None:
         for a in actions:
-            if a.action == "enter":
+            if a.action == ActionKind.ENTER:
                 pass
-            elif a.action == "exit":
+            elif a.action == ActionKind.EXIT:
                 pass
 
 

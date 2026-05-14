@@ -84,13 +84,25 @@ uv run python scripts/trade.py live dry
 - **Python 3.12** via `uv`
 - **Polars** DataFrame library
 - **python-okx** SDK for trading
+- **ty** for type checking
 - GitHub Actions: 1H cron schedule on test environment
+
+## Quality
+
+```bash
+uv run ruff check src/ tests/ scripts/   # lint
+uv run ty check src/                      # type check
+uv run pytest tests/ -v                   # unit + integration tests
+```
 
 ## Project structure
 
 ```text
 src/qooi/
-  core/              ← signal.py (compute_*_1h), decide.py (decision engine)
+  core/              ← __init__.py (process_bar), basket.py (Basket + exits),
+                       decide.py (AssetConfig), config.py (PairConfig),
+                       executor.py (Live + Backtest), indicators.py,
+                       recovery.py (grid/martingale/hedge)
   exchange/          ← market.py, trading.py, backtest.py, eval.py, indicator.py
   strategies/        ← momentum_1h.py, rsi_reversion.py, momentum.py,
                        ema_pullback.py, ema_pullback_v2.py, flow_pipeline.py,

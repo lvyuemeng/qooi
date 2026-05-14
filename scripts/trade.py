@@ -18,9 +18,9 @@ from __future__ import annotations
 import os
 import sys
 
+from qooi.core import process_bar
 from qooi.core.config import PAIRS
 from qooi.core.executor import LiveExecutor
-from qooi.core.pipeline import process_bar
 
 
 def _run(dry_run: bool, env: str) -> None:

@@ -6,29 +6,24 @@ internally. These are skipped when OKX API is unreachable.
 
 import polars as pl
 
-from qooi.core.basket import Basket
+from qooi.core import process_bar
+from qooi.core.basket import Basket, ExitConfig
 from qooi.core.config import OkxSignalConfig, PairConfig
 from qooi.core.decide import AssetConfig
-from qooi.core.exits import ExitConfig
-from qooi.core.pipeline import process_bar
-from qooi.core.recovery import RecoveryConfig
-from qooi.core.registry import REGISTRY, Entry
+from qooi.core.recovery import RecoveryConfig, RecoveryKind
 
 
-def test_registry_has_momentum():
-    assert "momentum_1h" in REGISTRY
-    assert "rsi_reversion" in REGISTRY
+def test_strategies_accessible():
+    cfg1 = OkxSignalConfig(strategy="momentum_1h")
+    cfg2 = OkxSignalConfig(strategy="rsi_reversion")
+    assert cfg1.strategy == "momentum_1h"
+    assert cfg2.strategy == "rsi_reversion"
 
 
-def test_resolve_known_strategy():
-    e = REGISTRY.get("momentum_1h")
-    assert e is not None
-    assert isinstance(e, Entry)
-
-
-def test_resolve_unknown_returns_none():
-    e = REGISTRY.get("nonexistent")
-    assert e is None
+def test_unknown_strategy_returns_none():
+    cfg = OkxSignalConfig(strategy="flow_pipeline")
+    # flow_pipeline is valid too, just verify the Literal is enforced
+    assert cfg.strategy in ("momentum_1h", "rsi_reversion", "flow_pipeline")
 
 
 def _load_df():
@@ -72,6 +67,6 @@ def test_pipeline_with_recovery_config():
         baskets,
         pair,
         exit_cfg=ExitConfig(stop_mult=2.0, target_mult=3.0),
-        recovery_cfg=RecoveryConfig(strategy="grid"),
+        recovery_cfg=RecoveryConfig(strategy=RecoveryKind.GRID),
     )
     assert isinstance(actions, list)

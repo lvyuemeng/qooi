@@ -1,7 +1,6 @@
-"""Shared decision engine — identical for live trading and backtesting.
+"""Asset configuration — shared compute-time parameters.
 
-Both paths call the same functions: what changes is only the I/O layer
-(fetching prices vs reading cached data; calling OKX vs simulating fills).
+Used by backtest and live trading via PairConfig.
 """
 
 from __future__ import annotations
@@ -67,11 +66,7 @@ def compute_stop_target(
     )
 
 
-def compute_sz(
-    entry_px: float,
-    stop_px: float,
-    cfg: AssetConfig,
-) -> int:
+def compute_sz(entry_px: float, stop_px: float, cfg: AssetConfig) -> int:
     risk_per_ct = abs(entry_px - stop_px) * cfg.ct_val
     if risk_per_ct <= 0:
         return 0
@@ -82,26 +77,19 @@ def compute_sz(
     return max(1, min(sz, max_sz))
 
 
-def decide_idle(
-    signal: SignalResult,
-    entry_px: float,
-    side: str,
-    cfg: AssetConfig,
-) -> Decision:
+def decide_idle(signal: SignalResult, entry_px: float, side: str, cfg: AssetConfig) -> Decision:
     if abs(signal.signal) < cfg.signal_threshold:
         return Decision(action=Action.HOLD, detail="weak_signal")
     if abs(signal.mom_fast) > 0.3 and signal.signal * signal.mom_fast < 0:
         return Decision(action=Action.HOLD, detail="momentum_opposing")
     if signal.vol_conf < 0.3:
         return Decision(action=Action.HOLD, detail="low_volume")
-
     stop_px, target_px = compute_stop_target(
         side, entry_px, signal.atr, cfg, signal.regime_strength
     )
     sz = compute_sz(entry_px, stop_px, cfg)
     if sz < 1:
         return Decision(action=Action.HOLD, detail="insufficient_margin")
-
     return Decision(
         action=Action.ENTER,
         side=side,
@@ -120,23 +108,14 @@ def decide_active(
     mark_px: float = 0.0,
     exit_mode: str = "signal_flip_only",
 ) -> Decision:
-    """Check if position should be exited.
-
-    exit_mode:
-      - signal_flip_only: only exit on direction reversal (live signal-bot)
-      - with_sl_tp: exit on signal flip, stop, or target breach (backtest)
-      - full: signal flip, stop, target, trailing stop (backtest + future)
-    """
     d = 1 if pos_side == "buy" else -1
-
     if signal.signal * d < 0:
         return Decision(action=Action.EXIT, side=pos_side, detail="signal_flipped")
-
     if exit_mode in ("with_sl_tp", "full") and entry_px > 0 and mark_px > 0:
         atr = signal.atr if signal.atr > 0 else 50.0
         stop_m, target_m = compute_stop_target(pos_side, entry_px, atr, cfg, signal.regime_strength)
-        stop_px = entry_px - d * stop_m * atr if exit_mode else entry_px
-        target_px = entry_px + d * target_m * atr if exit_mode else entry_px
+        stop_px = entry_px - d * stop_m * atr
+        target_px = entry_px + d * target_m * atr
         if d * (stop_px - mark_px) >= 0:
             return Decision(
                 action=Action.EXIT,
@@ -153,5 +132,4 @@ def decide_active(
                 stop_px=stop_px,
                 target_px=target_px,
             )
-
     return Decision(action=Action.HOLD, detail="holding")

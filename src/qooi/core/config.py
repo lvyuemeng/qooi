@@ -14,8 +14,12 @@ Runtime discovery (from OKX API):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from qooi.core.decide import AssetConfig
+from qooi.core.indicators import SignalResult
+
+StrategyName = Literal["momentum_1h", "rsi_reversion", "flow_pipeline"]
 
 
 @dataclass
@@ -25,9 +29,25 @@ class OkxSignalConfig:
     Orthogonal to AssetConfig — only contains fields the OKX API needs.
     """
 
-    strategy: str = "momentum_1h"
+    strategy: StrategyName = "momentum_1h"
     tp_pct: str = "2.0"
     sl_pct: str = "2.5"
+
+    def compute(self, symbol: str) -> SignalResult | None:
+        """Compute signal via the strategy-specific function."""
+        from qooi.core.indicators import (
+            compute_momentum_1h,
+            compute_rsi_reversion_1h,
+            compute_single,
+        )
+
+        if self.strategy == "momentum_1h":
+            return compute_momentum_1h(symbol)
+        if self.strategy == "rsi_reversion":
+            return compute_rsi_reversion_1h(symbol)
+        if self.strategy == "flow_pipeline":
+            return compute_single(symbol, "4h", 0.25)
+        return None
 
 
 @dataclass
