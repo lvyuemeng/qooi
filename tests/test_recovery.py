@@ -80,6 +80,22 @@ def test_none_strategy_no_action():
     assert len(actions) == 0
 
 
+def test_max_loss_exits_before_recovery_add():
+    b = _b("buy", 100.0, sz=1.0)
+    cfg = RecoveryConfig(strategy=RecoveryKind.GRID, zone_atr=1.0, max_loss_pct=2.0)
+    actions = evaluate(b, bar_close=95.0, atr=2.0, config=cfg, current_level=0)
+    a = _first(actions)
+    assert a.action == ActionKind.EXIT
+    assert a.reason == ExitReason.GLOBAL_LOSS_LIMIT.value
+
+
+def test_martingale_size_uses_contract_value_units():
+    b = _b("buy", 100.0, sz=10.0)
+    cfg = RecoveryConfig(strategy=RecoveryKind.MARTINGALE, zone_atr=1.0, max_levels=3)
+    actions = evaluate(b, bar_close=95.0, atr=2.0, config=cfg, current_level=0, ct_val=0.1)
+    assert actions[1].sz == 25
+
+
 def test_idle_basket_skipped():
     b = _b("buy", 100.0)
     b.state = BasketState.IDLE

@@ -33,10 +33,10 @@ queries OKX position state, decides, and pushes orders to the signal bot.
 ### What the output means
 
 ```text
-  ETH-USDT-SWAP        strategy=momentum_1h sig=+1 atr=42.5 pos=flat action=enter
+  ETH-USDT-SWAP        strategy=momentum_burst sig=+1 atr=42.5 pos=flat action=enter
     ORDER buy sz=2 px=2320.50 sl=2250.0 tp=2367.0
 
-  SOL-USDT-SWAP        strategy=rsi_reversion sig=0 atr=3.8 pos=flat action=hold (weak_signal)
+  SOL-USDT-SWAP        strategy=rsi_bounce_reversion sig=0 atr=3.8 pos=flat action=hold (weak_signal)
 ```
 
 Action labels:
@@ -56,8 +56,8 @@ Position state is queried from `GET /signal/positions` (server-side truth).
 
 | Strategy | Asset | What to expect |
 |----------|-------|---------------|
-| `momentum_1h` | ETH | Enters on strong 1H directional bursts (6-bar return > 0.3%) with volume confirmation. Signal stays at ±1 until trend flips. Frequent signals during trending markets, quiet during chop. |
-| `rsi_reversion` | SOL | Enters only on oversold bounces in uptrends (RSI < 30 then recovers). Long-only. Less frequent than momentum — expect 2-4 signals per week. |
+| `momentum_burst` | any configured asset | Enters on strong 1H directional bursts (6-bar return > 0.3%) with volume confirmation. Signal stays at ±1 until trend flips. Frequent signals during trending markets, quiet during chop. |
+| `rsi_bounce_reversion` | any configured asset | Enters only on oversold bounces in uptrends (RSI < 30 then recovers). Long-only. Less frequent than momentum — expect 2-4 signals per week. |
 
 ## Fast Validation (Local)
 

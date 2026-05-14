@@ -1,60 +1,53 @@
-"""Unit tests for basket management layer."""
+"""Basket invariants."""
 
-from qooi.core.basket import ActionKind, Basket, BasketAction, BasketManager, BasketState, Position
+from qooi.core.basket import Basket, BasketBook, BasketManager, BasketState, Position
 
 
-def test_create_basket():
+def test_create_basket_initializes_full_state():
     mgr = BasketManager(max_baskets=3, max_per_symbol=1)
     b = mgr.create(
-        "ETH-USDT-SWAP", "momentum_1h", "buy", 3000.0, sz=2.0, stop_px=2950.0, target_px=3060.0
+        "ETH-USDT-SWAP",
+        "momentum_burst",
+        "buy",
+        3000.0,
+        sz=2.0,
+        stop_px=2950.0,
+        target_px=3060.0,
     )
-    assert b.basket_id == "ETH-USDT-SWAP-momentum_1h"
+    assert b.basket_id == "ETH-USDT-SWAP-momentum_burst"
     assert b.state == BasketState.ACTIVE
-    assert b.side == "buy"
     assert b.entry_px == 3000.0
     assert b.current_sz == 2.0
+    assert b.stop_px == 2950.0
+    assert b.target_px == 3060.0
 
 
-def test_manager_dedup_per_symbol():
+def test_can_open_counts_only_active_baskets():
     mgr = BasketManager(max_baskets=5, max_per_symbol=1)
-    active: list[Basket] = []
-    b1 = mgr.create("ETH-USDT-SWAP", "m1", "buy", 100.0, sz=1.0, stop_px=95.0, target_px=105.0)
-    active.append(b1)
-    assert mgr.can_open("ETH-USDT-SWAP", active) is False
-    assert mgr.can_open("SOL-USDT-SWAP", active) is True
-
-
-def test_cannot_open_when_full():
-    mgr = BasketManager(max_baskets=2, max_per_symbol=5)
-    active = [
-        Basket(basket_id="a", symbol="X", strategy="s", side="buy"),
-        Basket(basket_id="b", symbol="Y", strategy="s", side="sell"),
+    baskets = [
+        Basket(
+            basket_id="SOL-rsi",
+            symbol="SOL",
+            strategy="rsi",
+            side="buy",
+            state=BasketState.ACTIVE,
+        )
     ]
-    assert mgr.can_open("Z", active) is False
+    assert mgr.can_open("SOL", baskets) is False
+    mgr.remove(baskets[0])
+    assert mgr.can_open("SOL", baskets) is True
 
 
-def test_basket_properties():
-    b = Basket(basket_id="test", symbol="ETH", strategy="m", side="buy", state=BasketState.IDLE)
-    assert b.is_idle is True
-    assert b.is_active is False
-    b.state = BasketState.ACTIVE
-    assert b.is_active is True
+def test_max_basket_limit_blocks_new_entries():
+    mgr = BasketManager(max_baskets=2, max_per_symbol=5)
+    baskets = [
+        Basket(basket_id="a", symbol="X", strategy="s", side="buy", state=BasketState.ACTIVE),
+        Basket(basket_id="b", symbol="Y", strategy="s", side="sell", state=BasketState.ACTIVE),
+    ]
+    assert mgr.can_open("Z", baskets) is False
 
 
-def test_basket_action_defaults():
-    a = BasketAction(basket_id="x", action=ActionKind.ENTER, reason="signal")
-    assert a.side == ""
-    assert a.px == 0.0
-    assert a.fraction == 1.0
-    assert a.order_type == "limit"
-
-
-def test_position_defaults():
-    p = Position(symbol="ETH", side="buy", sz=1.0, avg_px=2000.0)
-    assert p.order_id == ""
-
-
-def test_manager_remove():
+def test_remove_fully_resets_basket():
     mgr = BasketManager()
     b = Basket(
         basket_id="x",
@@ -63,7 +56,50 @@ def test_manager_remove():
         side="buy",
         state=BasketState.ACTIVE,
         positions=[Position("A", "buy", 1.0, 100.0)],
+        bars_in_pos=5,
+        trail_high=110.0,
+        target_hit=True,
+        recovery_activated=True,
+        recovery_level=2,
+        cumulative_loss=42.0,
+        current_sz=3.0,
     )
     mgr.remove(b)
     assert b.state == BasketState.IDLE
-    assert len(b.positions) == 0
+    assert b.positions == []
+    assert b.bars_in_pos == 0
+    assert b.trail_high == 0.0
+    assert b.trail_low == float("inf")
+    assert b.target_hit is False
+    assert b.recovery_activated is False
+    assert b.recovery_level == 0
+    assert b.cumulative_loss == 0.0
+    assert b.current_sz == 0.0
+
+
+def test_replace_invariant_same_symbol_reopens_without_list_growth():
+    mgr = BasketManager(max_per_symbol=1)
+    baskets = [
+        Basket(
+            basket_id="SOL-rsi",
+            symbol="SOL",
+            strategy="rsi",
+            side="buy",
+            state=BasketState.ACTIVE,
+        )
+    ]
+    mgr.remove(baskets[0])
+    assert mgr.can_open("SOL", baskets) is True
+
+
+def test_basket_book_owns_lifecycle_state():
+    book = BasketBook(max_per_symbol=1)
+    basket = book.open("ETH", "momentum", "buy", 100.0, 2.0, 95.0, 110.0)
+
+    assert book.get("ETH-momentum") is basket
+    assert book.active_exposure() == 2.0
+    assert book.can_open("ETH") is False
+
+    book.close(basket)
+    assert basket.is_idle
+    assert book.can_open("ETH") is True

@@ -11,7 +11,7 @@ from qooi.core.styles import walk_forward
 
 
 def _cache_path(sig_symbol: str) -> str:
-    return f"data/cache/{sig_symbol.replace('-', '')}_1H.parquet"
+    return f"data/cache/{sig_symbol.replace('-', '_')}_1H.parquet"
 
 
 if __name__ == "__main__":
@@ -21,7 +21,7 @@ if __name__ == "__main__":
 
         def trades_fn(seg):
             bt = BacktestExecutor(initial_capital=pair.asset.capital)
-            return bt.run(seg, pair)
+            return bt.run(seg, pair, strategy="momentum_burst")
 
         result = walk_forward(trades_fn, df, train_bars=500, test_bars=100)
         print(result.summary())

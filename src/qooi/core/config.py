@@ -2,7 +2,7 @@
 
 Orthogonal layers:
   - AssetConfig — compute-time: sizing, stop/target, capital, leverage
-  - OkxSignalConfig — OKX signal bot execution: TP/SL, strategy dispatch
+  - OkxSignalConfig — OKX signal bot execution settings
 
 Composition: PairConfig = AssetConfig + OkxSignalConfig.
 
@@ -14,9 +14,6 @@ Runtime discovery (from OKX API):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
-
-from qooi.core.indicators import SignalResult
 
 
 @dataclass
@@ -34,35 +31,12 @@ class AssetConfig:
     ord_type: str = "limit"
 
 
-StrategyName = Literal["momentum_1h", "rsi_reversion", "flow_pipeline"]
-
-
 @dataclass
 class OkxSignalConfig:
-    """OKX signal bot execution-layer config.
+    """OKX signal bot execution-layer TP/SL config."""
 
-    Orthogonal to AssetConfig — only contains fields the OKX API needs.
-    """
-
-    strategy: StrategyName = "momentum_1h"
     tp_pct: str = "2.0"
     sl_pct: str = "2.5"
-
-    def compute(self, symbol: str) -> SignalResult | None:
-        """Compute signal via the strategy-specific function."""
-        from qooi.core.indicators import (
-            compute_momentum_1h,
-            compute_rsi_reversion_1h,
-            compute_single,
-        )
-
-        if self.strategy == "momentum_1h":
-            return compute_momentum_1h(symbol)
-        if self.strategy == "rsi_reversion":
-            return compute_rsi_reversion_1h(symbol)
-        if self.strategy == "flow_pipeline":
-            return compute_single(symbol, "4h", 0.25)
-        return None
 
 
 @dataclass
@@ -106,7 +80,7 @@ PAIRS: list[PairConfig] = [
             ct_val=0.1,
             signal_threshold=0.01,
         ),
-        okx=OkxSignalConfig(strategy="momentum_1h", tp_pct="2.0", sl_pct="2.5"),
+        okx=OkxSignalConfig(tp_pct="2.0", sl_pct="2.5"),
     ),
     PairConfig(
         asset=AssetConfig(
@@ -118,6 +92,34 @@ PAIRS: list[PairConfig] = [
             ct_val=1.0,
             signal_threshold=0.01,
         ),
-        okx=OkxSignalConfig(strategy="rsi_reversion", tp_pct="2.0", sl_pct="2.0"),
+        okx=OkxSignalConfig(tp_pct="2.0", sl_pct="2.0"),
+    ),
+]
+
+RESEARCH_PAIRS: list[PairConfig] = [
+    *PAIRS,
+    PairConfig(
+        asset=AssetConfig(
+            symbol="BTC-USDT-SWAP",
+            sig_symbol="BTC-USDT",
+            timeframe="1H",
+            capital=500,
+            leverage=2.0,
+            ct_val=0.01,
+            signal_threshold=0.01,
+        ),
+        okx=OkxSignalConfig(tp_pct="2.0", sl_pct="2.5"),
+    ),
+    PairConfig(
+        asset=AssetConfig(
+            symbol="XAU-USDT-SWAP",
+            sig_symbol="XAU-USDT",
+            timeframe="1H",
+            capital=500,
+            leverage=2.0,
+            ct_val=0.01,
+            signal_threshold=0.01,
+        ),
+        okx=OkxSignalConfig(tp_pct="2.0", sl_pct="2.5"),
     ),
 ]

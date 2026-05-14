@@ -6,87 +6,15 @@ Both consume the same list[BasketAction] from the pipeline.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-from qooi.core.basket import ActionKind, Basket, BasketAction, BasketState, Position
-
-STATE_DIR = Path("data") / "state"
-STATE_PATH = STATE_DIR / "baskets.json"
+from qooi.core.basket import ActionKind, Basket, BasketAction, BasketBook, BasketState
 
 
 class LiveExecutor:
-    """Execute BasketActions via direct OKX Trading API calls.
-
-    State management: loads soft accumulators (trail_high, trail_low,
-    recovery_level, target_hit, bars_in_pos) from data/state/baskets.json
-    on startup.  Hard truth (position side, size, avg price) comes from
-    OKX API via TradingClient.
-    """
+    """Execute BasketActions via direct OKX Trading API calls."""
 
     def __init__(self, tc, md):
         self._tc = tc
         self._md = md
-
-    def load_state(self, pairs) -> list[Basket]:
-        """Reconstruct Basket state from OKX positions + persisted JSON.
-
-        Hard truth from API: side, size, avgPx, open orders.
-        Soft accumulators from disk: trail_high, trail_low, recovery_level,
-        target_hit, bars_in_pos, recovery_activated.
-        """
-        positions = self._fetch_positions()
-        persisted = _read_state()
-
-        baskets: list[Basket] = []
-        for p in pairs:
-            sym = p.asset.symbol
-            bid = f"{sym}-{p.okx.strategy}"
-
-            pos = next((px for px in positions if px.get("instId") == sym), None)
-            saved = persisted.get(bid, {})
-
-            if pos and float(pos.get("pos", 0)) != 0:
-                qty = float(pos.get("pos", 0))
-                basket = Basket(
-                    basket_id=bid,
-                    symbol=sym,
-                    strategy=p.okx.strategy,
-                    side="buy" if qty > 0 else "sell",
-                    state=BasketState.ACTIVE,
-                    entry_px=float(pos.get("avgPx", 0)),
-                    current_sz=abs(qty),
-                    recovery_level=saved.get("recovery_level", 0),
-                    trail_high=saved.get("trail_high", 0.0),
-                    trail_low=saved.get("trail_low", 0.0),
-                    target_hit=saved.get("target_hit", False),
-                    bars_in_pos=saved.get("bars_in_pos", 0),
-                    recovery_activated=saved.get("recovery_activated", False),
-                    loss_streak=saved.get("loss_streak", 0),
-                    suspended_long=saved.get("suspended_long", False),
-                    suspended_short=saved.get("suspended_short", False),
-                    suspension_px=saved.get("suspension_px", 0.0),
-                )
-                for o in self._fetch_orders(sym):
-                    basket.positions.append(
-                        Position(
-                            symbol=sym,
-                            side=o.get("side", ""),
-                            sz=float(o.get("sz", 0)),
-                            avg_px=float(o.get("px", 0)),
-                            order_id=o.get("ordId", ""),
-                        )
-                    )
-                if saved.get("recovery_level", 0) > 0:
-                    basket.recovery_activated = True
-            else:
-                basket = Basket(basket_id=bid, symbol=sym, strategy=p.okx.strategy, side="")
-
-            baskets.append(basket)
-        return baskets
-
-    def save_state(self, baskets: list[Basket]) -> None:
-        _write_state(baskets)
 
     def execute(self, actions: list[BasketAction], dry_run: bool = False) -> None:
         for a in actions:
@@ -120,18 +48,6 @@ class LiveExecutor:
             return 0.0
         return obi.ask_price if side == "buy" else obi.bid_price
 
-    def _fetch_positions(self) -> list[dict]:
-        try:
-            return self._tc.positions(inst_type="SWAP")
-        except Exception:
-            return []
-
-    def _fetch_orders(self, inst_id: str) -> list[dict]:
-        try:
-            return self._tc.orders(inst_id, inst_type="SWAP")
-        except Exception:
-            return []
-
     def _log(self, a: BasketAction) -> None:
         print(f"    {a.action.upper():10s} {a.side:5s} sz={a.sz:.0f} px={a.px:.2f} ({a.reason})")
 
@@ -140,62 +56,84 @@ class BacktestExecutor:
     """Simulate BasketActions against OHLCV bars for backtesting.
 
     Loops process_bar() over all bars and computes equity/PnL from
-    the BasketAction stream — no decide_idle/decide_active needed.
+    the BasketAction stream.
     """
 
     def __init__(self, initial_capital: float = 10000.0, cost_pct: float = 0.00005):
         self._initial_capital = initial_capital
         self._cost = cost_pct
 
-    def run(self, df, pair, exit_cfg=None, recovery_cfg=None) -> tuple[list[dict], list[float]]:
+    def run(
+        self,
+        df,
+        pair,
+        exit_cfg=None,
+        recovery_cfg=None,
+        *,
+        strategy="momentum_burst",
+    ) -> tuple[list[dict], list[float]]:
         from qooi.core import process_bar
-        from qooi.exchange.indicator import add_indicators
-        from qooi.strategies.momentum_1h import momentum_1h_signal
-        from qooi.strategies.rsi_reversion import rsi_reversion_signal
+        from qooi.core.state import BacktestStateProvider
+        from qooi.strategies import compute_signal_frame
+        from qooi.strategies.specs import resolve_spec
 
-        df = add_indicators(df)
-        if "vol" not in df.columns and "volume" in df.columns:
-            df = df.rename({"volume": "vol"})
-
-        if pair.okx.strategy == "momentum_1h":
-            df = momentum_1h_signal(df)
-        elif pair.okx.strategy == "rsi_reversion":
-            df = rsi_reversion_signal(df)
+        strategy_id = resolve_spec(strategy).name if isinstance(strategy, str) else strategy.name
+        df = compute_signal_frame(df, strategy)
         signal_col = df["signal"].to_list()
 
-        baskets: list[Basket] = []
+        state = BacktestStateProvider()
+        baskets = state.load([pair])
+        book = BasketBook(baskets)
         trades: list[dict] = []
         equity = [self._initial_capital]
+        active_exposure = [0.0]
         peak_equity = self._initial_capital
         stopped_out = False
 
+        def _exit_pnl(
+            basket: Basket, exit_px: float, sz: float = 0.0
+        ) -> tuple[float, float, float]:
+            d = 1 if basket.side == "buy" else -1
+            pnl_pct = d * (exit_px / basket.entry_px - 1) if basket.entry_px > 0 else 0.0
+            effective_sz = sz if sz > 0 else basket.current_sz
+            notional = effective_sz * pair.asset.ct_val * basket.entry_px
+            pnl_usd = pnl_pct * notional
+            return pnl_pct, pnl_usd, effective_sz
+
         for i in range(1, df.height):
+            active_before = book.active_exposure()
             bar_df = df.slice(i, 1)
             actions = process_bar(
-                bar_df, baskets, pair, exit_cfg, recovery_cfg, signal_src=signal_col[i]
+                bar_df,
+                book,
+                pair,
+                exit_cfg,
+                recovery_cfg,
+                signal_src=signal_col[i],
+                strategy_id=strategy_id,
             )
             close = float(df["close"][i])
             prev_eq = equity[-1]
 
             for a in actions:
-                basket = next((b for b in baskets if b.basket_id == a.basket_id), None)
+                basket = book.get(a.basket_id)
 
                 if a.action == ActionKind.ENTER:
                     prev_eq *= 1.0 - self._cost
 
                 elif a.action == ActionKind.EXIT:
                     if basket:
-                        d = 1 if basket.side == "buy" else -1
-                        pnl_pct = d * (close / basket.entry_px - 1) if basket.entry_px > 0 else 0.0
-                        notional = basket.current_sz * pair.asset.ct_val * basket.entry_px
-                        pnl_usd = pnl_pct * notional * pair.asset.leverage
+                        exit_px = a.px if a.px > 0 else close
+                        pnl_pct, pnl_usd, _ = _exit_pnl(basket, exit_px, a.sz)
                         basket.cumulative_loss += abs(min(0, pnl_usd))
                         trades.append(
                             {
                                 "side": basket.side,
                                 "entry_px": basket.entry_px,
-                                "exit_px": close,
-                                "pnl": pnl_usd,
+                                "exit_px": exit_px,
+                                "pnl": round(pnl_pct, 6),
+                                "pnl_usd": round(pnl_usd, 6),
+                                "bars_held": basket.bars_in_pos,
                                 "reason": a.reason,
                             }
                         )
@@ -210,13 +148,13 @@ class BacktestExecutor:
                     new_basket = Basket(
                         basket_id=f"{a.basket_id}_hedge",
                         symbol=pair.asset.symbol,
-                        strategy=pair.okx.strategy,
+                        strategy=strategy_id,
                         side=a.side,
                         state=BasketState.ACTIVE,
                         entry_px=a.px,
                         current_sz=a.sz,
                     )
-                    baskets.append(new_basket)
+                    book.replace_or_add(new_basket)
                     prev_eq *= 1.0 - self._cost
 
             if prev_eq > peak_equity:
@@ -226,54 +164,42 @@ class BacktestExecutor:
                 print(f"    WARNING: portfolio 5% drawdown from peak ${peak_equity:.0f} — stopping")
                 for b in baskets:
                     if b.is_active:
+                        pnl_pct, pnl_usd, _ = _exit_pnl(b, close)
                         trades.append(
                             {
                                 "side": b.side,
                                 "entry_px": b.entry_px,
                                 "exit_px": close,
-                                "pnl": 0,
+                                "pnl": round(pnl_pct, 6),
+                                "pnl_usd": round(pnl_usd, 6),
+                                "bars_held": b.bars_in_pos,
                                 "reason": "global_drawdown_stop",
                             }
                         )
+                        prev_eq += pnl_usd
                 stopped_out = True
 
+            active_exposure.append(active_before)
             equity.append(prev_eq)
             if stopped_out:
                 break
 
+        self._last_active_exposure = active_exposure
+        state.save_soft(baskets)
         return trades, equity
 
-    def run_report(self, df, pair, exit_cfg=None, recovery_cfg=None):
+    def run_report(
+        self, df, pair, exit_cfg=None, recovery_cfg=None, *, strategy="momentum_burst"
+    ):
         from qooi.core.evaluate import Report
+        from qooi.strategies.specs import resolve_spec
 
-        trades, equity = self.run(df, pair, exit_cfg, recovery_cfg)
-        return Report.from_raw(trades, equity, pair)
-
-
-def _read_state() -> dict[str, dict]:
-    if not STATE_PATH.exists():
-        return {}
-    try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _write_state(baskets: list[Basket]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    data: dict[str, dict] = {}
-    for b in baskets:
-        data[b.basket_id] = {
-            "recovery_level": b.recovery_level,
-            "trail_high": b.trail_high,
-            "trail_low": b.trail_low,
-            "target_hit": b.target_hit,
-            "bars_in_pos": b.bars_in_pos,
-            "recovery_activated": b.recovery_activated,
-            "loss_streak": b.loss_streak,
-            "suspended_long": b.suspended_long,
-            "suspended_short": b.suspended_short,
-            "suspension_px": b.suspension_px,
-        }
-    STATE_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        strategy_id = resolve_spec(strategy).name if isinstance(strategy, str) else strategy.name
+        trades, equity = self.run(df, pair, exit_cfg, recovery_cfg, strategy=strategy)
+        return Report.from_raw(
+            trades,
+            equity,
+            pair,
+            label=f"{pair.asset.symbol} {strategy_id}",
+            active_exposure=getattr(self, "_last_active_exposure", None),
+        )

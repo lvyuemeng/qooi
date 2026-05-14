@@ -6,15 +6,15 @@ All trading is on OKX perpetual swaps via the OKX Signal Bot (server-driven TP/S
 
 | Symbol | Strategy | ctVal | Leverage | Capital | TP | SL |
 |--------|----------|-------|----------|---------|-----|-----|
-| ETH-USDT-SWAP | momentum_1h | 0.1 ETH/ct | 2× | $500 | 2.0% | 2.5% |
-| SOL-USDT-SWAP | rsi_reversion | 1 SOL/ct | 3× | $200 | 2.0% | 2.0% |
+| ETH-USDT-SWAP | runtime selected | 0.1 ETH/ct | 2× | $500 | 2.0% | 2.5% |
+| SOL-USDT-SWAP | runtime selected | 1 SOL/ct | 3× | $200 | 2.0% | 2.0% |
 
 ## Signal Pipelines
 
 ### Momentum Burst (ETH)
 
 ```text
-1H OHLCV → add_indicators → momentum_1h_signal
+1H OHLCV → compute_signal_frame("momentum_burst")
          → 6-bar return > 0.3%, EMA50>EMA200, ADX>20, volume > 1.5× avg
          → session 08-22 UTC, trend maturity ≥20 bars
          → signal = 1 / -1 / 0
@@ -23,31 +23,39 @@ All trading is on OKX perpetual swaps via the OKX Signal Bot (server-driven TP/S
 ### RSI Reversion (SOL)
 
 ```text
-1H OHLCV → add_indicators → rsi_reversion_signal
+1H OHLCV → compute_signal_frame("rsi_bounce_reversion")
          → RSI(14) < 30 → bounce > 25 with confirmation
          → EMA50>EMA200, ADX>20, session 08-22 UTC
          → signal = 1 / 0  (long only)
 ```
 
-## Backtest Results (1H, 83 days, 4 assets)
+## Backtest Results (1H, current pipeline)
 
-| Asset | Strategy | Trades | Avg Ret | WR | PL | Sharpe |
-|-------|----------|--------|---------|-----|----|--------|
-| ETH | momentum_1h | 24 | +0.88% | 67% | 1.84 | +0.45 |
-| SOL | rsi_reversion | 9 | +0.48% | 78% | 1.04 | +0.51 |
-| BTC | momentum_1h | 26 | -0.08% | 42% | 1.06 | -0.09 |
-| XAU | momentum_1h | 2 | -0.21% | 0% | — | — |
-| **Ensemble** | **all** | **93** | **+0.21%** | **53%** | **1.32** | **+0.14** |
+| Asset | Strategy | Trades | WR | PL | Avg Win | Avg Loss | Calendar Sharpe |
+|-------|----------|--------|----|----|---------|----------|-----------------|
+| ETH | momentum_burst | 28 | 64% | 2.88 | +1.56% | 0.98% | unstable |
+| SOL | rsi_bounce_reversion | 11 | 64% | 2.08 | +0.88% | 0.74% | unstable |
 
-BTC excluded from live trading due to persistent negative expectancy across all
-tested strategies and timeframes. XAU-USDT had insufficient data (34 days).
+Calendar Sharpe/Sortino on sparse 1H equity are not primary truth. Use trade
+count, win rate, profit factor, avg win/loss, and expectancy first.
+
+Backtest profiles:
+
+```bash
+uv run python scripts/backtest.py --mode base
+uv run python scripts/backtest.py --mode grid
+uv run python scripts/backtest.py --mode martingale
+uv run python scripts/backtest.py --mode hedge
+```
+
+Use profile sweep to separate weak edge from weak exposure / conservative sizing.
 
 ## Backtest ↔ Live Parity
 
 | Feature | Backtest | Live |
 |---------|----------|------|
-| Signal computation | `momentum_1h_signal()` / `rsi_reversion_signal()` on full DataFrame | Same — re-runs on cached data each invocation |
-| Indicators | `add_indicators()` | Same |
+| Signal computation | `compute_signal_frame()` on full DataFrame | Same — re-runs on cached data each invocation |
+| Indicators | `strategies.indicators.add_indicators()` | Same |
 | Decision engine | `process_bar()` (pipeline) | `process_bar()` (pipeline) |
 | Exit mode | `signal_flip_only` + tiered exits in pipeline | `signal_flip_only` via OKX signal bot |
 | Stop-loss | Strategy state-machine (hard stop at 1.5–1.8× ATR) | OKX Signal Bot server-side TP/SL + direct TradeAPI close_position() |

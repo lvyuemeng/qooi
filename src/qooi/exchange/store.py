@@ -34,8 +34,9 @@ class CacheStore:
 
     @staticmethod
     def _path(inst_id: str, bar: str) -> Path:
-        safe = inst_id.replace("-", "_")
-        return CACHE_DIR / f"{safe}_{bar}.parquet"
+        safe = inst_id.replace("-", "_").replace("/", "_").upper()
+        timeframe = bar.replace(" ", "").upper()
+        return CACHE_DIR / f"{safe}_{timeframe}.parquet"
 
     @staticmethod
     def _funding_path(inst_id: str) -> Path:

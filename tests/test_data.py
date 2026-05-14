@@ -2,7 +2,9 @@
 
 import polars as pl
 
-from qooi.exchange.indicator import add_indicators
+from qooi.exchange.market import _cache_path as market_cache_path
+from qooi.exchange.store import CacheStore
+from qooi.strategies.indicators import add_indicators
 
 
 class TestIndicators:
@@ -33,10 +35,7 @@ class TestIndicators:
             "ATR should have values for 80%+ of rows"
         )
 
-    def test_empty_df(self):
-        df = pl.DataFrame()
-        # add_indicators doesn't guard empty input — skip gracefully
-        if df.is_empty():
-            return
-        df = add_indicators(df)
-        assert df.is_empty()
+
+def test_cache_store_path_matches_market_cache_path():
+    assert CacheStore._path("BTC-USDT", "1H") == market_cache_path("BTC-USDT", "1H")
+    assert CacheStore._path("XAU/USDT", "1h") == market_cache_path("XAU/USDT", "1h")

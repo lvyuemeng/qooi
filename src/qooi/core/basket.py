@@ -35,6 +35,7 @@ class ExitReason(StrEnum):
     HEDGE_DRAWDOWN = "hedge_on_drawdown"
     GRID_LEVEL = "grid_level"
     GLOBAL_LOSS_LIMIT = "global_loss_limit"
+    SIGNAL_ZERO = "signal_zero"
 
 
 @dataclass
@@ -129,10 +130,9 @@ class TrailTracker:
 
 
 class BasketManager:
-    """Creates, deduplicates, and limits baskets per instrument.
+    """Stateless basket policy/factory.
 
-    Owns sizing and stop/target computation — the full Basket is
-    initialized at creation with no post-hoc caller mutation.
+    Basket state is owned by ``BasketBook`` or by legacy caller-owned lists.
     """
 
     def __init__(self, max_baskets: int = 5, max_per_symbol: int = 1):
@@ -140,9 +140,10 @@ class BasketManager:
         self.max_per_symbol = max_per_symbol
 
     def can_open(self, symbol: str, active: list[Basket]) -> bool:
-        if len(active) >= self.max_baskets:
+        active_baskets = [b for b in active if b.is_active]
+        if len(active_baskets) >= self.max_baskets:
             return False
-        symbol_count = sum(1 for b in active if b.symbol == symbol)
+        symbol_count = sum(1 for b in active_baskets if b.symbol == symbol)
         return symbol_count < self.max_per_symbol
 
     def create(
@@ -155,8 +156,10 @@ class BasketManager:
         stop_px: float,
         target_px: float,
     ) -> Basket:
+        # Reuse existing idle basket if present, otherwise create
+        bid = f"{symbol}-{strategy}"
         return Basket(
-            basket_id=f"{symbol}-{strategy}",
+            basket_id=bid,
             symbol=symbol,
             strategy=strategy,
             side=side,
@@ -167,9 +170,19 @@ class BasketManager:
             target_px=target_px,
         )
 
-    def remove(self, basket: Basket) -> None:
+    @staticmethod
+    def remove(basket: Basket) -> None:
+        """Full reset — clears state, positions, and all accumulators."""
         basket.state = BasketState.IDLE
         basket.positions.clear()
+        basket.bars_in_pos = 0
+        basket.trail_high = 0.0
+        basket.trail_low = float("inf")
+        basket.target_hit = False
+        basket.recovery_activated = False
+        basket.recovery_level = 0
+        basket.cumulative_loss = 0.0
+        basket.current_sz = 0.0
 
     @staticmethod
     def size_position(entry_px: float, stop_px: float, cfg) -> int:
@@ -189,6 +202,59 @@ class BasketManager:
             round(entry_px - d * cfg.atr_stop_mult * atr, 2),
             round(entry_px + d * cfg.atr_target_mult * atr, 2),
         )
+
+
+class BasketBook:
+    """Owns basket lifecycle state for one pipeline run/session."""
+
+    def __init__(
+        self,
+        baskets: list[Basket] | None = None,
+        *,
+        max_baskets: int = 5,
+        max_per_symbol: int = 1,
+    ):
+        self.baskets = baskets if baskets is not None else []
+        self.policy = BasketManager(max_baskets=max_baskets, max_per_symbol=max_per_symbol)
+
+    def get(self, basket_id: str) -> Basket | None:
+        return next((b for b in self.baskets if b.basket_id == basket_id), None)
+
+    def for_pair(self, symbol: str, strategy: str) -> Basket | None:
+        return self.get(f"{symbol}-{strategy}")
+
+    def active(self) -> list[Basket]:
+        return [b for b in self.baskets if b.is_active]
+
+    def active_exposure(self) -> float:
+        return sum(abs(b.current_sz) for b in self.baskets if b.is_active)
+
+    def can_open(self, symbol: str) -> bool:
+        return self.policy.can_open(symbol, self.baskets)
+
+    def replace_or_add(self, basket: Basket) -> None:
+        for i, existing in enumerate(self.baskets):
+            if existing.basket_id == basket.basket_id:
+                self.baskets[i] = basket
+                return
+        self.baskets.append(basket)
+
+    def open(
+        self,
+        symbol: str,
+        strategy: str,
+        side: str,
+        entry_px: float,
+        sz: float,
+        stop_px: float,
+        target_px: float,
+    ) -> Basket:
+        basket = self.policy.create(symbol, strategy, side, entry_px, sz, stop_px, target_px)
+        self.replace_or_add(basket)
+        return basket
+
+    def close(self, basket: Basket) -> None:
+        self.policy.remove(basket)
 
 
 def evaluate_exits(
@@ -270,7 +336,7 @@ def evaluate_exits(
     if not trail.target_hit and d * (bar_close - target_px) >= 0:
         trail.target_hit = True
 
-    if not trail.target_hit and bars >= config.max_bars:
+    if bars >= config.max_bars:
         return BasketAction(
             basket_id=basket.basket_id,
             action=ActionKind.EXIT,

@@ -10,6 +10,7 @@ close-position + place order.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -29,7 +30,7 @@ class RecoveryConfig:
     zone_atr: float = 2.0
     multiplier: float = 2.0
     max_levels: int = 3
-    max_loss_pct: float = 10.0
+    max_loss_pct: float = 100.0
     breakeven_atr: float = 1.0
 
 
@@ -39,6 +40,8 @@ def evaluate(
     atr: float,
     config: RecoveryConfig,
     current_level: int,
+    *,
+    ct_val: float = 1.0,
 ) -> list[BasketAction]:
     """Evaluate recovery logic. Returns list of actions (may be empty)."""
 
@@ -51,10 +54,26 @@ def evaluate(
     d = 1 if basket.side == "buy" else -1
     loss_pct = d * (bar_close / basket.entry_px - 1) * 100 if basket.entry_px > 0 else 0
 
+    if basket.current_sz <= 0:
+        return []
+
+    if loss_pct < -abs(config.max_loss_pct):
+        return [
+            BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.EXIT,
+                side=basket.side,
+                sz=basket.current_sz,
+                px=bar_close,
+                reason=ExitReason.GLOBAL_LOSS_LIMIT.value,
+                fraction=1.0,
+            )
+        ]
+
     if config.strategy == RecoveryKind.GRID:
         return _grid(basket, bar_close, atr, config, current_level, loss_pct, d)
     if config.strategy == RecoveryKind.MARTINGALE:
-        return _martingale(basket, bar_close, atr, config, current_level, loss_pct, d)
+        return _martingale(basket, bar_close, atr, config, current_level, loss_pct, d, ct_val)
     if config.strategy == RecoveryKind.HEDGE:
         return _hedge(basket, bar_close, config, loss_pct)
 
@@ -98,12 +117,13 @@ def _martingale(
     level: int,
     loss_pct: float,
     d: int,
+    ct_val: float,
 ) -> list[BasketAction]:
     if level >= config.max_levels or loss_pct > -config.zone_atr:
         return []
 
     reversal_side = "sell" if basket.side == "buy" else "buy"
-    reversal_sz = _reversal_size(basket, bar_close, atr, config)
+    reversal_sz = _reversal_size(basket, bar_close, atr, config, ct_val)
 
     return [
         BasketAction(
@@ -130,6 +150,8 @@ def _hedge(
     config: RecoveryConfig,
     loss_pct: float,
 ) -> list[BasketAction]:
+    if basket.recovery_level > 0:
+        return []
     if loss_pct < -config.zone_atr:
         hedge_side = "sell" if basket.side == "buy" else "buy"
         return [
@@ -145,10 +167,12 @@ def _hedge(
     return []
 
 
-def _reversal_size(basket: Basket, bar_close: float, atr: float, config: RecoveryConfig) -> int:
-    loss_amt = abs(basket.entry_px - bar_close) * basket.current_sz * basket.entry_px
-    zone_value = config.zone_atr * atr
-    if zone_value <= 0 or basket.entry_px <= 0:
+def _reversal_size(
+    basket: Basket, bar_close: float, atr: float, config: RecoveryConfig, ct_val: float
+) -> int:
+    loss_usd = abs(basket.entry_px - bar_close) * basket.current_sz * ct_val
+    zone_profit_per_contract = config.zone_atr * atr * ct_val
+    if zone_profit_per_contract <= 0 or basket.entry_px <= 0:
         return 1
-    sz = int(loss_amt / zone_value / basket.entry_px)
+    sz = math.ceil(loss_usd / zone_profit_per_contract)
     return max(1, sz)

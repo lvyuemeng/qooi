@@ -12,7 +12,7 @@ from qooi.core.basket import (
     ActionKind,
     Basket,
     BasketAction,
-    BasketManager,
+    BasketBook,
     ExitConfig,
     ExitReason,
     TrailTracker,
@@ -25,12 +25,13 @@ from qooi.core.recovery import evaluate as evaluate_recovery
 
 def process_bar(
     df: pl.DataFrame,
-    baskets: list[Basket],
+    baskets: list[Basket] | BasketBook,
     pair: PairConfig,
     exit_cfg: ExitConfig | None = None,
     recovery_cfg: RecoveryConfig | None = None,
     *,
     signal_src: float | None = None,
+    strategy_id: str = "default",
 ) -> list[BasketAction]:
     """Run all four layers. Returns BasketActions for executor."""
 
@@ -41,13 +42,9 @@ def process_bar(
     bar_idx = df.height - 1
 
     # ---- Layer 1: Signal ----
-    if signal_src is not None:
-        sig_val = signal_src
-    else:
-        signal = pair.okx.compute(pair.asset.sig_symbol)
-        if signal is None:
-            return actions
-        sig_val = signal.signal
+    if signal_src is None:
+        return actions
+    sig_val = signal_src
 
     close = float(df["close"][bar_idx])
     high = float(df["high"][bar_idx])
@@ -55,17 +52,28 @@ def process_bar(
     atr = float(df["atr_14"][bar_idx] or 1.0)
 
     sym = pair.asset.symbol
-    mgr = BasketManager()
-    basket = next((b for b in baskets if b.basket_id == f"{sym}-{pair.okx.strategy}"), None)
+    book = baskets if isinstance(baskets, BasketBook) else BasketBook(baskets)
+    basket = book.for_pair(sym, strategy_id)
+
+    def _snapshot_exit(reason: str) -> BasketAction:
+        assert basket is not None
+        return BasketAction(
+            basket_id=basket.basket_id,
+            action=ActionKind.EXIT,
+            side=basket.side,
+            sz=basket.current_sz,
+            px=close,
+            reason=reason,
+            fraction=1.0,
+        )
 
     # ---- Layer 2: Basket — signal → basket lifecycle ----
     if basket is None or basket.is_idle:
-        if sig_val != 0 and mgr.can_open(sym, baskets):
+        if sig_val != 0 and book.can_open(sym):
             side = "buy" if sig_val > 0 else "sell"
-            stop_px, target_px = mgr.compute_stop_target(side, close, atr, pair.asset)
-            sz = mgr.size_position(close, stop_px, pair.asset)
-            basket = mgr.create(sym, pair.okx.strategy, side, close, sz, stop_px, target_px)
-            baskets.append(basket)
+            stop_px, target_px = book.policy.compute_stop_target(side, close, atr, pair.asset)
+            sz = book.policy.size_position(close, stop_px, pair.asset)
+            basket = book.open(sym, strategy_id, side, close, sz, stop_px, target_px)
             actions.append(
                 BasketAction(
                     basket_id=basket.basket_id,
@@ -81,16 +89,12 @@ def process_bar(
     elif basket.is_active:
         d = 1 if basket.side == "buy" else -1
         if sig_val * d < 0:
-            actions.append(
-                BasketAction(
-                    basket_id=basket.basket_id,
-                    action=ActionKind.EXIT,
-                    side=basket.side,
-                    reason=ExitReason.SIGNAL_FLIP.value,
-                    fraction=1.0,
-                )
-            )
-            mgr.remove(basket)
+            actions.append(_snapshot_exit(ExitReason.SIGNAL_FLIP.value))
+            book.close(basket)
+            return actions
+        if sig_val == 0:
+            actions.append(_snapshot_exit(ExitReason.SIGNAL_ZERO.value))
+            book.close(basket)
             return actions
 
         # ---- Layer 3: Recovery ----
@@ -100,16 +104,19 @@ def process_bar(
             atr,
             recovery_cfg,
             basket.recovery_level,
+            ct_val=pair.asset.ct_val,
         )
         if r_actions:
             for r_a in r_actions:
+                if r_a.action == ActionKind.EXIT:
+                    r_a.sz = basket.current_sz
+                    r_a.px = close
                 actions.append(r_a)
-                if r_a.action == ActionKind.ADD_GRID:
-                    basket.add_to_position(r_a.sz, r_a.px)
+                if r_a.action in (ActionKind.ADD_GRID, ActionKind.HEDGE):
                     basket.recovery_level += 1
                     basket.recovery_activated = True
                 elif r_a.action == ActionKind.EXIT and r_a.reason == ExitReason.MARTINGALE.value:
-                    mgr.remove(basket)
+                    book.close(basket)
             return actions
 
         # ---- Layer 4: Exits ----
@@ -129,8 +136,10 @@ def process_bar(
             skip_trailing=basket.recovery_activated and basket.recovery_level > 0,
         )
         if e_action:
+            e_action.sz = basket.current_sz
+            e_action.px = close
             actions.append(e_action)
-            mgr.remove(basket)
+            book.close(basket)
         else:
             basket.trail_high = trail.trail_high
             basket.trail_low = trail.trail_low

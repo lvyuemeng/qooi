@@ -11,7 +11,7 @@ Perpetual futures (swap) for execution, spot data for signal computation.
 - **Python version**: 3.12
 - **DataFrame library**: Polars (primary)
 - **Exchange SDK**: python-okx (trading), ccxt (market data)
-- **Ty**: type checker for core modules
+- **Ty**: type checker; run with `uv run ty check <path>`
 - **Ruff**: linter
 
 ## Data source
@@ -37,41 +37,51 @@ Instruments: SPOT, SWAP (perp), FUTURES, OPTION.
 │     Trailing/breakeven paused during active recovery.│
 ├──────────────────────────────────────────────────────┤
 │  2. Basket — Dedup / Exposure / Limit / Sizing       │
-│     BasketManager creates fully-sized Baskets.       │
+│     BasketBook owns lifecycle state.                 │
 │     BasketAction is the unified executor API.        │
 ├──────────────────────────────────────────────────────┤
-│  1. Signal — OkxSignalConfig.compute() → Strategy    │
-│     Backtest uses pre-computed signal column.        │
-│     Live uses pair.okx.compute() → OKX API.          │
+│  1. Signal — Composable specs in qooi.strategies     │
+│     Backtest/live precompute the signal column.      │
+│     process_bar() consumes signal_src only.          │
 └──────────────────────────────────────────────────────┘
 ```
 
-Data flow: OHLCV → add_indicators → core.process_bar() → list[BasketAction] → Executor.
+Data flow: OHLCV → strategies.indicators.add_indicators() inside
+strategies.compute_signal_frame() → core.process_bar(signal_src=..., strategy_id=...)
+→ list[BasketAction] → Executor.
 
 Same pipeline for backtest (BacktestExecutor.run) and live (LiveExecutor.execute).
 
-### Layer 1: Signal (`core/config.py` (OkxSignalConfig.compute), `core/indicators.py`)
+### Layer 1: Signal (`strategies/compose.py`, `strategies/specs.py`)
 
-`OkxSignalConfig.compute()` dispatches strategy names (`momentum_1h`, `rsi_reversion`)
-to signal functions in `core/indicators.py`. Backtest mode uses pre-computed signal
-column via `signal_src` parameter on `process_bar()` — no live API calls.
+Signal generation is composable and functionality-focused. Strategy specs combine
+feature builders, entry conditions, filters, and hold policies. Strategy selection
+is an orchestration input (`momentum_burst`, `rsi_bounce_reversion`, or retained
+`flow_pipeline`), not a property of `PairConfig` or `OkxSignalConfig`. Old names
+such as `momentum_1h` and `rsi_reversion` are intentionally rejected. `process_bar()`
+receives a precomputed `signal_src` value and a runtime `strategy_id` label for
+basket identity; it does not fetch market data or dispatch strategy functions.
 
 ### Layer 2: Basket (`core/basket.py`)
 
-`BasketManager` isolates parallel signals per instrument. Owns sizing
-(`size_position()`), stop/target computation (`compute_stop_target()`),
-and Basket lifecycle (`create()`, `remove()`). Each `Basket` tracks
-entry price, size, position state, recovery level, trail data, and
-cumulative loss. `BasketAction` is the unified action type consumed by
-all executors. `basket.add_to_position()` handles weighted-average
-entry price updates without caller mutation.
+`BasketBook` owns basket lifecycle state for a pipeline run/session. `BasketManager`
+is a stateless sizing/factory policy (`size_position()`, `compute_stop_target()`,
+`create()`, `remove()`). Each `Basket` tracks entry price, size, position state,
+recovery level, trail data, and cumulative loss. `BasketAction` is the unified
+action type consumed by all executors. `basket.add_to_position()` handles
+weighted-average entry price updates after execution actions are consumed.
 
 ### Layer 3: Recovery (`core/recovery.py`)
 
 Grid, martingale reversal, and hedge strategies for drawdown recovery.
 Returns `list[BasketAction]` — may be empty, single action, or multiple
 (EXIT + ENTER for martingale reversal). Martingale reversal size computed
-from loss amount / zone ATR. `RecoveryKind` enum: NONE, GRID, MARTINGALE, HEDGE.
+from contract-value loss / zone ATR value. `RecoveryKind` enum: NONE, GRID,
+MARTINGALE, HEDGE.
+
+Grid and hedge are experimental until recovery risk semantics are complete.
+Grid compounds exposure and must respect `max_loss_pct`. Hedge requires explicit
+hedge-group unwind logic; without that, it can freeze exposure rather than recover.
 
 During active recovery, trailing/breakeven exits are paused (only hard
 stop active) to avoid interference. Controlled by `basket.recovery_activated`
@@ -89,8 +99,17 @@ HEDGE_DRAWDOWN, GRID_LEVEL, GLOBAL_LOSS_LIMIT.
 ### Executor (`core/executor.py`)
 
 Two executors consume the same `list[BasketAction]`:
-- `LiveExecutor` — `place()`, `cancel()`, `close_position()`, `amend()` via direct OKX TradeAPI. State persists to `data/state/baskets.json`.
-- `BacktestExecutor.run()` — loops `process_bar()` with pre-computed signal column. Computes PnL from BasketAction stream. Tracks portfolio drawdown (5% stop). `run_report()` returns a `Report`.
+- `LiveExecutor` — action execution via OKX. Hard position/order truth comes from `OkxStateProvider`; JSON stores only soft strategy state.
+- `BacktestExecutor.run()` — in-memory `BacktestStateProvider`, precomputed signal column, BasketAction PnL, and portfolio drawdown stop. `run_report()` returns a `Report`.
+
+Validation commands:
+
+```bash
+uv run ruff check <path>
+uv run ty check <path>
+uv run pytest <path>
+uv run python scripts/backtest.py --mode base|grid|martingale|hedge
+```
 
 ### Backtest Styles (`core/styles.py`) — strategy-independent
 
@@ -112,7 +131,7 @@ Takes raw trades + equity and produces formatted output.
 | Component | Description |
 |-----------|-------------|
 | `Report.from_raw(trades, equity, pair)` | Build from `BacktestExecutor.run()` output |
-| `report.summary()` | Terse one-liner: trades, ret%, WR%, PL, Sharpe |
+| `report.summary()` | Terse one-liner: trades, WR%, PF, expectancy, trade/active-bar Sharpe |
 | `report.table()` | Multi-line aligned metrics block |
 | `compare(*reports)` | Side-by-side ensemble comparison table |
 | `format_table(headers, rows)` | Generic aligned-column formatter |
@@ -121,8 +140,8 @@ Takes raw trades + equity and produces formatted output.
 
 | Strategy | Asset | Signal | Recovery | Exit |
 |----------|-------|--------|----------|------|
-| `momentum_1h` | ETH | 6-bar return > 0.3%, ADX>20, vol>1.5× | grid/martingale/hedge (pipeline) | stop/target/trail/time |
-| `rsi_reversion` | SOL | RSI(14)<30 bounce, uptrend | grid/martingale/hedge (pipeline) | stop/target/RSI exit/time |
+| `momentum_burst` | any configured asset | N-bar momentum, trend/session/volume/structure filters | grid/martingale/hedge (pipeline) | stop/target/trail/time |
+| `rsi_bounce_reversion` | any configured asset | RSI oversold bounce, uptrend/session/structure filters | grid/martingale/hedge (pipeline) | stop/target/trail/time |
 
 Both via `process_bar()` in `core/__init__.py` — same entry point for backtest and live.
 
@@ -140,16 +159,55 @@ Backtest evidence (93 trades over 83 days):
 - They are complementary (uncorrelated entry triggers) and produce a
   smoother combined equity curve than either alone.
 
+## Backtest Status
+
+- [x] Pipeline backtest runs end-to-end
+- [x] Basket lifecycle verified by white-box tests
+- [x] Recovery branches verified by white-box tests
+- [x] Exit branches verified by white-box tests
+- [x] Multiple sequential baskets reopen correctly
+- [x] Multiple active baskets possible (hedge path)
+- [x] Recovery modes validated by report workflow (`base`, `grid`, `martingale`, `hedge`)
+- [ ] LiveExecutor places real direct orders
+- [ ] Active-bar or trade-level robust Sharpe added
+
+## Metric Caveat
+
+Current Sharpe / Sortino are calendar-bar metrics on sparse equity series.
+For low-frequency systems with many flat bars, annualized ratios can become
+numerically extreme. `Report` now exposes trade-level metrics too:
+
+- trade count
+- win rate
+- profit factor
+- avg win / avg loss
+- expectancy
+- trade Sharpe
+- median trade return
+
+Use Sharpe / Sortino only as secondary diagnostics.
+
+Current metric stack:
+
+- primary: trade count, win rate, profit factor, avg win/loss, expectancy %, expectancy $
+- secondary: trade Sharpe, median trade %, active-bar Sharpe, active-bar %
+- tertiary: calendar Sharpe / Sortino / annualized return / annualized vol
+
+Sparse-equity systems should be judged by primary + secondary metrics first.
+
 Key files:
 
 - `src/qooi/core/__init__.py` — `process_bar()` pipeline entry point
-- `src/qooi/core/basket.py` — Basket, BasketManager, BasketAction, evaluate_exits
+- `src/qooi/core/basket.py` — Basket, BasketBook, BasketManager, BasketAction, evaluate_exits
 - `src/qooi/core/recovery.py` — RecoveryConfig, RecoveryKind, grid/martingale/hedge
-- `src/qooi/core/executor.py` — LiveExecutor, BacktestExecutor, state persistence
-- `src/qooi/core/config.py` — AssetConfig, OkxSignalConfig, PairConfig, PAIRS
-- `src/qooi/core/indicators.py` — compute_momentum_1h(), compute_rsi_reversion_1h()
-- `src/qooi/strategies/momentum_1h.py` — 1H momentum burst state-machine
-- `src/qooi/strategies/rsi_reversion.py` — 1H RSI mean-reversion state-machine
+- `src/qooi/core/executor.py` — LiveExecutor, BacktestExecutor
+- `src/qooi/core/state.py` — OkxStateProvider, BacktestStateProvider, soft-state stores
+- `src/qooi/core/config.py` — AssetConfig, OkxSignalConfig, PairConfig, PAIRS, RESEARCH_PAIRS
+- `src/qooi/strategies/compose.py` — apply composable StrategySpec to OHLCV
+- `src/qooi/strategies/specs.py` — composable strategy specs and canonical strategy names
+- `src/qooi/strategies/indicators.py` — generic technical indicator precompute
+- `src/qooi/strategies/features.py` — reusable feature builders
+- `src/qooi/strategies/conditions.py` — reusable condition/filter expressions
 - `src/qooi/exchange/trading.py` — TradingClient + signal bot + direct TradeAPI
 - `scripts/trade.py` — live trading entry point (test, live)
 

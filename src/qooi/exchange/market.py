@@ -63,6 +63,8 @@ class OrderBookProvider(Protocol):
         self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
     ) -> list[list]: ...
 
+    def close(self) -> None: ...
+
 
 class StreamProvider(Protocol):
     """Any backend that can stream order book via WebSocket."""

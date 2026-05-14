@@ -69,6 +69,16 @@ class TradingClient:
         return resp.get(key, [{}])[0] if resp.get(key) else {}
 
     @staticmethod
+    def _okx_list(resp: dict, key: str = "data") -> list:
+        if resp.get("code") != "0":
+            code = resp.get("code", "?")
+            msg = resp.get("msg", str(resp))
+            data = resp.get("data", [])
+            raise RuntimeError(f"OKX error [{code}]: {msg}  data={data}")
+        data = resp.get(key, [])
+        return data if isinstance(data, list) else []
+
+    @staticmethod
     def _retry(fn, *args, **kwargs):
         attempts = TradingClient._RETRY_ATTEMPTS
         last_err = None
@@ -123,9 +133,7 @@ class TradingClient:
         return self._okx(self._account.get_account_balance(**p)).get("details", [])
 
     def orders(self, inst_id: str, inst_type: str = "SWAP") -> list:
-        return self._okx(self._trade.get_order_list(instType=inst_type, instId=inst_id)).get(
-            "data", []
-        )
+        return self._okx_list(self._trade.get_order_list(instType=inst_type, instId=inst_id))
 
     def amend(self, inst_id: str, ord_id: str, new_sz: str = "", new_px: str = "") -> dict:
         params = {"instId": inst_id, "ordId": ord_id}
@@ -136,7 +144,7 @@ class TradingClient:
         return self._okx(self._trade.amend_order(**params))
 
     def positions(self, inst_type: str = "SWAP") -> list:
-        return self._okx(self._account.get_positions(instType=inst_type)).get("data", [])
+        return self._okx_list(self._account.get_positions(instType=inst_type))
 
     # -- signal bot (tradingBot endpoints, not in python-okx SDK) ---------------
 
@@ -234,7 +242,7 @@ class TradingClient:
             inst_id=inst_id,
         )
 
-    def signal_ensure_bot(self, pair):
+    def signal_ensure_bot(self, pair, label: str = ""):
         """Find or create the OKX signal bot for this pair.  Idempotent.
 
         Uses ``algoClOrdId`` to prevent duplicate algos — if the algo
@@ -253,7 +261,8 @@ class TradingClient:
             return bot
 
         name = pair.chan_name
-        desc = f"{pair.okx.strategy} signal for {pair.asset.symbol} {pair.asset.timeframe}"
+        desc_label = f"{label} " if label else ""
+        desc = f"{desc_label}signal for {pair.asset.symbol} {pair.asset.timeframe}"
         try:
             chan = self.signal_create(name, desc)
         except RuntimeError:

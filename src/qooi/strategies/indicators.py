@@ -1,8 +1,4 @@
-"""Technical indicators for OHLCV data — built on Polars.
-
-All functions accept/return Polars DataFrames with at minimum columns:
-    timestamp, close  (and open/high/low/vol where relevant)
-"""
+"""Technical indicator feature precompute for OHLCV data."""
 
 from __future__ import annotations
 
@@ -45,7 +41,6 @@ def atr(df: pl.DataFrame, period: int = 14) -> pl.Series:
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
 
-    # Take max of the three per row
     true_range = pl.Series(
         [
             max(a or 0.0, b or 0.0, c or 0.0)
@@ -111,21 +106,7 @@ def vumanchu_swing(
     multiplier: float = 3.5,
     channel_deviation_mult: float = 0.0,
 ) -> tuple[pl.Series, pl.Series]:
-    """VuManChu Swing Free — range filter with long/short conditions.
-
-    1. Compute range size = EMA(abs(close - close[1]), period) * multiplier
-    2. Range filter = smoothed series within the range channel
-    3. longCondition = close breaks above upper band (favorable)
-    4. shortCondition = close breaks below lower band (favorable)
-    5. Signal persists until opposite trigger or channel deviation exit
-
-    When ``channel_deviation_mult > 0``, the position flattens if price
-    deviates more than ``channel_deviation_mult * range_size`` from the
-    range filter midpoint. This prevents the VM from holding a position
-    through a crash where the channel widens with volatility.
-
-    Returns (long_signal, short_signal) as 1/0 booleans.
-    """
+    """VuManChu Swing Free — range filter with long/short conditions."""
     close = df["close"]
     range_raw = (close - close.shift(1)).abs().ewm_mean(span=period, min_samples=period)
     range_size = range_raw * multiplier
@@ -159,14 +140,9 @@ def vumanchu_swing(
 
 
 def add_indicators(df: pl.DataFrame, vm_channel_deviation_mult: float = 1.5) -> pl.DataFrame:
-    """Convenience: add the most common indicators in one call.
-
-    Args:
-        vm_channel_deviation_mult: Exit VM position when price deviates
-            beyond this multiple of the channel width from midpoint.
-            Set to 0 to disable (original behavior). Default 1.5 avoids
-            the "channel expansion trap" during crashes.
-    """
+    """Add generic reusable technical feature columns."""
+    if "vol" not in df.columns and "volume" in df.columns:
+        df = df.rename({"volume": "vol"})
     long_sig, short_sig = vumanchu_swing(df, channel_deviation_mult=vm_channel_deviation_mult)
     adx_vals = adx(df, 14)
     return df.with_columns(
