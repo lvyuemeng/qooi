@@ -1,7 +1,11 @@
 """Recovery — grid, martingale, and hedge strategies for drawdown recovery.
 
-Produces BasketActions for grid adds, direction reversals, and hedges.
+Produces list[BasketAction] for grid adds, direction reversals, and hedges.
 Activated when a basket is in a losing state beyond thresholds.
+
+Martingale reversal produces TWO actions: EXIT (close original) + ENTER
+(open opposite with computed size from loss).  This maps to OKX
+close-position + place order.
 """
 
 from __future__ import annotations
@@ -35,14 +39,14 @@ def evaluate(
     atr: float,
     config: RecoveryConfig,
     current_level: int,
-) -> BasketAction | None:
-    """Evaluate recovery logic for a basket. Returns an action or None."""
+) -> list[BasketAction]:
+    """Evaluate recovery logic. Returns list of actions (may be empty)."""
 
     if config.strategy == RecoveryKind.NONE:
-        return None
+        return []
 
     if not basket.is_active:
-        return None
+        return []
 
     d = 1 if basket.side == "buy" else -1
     loss_pct = d * (bar_close / basket.entry_px - 1) * 100 if basket.entry_px > 0 else 0
@@ -50,11 +54,11 @@ def evaluate(
     if config.strategy == RecoveryKind.GRID:
         return _grid(basket, bar_close, atr, config, current_level, loss_pct, d)
     if config.strategy == RecoveryKind.MARTINGALE:
-        return _martingale(basket, bar_close, config, current_level, loss_pct, d)
+        return _martingale(basket, bar_close, atr, config, current_level, loss_pct, d)
     if config.strategy == RecoveryKind.HEDGE:
         return _hedge(basket, bar_close, config, loss_pct)
 
-    return None
+    return []
 
 
 def _grid(
@@ -65,43 +69,59 @@ def _grid(
     level: int,
     loss_pct: float,
     d: int,
-) -> BasketAction | None:
+) -> list[BasketAction]:
     if level >= config.max_levels:
-        return None
+        return []
     if basket.current_sz <= 0:
-        return None
+        return []
 
     target_px = basket.entry_px - d * config.zone_atr * atr * (level + 1)
     if d * (bar_close - target_px) <= 0:
-        return BasketAction(
-            basket_id=basket.basket_id,
-            action=ActionKind.ADD_GRID,
-            side=basket.side,
-            sz=basket.current_sz * config.multiplier,
-            px=bar_close,
-            reason=f"grid_level_{level + 1}",
-        )
-    return None
+        return [
+            BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.ADD_GRID,
+                side=basket.side,
+                sz=basket.current_sz * config.multiplier,
+                px=bar_close,
+                reason=f"grid_level_{level + 1}",
+            )
+        ]
+    return []
 
 
 def _martingale(
     basket: Basket,
     bar_close: float,
+    atr: float,
     config: RecoveryConfig,
     level: int,
     loss_pct: float,
     d: int,
-) -> BasketAction | None:
+) -> list[BasketAction]:
     if level >= config.max_levels or loss_pct > -config.zone_atr:
-        return None
+        return []
 
-    return BasketAction(
-        basket_id=basket.basket_id,
-        action=ActionKind.EXIT,
-        side=basket.side,
-        reason=ExitReason.MARTINGALE.value,
-        fraction=1.0,
-    )
+    reversal_side = "sell" if basket.side == "buy" else "buy"
+    reversal_sz = _reversal_size(basket, bar_close, atr, config)
+
+    return [
+        BasketAction(
+            basket_id=basket.basket_id,
+            action=ActionKind.EXIT,
+            side=basket.side,
+            reason=ExitReason.MARTINGALE.value,
+            fraction=1.0,
+        ),
+        BasketAction(
+            basket_id=basket.basket_id + "_reversal",
+            action=ActionKind.ENTER,
+            side=reversal_side,
+            sz=max(1, reversal_sz),
+            px=bar_close,
+            reason=ExitReason.MARTINGALE.value,
+        ),
+    ]
 
 
 def _hedge(
@@ -109,16 +129,26 @@ def _hedge(
     bar_close: float,
     config: RecoveryConfig,
     loss_pct: float,
-) -> BasketAction | None:
+) -> list[BasketAction]:
     if loss_pct < -config.zone_atr:
         hedge_side = "sell" if basket.side == "buy" else "buy"
-        return BasketAction(
-            basket_id=basket.basket_id,
-            action=ActionKind.HEDGE,
-            side=hedge_side,
-            sz=basket.current_sz,
-            px=bar_close,
-            reason=ExitReason.HEDGE_DRAWDOWN.value,
-        )
-    return None
-    return None
+        return [
+            BasketAction(
+                basket_id=basket.basket_id,
+                action=ActionKind.HEDGE,
+                side=hedge_side,
+                sz=basket.current_sz,
+                px=bar_close,
+                reason=ExitReason.HEDGE_DRAWDOWN.value,
+            )
+        ]
+    return []
+
+
+def _reversal_size(basket: Basket, bar_close: float, atr: float, config: RecoveryConfig) -> int:
+    loss_amt = abs(basket.entry_px - bar_close) * basket.current_sz * basket.entry_px
+    zone_value = config.zone_atr * atr
+    if zone_value <= 0 or basket.entry_px <= 0:
+        return 1
+    sz = int(loss_amt / zone_value / basket.entry_px)
+    return max(1, sz)

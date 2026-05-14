@@ -29,6 +29,8 @@ def process_bar(
     pair: PairConfig,
     exit_cfg: ExitConfig | None = None,
     recovery_cfg: RecoveryConfig | None = None,
+    *,
+    signal_src: float | None = None,
 ) -> list[BasketAction]:
     """Run all four layers. Returns BasketActions for executor."""
 
@@ -39,7 +41,13 @@ def process_bar(
     bar_idx = df.height - 1
 
     # ---- Layer 1: Signal ----
-    signal = pair.okx.compute(pair.asset.sig_symbol)
+    if signal_src is not None:
+        sig_val = signal_src
+    else:
+        signal = pair.okx.compute(pair.asset.sig_symbol)
+        if signal is None:
+            return actions
+        sig_val = signal.signal
 
     close = float(df["close"][bar_idx])
     high = float(df["high"][bar_idx])
@@ -51,11 +59,6 @@ def process_bar(
     basket = next((b for b in baskets if b.basket_id == f"{sym}-{pair.okx.strategy}"), None)
 
     # ---- Layer 2: Basket — signal → basket lifecycle ----
-    if signal is None:
-        return actions
-
-    sig_val = signal.signal
-
     if basket is None or basket.is_idle:
         if sig_val != 0 and mgr.can_open(sym, baskets):
             side = "buy" if sig_val > 0 else "sell"
@@ -91,21 +94,22 @@ def process_bar(
             return actions
 
         # ---- Layer 3: Recovery ----
-        r_action = evaluate_recovery(
+        r_actions = evaluate_recovery(
             basket,
             close,
             atr,
             recovery_cfg,
             basket.recovery_level,
         )
-        if r_action:
-            actions.append(r_action)
-            if r_action.action == ActionKind.ADD_GRID:
-                basket.add_to_position(r_action.sz, r_action.px)
-                basket.recovery_level += 1
-                basket.recovery_activated = True
-            elif r_action.reason == ExitReason.MARTINGALE.value:
-                mgr.remove(basket)
+        if r_actions:
+            for r_a in r_actions:
+                actions.append(r_a)
+                if r_a.action == ActionKind.ADD_GRID:
+                    basket.add_to_position(r_a.sz, r_a.px)
+                    basket.recovery_level += 1
+                    basket.recovery_activated = True
+                elif r_a.action == ActionKind.EXIT and r_a.reason == ExitReason.MARTINGALE.value:
+                    mgr.remove(basket)
             return actions
 
         # ---- Layer 4: Exits ----
@@ -114,7 +118,16 @@ def process_bar(
             trail_low=basket.trail_low,
             target_hit=basket.target_hit,
         )
-        e_action = evaluate_exits(basket, close, high, low, atr, trail, exit_cfg)
+        e_action = evaluate_exits(
+            basket,
+            close,
+            high,
+            low,
+            atr,
+            trail,
+            exit_cfg,
+            skip_trailing=basket.recovery_activated and basket.recovery_level > 0,
+        )
         if e_action:
             actions.append(e_action)
             mgr.remove(basket)

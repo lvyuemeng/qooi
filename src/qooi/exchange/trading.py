@@ -107,6 +107,12 @@ class TradingClient:
     def cancel(self, inst_id: str, ord_id: str) -> dict:
         return self._okx(self._trade.cancel_order(instId=inst_id, ordId=ord_id))
 
+    def close_position(self, inst_id: str, pos_side: str = "", mgn_mode: str = "cross") -> dict:
+        params = {"instId": inst_id, "mgnMode": mgn_mode}
+        if pos_side:
+            params["posSide"] = pos_side
+        return self._okx(self._trade.close_position(**params))
+
     def set_leverage(self, inst_id, lever, mgn_mode="isolated"):
         return self._okx(
             self._account.set_leverage(instId=inst_id, lever=str(lever), mgnMode=mgn_mode)

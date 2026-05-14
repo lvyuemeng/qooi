@@ -150,18 +150,30 @@ class BacktestExecutor:
     def run(self, df, pair, exit_cfg=None, recovery_cfg=None) -> tuple[list[dict], list[float]]:
         from qooi.core import process_bar
         from qooi.exchange.indicator import add_indicators
+        from qooi.strategies.momentum_1h import momentum_1h_signal
+        from qooi.strategies.rsi_reversion import rsi_reversion_signal
 
         df = add_indicators(df)
         if "vol" not in df.columns and "volume" in df.columns:
             df = df.rename({"volume": "vol"})
 
+        if pair.okx.strategy == "momentum_1h":
+            df = momentum_1h_signal(df)
+        elif pair.okx.strategy == "rsi_reversion":
+            df = rsi_reversion_signal(df)
+        signal_col = df["signal"].to_list()
+
         baskets: list[Basket] = []
         trades: list[dict] = []
         equity = [self._initial_capital]
+        peak_equity = self._initial_capital
+        stopped_out = False
 
         for i in range(1, df.height):
             bar_df = df.slice(i, 1)
-            actions = process_bar(bar_df, baskets, pair, exit_cfg, recovery_cfg)
+            actions = process_bar(
+                bar_df, baskets, pair, exit_cfg, recovery_cfg, signal_src=signal_col[i]
+            )
             close = float(df["close"][i])
             prev_eq = equity[-1]
 
@@ -177,6 +189,7 @@ class BacktestExecutor:
                         pnl_pct = d * (close / basket.entry_px - 1) if basket.entry_px > 0 else 0.0
                         notional = basket.current_sz * pair.asset.ct_val * basket.entry_px
                         pnl_usd = pnl_pct * notional * pair.asset.leverage
+                        basket.cumulative_loss += abs(min(0, pnl_usd))
                         trades.append(
                             {
                                 "side": basket.side,
@@ -206,9 +219,57 @@ class BacktestExecutor:
                     baskets.append(new_basket)
                     prev_eq *= 1.0 - self._cost
 
+            if prev_eq > peak_equity:
+                peak_equity = prev_eq
+
+            if peak_equity > 0 and prev_eq / peak_equity - 1 < -0.05:
+                print(f"    WARNING: portfolio 5% drawdown from peak ${peak_equity:.0f} — stopping")
+                for b in baskets:
+                    if b.is_active:
+                        trades.append(
+                            {
+                                "side": b.side,
+                                "entry_px": b.entry_px,
+                                "exit_px": close,
+                                "pnl": 0,
+                                "reason": "global_drawdown_stop",
+                            }
+                        )
+                stopped_out = True
+
             equity.append(prev_eq)
+            if stopped_out:
+                break
 
         return trades, equity
+
+    def run_report(self, df, pair, exit_cfg=None, recovery_cfg=None) -> str:
+        from qooi.exchange.eval import compute_metrics
+
+        trades, equity = self.run(df, pair, exit_cfg, recovery_cfg)
+        if not trades:
+            return f"{pair.asset.symbol}: 0 trades"
+
+        eq_s = equity
+        n = len(eq_s)
+        eq_df = __import__("polars").DataFrame(
+            {
+                "portfolio_value": eq_s,
+                "returns": [0.0] + [(eq_s[i] / eq_s[i - 1] - 1) for i in range(1, n)],
+            }
+        )
+        t_df = __import__("polars").DataFrame(trades) if trades else None
+        m = compute_metrics(eq_df, trades=t_df)
+        wins = len([t for t in trades if t["pnl"] > 0])
+        wr = wins / len(trades) * 100 if trades else 0
+        total_ret = (equity[-1] / equity[0] - 1) * 100
+
+        lines = [
+            f"  {pair.asset.symbol}: {len(trades)} trades, final equity=${equity[-1]:.0f}",
+            f"  Ret={total_ret:+.1f}%  Sharpe={m.sharpe_ratio:+.2f}  DD={m.max_drawdown_pct:.1f}%",
+            f"  WR={wr:.0f}%  PL={m.profit_factor:.2f}  IC={m.ic_mean:.4f}",
+        ]
+        return "\n".join(lines)
 
 
 def _read_state() -> dict[str, dict]:

@@ -11,7 +11,8 @@ Perpetual futures (swap) for execution, spot data for signal computation.
 - **Python version**: 3.12
 - **DataFrame library**: Polars (primary)
 - **Exchange SDK**: python-okx (trading), ccxt (market data)
-- **Validation**: pydantic models for data contracts
+- **Ty**: type checker for core modules
+- **Ruff**: linter
 
 ## Data source
 
@@ -27,63 +28,83 @@ Instruments: SPOT, SWAP (perp), FUTURES, OPTION.
 ## Architecture: Four-Layer Pipeline
 
 ```
-┌──────────────────────────────────────────────────┐
-│           4. Exits — Stop / Target / Trail / Time │
-├──────────────────────────────────────────────────┤
-│           3. Recovery — Grid / Martingale / Hedge │
-├──────────────────────────────────────────────────┤
-│           2. Basket — Dedup / Exposure / Limit   │
-├──────────────────────────────────────────────────┤
-│           1. Signal — Registry → Strategy Dispatch│
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  4. Exits — Stop / Target / Trail / Time / Breakeven │
+├──────────────────────────────────────────────────────┤
+│  3. Recovery — Grid / Martingale / Hedge             │
+│     Recovery returns list[BasketAction].             │
+│     Martingale: EXIT original + ENTER opposite.      │
+│     Trailing/breakeven paused during active recovery.│
+├──────────────────────────────────────────────────────┤
+│  2. Basket — Dedup / Exposure / Limit / Sizing       │
+│     BasketManager creates fully-sized Baskets.       │
+│     BasketAction is the unified executor API.        │
+├──────────────────────────────────────────────────────┤
+│  1. Signal — OkxSignalConfig.compute() → Strategy    │
+│     Backtest uses pre-computed signal column.        │
+│     Live uses pair.okx.compute() → OKX API.          │
+└──────────────────────────────────────────────────────┘
 ```
 
-Data flow: OHLCV → add_indicators → pipeline.process_bar() → list[BasketAction] → Executor.
+Data flow: OHLCV → add_indicators → core.process_bar() → list[BasketAction] → Executor.
 
-Same pipeline for backtest (BacktestExecutor.simulate) and live (LiveExecutor.execute).
+Same pipeline for backtest (BacktestExecutor.run) and live (LiveExecutor.execute).
 
-### Layer 1: Signal (`core/registry.py`, `core/indicators.py`)
+### Layer 1: Signal (`core/config.py` (OkxSignalConfig.compute), `core/indicators.py`)
 
-Strategy registry maps names (`momentum_1h`, `rsi_reversion`) to signal functions.
-`indicators.py` provides `compute_momentum_1h()`, `compute_rsi_reversion_1h()` —
-full state-machine pipelines that re-run on each invocation (matches backtest exactly).
+`OkxSignalConfig.compute()` dispatches strategy names (`momentum_1h`, `rsi_reversion`)
+to signal functions in `core/indicators.py`. Backtest mode uses pre-computed signal
+column via `signal_src` parameter on `process_bar()` — no live API calls.
 
 ### Layer 2: Basket (`core/basket.py`)
 
-`BasketManager` isolates parallel signals per instrument. Each Basket tracks
-entry price, size, position state, recovery level, and trail data.
-`BasketAction` is the unified action type consumed by all executors.
+`BasketManager` isolates parallel signals per instrument. Owns sizing
+(`size_position()`), stop/target computation (`compute_stop_target()`),
+and Basket lifecycle (`create()`, `remove()`). Each `Basket` tracks
+entry price, size, position state, recovery level, trail data, and
+cumulative loss. `BasketAction` is the unified action type consumed by
+all executors. `basket.add_to_position()` handles weighted-average
+entry price updates without caller mutation.
 
 ### Layer 3: Recovery (`core/recovery.py`)
 
 Grid, martingale reversal, and hedge strategies for drawdown recovery.
-Activated when a basket exceeds loss thresholds. Produces BasketActions
-for grid adds, direction reversals, and opposing hedges.
+Returns `list[BasketAction]` — may be empty, single action, or multiple
+(EXIT + ENTER for martingale reversal). Martingale reversal size computed
+from loss amount / zone ATR. `RecoveryKind` enum: NONE, GRID, MARTINGALE, HEDGE.
 
-### Layer 4: Exits (`core/exits.py`)
+During active recovery, trailing/breakeven exits are paused (only hard
+stop active) to avoid interference. Controlled by `basket.recovery_activated`
+and `basket.recovery_level > 0` → passed as `skip_trailing=True` to
+`evaluate_exits()`.
+
+### Layer 4: Exits (`core/basket.py` — evaluate_exits() + TrailTracker)
 
 Tiered exit evaluation in priority order: hard stop → trailing stop →
 breakeven → target → time. `TrailTracker` maintains highest/lowest since
-entry for trailing stop calculation.
+entry for trailing stop calculation. `ExitReason` enum includes STOP,
+TRAILING, BREAKEVEN, TIME, SIGNAL_ENTRY, SIGNAL_FLIP, MARTINGALE,
+HEDGE_DRAWDOWN, GRID_LEVEL, GLOBAL_LOSS_LIMIT.
 
 ### Executor (`core/executor.py`)
 
 Two executors consume the same `list[BasketAction]`:
-- `LiveExecutor` — `place_order``, ``cancel_order`, ``amend_order` via direct OKX TradeAPI
-- `BacktestExecutor` — simulate fills against OHLCV bars, track equity curve
+- `LiveExecutor` — `place()`, `cancel()`, `close_position()`, `amend()` via direct OKX TradeAPI. State persists to `data/state/baskets.json`.
+- `BacktestExecutor.run()` — loops `process_bar()` with pre-computed signal column. Computes PnL from BasketAction stream. Tracks portfolio drawdown (5% stop). `run_report()` chains through `compute_metrics()`.
 
 ### Current Strategies
 
 | Strategy | Asset | Signal | Recovery | Exit |
 |----------|-------|--------|----------|------|
-| `momentum_1h` | ETH | 6-bar return > 0.3%, ADX>20, vol>1.5× | none | stop/target/trail/time |
-| `rsi_reversion` | SOL | RSI(14)<30 bounce, uptrend | none | stop/target/RSI exit/time |
+| `momentum_1h` | ETH | 6-bar return > 0.3%, ADX>20, vol>1.5× | grid/martingale/hedge (pipeline) | stop/target/trail/time |
+| `rsi_reversion` | SOL | RSI(14)<30 bounce, uptrend | grid/martingale/hedge (pipeline) | stop/target/RSI exit/time |
 
-Both via `process_bar()` in `core/pipeline.py` — same entry point for backtest and live.
+Both via `process_bar()` in `core/__init__.py` — same entry point for backtest and live.
 
-Mean-reversion strategy: buys oversold bounces within confirmed uptrends.
-The confirmation bar rule prevents entries into continuing sell-offs.
-Exits via OKX server-side TP/SL or client-side RSI > 50 / trend-flip.
+Recovery is available to all strategies through the pipeline's Layer 3.
+Martingale reversal: closes original position and opens opposite with
+computed size. During recovery, trailing/breakeven are paused to avoid
+interfering with grid accumulation or reversal logic.
 
 ### Why Two Strategies?
 
@@ -96,10 +117,15 @@ Backtest evidence (93 trades over 83 days):
 
 Key files:
 
-- `src/qooi/strategies/momentum_1h.py` — 1H momentum burst state-machine with tiered exits
+- `src/qooi/core/__init__.py` — `process_bar()` pipeline entry point
+- `src/qooi/core/basket.py` — Basket, BasketManager, BasketAction, evaluate_exits
+- `src/qooi/core/recovery.py` — RecoveryConfig, RecoveryKind, grid/martingale/hedge
+- `src/qooi/core/executor.py` — LiveExecutor, BacktestExecutor, state persistence
+- `src/qooi/core/config.py` — AssetConfig, OkxSignalConfig, PairConfig, PAIRS
+- `src/qooi/core/indicators.py` — compute_momentum_1h(), compute_rsi_reversion_1h()
+- `src/qooi/strategies/momentum_1h.py` — 1H momentum burst state-machine
 - `src/qooi/strategies/rsi_reversion.py` — 1H RSI mean-reversion state-machine
-- `src/qooi/core/signal.py` — `compute_momentum_1h()`, `compute_rsi_reversion_1h()`
-- `src/qooi/exchange/trading.py` — TradingClient + signal bot endpoints
+- `src/qooi/exchange/trading.py` — TradingClient + signal bot + direct TradeAPI
 - `scripts/trade.py` — live trading entry point (test, live)
 
 ## Glossary
@@ -119,6 +145,13 @@ Key files:
 | circuit breaker | 2 consecutive losses → suspend asset until 20-bar high/low break |
 | trend maturity | EMA50/200 direction must persist for ≥20 consecutive bars before entry |
 | signal bot | OKX server-driven execution engine — handles TP/SL autonomously |
+| martingale reversal | EXIT original + ENTER opposite with computed size from loss |
+| cumulative_loss | Total realized loss tracked per Basket |
+| trailing pause | Trailing/breakeven disabled during active recovery to avoid interference |
+| global loss limit | Force-close basket when cumulative loss exceeds threshold |
+| portfolio drawdown stop | 5% drawdown from peak equity → force-close all baskets |
+| signal_src | Backtest pre-computed signal column — bypasses live API |
+| BasketAction | Unified payload: action kind, side, size, price, stop/target, reason |
 
 ## Data depth notes
 

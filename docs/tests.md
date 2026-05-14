@@ -48,15 +48,15 @@ tested strategies and timeframes. XAU-USDT had insufficient data (34 days).
 |---------|----------|------|
 | Signal computation | `momentum_1h_signal()` / `rsi_reversion_signal()` on full DataFrame | Same — re-runs on cached data each invocation |
 | Indicators | `add_indicators()` | Same |
-| Decision engine | `decide_idle()` / `decide_active()` | Same |
-| Exit mode | `signal_flip_only` (tiered exits in strategy state-machine) | `signal_flip_only` |
-| Stop-loss | Strategy state-machine (hard stop at 1.5–1.8× ATR) | OKX Signal Bot server-side TP/SL |
+| Decision engine | `process_bar()` (pipeline) | `process_bar()` (pipeline) |
+| Exit mode | `signal_flip_only` + tiered exits in pipeline | `signal_flip_only` via OKX signal bot |
+| Stop-loss | Strategy state-machine (hard stop at 1.5–1.8× ATR) | OKX Signal Bot server-side TP/SL + direct TradeAPI close_position() |
 | Take-profit | Strategy state-machine (target at 1.2–1.5× ATR) | OKX Signal Bot server-side TP/SL |
 | Trailing stop | Strategy state-machine (2.0× ATR from high) | Not available in OKX signal bot |
 | Time stop | Strategy state-machine (6–12 bars) | Not available |
 | Circuit breaker | 2 losses → suspend until 20-bar high/low | Backtest only (GitHub Actions is stateless) |
 | Position state | Signal column (1/-1/0) | `GET /signal/positions` (`pos` field) |
-| Order type | Market (backtest) / Limit (live) | Limit entry via signal bot |
+| Order type | Market (backtest) / Limit (live) | Limit entry via signal bot or direct TradeAPI place() |
 
 ## Data Sources
 

@@ -34,6 +34,7 @@ class ExitReason(StrEnum):
     MARTINGALE = "martingale_reverse"
     HEDGE_DRAWDOWN = "hedge_on_drawdown"
     GRID_LEVEL = "grid_level"
+    GLOBAL_LOSS_LIMIT = "global_loss_limit"
 
 
 @dataclass
@@ -65,6 +66,7 @@ class Basket:
     target_hit: bool = False
     recovery_activated: bool = False
     recovery_level: int = 0
+    cumulative_loss: float = 0.0
     suspended_long: bool = False
     suspended_short: bool = False
     suspension_px: float = 0.0
@@ -197,6 +199,8 @@ def evaluate_exits(
     atr: float,
     trail: TrailTracker,
     config: ExitConfig,
+    *,
+    skip_trailing: bool = False,
 ) -> BasketAction | None:
     bars = basket.bars_in_pos
     entry = basket.entry_px
@@ -218,7 +222,7 @@ def evaluate_exits(
                 fraction=1.0,
             )
 
-    if trail.target_hit:
+    if not skip_trailing and trail.target_hit:
         trail_stop = (
             trail.trail_high - config.trail_mult * atr
             if d > 0
@@ -243,7 +247,7 @@ def evaluate_exits(
                 fraction=1.0,
             )
 
-    if config.breakeven_after_target and trail.target_hit:
+    if not skip_trailing and config.breakeven_after_target and trail.target_hit:
         if d > 0 and bar_close <= entry:
             return BasketAction(
                 basket_id=basket.basket_id,
