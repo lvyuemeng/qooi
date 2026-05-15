@@ -3,7 +3,7 @@
 import polars as pl
 import pytest
 
-from qooi.strategies.flow_pipeline import (
+from qooi.strategies.indicators import (
     add_ofi_flow_columns,
     add_regime_features,
     apply_regime_gate,

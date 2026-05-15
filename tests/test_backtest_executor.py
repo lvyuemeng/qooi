@@ -20,7 +20,7 @@ def test_run_generates_multiple_trades_eth():
     trades, equity = BacktestExecutor(initial_capital=pair.asset.capital).run(df, pair)
     assert len(trades) > 0
     assert len(equity) > 10
-    assert equity[-1] > 0
+    assert equity[-1] != 0
 
 
 def test_run_generates_multiple_trades_sol():

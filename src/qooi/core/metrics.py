@@ -1,4 +1,4 @@
-"""Strategy evaluation metrics — IC, IR, win rate, profit/loss ratio, drawdown, etc."""
+"""Core evaluation metrics for equity/trade frames."""
 
 from __future__ import annotations
 
@@ -33,25 +33,18 @@ class EvalMetrics:
     ic_positive_pct: float
     factor_return_pct: float
 
-    def __str__(self) -> str:
-        lines = [
-            f"  Return:   {self.total_return_pct:>7.2f}%  Ann: {self.annual_return_pct:.2f}%",
-            f"  Ann.Vol:  {self.annual_volatility_pct:>7.2f}%  Sharpe:     {self.sharpe_ratio:.2f}",
-            f"  Sortino:  {self.sortino_ratio:>7.2f}  Calmar:     {self.calmar_ratio:.2f}",
-            f"  Max DD:   {self.max_drawdown_pct:>7.2f}%  Avg DD:     {self.avg_drawdown_pct:.2f}%",
-            f"  DD Days:  {self.drawdown_days:>7d}",
-            f"  Trades:   {self.num_trades:>5d}  Win Rate:   {self.win_rate_pct:.1f}%",
-            f"  Avg Win:  {self.avg_win_pct:>7.2f}%  Avg Loss:   {self.avg_loss_pct:.2f}%",
-            f"  P/L Ratio:{self.profit_loss_ratio:>7.2f}  Expectancy: {self.expectancy:.2f}%",
-            f"  Profit F: {self.profit_factor:>7.2f}",
-            f"  IC Mean:  {self.ic_mean:>7.4f}  IC IR:      {self.ic_ir:.2f}",
-            f"  IC Pos:   {self.ic_positive_pct:>7.1f}%",
-        ]
-        sep = "=" * 50
-        return f"\n{sep}\n" + "\n".join(lines) + f"\n{sep}"
+
+def as_float(value: object, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return default
 
 
-def _spearman_rho(x: pl.Series, y: pl.Series) -> float:
+def spearman_rho(x: pl.Series, y: pl.Series) -> float:
     if x.len() < 3:
         return 0.0
     rx = x.rank().to_numpy()
@@ -63,7 +56,7 @@ def _spearman_rho(x: pl.Series, y: pl.Series) -> float:
     return float((d * e).sum()) / denom if denom > 1e-10 else 0.0
 
 
-def _infer_periods_per_year(equity_curve: pl.DataFrame, fallback: int = 365) -> int:
+def infer_periods_per_year(equity_curve: pl.DataFrame, fallback: int = 365 * 24) -> int:
     """Infer annualization frequency from timestamp spacing."""
     if "timestamp" not in equity_curve.columns or equity_curve.height < 2:
         return fallback
@@ -84,9 +77,7 @@ def _infer_periods_per_year(equity_curve: pl.DataFrame, fallback: int = 365) -> 
     median_delta_ms = statistics.median(deltas)
     if median_delta_ms <= 0:
         return fallback
-
-    periods = int(round((86_400_000.0 / median_delta_ms) * 365.0))
-    return max(1, periods)
+    return max(1, int(round((86_400_000.0 / median_delta_ms) * 365.0)))
 
 
 def compute_metrics(
@@ -99,13 +90,11 @@ def compute_metrics(
     eq = equity_curve["portfolio_value"]
     rets = equity_curve["returns"]
     n = rets.len()
-    effective_periods_per_year = periods_per_year or _infer_periods_per_year(equity_curve)
+    effective_periods_per_year = periods_per_year or infer_periods_per_year(equity_curve)
 
-    # --- Basic return & risk (Polars expressions) ---
-    lv = eq.last()
-    fv = eq.first()
-    assert lv is not None and fv is not None
-    total_ret = float(lv / fv - 1)
+    lv = as_float(eq.last())
+    fv = as_float(eq.first(), 1.0)
+    total_ret = lv / fv - 1 if fv != 0 else 0.0
     ann_factor = effective_periods_per_year / n if n > 0 else 1.0
     if total_ret > -1:
         ann_log_return = math.log1p(total_ret) * ann_factor
@@ -114,50 +103,44 @@ def compute_metrics(
         ann_ret = -1.0
 
     std_val = rets.std()
-    std = float(std_val) if std_val is not None and n > 1 else 0.0
+    std = as_float(std_val) if n > 1 else 0.0
     ann_vol = std * math.sqrt(effective_periods_per_year) if std > 0 else 0.0
     excess = ann_ret - risk_free_rate
     sharpe = excess / ann_vol if ann_vol > 0 else 0.0
 
-    # Sortino
     neg_rets = rets.filter(rets < 0)
     ds = neg_rets.std()
-    downside = float(ds) if ds is not None and neg_rets.len() > 1 else 0.0
+    downside = as_float(ds) if neg_rets.len() > 1 else 0.0
     ann_downside = downside * math.sqrt(effective_periods_per_year)
     sortino = excess / ann_downside if ann_downside > 0 else 0.0
 
-    # Drawdown (Polars expression)
     peak = eq.cum_max()
     dd = (peak - eq) / peak
     md = dd.max()
     ad = dd.mean()
     assert md is not None and ad is not None
-    max_dd = float(md)
-    avg_dd = float(ad)
+    max_dd = as_float(md)
+    avg_dd = as_float(ad)
     calmar = ann_ret / max_dd if max_dd > 0 else 0.0
 
-    # Consecutive drawdown days — needs iteration, keep as list
-    dd_iter = iter(dd)
     dd_days = 0
-    for v in dd_iter:
+    for v in dd:
         if v > 0.01:
             dd_days += 1
         else:
             dd_days = 0
 
-    # --- Trade statistics ---
     if has_real_trades:
+        assert trades is not None
         pnl = trades["pnl"]
     elif "position" in equity_curve.columns:
         pos = equity_curve["position"]
         entry_equity: list[float] = []
-        entry_idx: list[int] = []
         i = 1
         pos_arr = pos.to_list()
         eq_arr = eq.to_list()
         while i < len(pos_arr):
             if pos_arr[i] != pos_arr[i - 1]:
-                entry_idx.append(i)
                 j = i + 1
                 while j < len(pos_arr) and pos_arr[j] == pos_arr[i]:
                     j += 1
@@ -176,15 +159,14 @@ def compute_metrics(
     nw = win_pnl.len()
     nl = loss_pnl.len()
     win_rate = nw / num_trades if num_trades > 0 else 0.0
-    avg_win = float(win_pnl.mean()) * 100 if nw > 0 else 0.0  # type: ignore[arg-type]
-    avg_loss = abs(float(loss_pnl.mean())) * 100 if nl > 0 else 0.0  # type: ignore[arg-type]
+    avg_win = as_float(win_pnl.mean()) * 100 if nw > 0 else 0.0
+    avg_loss = abs(as_float(loss_pnl.mean())) * 100 if nl > 0 else 0.0
     pl_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
     total_win = float(win_pnl.sum())
     total_loss = abs(float(loss_pnl.sum()))
     profit_factor = total_win / total_loss if total_loss > 0 else float("inf")
     expectancy = (win_rate * avg_win - (1 - win_rate) * avg_loss) if avg_loss > 0 else 0.0
 
-    # --- Information Coefficient (rolling Spearman) ---
     has_signal = "signal" in equity_curve.columns and equity_curve["signal"].n_unique() > 1
     ic_values: list[float] = []
     if has_signal:
@@ -202,15 +184,15 @@ def compute_metrics(
             fw = fwd_s.slice(i - window, window)
             if sw.std() == 0 or fw.std() == 0:
                 continue
-            ic_values.append(_spearman_rho(sw, fw))
+            ic_values.append(spearman_rho(sw, fw))
     elif ic_df.height > 3:
-        rho = _spearman_rho(ic_df["signal"], ic_df["fwd_return"])
+        rho = spearman_rho(ic_df["signal"], ic_df["fwd_return"])
         if rho != 0.0:
             ic_values.append(rho)
 
     ic_s = pl.Series(ic_values) if ic_values else pl.Series([0.0])
-    ic_mean = float(ic_s.mean())  # type: ignore[arg-type]
-    ic_std = float(ic_s.std()) if ic_s.len() > 1 else 0.0  # type: ignore[arg-type]
+    ic_mean = as_float(ic_s.mean())
+    ic_std = as_float(ic_s.std()) if ic_s.len() > 1 else 0.0
     ic_ir = ic_mean / ic_std if ic_std > 0 else 0.0
     ic_pos = float((ic_s > 0).sum()) / ic_s.len() * 100 if ic_s.len() > 0 else 0.0
 

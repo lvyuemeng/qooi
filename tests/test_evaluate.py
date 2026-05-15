@@ -1,7 +1,8 @@
 """Evaluation layer tests."""
 
 from qooi.core.config import PAIRS
-from qooi.core.evaluate import Report, compare
+from qooi.core.evaluate import Report, compare, format_strategy_recommendations
+from qooi.core.metrics import compute_metrics
 
 
 def test_report_uses_return_ratios_not_usd():
@@ -92,3 +93,23 @@ def test_report_table_distinguishes_pl_ratio_and_profit_factor():
     table = report.table()
     assert "P/L=" in table
     assert "PF=" in table
+
+
+def test_metrics_live_in_core_metrics():
+    report = Report.from_raw([], [100.0, 101.0], PAIRS[0])
+    metrics = compute_metrics(report.equity, trades=report.trades)
+    assert metrics.total_return_pct == report.metrics.total_return_pct
+
+
+def test_strategy_recommendation_prioritizes_primary_metrics():
+    pair = PAIRS[0]
+    trades = [
+        {"side": "buy", "entry_px": 100.0, "exit_px": 99.0, "pnl": -0.01, "reason": "x"}
+    ]
+    report = Report.from_raw(trades, [100.0, 99.0], pair)
+
+    text = format_strategy_recommendations("momentum_burst", [report])
+
+    assert "Reject current momentum_burst baseline" in text
+    assert "do not loosen filters" in text
+    assert "calendar Sharpe/Sortino as tertiary" in text

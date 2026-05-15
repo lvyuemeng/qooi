@@ -158,6 +158,7 @@ class ExchangeBackend:
     def __init__(self, exchange_id: str = "okx", proxy: str | None = None) -> None:
         self._exchange_id = exchange_id
         self._proxy = proxy
+        self._last_ohlcv_audit: tuple[str, ...] = ()
 
     @property
     def exchange_id(self) -> str:
@@ -173,20 +174,37 @@ class ExchangeBackend:
     ) -> pl.DataFrame:
         data: list[list] = []
         since_ms = int(datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
+        pages = 0
+        stop_reason = "limit_reached"
         while len(data) < limit:
             chunk = self.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=500)
             if not chunk:
+                stop_reason = "empty_page"
                 break
+            pages += 1
             data.extend(chunk)
             since_ms = chunk[-1][0] + 1
             if len(chunk) < 500:
+                stop_reason = "short_page"
                 break
         if len(data) > limit:
             data = data[:limit]
+        self._last_ohlcv_audit = (
+            f"fetch_backend={self.exchange_id}",
+            "fetch_endpoint=ccxt_fetch_ohlcv",
+            f"fetch_pages={pages}",
+            "fetch_page_limit=500",
+            f"fetch_stop={stop_reason}",
+            "fetch_cursor=since",
+        )
         return _parse_ohlcv(data)
 
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot:
         raise NotImplementedError
+
+    @property
+    def last_ohlcv_audit(self) -> tuple[str, ...]:
+        return self._last_ohlcv_audit
 
     def funding_rate_history(
         self, inst_id: str = "BTC-USDT-SWAP", limit: int = 100
@@ -299,26 +317,63 @@ class OkxSdkBackend(ExchangeBackend):
         after = ""
         rows: list[list] = []
         seen: set[int] = set()
+        pages = 0
+        duplicate_count = 0
+        stop_reason = "limit_reached"
+        first_page_range = "fetch_first_page=n/a"
+        last_page_range = "fetch_last_page=n/a"
 
         while len(rows) < limit:
-            resp = self._api.get_history_candlesticks(
-                instId=symbol,
-                after=after,
-                bar=_okx_timeframe(timeframe),
-                limit=str(page_limit),
-            )
+            try:
+                resp = self._api.get_history_candlesticks(
+                    instId=symbol,
+                    after=after,
+                    bar=_okx_timeframe(timeframe),
+                    limit=str(page_limit),
+                )
+            except Exception as exc:
+                stop_reason = f"page_error_{type(exc).__name__}"
+                if rows:
+                    break
+                self._last_ohlcv_audit = (
+                    "fetch_backend=okx",
+                    "fetch_endpoint=history_candlesticks",
+                    f"fetch_pages={pages}",
+                    f"fetch_page_limit={page_limit}",
+                    f"fetch_stop={stop_reason}_fallback",
+                    "fetch_cursor=after",
+                    f"fetch_duplicates={duplicate_count}",
+                )
+                return ExchangeBackend.fetch_ohlcv_range(self, symbol, timeframe, since, limit)
             if resp.get("code") != "0":
+                self._last_ohlcv_audit = (
+                    "fetch_backend=okx",
+                    "fetch_endpoint=history_candlesticks",
+                    f"fetch_pages={pages}",
+                    f"fetch_page_limit={page_limit}",
+                    "fetch_stop=sdk_error_fallback",
+                    "fetch_cursor=after",
+                    f"fetch_duplicates={duplicate_count}",
+                )
                 return ExchangeBackend.fetch_ohlcv_range(self, symbol, timeframe, since, limit)
 
             chunk = resp.get("data", [])
             if not chunk:
+                stop_reason = "empty_page"
                 break
+            pages += 1
+            chunk_ts = [int(candle[0]) for candle in chunk]
+            page_range = f"{min(chunk_ts)}..{max(chunk_ts)}"
+            if pages == 1:
+                first_page_range = f"fetch_first_page={page_range}"
+            last_page_range = f"fetch_last_page={page_range}"
 
             oldest_ts = None
             for candle in chunk:
                 ts = int(candle[0])
                 oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
                 if ts in seen:
+                    duplicate_count += 1
                     continue
                 seen.add(ts)
                 rows.append(
@@ -333,9 +388,28 @@ class OkxSdkBackend(ExchangeBackend):
                 )
 
             if oldest_ts is None or oldest_ts <= since_ms or len(chunk) < page_limit:
+                if oldest_ts is None:
+                    stop_reason = "missing_oldest_ts"
+                elif oldest_ts <= since_ms:
+                    stop_reason = "reached_since"
+                else:
+                    stop_reason = "short_page"
                 break
             after = str(oldest_ts)
 
+        self._last_ohlcv_audit = (
+            "fetch_backend=okx",
+            "fetch_endpoint=history_candlesticks",
+            f"fetch_pages={pages}",
+            f"fetch_page_limit={page_limit}",
+            f"fetch_stop={stop_reason}",
+            "fetch_cursor=after",
+            f"fetch_oldest_ts={min(seen) if seen else 'n/a'}",
+            f"fetch_since_ms={since_ms}",
+            f"fetch_duplicates={duplicate_count}",
+            first_page_range,
+            last_page_range,
+        )
         if not rows:
             return pl.DataFrame()
 
@@ -538,6 +612,10 @@ class MarketData:
     @property
     def proxy(self) -> str | None:
         return self._proxy
+
+    @property
+    def last_ohlcv_audit(self) -> tuple[str, ...]:
+        return self._backend.last_ohlcv_audit
 
     # -- OHLCV -----------------------------------------------------------
 

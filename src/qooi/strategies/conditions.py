@@ -71,3 +71,51 @@ def rsi_bounce_held(*, rsi_period: int = 14, confirmation: float = 20.0) -> pl.E
 
 def rsi_above(*, rsi_period: int = 14, threshold: float = 50.0) -> pl.Expr:
     return pl.col(f"rsi_{rsi_period}") > threshold
+
+
+def rsi_below(*, rsi_period: int = 14, threshold: float = 50.0) -> pl.Expr:
+    return pl.col(f"rsi_{rsi_period}") < threshold
+
+
+def zscore_below(threshold: float, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) <= threshold
+
+
+def zscore_above(threshold: float, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) >= threshold
+
+
+def zscore_reverted_long(exit_level: float = 0.0, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) >= exit_level
+
+
+def zscore_reverted_short(exit_level: float = 0.0, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) <= -exit_level
+
+
+def dynamic_z_below(threshold: float, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) <= threshold
+
+
+def dynamic_z_above(threshold: float, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) >= threshold
+
+
+def dynamic_z_reverted_long(exit_level: float = 0.0, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) >= -abs(exit_level)
+
+
+def dynamic_z_reverted_short(exit_level: float = 0.0, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) <= abs(exit_level)
+
+
+def volatility_ratio_below(threshold: float, *, col: str = "volatility_ratio") -> pl.Expr:
+    return pl.col(col) <= threshold
+
+
+def macd_hist_above(threshold: float = 0.0, *, col: str = "macd_hist") -> pl.Expr:
+    return pl.col(col) > threshold
+
+
+def macd_hist_below(threshold: float = 0.0, *, col: str = "macd_hist") -> pl.Expr:
+    return pl.col(col) < threshold

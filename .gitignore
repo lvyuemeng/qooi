@@ -30,6 +30,7 @@ Thumbs.db
 # Scratch / working notes
 .scratch/
 .deepseek/
+.kilo/
 
 # Generated data (cache + charts + signals)
 data/cache/

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +17,52 @@ import polars as pl
 from qooi.exchange.market import MarketData
 
 CACHE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "cache"
+
+
+@dataclass(frozen=True)
+class HistoryRequest:
+    inst_id: str
+    bar: str = "1H"
+    days: int = 30
+    min_bars: int = 400
+    refresh: bool = False
+
+
+@dataclass(frozen=True)
+class HistoryTarget:
+    inst_id: str
+    bar: str
+    requested_days: int
+    requested_min_bars: int
+    target_days: int
+    target_bars: int
+    target_since_ms: int
+
+
+@dataclass(frozen=True)
+class HistoryCoverage:
+    inst_id: str
+    bar: str
+    target: HistoryTarget
+    actual_bars: int
+    actual_start_ms: int | None
+    actual_end_ms: int | None
+    duplicate_timestamps: int
+    gap_count: int
+    newest_age_hours: float
+    coverage_pct: float
+    refreshed: bool = False
+    notes: tuple[str, ...] = ()
+
+    def note(self) -> str:
+        return (
+            f"{self.inst_id} {self.bar}: target_bars={self.target.target_bars} "
+            f"target_days={self.target.target_days} actual_bars={self.actual_bars} "
+            f"coverage={self.coverage_pct:.1f}% "
+            f"start={self.actual_start_ms or 'n/a'} end={self.actual_end_ms or 'n/a'} "
+            f"dups={self.duplicate_timestamps} gaps={self.gap_count} "
+            f"age_h={self.newest_age_hours:.1f} refreshed={'yes' if self.refreshed else 'no'}"
+        )
 
 
 class CacheStore:
@@ -66,8 +113,22 @@ class CacheStore:
         with recent data from ``candles`` (OKX only).  Works with both
         OKX SDK and CCXT backends.
         """
-        since = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
-        hist = self._md.candles_range(inst_id, timeframe=bar, since=since, limit=min_bars)
+        target = plan_history(inst_id, bar, days=days, min_bars=min_bars)
+        since = datetime.fromtimestamp(target.target_since_ms / 1000, tz=UTC).strftime("%Y-%m-%d")
+        hist = self._md.candles_range(inst_id, timeframe=bar, since=since, limit=target.target_bars)
+        path = self._path(inst_id, bar)
+        if hist.is_empty() and path.exists():
+            return self.load(inst_id, bar=bar)
+        hist = self._normalize(hist)
+        if path.exists():
+            existing = self.load(inst_id, bar=bar)
+            if not existing.is_empty():
+                common_cols = [col for col in existing.columns if col in hist.columns]
+                existing = existing.select(common_cols)
+                hist = hist.select(common_cols)
+                hist = pl.concat([existing, hist]).unique(subset=["timestamp"]).sort("timestamp")
+                if hist.height > target.target_bars:
+                    hist = hist.tail(target.target_bars)
         seen_ts: set[int] = set(hist["timestamp"].to_list()) if not hist.is_empty() else set()
 
         recent = pl.DataFrame()
@@ -81,8 +142,27 @@ class CacheStore:
             if not new_recent.is_empty():
                 hist = pl.concat([hist, new_recent]).unique(subset=["timestamp"]).sort("timestamp")
 
-        hist.write_parquet(self._path(inst_id, bar))
+        hist.write_parquet(path)
         return self._normalize(hist)
+
+    def load_history(self, request: HistoryRequest) -> tuple[pl.DataFrame, HistoryCoverage]:
+        """Load or refresh one cache and return data-layer coverage metadata."""
+        target = plan_history(
+            request.inst_id,
+            request.bar,
+            days=request.days,
+            min_bars=request.min_bars,
+        )
+        refreshed = request.refresh or not self._path(request.inst_id, request.bar).exists()
+        df = self.load_or_refresh(
+            request.inst_id,
+            bar=request.bar,
+            days=request.days,
+            min_bars=request.min_bars,
+            refresh=request.refresh,
+        )
+        fetch_notes = self._md.last_ohlcv_audit if refreshed else ()
+        return df, validate_history(df, target, refreshed=refreshed, extra_notes=fetch_notes)
 
     # ------------------------------------------------------------------
     # Load / list / clear
@@ -93,6 +173,20 @@ class CacheStore:
         if not path.exists():
             raise FileNotFoundError(f"No cache for {inst_id} ({bar}). Run .refresh() first.")
         return self._normalize(pl.read_parquet(path))
+
+    def load_or_refresh(
+        self,
+        inst_id: str,
+        bar: str = "1H",
+        *,
+        days: int = 30,
+        min_bars: int = 400,
+        refresh: bool = False,
+    ) -> pl.DataFrame:
+        """Load one OHLCV cache, refreshing only when requested or missing."""
+        if refresh or not self._path(inst_id, bar).exists():
+            return self.refresh(inst_id, bar=bar, days=days, min_bars=min_bars)
+        return self.load(inst_id, bar=bar)
 
     def refresh_funding(self, inst_id: str, limit: int = 400) -> pl.DataFrame:
         """Fetch funding-rate history and cache it as Parquet."""
@@ -271,12 +365,12 @@ class CacheStore:
         funding_inst_id: str | None = None,
         order_book_inst_id: str | None = None,
     ) -> pl.DataFrame:
-        """Load cached bars and align optional funding / order-book features."""
+        """Load cached bars and align optional funding data."""
         df = self.load(inst_id, bar=bar)
         if funding_inst_id:
             df = self.attach_funding_rate(df, self.load_funding(funding_inst_id))
         if order_book_inst_id:
-            df = self.attach_order_book(df, self.load_order_book(order_book_inst_id))
+            raise ValueError("Order-book enrichment belongs in qooi.strategies.indicators")
         return df
 
     def list_cached(self) -> list[dict]:
@@ -316,8 +410,8 @@ class CacheStore:
     def _normalize(df: pl.DataFrame) -> pl.DataFrame:
         if df.is_empty():
             return df
-        cols = {"timestamp", "datetime", "open", "high", "low", "close", "vol"}
-        keep = [c for c in cols if c in df.columns]
+        cols = ("timestamp", "datetime", "open", "high", "low", "close", "vol")
+        keep = [col for col in cols if col in df.columns]
         return df.select(keep).sort("timestamp")
 
     @staticmethod
@@ -351,97 +445,6 @@ class CacheStore:
         )
 
     @staticmethod
-    def attach_order_book(df: pl.DataFrame, snapshot_df: pl.DataFrame) -> pl.DataFrame:
-        """Aggregate recorded order-book snapshots into the OHLCV bar grid."""
-        if df.is_empty():
-            return df.with_columns(
-                [
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_price"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_price"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol_25"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol_25"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_imbalance_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_imbalance_25"),
-                    pl.lit(0, dtype=pl.Int64).alias("ob_samples"),
-                ]
-            )
-
-        snapshots = CacheStore._normalize_order_book(snapshot_df)
-        if snapshots.is_empty():
-            return df.with_columns(
-                [
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_price"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_price"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol_25"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol_25"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_imbalance_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_imbalance_25"),
-                    pl.lit(0, dtype=pl.Int64).alias("ob_samples"),
-                ]
-            )
-
-        bar_ms = CacheStore._bar_interval_ms(df)
-        bars = df.select(pl.col("timestamp").alias("bar_timestamp")).sort("bar_timestamp")
-        mapped = (
-            snapshots.rename({"timestamp": "snapshot_timestamp"})
-            .sort("snapshot_timestamp")
-            .join_asof(
-                bars,
-                left_on="snapshot_timestamp",
-                right_on="bar_timestamp",
-                strategy="backward",
-            )
-            .drop_nulls(["bar_timestamp"])
-            .filter((pl.col("snapshot_timestamp") - pl.col("bar_timestamp")) < bar_ms)
-        )
-        if mapped.is_empty():
-            return df.with_columns(
-                [
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_price"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_price"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol_25"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol_25"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_bid_vol"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_ask_vol"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_imbalance_5"),
-                    pl.lit(None, dtype=pl.Float64).alias("ob_imbalance_25"),
-                    pl.lit(0, dtype=pl.Int64).alias("ob_samples"),
-                ]
-            )
-
-        per_bar = (
-            mapped.group_by("bar_timestamp")
-            .agg(
-                [
-                    pl.col("ob_bid_price").last().alias("ob_bid_price"),
-                    pl.col("ob_ask_price").last().alias("ob_ask_price"),
-                    pl.col("ob_bid_vol_5").mean().alias("ob_bid_vol_5"),
-                    pl.col("ob_ask_vol_5").mean().alias("ob_ask_vol_5"),
-                    pl.col("ob_bid_vol_25").mean().alias("ob_bid_vol_25"),
-                    pl.col("ob_ask_vol_25").mean().alias("ob_ask_vol_25"),
-                    pl.col("ob_bid_vol").mean().alias("ob_bid_vol"),
-                    pl.col("ob_ask_vol").mean().alias("ob_ask_vol"),
-                    pl.col("ob_imbalance_5").mean().alias("ob_imbalance_5"),
-                    pl.col("ob_imbalance_25").mean().alias("ob_imbalance_25"),
-                    pl.len().alias("ob_samples"),
-                ]
-            )
-            .rename({"bar_timestamp": "timestamp"})
-            .sort("timestamp")
-        )
-        return df.sort("timestamp").join(per_bar, on="timestamp", how="left")
-
-    @staticmethod
     def _normalize_funding(df: pl.DataFrame) -> pl.DataFrame:
         if df.is_empty():
             return pl.DataFrame(
@@ -463,6 +466,19 @@ class CacheStore:
 
     @staticmethod
     def _normalize_order_book(df: pl.DataFrame) -> pl.DataFrame:
+        required = [
+            "timestamp",
+            "ob_bid_price",
+            "ob_ask_price",
+            "ob_bid_vol_5",
+            "ob_ask_vol_5",
+            "ob_bid_vol_25",
+            "ob_ask_vol_25",
+            "ob_bid_vol",
+            "ob_ask_vol",
+            "ob_imbalance_5",
+            "ob_imbalance_25",
+        ]
         if df.is_empty():
             return pl.DataFrame(
                 schema={
@@ -479,30 +495,98 @@ class CacheStore:
                     "ob_imbalance_25": pl.Float64,
                 }
             )
-
-        required = [
-            "timestamp",
-            "ob_bid_price",
-            "ob_ask_price",
-            "ob_bid_vol_5",
-            "ob_ask_vol_5",
-            "ob_bid_vol_25",
-            "ob_ask_vol_25",
-            "ob_bid_vol",
-            "ob_ask_vol",
-            "ob_imbalance_5",
-            "ob_imbalance_25",
-        ]
         missing = [col for col in required if col not in df.columns]
         if missing:
             raise ValueError(f"Order-book frame missing columns: {missing}")
         return df.select(required).unique(subset=["timestamp"]).sort("timestamp")
 
-    @staticmethod
-    def _bar_interval_ms(df: pl.DataFrame) -> int:
-        if df.height < 2:
-            return 3_600_000
-        timestamps = df["timestamp"].to_list()
-        deltas = [int(timestamps[i] - timestamps[i - 1]) for i in range(1, len(timestamps))]
-        positive = [delta for delta in deltas if delta > 0]
-        return min(positive) if positive else 3_600_000
+
+def plan_history(inst_id: str, bar: str, *, days: int, min_bars: int) -> HistoryTarget:
+    interval_ms = _bar_interval_ms(bar) or 86_400_000
+    days_from_bars = max(1, int((min_bars * interval_ms + 86_400_000 - 1) / 86_400_000))
+    target_bars = max(1, min_bars)
+    target_days = max(days, days_from_bars)
+    target_since_ms = int((datetime.now(UTC) - timedelta(days=target_days)).timestamp() * 1000)
+    return HistoryTarget(
+        inst_id=inst_id,
+        bar=bar,
+        requested_days=days,
+        requested_min_bars=min_bars,
+        target_days=target_days,
+        target_bars=target_bars,
+        target_since_ms=target_since_ms,
+    )
+
+
+def validate_history(
+    df: pl.DataFrame,
+    target: HistoryTarget,
+    *,
+    refreshed: bool = False,
+    extra_notes: tuple[str, ...] = (),
+) -> HistoryCoverage:
+    if df.is_empty() or "timestamp" not in df.columns:
+        return HistoryCoverage(
+            inst_id=target.inst_id,
+            bar=target.bar,
+            target=target,
+            actual_bars=0,
+            actual_start_ms=None,
+            actual_end_ms=None,
+            duplicate_timestamps=0,
+            gap_count=0,
+            newest_age_hours=0.0,
+            coverage_pct=0.0,
+            refreshed=refreshed,
+            notes=("empty_or_missing_timestamp", *extra_notes),
+        )
+    ts = [int(v) for v in df["timestamp"].to_list() if v is not None]
+    unique_ts = len(set(ts))
+    duplicate_timestamps = len(ts) - unique_ts
+    expected_ms = _bar_interval_ms(target.bar)
+    gap_count = sum(
+        1 for i in range(1, len(ts)) if expected_ms > 0 and ts[i] - ts[i - 1] != expected_ms
+    )
+    newest_age_hours = max(0.0, (datetime.now(UTC).timestamp() * 1000 - ts[-1]) / 3_600_000.0)
+    coverage_pct = len(ts) / max(target.target_bars, 1) * 100.0
+    notes = []
+    if len(ts) < target.target_bars:
+        notes.append("below_target_bars")
+    if ts[0] > target.target_since_ms + expected_ms:
+        notes.append("starts_after_target_since")
+    if duplicate_timestamps:
+        notes.append("duplicate_timestamps")
+    if gap_count:
+        notes.append("timeframe_gaps")
+    return HistoryCoverage(
+        inst_id=target.inst_id,
+        bar=target.bar,
+        target=target,
+        actual_bars=df.height,
+        actual_start_ms=ts[0] if ts else None,
+        actual_end_ms=ts[-1] if ts else None,
+        duplicate_timestamps=duplicate_timestamps,
+        gap_count=gap_count,
+        newest_age_hours=newest_age_hours,
+        coverage_pct=coverage_pct,
+        refreshed=refreshed,
+        notes=(*notes, *extra_notes),
+    )
+
+
+def _bar_interval_ms(bar: str) -> int:
+    normalized = bar.replace(" ", "")
+    unit = normalized[-1:].upper()
+    try:
+        value = int(normalized[:-1])
+    except ValueError:
+        return 0
+    if unit == "M":
+        return value * 60_000
+    if unit == "H":
+        return value * 3_600_000
+    if unit == "D":
+        return value * 86_400_000
+    if unit == "W":
+        return value * 7 * 86_400_000
+    return 0

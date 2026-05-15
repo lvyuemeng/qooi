@@ -2,244 +2,461 @@
 
 ## Domain
 
-Quantitative trading strategy research on crypto (OKX exchange).
-Perpetual futures (swap) for execution, spot data for signal computation.
+`qooi` is a quantitative strategy research and execution system for OKX crypto perpetual swaps.
+
+Execution is swap/perp-first. Default research data is swap OHLCV because fills and contract sizing happen on swap instruments. Spot data may be used as an explicit signal source policy only when a strategy intentionally needs underlying spot prices. Spot-vs-swap is orchestration metadata, not a strategy identity.
+
+The core domain object is a basket: an independent vehicle opened by an entry event and managed until basket-owned exits, strategy thesis failure, or bounded recovery closes or transforms it.
 
 ## Stack
 
-- **Python management**: `uv` — no global Python state
-- **Python version**: 3.12
-- **DataFrame library**: Polars (primary)
-- **Exchange SDK**: python-okx (trading), ccxt (market data)
-- **Ty**: type checker; run with `uv run ty check <path>`
-- **Ruff**: linter
+- Python management: `uv`
+- Python: 3.12
+- DataFrame library: Polars
+- Exchange access: OKX SDK and CCXT
+- Static checks: Ruff and Ty
+- Test runner: Pytest
 
-## Data source
+## Architectural Rules
 
-OKX Market API — free, no auth for public market data.
-Instruments: SPOT, SWAP (perp), FUTURES, OPTION.
+The system is layered. Lower layers must not import higher-layer policy.
 
-- `get_candlesticks` — up to 300 recent bars via OKX SDK
-- `get_candlesticks_history` — paginated, 100 per page, goes back years
-- `MarketData` client in `src/qooi/exchange/market.py`
-- `CacheStore` in `src/qooi/exchange/store.py` auto-paginates; call `refresh(days=1000, min_bars=2000)` for deep history
-- CCXT backend via `CcxtBackend` supports LBank, Gate, KuCoin for 2000+ bars
+Forbidden dependencies:
 
-## Architecture: Four-Layer Pipeline
+- Data layer must not know strategies, baskets, execution, or reports.
+- Strategy layer must not know basket caps, fills, fees, account equity, or recovery state.
+- Basket lifecycle must not fetch data, compute indicators, format reports, or account cash.
+- Recovery evaluators must not mutate baskets or open/close positions directly.
+- Executor must not compute strategy indicators or choose spot/swap source policy.
+- Evaluation must not mutate execution state or silently compare incompatible runs.
 
-```
-┌──────────────────────────────────────────────────────┐
-│  4. Exits — Stop / Target / Trail / Time / Breakeven │
-├──────────────────────────────────────────────────────┤
-│  3. Recovery — Grid / Martingale / Hedge             │
-│     Recovery returns list[BasketAction].             │
-│     Martingale: EXIT original + ENTER opposite.      │
-│     Trailing/breakeven paused during active recovery.│
-├──────────────────────────────────────────────────────┤
-│  2. Basket — Dedup / Exposure / Limit / Sizing       │
-│     BasketBook owns lifecycle state.                 │
-│     BasketAction is the unified executor API.        │
-├──────────────────────────────────────────────────────┤
-│  1. Signal — Composable specs in qooi.strategies     │
-│     Backtest/live precompute the signal column.      │
-│     process_bar() consumes signal_src only.          │
-└──────────────────────────────────────────────────────┘
-```
+Mutation boundary:
 
-Data flow: OHLCV → strategies.indicators.add_indicators() inside
-strategies.compute_signal_frame() → core.process_bar(signal_src=..., strategy_id=...)
-→ list[BasketAction] → Executor.
+- `process_bar()` returns proposals only.
+- `BasketBook` owns basket lifecycle mutation.
+- Executor owns cash, fills, fees, trade rows, and equity accounting.
+- Executor accounts accepted proposals before applying terminal lifecycle actions.
 
-Same pipeline for backtest (BacktestExecutor.run) and live (LiveExecutor.execute).
+## 1. Data Layer
 
-### Layer 1: Signal (`strategies/compose.py`, `strategies/specs.py`)
+Files:
 
-Signal generation is composable and functionality-focused. Strategy specs combine
-feature builders, entry conditions, filters, and hold policies. Strategy selection
-is an orchestration input (`momentum_burst`, `rsi_bounce_reversion`, or retained
-`flow_pipeline`), not a property of `PairConfig` or `OkxSignalConfig`. Old names
-such as `momentum_1h` and `rsi_reversion` are intentionally rejected. `process_bar()`
-receives a precomputed `signal_src` value and a runtime `strategy_id` label for
-basket identity; it does not fetch market data or dispatch strategy functions.
+- `src/qooi/exchange/market.py`
+- `src/qooi/exchange/store.py`
 
-### Layer 2: Basket (`core/basket.py`)
+Responsibilities:
 
-`BasketBook` owns basket lifecycle state for a pipeline run/session. `BasketManager`
-is a stateless sizing/factory policy (`size_position()`, `compute_stop_target()`,
-`create()`, `remove()`). Each `Basket` tracks entry price, size, position state,
-recovery level, trail data, and cumulative loss. `BasketAction` is the unified
-action type consumed by all executors. `basket.add_to_position()` handles
-weighted-average entry price updates after execution actions are consumed.
+- Fetch OHLCV, order-book, and funding data from exchange backends.
+- Normalize exchange schemas.
+- Store and load Parquet caches.
+- Plan historical fetch horizon from `days`, `min_bars`, and bar size.
+- Validate actual cache coverage against the planned horizon.
+- Return data-only metadata.
 
-### Layer 3: Recovery (`core/recovery.py`)
+Canonical history types:
 
-Grid, martingale reversal, and hedge strategies for drawdown recovery.
-Returns `list[BasketAction]` — may be empty, single action, or multiple
-(EXIT + ENTER for martingale reversal). Martingale reversal size computed
-from contract-value loss / zone ATR value. `RecoveryKind` enum: NONE, GRID,
-MARTINGALE, HEDGE.
+- `HistoryRequest`: one instrument/timeframe/history request.
+- `HistoryTarget`: planned target bars, days, and since timestamp.
+- `HistoryCoverage`: actual bars, range, gaps, duplicates, freshness, refresh flag, and coverage percent.
 
-Grid and hedge are experimental until recovery risk semantics are complete.
-Grid compounds exposure and must respect `max_loss_pct`. Hedge requires explicit
-hedge-group unwind logic; without that, it can freeze exposure rather than recover.
+Source policy is selected outside the data layer:
 
-During active recovery, trailing/breakeven exits are paused (only hard
-stop active) to avoid interference. Controlled by `basket.recovery_activated`
-and `basket.recovery_level > 0` → passed as `skip_trailing=True` to
-`evaluate_exits()`.
+- `swap`: swap signal and swap execution, default.
+- `spot_signal_swap_exec`: spot signal with swap execution.
+- `spot`: spot-only research approximation.
 
-### Layer 4: Exits (`core/basket.py` — evaluate_exits() + TrailTracker)
+Removed old APIs:
 
-Tiered exit evaluation in priority order: hard stop → trailing stop →
-breakeven → target → time. `TrailTracker` maintains highest/lowest since
-entry for trailing stop calculation. `ExitReason` enum includes STOP,
-TRAILING, BREAKEVEN, TIME, SIGNAL_ENTRY, SIGNAL_FLIP, MARTINGALE,
-HEDGE_DRAWDOWN, GRID_LEVEL, GLOBAL_LOSS_LIMIT.
+- `CacheValidation`
+- `CacheSummary`
+- `validate_ohlcv()`
+- `describe_ohlcv()`
 
-### Executor (`core/executor.py`)
+Only planned-history vocabulary should remain for cache validity.
 
-Two executors consume the same `list[BasketAction]`:
-- `LiveExecutor` — action execution via OKX. Hard position/order truth comes from `OkxStateProvider`; JSON stores only soft strategy state.
-- `BacktestExecutor.run()` — in-memory `BacktestStateProvider`, precomputed signal column, BasketAction PnL, and portfolio drawdown stop. `run_report()` returns a `Report`.
+## 2. Strategy/Signal Layer
 
-Validation commands:
+Files:
+
+- `src/qooi/strategies/specs.py`
+- `src/qooi/strategies/conditions.py`
+- `src/qooi/strategies/features.py`
+- `src/qooi/strategies/indicators.py`
+
+Responsibilities:
+
+- Compute indicators and reusable features.
+- Apply filters and entry rules.
+- Emit explicit signal columns.
+- Express strategy-owned exit intent.
+- Provide signal diagnostics by rule/module.
+
+Required signal columns:
+
+- `raw_entry_signal`: signed raw rule output after filters.
+- `entry_signal`: event-like signed signal that may open a new basket.
+- `position_signal`: held directional thesis state.
+- `exit_signal`: strategy-owned exit intent.
+- `signal_strength`: numeric confidence or quality scalar for sizing and diagnostics.
+- `signal_id`: stable module/rule identifier for dedupe and reporting.
+- `signal`: compatibility alias, preferably equal to `position_signal` until all callers migrate.
+
+Signal semantics:
+
+- Entry signals decide when a new basket may be opened.
+- Position signals describe whether the strategy thesis is currently long, short, or neutral.
+- Exit signals describe explicit strategy-owned exit intent.
+- Signal strength should not encode direction; direction stays signed in signal columns.
+- Signal ID should identify the module/rule, not the symbol or basket ID.
+
+Strategies do not decide how many baskets may be active. Basket caps and lifecycle rules decide that.
+
+## 3. Pipeline Context
+
+The per-bar pipeline is configured by domain objects instead of many scalar arguments.
+
+Core concepts:
+
+- `BarMarket`: close, high, low, ATR, timestamp, and bar index.
+- `BarSignal`: position, entry, exit, strength, and signal ID.
+- `PipelinePolicy`: neutral-close compatibility, flip policy, and thesis-continuation mode.
+- `PipelineContext`: strategy ID plus market, signal, and policy.
+
+The pipeline contract:
+
+- Consume one market bar and one explicit signal context.
+- Evaluate existing baskets independently.
+- Return fully populated action proposals.
+- Do not mutate baskets.
+- Do not mutate recovery action proposals in place.
+- Do not apply lifecycle actions.
+- Do not update trailing state or bars-held counters.
+
+This keeps signal interpretation, lifecycle mutation, and executor accounting separated.
+
+## 4. Basket Layer
+
+Files:
+
+- `src/qooi/core/basket.py`
+- `src/qooi/core/__init__.py`
+
+Responsibilities:
+
+- Manage independent baskets created from entry events.
+- Enforce basket caps.
+- Store basket entry, size, stop, target, trailing state, recovery state, and lifecycle state.
+- Provide immutable snapshots for executor accounting.
+- Apply accepted lifecycle actions.
+- Advance active basket bar state after the executor has accounted fills.
+
+Correct basket semantics:
+
+- A symbol may have multiple independent baskets.
+- Multiple signals on the same symbol may create independent baskets up to explicit caps.
+- Caps prevent signal storms; they should not force one basket per symbol by default.
+- Basket IDs include symbol, strategy, direction, timestamp or sequence, and a uniqueness suffix.
+
+Basket caps:
+
+- `max_total`
+- `max_per_symbol`
+- `max_per_strategy_symbol`
+
+Lifecycle mutation belongs in `BasketBook`:
+
+- `apply_action()` applies accepted `ENTER`, `EXIT`, `ADD_GRID`, and `HEDGE` actions.
+- `apply_actions()` applies a batch in executor order.
+- `advance_bar()` updates trail state, target-hit state, and bars-held for still-active baskets that were not touched by an accepted action.
+- `snapshot()` captures pre-mutation state for accounting and reports.
+
+## 5. Hold And Thesis Continuation
+
+A basket is held while its management rules say the thesis remains valid.
+
+There are two supported hold modes:
+
+- Basket-owned hold mode, default: a basket remains active until basket-owned stop, target, trailing, time stop, strategy `exit_signal`, or recovery terminal action fires.
+- Strict thesis-continuation mode: a basket also exits when the held strategy thesis no longer confirms the basket direction.
+
+Default rules:
+
+- Neutral `position_signal == 0` does not close active baskets by default.
+- Opposite held `position_signal` does not close active baskets by default.
+- `exit_signal=True` closes matching active baskets as `strategy_exit`.
+- `close_on_neutral_signal=True` is compatibility mode only.
+- `require_thesis_continuation=True` exits as `thesis_failed` when the position thesis no longer supports the basket direction.
+
+Flip policy applies only to opposite entry events, not passive held state:
+
+- `ignore`: existing baskets continue; opposite entries may open another basket if caps allow.
+- `close_same_strategy_opposite`: close same-strategy opposite-direction baskets when an opposite entry event appears.
+- `reverse`: reserved for explicit close-and-open reversal semantics.
+
+## 6. Recovery Layer
+
+File:
+
+- `src/qooi/core/recovery.py`
+
+Responsibilities:
+
+- Generate pure recovery proposals for grid, hedge, martingale, and reverse recovery.
+- Respect recovery level and loss controls.
+- Leave all basket mutation to `BasketBook`.
+
+Recovery rules:
+
+- Recovery policies return `BasketAction` proposals only.
+- Recovery policies must not mutate `Basket`.
+- Recovery level increments only after an accepted lifecycle action is applied.
+- Grid recovery adds to the same basket after acceptance.
+- Hedge recovery opens a separate hedge basket after acceptance.
+- Reverse recovery closes the old basket and opens an opposite basket only when adverse movement criteria are met and, by default, an opposite signal thesis confirms the reversal.
+
+Reverse recovery is not a rescue for weak entries. It should only be tested on strategies with positive base expectancy and bounded exposure.
+
+## 7. Exit And Fill Layer
+
+Files:
+
+- `src/qooi/core/basket.py`
+- `src/qooi/core/executor.py`
+
+Exit responsibilities:
+
+- Stored basket stop and target levels are canonical.
+- Intrabar OHLC stop/target checks are used in backtests.
+- Trailing and breakeven logic read basket state but return proposals.
+- Same-bar ambiguity should use a documented conservative policy.
+
+Fill/accounting responsibilities:
+
+- Fees are notional based and charged on every fill.
+- Trade PnL is computed from immutable pre-close `BasketSnapshot` fields.
+- Mark-to-market equity includes unrealized PnL by default.
+- Lifecycle close is applied after accounting so reset-in-place cannot erase accounting inputs.
+
+Executor order per bar:
+
+1. Build `PipelineContext` from signal columns and market bar.
+2. Call `process_bar()` for proposals.
+3. Account accepted fills, fees, and trade rows using action snapshots.
+4. Apply accepted actions through `BasketBook`.
+5. Advance untouched active baskets with `BasketBook.advance_bar()`.
+6. Mark portfolio value and drawdown state.
+
+## 8. Sizing And Investment Per Basket
+
+Sizing must explain risk and notional constraints.
+
+Current formula:
+
+- `risk_per_contract = abs(entry_px - stop_px) * ct_val`
+- `risk_budget_usd = capital * max_risk_pct * signal_strength * lot_multiplier`
+- `risk_sized_contracts = floor(risk_budget_usd / risk_per_contract)`
+- `max_notional_usd = capital * leverage * max_notional_pct_per_basket`
+- `notional_sized_contracts = floor(max_notional_usd / (entry_px * ct_val))`
+- `contracts = min(risk_sized_contracts, notional_sized_contracts)` when at least `min_contracts`
+
+If the calculated size is below `min_contracts`, the trade is blocked rather than forcing a minimum that violates risk or notional caps.
+
+`SizingDecision` records:
+
+- selected contracts
+- risk per contract
+- risk budget
+- risk-sized contracts
+- max notional budget
+- notional-sized contracts
+- binding cap
+- blocked reason
+
+## 9. Backtest Engine Layer
+
+File:
+
+- `src/qooi/core/executor.py`
+
+Responsibilities:
+
+- Simulate one prepared OHLCV/signal frame.
+- Consume explicit signal columns.
+- Invoke the basket pipeline.
+- Simulate fills, fees, mark-to-market equity, and diagnostics.
+- Return raw trades/equity or structured `BacktestResult`.
+
+The engine does not fetch data, choose spot/swap policy, parse CLI, run temporal validation styles directly, or format reports.
+
+## 10. Backtest Styles Layer
+
+File:
+
+- `src/qooi/core/styles.py`
+
+Responsibilities:
+
+- Walk-forward validation.
+- Rolling-window validation.
+- Cross-validation.
+- Stability statistics.
+
+Styles are strategy-independent and repeatedly call a backtest function over slices.
+
+## 11. Evaluation Layer
+
+Files:
+
+- `src/qooi/core/metrics.py`
+- `src/qooi/core/evaluate.py`
+
+Responsibilities:
+
+- Compute metrics from trades and equity.
+- Format reports.
+- Compare compatible runs.
+- Warn when runs are not comparable.
+
+Metric priority:
+
+- Primary: trade count, win rate, profit factor, expectancy, average win/loss, median trade, exit reason mix.
+- Secondary: exposure-normalized return, drawdown, active bars, mark-to-market equity metrics.
+- Tertiary: calendar Sharpe, Sortino, annual return, annual volatility.
+
+Calendar annualized metrics are diagnostics only for sparse systems.
+
+Required report sections:
+
+1. Run metadata.
+2. Data coverage.
+3. Signal funnel.
+4. Basket lifecycle.
+5. Trade metrics.
+6. Exposure metrics.
+7. Equity metrics.
+8. Annualized diagnostics.
+
+Comparability warnings should appear when data horizon, source policy, strategy arguments, basket caps, fill policy, fee model, drawdown stop, or mark-to-market settings differ.
+
+## 12. Backtest Orchestration
+
+File:
+
+- `scripts/backtest.py`
+
+Responsibilities:
+
+- Parse CLI.
+- Select pairs.
+- Construct strategies from arguments.
+- Choose data-source policy.
+- Ask the data layer for requested histories.
+- Prepare the final execution frame.
+- Call the engine or styles layer.
+- Call evaluation formatting.
+
+## 13. Dynamic Statistics Research
+
+The first adaptive-indicator slice is dependency-free and intentionally precedes HMM, PCA, Kalman, GARCH package fitting, or ML classifiers.
+
+Available composable features:
+
+- `add_ewma_z_score()` for exponentially weighted price normalization.
+- `add_robust_z_score()` for rolling median/MAD normalization.
+- `add_volatility_regime()` for short/long realized volatility ratio and numeric regime.
+- `add_garch_like_volatility()` for recursive conditional-volatility approximation and `garch_z_return`.
+- `add_dynamic_z_blend()` for inspectable blended fixed, EWMA, and robust Z-score columns.
+
+Research strategy variants:
+
+- `adaptive_zscore_mean_reversion` compares blended dynamic Z-score with ADX and volatility-ratio gates.
+- `robust_zscore_mean_reversion` isolates MAD normalization against the fixed rolling Z-score baseline.
+
+Signal strength remains `1.0` for entries in this slice. Strength-based sizing should not be enabled until base signal quality is measured under comparable data settings.
+
+## 14. Data Depth Research
+
+Backtest research defaults target `730` days and `12,000` bars. These are requested targets, not guaranteed exchange availability.
+
+Cache coverage must be interpreted with `HistoryCoverage.notes`, which may include fetch audit details such as backend, endpoint, page count, page limit, cursor direction, duplicate count, and pagination stop reason. Coverage below target is a comparability warning unless the CLI is run with a positive `--min-coverage-pct` threshold.
+
+Asset universes are explicit:
+
+- `PAIRS` remains the live/core universe.
+- `RESEARCH_PAIRS` expands liquid swap research assets without changing live trading defaults.
+- `scripts/backtest.py --universe core|research` selects the orchestration universe.
+
+## 15. Current Strategy Recommendation
+
+Representative cached ETH runs from the current comparable slice showed:
+
+| Strategy | Trades | Win Rate | Profit Factor | Expectancy | Return | Recommendation |
+|---|---:|---:|---:|---:|---:|---|
+| `rsi_bounce_reversion` | 7 | 71% | 2.31 | +0.49% | +5.89% | Keep as sparse quality baseline |
+| `zscore_mean_reversion` | 34 | 47% | 1.42 | +0.63% | +39.46% | Current research candidate, but weaker after corrected lifecycle accounting |
+| `rsi_macd_trend` | 104 | 30% | 0.33 | -1.36% | -253.14% | Reject in current form |
+
+Recommendation:
+
+- Use `zscore_mean_reversion` as the current research candidate, not final allocation.
+- Keep `rsi_bounce_reversion` as a sparse baseline for comparison.
+- Do not allocate or recover `rsi_macd_trend` until entry quality is retuned.
+- Do not apply grid, martingale, or reverse recovery to a negative-expectancy base strategy.
+- Current ETH `zscore_mean_reversion` reverse-recovery run matched base metrics, indicating the gated reverse condition did not materially trigger on that cached slice.
+- Validate candidate strategies with rolling or walk-forward tests before increasing basket caps or notional budgets.
+- Treat cache coverage warnings as comparability limitations.
+
+## 14. Dead-Code Policy
+
+Removed or obsolete APIs should not be reintroduced unless a current caller requires them.
+
+Known removed branches/modules:
+
+- old cache validation vocabulary: `CacheValidation`, `CacheSummary`, `validate_ohlcv()`, `describe_ohlcv()`
+- old strategy composition modules: `compose.py`, `flow_pipeline.py`
+- old misplaced indicator module: `core/indicators.py`
+- old exchange evaluation module: `exchange/eval.py`
+- old standalone walk-forward script: `scripts/backtest_walkforward.py`
+
+Active code should use:
+
+- `HistoryRequest`, `HistoryTarget`, `HistoryCoverage`
+- `strategies/specs.py`, `features.py`, `conditions.py`, `indicators.py`
+- `core/styles.py` for temporal validation styles
+- `scripts/backtest.py` for orchestration
+
+## Validation Commands
 
 ```bash
-uv run ruff check <path>
-uv run ty check <path>
-uv run pytest <path>
-uv run python scripts/backtest.py --mode base|grid|martingale|hedge
+uv run ruff check src/qooi/core src/qooi/strategies src/qooi/exchange scripts tests
+uv run ty check src/qooi/core
+uv run ty check src/qooi/strategies
+uv run ty check src/qooi/exchange/market.py src/qooi/exchange/store.py src/qooi/exchange/trading.py scripts/backtest.py scripts/trade.py
+uv run pytest
+uv run python scripts/backtest.py --mode base --strategy rsi_bounce_reversion --diagnostics --data-source swap --style single
+uv run python scripts/backtest.py --mode base --strategy zscore_mean_reversion --diagnostics --data-source swap --style single
+uv run python scripts/backtest.py --mode reverse --strategy zscore_mean_reversion --diagnostics --data-source swap --style single
 ```
-
-### Backtest Styles (`core/styles.py`) — strategy-independent
-
-Backtest styles run a `trades_fn` (any function producing `(trades, equity)`)
-repeatedly under different slicing regimes. Pure functions, zero strategy imports.
-
-| Style | Function | Description |
-|-------|----------|-------------|
-| walk-forward | `walk_forward(trades_fn, df, train, test, step)` | Slide train→test windows, report OOS metrics |
-| rolling window | `rolling_window(trades_fn, df, lookback, step)` | Fixed lookback window, slide forward |
-| cross-validate | `cross_validate(trades_fn, df, folds)` | K-fold cross-validation across time segments |
-
-All return `StyleResult` with `WindowSlice` list, combined OOS metrics, and stability stats.
-
-### Evaluation (`core/evaluate.py`) — strategy-independent
-
-Takes raw trades + equity and produces formatted output.
-
-| Component | Description |
-|-----------|-------------|
-| `Report.from_raw(trades, equity, pair)` | Build from `BacktestExecutor.run()` output |
-| `report.summary()` | Terse one-liner: trades, WR%, PF, expectancy, trade/active-bar Sharpe |
-| `report.table()` | Multi-line aligned metrics block |
-| `compare(*reports)` | Side-by-side ensemble comparison table |
-| `format_table(headers, rows)` | Generic aligned-column formatter |
-
-### Current Strategies
-
-| Strategy | Asset | Signal | Recovery | Exit |
-|----------|-------|--------|----------|------|
-| `momentum_burst` | any configured asset | N-bar momentum, trend/session/volume/structure filters | grid/martingale/hedge (pipeline) | stop/target/trail/time |
-| `rsi_bounce_reversion` | any configured asset | RSI oversold bounce, uptrend/session/structure filters | grid/martingale/hedge (pipeline) | stop/target/trail/time |
-
-Both via `process_bar()` in `core/__init__.py` — same entry point for backtest and live.
-
-Recovery is available to all strategies through the pipeline's Layer 3.
-Martingale reversal: closes original position and opens opposite with
-computed size. During recovery, trailing/breakeven are paused to avoid
-interfering with grid accumulation or reversal logic.
-
-### Why Two Strategies?
-
-Backtest evidence (93 trades over 83 days):
-
-- Momentum burst wins during trend accelerations (ETH, 67% WR)
-- RSI reversion wins during sharp oversold bounces (SOL, 78% WR)
-- They are complementary (uncorrelated entry triggers) and produce a
-  smoother combined equity curve than either alone.
-
-## Backtest Status
-
-- [x] Pipeline backtest runs end-to-end
-- [x] Basket lifecycle verified by white-box tests
-- [x] Recovery branches verified by white-box tests
-- [x] Exit branches verified by white-box tests
-- [x] Multiple sequential baskets reopen correctly
-- [x] Multiple active baskets possible (hedge path)
-- [x] Recovery modes validated by report workflow (`base`, `grid`, `martingale`, `hedge`)
-- [ ] LiveExecutor places real direct orders
-- [ ] Active-bar or trade-level robust Sharpe added
-
-## Metric Caveat
-
-Current Sharpe / Sortino are calendar-bar metrics on sparse equity series.
-For low-frequency systems with many flat bars, annualized ratios can become
-numerically extreme. `Report` now exposes trade-level metrics too:
-
-- trade count
-- win rate
-- profit factor
-- avg win / avg loss
-- expectancy
-- trade Sharpe
-- median trade return
-
-Use Sharpe / Sortino only as secondary diagnostics.
-
-Current metric stack:
-
-- primary: trade count, win rate, profit factor, avg win/loss, expectancy %, expectancy $
-- secondary: trade Sharpe, median trade %, active-bar Sharpe, active-bar %
-- tertiary: calendar Sharpe / Sortino / annualized return / annualized vol
-
-Sparse-equity systems should be judged by primary + secondary metrics first.
-
-Key files:
-
-- `src/qooi/core/__init__.py` — `process_bar()` pipeline entry point
-- `src/qooi/core/basket.py` — Basket, BasketBook, BasketManager, BasketAction, evaluate_exits
-- `src/qooi/core/recovery.py` — RecoveryConfig, RecoveryKind, grid/martingale/hedge
-- `src/qooi/core/executor.py` — LiveExecutor, BacktestExecutor
-- `src/qooi/core/state.py` — OkxStateProvider, BacktestStateProvider, soft-state stores
-- `src/qooi/core/config.py` — AssetConfig, OkxSignalConfig, PairConfig, PAIRS, RESEARCH_PAIRS
-- `src/qooi/strategies/compose.py` — apply composable StrategySpec to OHLCV
-- `src/qooi/strategies/specs.py` — composable strategy specs and canonical strategy names
-- `src/qooi/strategies/indicators.py` — generic technical indicator precompute
-- `src/qooi/strategies/features.py` — reusable feature builders
-- `src/qooi/strategies/conditions.py` — reusable condition/filter expressions
-- `src/qooi/exchange/trading.py` — TradingClient + signal bot + direct TradeAPI
-- `scripts/trade.py` — live trading entry point (test, live)
 
 ## Glossary
 
 | Term | Definition |
-|------|-----------|
-| bar | OHLCV candle granularity (1m, 5m, 15m, 1H, 4H, 1D, etc.) |
-| instrument | Product ID e.g. `BTC-USDT`, `ETH-USDT-SWAP` |
-| SWAP | Perpetual swap (no expiry, funding rate) |
-| ct_val | Contract value in base currency (ETH=0.1, SOL=1, BTC=0.01) |
-| ATR | Average True Range — volatility measure |
-| ADX | Average Directional Index — trend strength (0-100, >20 = trending) |
-| OFI | Order Flow Imbalance — directional volume fraction |
-| IC | Information Coefficient — rank correlation of signal with forward returns |
-| momentum burst | 6-bar directional persistence signal with volume and session filters |
-| RSI reversion | Oversold bounce in confirmed uptrend, long-only, with confirmation bar |
-| circuit breaker | 2 consecutive losses → suspend asset until 20-bar high/low break |
-| trend maturity | EMA50/200 direction must persist for ≥20 consecutive bars before entry |
-| signal bot | OKX server-driven execution engine — handles TP/SL autonomously |
-| martingale reversal | EXIT original + ENTER opposite with computed size from loss |
-| cumulative_loss | Total realized loss tracked per Basket |
-| trailing pause | Trailing/breakeven disabled during active recovery to avoid interference |
-| global loss limit | Force-close basket when cumulative loss exceeds threshold |
-| portfolio drawdown stop | 5% drawdown from peak equity → force-close all baskets |
-| signal_src | Backtest pre-computed signal column — bypasses live API |
-| BasketAction | Unified payload: action kind, side, size, price, stop/target, reason |
-
-## Data depth notes
-
-- For 1D: `days=1000` yields ~3 years (1100 bars)
-- For 4H: `days=500` yields ~11 months (2000 bars)
-- For 1H: `days=200` yields ~3 months (2000 bars)
-- OKX SDK limit: 300 bars per request. Use CCXT (LBank) or CacheStore for deep history.
-- Signal cache accumulates via `MarketData.candles(cache=True)` — merges new bars with existing.
+|------|------------|
+| bar | OHLCV candle granularity such as 1H, 4H, 1D |
+| swap | Perpetual derivative instrument used for execution |
+| spot signal | Optional use of spot OHLCV for indicator/signal generation |
+| entry signal | Event-like signed signal that may open a new basket |
+| position signal | Held directional thesis state |
+| exit signal | Strategy-owned exit intent |
+| signal strength | Numeric quality/confidence scalar used for sizing and diagnostics |
+| signal ID | Stable module/rule identifier |
+| basket | Independent vehicle containing initial and recovery positions plus lifecycle state |
+| basket cap | Limit preventing too many concurrent baskets |
+| thesis continuation | Rule that confirms an active basket's original directional idea remains valid |
+| thesis failed | Exit reason when strict continuation mode no longer confirms the basket direction |
+| recovery | Grid, hedge, martingale, or reverse logic attached to one basket |
+| reverse recovery | Bounded adverse-move recovery that closes a basket and opens the opposite direction when confirmed |
+| basket snapshot | Immutable pre-mutation basket state used for executor accounting |
+| mark-to-market | Equity valuation including unrealized PnL each bar |
+| fill policy | Rules for stop/target/trailing fills and ambiguity handling |
+| comparability | Whether two reports share enough metadata to compare metrics |

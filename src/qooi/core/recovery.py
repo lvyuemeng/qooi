@@ -12,21 +12,41 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from enum import StrEnum
+from typing import Protocol
 
 from qooi.core.basket import ActionKind, Basket, BasketAction, ExitReason
 
 
-class RecoveryKind(StrEnum):
-    NONE = "none"
-    GRID = "grid"
-    MARTINGALE = "martingale"
-    HEDGE = "hedge"
+@dataclass(frozen=True)
+class RecoveryMarket:
+    close: float
+    atr: float
 
 
 @dataclass
-class RecoveryConfig:
-    strategy: RecoveryKind = RecoveryKind.NONE
+class RecoveryContext:
+    current_level: int
+    ct_val: float = 1.0
+    signal_position: float = 0.0
+    signal_entry: float = 0.0
+
+
+class RecoveryPolicy(Protocol):
+    def evaluate(
+        self, basket: Basket, market: RecoveryMarket, ctx: RecoveryContext
+    ) -> list[BasketAction]: ...
+
+
+@dataclass(frozen=True)
+class NoRecovery:
+    def evaluate(
+        self, basket: Basket, market: RecoveryMarket, ctx: RecoveryContext
+    ) -> list[BasketAction]:
+        return []
+
+
+@dataclass(frozen=True)
+class RecoverySettings:
     zone_atr: float = 2.0
     multiplier: float = 2.0
     max_levels: int = 3
@@ -34,29 +54,100 @@ class RecoveryConfig:
     breakeven_atr: float = 1.0
 
 
+@dataclass(frozen=True)
+class GridRecovery(RecoverySettings):
+    def evaluate(
+        self, basket: Basket, market: RecoveryMarket, ctx: RecoveryContext
+    ) -> list[BasketAction]:
+        shared = _shared_guard(basket, market.close, self)
+        if shared is not None:
+            return shared
+        d, loss_pct = _direction_and_loss(basket, market.close)
+        return _grid(basket, market.close, market.atr, self, ctx.current_level, loss_pct, d)
+
+
+@dataclass(frozen=True)
+class MartingaleRecovery(RecoverySettings):
+    def evaluate(
+        self, basket: Basket, market: RecoveryMarket, ctx: RecoveryContext
+    ) -> list[BasketAction]:
+        shared = _shared_guard(basket, market.close, self)
+        if shared is not None:
+            return shared
+        d, loss_pct = _direction_and_loss(basket, market.close)
+        return _martingale(
+            basket, market.close, market.atr, self, ctx.current_level, loss_pct, d, ctx.ct_val
+        )
+
+
+@dataclass(frozen=True)
+class ReverseRecovery(RecoverySettings):
+    require_opposite_signal: bool = True
+
+    def evaluate(
+        self, basket: Basket, market: RecoveryMarket, ctx: RecoveryContext
+    ) -> list[BasketAction]:
+        shared = _shared_guard(basket, market.close, self)
+        if shared is not None:
+            return shared
+        d, loss_pct = _direction_and_loss(basket, market.close)
+        if self.require_opposite_signal:
+            opposite_thesis = ctx.signal_entry * d < 0 or ctx.signal_position * d < 0
+            if not opposite_thesis:
+                return []
+        return _martingale(
+            basket, market.close, market.atr, self, ctx.current_level, loss_pct, d, ctx.ct_val
+        )
+
+
+@dataclass(frozen=True)
+class HedgeRecovery(RecoverySettings):
+    def evaluate(
+        self, basket: Basket, market: RecoveryMarket, ctx: RecoveryContext
+    ) -> list[BasketAction]:
+        shared = _shared_guard(basket, market.close, self)
+        if shared is not None:
+            return shared
+        _d, loss_pct = _direction_and_loss(basket, market.close)
+        return _hedge(basket, market.close, self, loss_pct)
+
+
 def evaluate(
     basket: Basket,
     bar_close: float,
     atr: float,
-    config: RecoveryConfig,
+    config: RecoveryPolicy,
     current_level: int,
     *,
     ct_val: float = 1.0,
+    signal_position: float = 0.0,
+    signal_entry: float = 0.0,
 ) -> list[BasketAction]:
-    """Evaluate recovery logic. Returns list of actions (may be empty)."""
+    """Evaluate recovery behavior. Returns list of actions (may be empty)."""
+    return config.evaluate(
+        basket,
+        RecoveryMarket(close=bar_close, atr=atr),
+        RecoveryContext(
+            current_level=current_level,
+            ct_val=ct_val,
+            signal_position=signal_position,
+            signal_entry=signal_entry,
+        ),
+    )
 
-    if config.strategy == RecoveryKind.NONE:
-        return []
 
-    if not basket.is_active:
-        return []
-
+def _direction_and_loss(basket: Basket, bar_close: float) -> tuple[int, float]:
     d = 1 if basket.side == "buy" else -1
-    loss_pct = d * (bar_close / basket.entry_px - 1) * 100 if basket.entry_px > 0 else 0
+    loss_pct = d * (bar_close / basket.entry_px - 1) * 100 if basket.entry_px > 0 else 0.0
+    return d, loss_pct
 
-    if basket.current_sz <= 0:
+
+def _shared_guard(
+    basket: Basket, bar_close: float, config: RecoverySettings
+) -> list[BasketAction] | None:
+    if not basket.is_active or basket.current_sz <= 0:
         return []
-
+    _d, loss_pct = _direction_and_loss(basket, bar_close)
     if loss_pct < -abs(config.max_loss_pct):
         return [
             BasketAction(
@@ -69,22 +160,14 @@ def evaluate(
                 fraction=1.0,
             )
         ]
-
-    if config.strategy == RecoveryKind.GRID:
-        return _grid(basket, bar_close, atr, config, current_level, loss_pct, d)
-    if config.strategy == RecoveryKind.MARTINGALE:
-        return _martingale(basket, bar_close, atr, config, current_level, loss_pct, d, ct_val)
-    if config.strategy == RecoveryKind.HEDGE:
-        return _hedge(basket, bar_close, config, loss_pct)
-
-    return []
+    return None
 
 
 def _grid(
     basket: Basket,
     bar_close: float,
     atr: float,
-    config: RecoveryConfig,
+    config: RecoverySettings,
     level: int,
     loss_pct: float,
     d: int,
@@ -113,7 +196,7 @@ def _martingale(
     basket: Basket,
     bar_close: float,
     atr: float,
-    config: RecoveryConfig,
+    config: RecoverySettings,
     level: int,
     loss_pct: float,
     d: int,
@@ -147,7 +230,7 @@ def _martingale(
 def _hedge(
     basket: Basket,
     bar_close: float,
-    config: RecoveryConfig,
+    config: RecoverySettings,
     loss_pct: float,
 ) -> list[BasketAction]:
     if basket.recovery_level > 0:
@@ -168,7 +251,7 @@ def _hedge(
 
 
 def _reversal_size(
-    basket: Basket, bar_close: float, atr: float, config: RecoveryConfig, ct_val: float
+    basket: Basket, bar_close: float, atr: float, config: RecoverySettings, ct_val: float
 ) -> int:
     loss_usd = abs(basket.entry_px - bar_close) * basket.current_sz * ct_val
     zone_profit_per_contract = config.zone_atr * atr * ct_val

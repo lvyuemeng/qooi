@@ -1,7 +1,8 @@
 # qooi
 
-Crypto quantitative trading toolkit — **1H momentum/mean-reversion strategies** executed via
-**OKX Signal Bot** (server-driven TP/SL, client-side signal generation).
+Crypto quantitative trading toolkit for OKX swap research and signal-bot execution.
+The current research focus is 1H mean-reversion with fixed, robust, and adaptive
+statistical indicators.
 
 ```bash
 uv sync
@@ -12,11 +13,10 @@ uv run python scripts/trade.py testnet
 
 ```text
 OKX REST API (public, no auth)
-    ↓ MarketData.candles(cache=True)    ← 1H OHLCV, auto-cached to Parquet
+    ↓ CacheStore.load_history()         ← planned OHLCV target + coverage audit
     ↓ strategies.compute_signal_frame() ← indicators + composable StrategySpec
-    ↓ core.process_bar()                ← Signal → Basket → Recovery → Exits
-    ↓ list[BasketAction]                ← Unified action stream
-    ↓ Executor (Live / Backtest)        ← place/cancel/amend or simulate fills
+    ↓ core.process_bar()                ← Bar context → BasketAction proposals
+    ↓ BasketBook / Executor             ← lifecycle mutation, fills, fees, equity
 ```
 
 Signals run identically in backtest and live. Strategy selection is a runtime input,
@@ -26,20 +26,22 @@ not part of pair/execution config.
 
 | Strategy | Asset | Timeframe | Entry Logic | Exit Logic |
 |----------|-------|-----------|-------------|------------|
-| `momentum_burst` | any configured asset | 1H | 6-bar return > 0.3%, EMA50>EMA200, ADX>20, vol > 1.5× avg, session 08-22 UTC | OKX TP/SL plus client close on trend-flip |
-| `rsi_bounce_reversion` | any configured asset | 1H | RSI(14) < 30 → bounce > 25 with confirmation, EMA50>EMA200, ADX>20, session 08-22 UTC | OKX TP/SL plus client close on trend-flip or RSI > 50 |
+| `zscore_mean_reversion` | configured swap assets | 1H | fixed rolling close Z-score extremes with ADX gate | Z-score reversion plus basket exits |
+| `robust_zscore_mean_reversion` | configured swap assets | 1H | rolling median/MAD Z-score extremes with ADX gate | robust Z-score reversion plus basket exits |
+| `adaptive_zscore_mean_reversion` | configured swap assets | 1H | blended fixed/EWMA/robust Z-score extremes with ADX and volatility-ratio gates | dynamic Z-score reversion plus basket exits |
+| `rsi_bounce_reversion` | configured swap assets | 1H | RSI oversold bounce with trend/session filters | RSI/trend thesis failure plus basket exits |
+| `momentum_burst` | configured swap assets | 1H | 6-bar momentum, trend, volume, ADX, and session filters | trend thesis failure plus basket exits |
 
-Both strategies use tiered exits in backtest (hard stop, target, trailing, time stop).
-In live trading, the OKX Signal Bot handles stop-loss and take-profit autonomously.
-The client only sends **ENTER** and **CLOSE** signals.
+Strategies use tiered exits in backtest: hard stop, target, trailing stop, time stop,
+and explicit strategy exit. In live trading, the OKX Signal Bot handles stop-loss and
+take-profit autonomously; the client sends entry and close signals.
 
-## Backtest Results (1H Ensemble, 83 days)
+## Data Readiness
 
-| Asset | Strategy | Trades | Avg Ret | WR | PL | Sharpe |
-|-------|----------|--------|---------|-----|----|--------|
-| ETH | momentum_burst | 24 | +0.88% | 67% | 1.84 | +0.45 |
-| SOL | rsi_bounce_reversion | 9 | +0.48% | 78% | 1.04 | +0.51 |
-| **Ensemble** | **all** | **93** | **+0.21%** | **53%** | **1.32** | **+0.14** |
+Research backtests request `730` days and `12,000` bars by default. Exchange retention
+or pagination may return less, so every run includes `HistoryCoverage` metadata and
+cache warnings. Use `--refresh-cache` to fetch again and `--min-coverage-pct` to fail
+fast when data is too shallow.
 
 ## Features
 
@@ -60,7 +62,13 @@ The client only sends **ENTER** and **CLOSE** signals.
 uv run python scripts/trade.py test
 
 # Backtest a strategy on cached data
-uv run python scripts/backtest.py --strategy momentum_burst
+uv run python scripts/backtest.py --strategy robust_zscore_mean_reversion --symbol ETH-USDT-SWAP --diagnostics
+
+# Refresh cache and require at least 90% target coverage
+uv run python scripts/backtest.py --strategy robust_zscore_mean_reversion --symbol ETH-USDT-SWAP --refresh-cache --min-coverage-pct 90
+
+# Compare current benchmark set
+uv run python scripts/backtest.py --benchmark --diagnostics --data-source swap
 
 # Sweep recovery profiles
 uv run python scripts/backtest.py --mode base
@@ -72,13 +80,14 @@ uv run python scripts/backtest.py --mode hedge
 uv run python -c "
 from qooi.core.executor import BacktestExecutor
 from qooi.core.config import PAIRS
+from qooi.strategies import robust_zscore_mean_reversion_spec
 import polars as pl
 
-df = pl.read_parquet('data/cache/ETH_USDT_1H.parquet')
+df = pl.read_parquet('data/cache/ETH_USDT_SWAP_1H.parquet')
 pair = PAIRS[0]
 bt = BacktestExecutor(initial_capital=pair.asset.capital)
-trades, equity = bt.run(df, pair, strategy='momentum_burst')
-print(f'Trades={len(trades)}  Final equity=${equity[-1]:.0f}')
+report = bt.run_report(df, pair, strategy=robust_zscore_mean_reversion_spec())
+print(report.summary())
 "
 
 # Switch between test / live:
@@ -106,13 +115,12 @@ uv run pytest tests/ -v                   # unit + integration tests
 
 ```text
 src/qooi/
-  core/              ← __init__.py (process_bar), basket.py (Basket + exits),
-                       decide.py (AssetConfig), config.py (PairConfig),
-                       executor.py (Live + Backtest), indicators.py,
-                       recovery.py (grid/martingale/hedge)
+  core/              ← __init__.py (process_bar), basket.py, config.py,
+                       executor.py, evaluate.py, metrics.py, recovery.py,
+                       state.py, styles.py
   exchange/          ← market.py, trading.py, store.py
-  strategies/        ← compose.py, specs.py, features.py, conditions.py,
-                       indicators.py, flow_pipeline.py, portfolio.py
+  strategies/        ← specs.py, features.py, conditions.py, indicators.py,
+                       portfolio.py
 scripts/
   trade.py           ← live trading entry point (auto-creates bot on first run)
   backtest.py        ← CLI backtest runner

@@ -10,11 +10,13 @@ from __future__ import annotations
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import polars as pl
 
-from qooi.exchange.eval import EvalMetrics, compute_metrics
+from qooi.core.metrics import EvalMetrics, compute_metrics
 
+BacktestFn = Callable[[pl.DataFrame], object]
 TradesFn = Callable[[pl.DataFrame], tuple[list[dict], list[float]]]
 
 
@@ -58,7 +60,7 @@ class StyleResult:
 
 
 def walk_forward(
-    trades_fn: TradesFn,
+    trades_fn: BacktestFn,
     df: pl.DataFrame,
     *,
     train_bars: int = 500,
@@ -86,14 +88,7 @@ def walk_forward(
             seg = df.slice(lo, hi - lo)
             if seg.height < 2:
                 continue
-            trades, equity = trades_fn(seg)
-            eq_df = pl.DataFrame(
-                {
-                    "portfolio_value": equity,
-                    "returns": pl.Series(equity).pct_change().fill_null(0.0),
-                }
-            )
-            td = pl.DataFrame(trades) if trades else pl.DataFrame()
+            trades, equity, eq_df, td = _coerce_result(trades_fn(seg))
             m = compute_metrics(eq_df, trades=td)
             windows.append(
                 WindowSlice(
@@ -126,7 +121,7 @@ def walk_forward(
 
 
 def rolling_window(
-    trades_fn: TradesFn,
+    trades_fn: BacktestFn,
     df: pl.DataFrame,
     *,
     lookback_bars: int = 500,
@@ -145,7 +140,7 @@ def rolling_window(
 
 
 def cross_validate(
-    trades_fn: TradesFn,
+    trades_fn: BacktestFn,
     df: pl.DataFrame,
     *,
     folds: int = 5,
@@ -166,14 +161,7 @@ def cross_validate(
         seg = df.slice(lo, hi - lo)
         if seg.height < 2:
             continue
-        trades, equity = trades_fn(seg)
-        eq_df = pl.DataFrame(
-            {
-                "portfolio_value": equity,
-                "returns": pl.Series(equity).pct_change().fill_null(0.0),
-            }
-        )
-        td = pl.DataFrame(trades) if trades else pl.DataFrame()
+        trades, equity, eq_df, td = _coerce_result(trades_fn(seg))
         m = compute_metrics(eq_df, trades=td)
         windows.append(
             WindowSlice(
@@ -212,6 +200,25 @@ def _build_equity(returns: list[float], initial: float = 10000.0) -> pl.DataFram
             "returns": [0.0] + returns,
         }
     )
+
+
+def _coerce_result(result: object) -> tuple[list[dict], list[float], pl.DataFrame, pl.DataFrame]:
+    if isinstance(result, tuple):
+        trades = cast(list[dict], result[0])
+        equity = cast(list[float], result[1])
+        eq_df = pl.DataFrame(
+            {
+                "portfolio_value": equity,
+                "returns": pl.Series(equity).pct_change().fill_null(0.0),
+            }
+        )
+        td = pl.DataFrame(trades) if trades else pl.DataFrame()
+        return trades, equity, eq_df, td
+    trades_df = getattr(result, "trades")
+    equity_df = getattr(result, "equity")
+    trades = trades_df.to_dicts() if isinstance(trades_df, pl.DataFrame) else []
+    equity = equity_df["portfolio_value"].to_list() if isinstance(equity_df, pl.DataFrame) else []
+    return trades, equity, equity_df, trades_df
 
 
 def _stability(windows: list[WindowSlice]) -> dict[str, float]:

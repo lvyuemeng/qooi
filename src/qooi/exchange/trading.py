@@ -6,10 +6,10 @@ All strategy logic lives in qooi.core.  This file is pure I/O.
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 # ============================================================================
 # 0. Environment
@@ -39,9 +39,6 @@ def load_okx_env(env_path: str | None = None) -> None:
 
 
 class TradingClient:
-    _RETRY_ATTEMPTS = 3
-    _RETRY_DELAY = 1.0
-
     def __init__(self) -> None:
         from okx.Account import AccountAPI
         from okx.Trade import TradeAPI
@@ -80,17 +77,13 @@ class TradingClient:
 
     @staticmethod
     def _retry(fn, *args, **kwargs):
-        attempts = TradingClient._RETRY_ATTEMPTS
-        last_err = None
-        for attempt in range(attempts):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                last_err = e
-                if attempt < attempts - 1:
-                    time.sleep(TradingClient._RETRY_DELAY * (attempt + 1))
-        if last_err is not None:
-            raise last_err
+        retryer = Retrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=8),
+            retry=retry_if_exception_type(Exception),
+            reraise=True,
+        )
+        return retryer(fn, *args, **kwargs)
 
     # -- order operations -------------------------------------------------------
 
@@ -105,7 +98,13 @@ class TradingClient:
         cl_ord_id: str = "",
         attach_algo_ords: list[dict] | None = None,
     ) -> dict:
-        params = {"instId": inst_id, "side": side, "ordType": ord_type, "sz": sz, "tdMode": td_mode}
+        params: dict[str, object] = {
+            "instId": inst_id,
+            "side": side,
+            "ordType": ord_type,
+            "sz": sz,
+            "tdMode": td_mode,
+        }
         if px:
             params["px"] = px
         if cl_ord_id:
@@ -121,7 +120,7 @@ class TradingClient:
         params = {"instId": inst_id, "mgnMode": mgn_mode}
         if pos_side:
             params["posSide"] = pos_side
-        return self._okx(self._trade.close_position(**params))
+        return self._okx(getattr(self._trade, "close_position")(**params))
 
     def set_leverage(self, inst_id, lever, mgn_mode="isolated"):
         return self._okx(
@@ -280,6 +279,9 @@ class TradingClient:
             return None
 
         try:
+            from qooi.core.state import format_basket_id, format_okx_client_id
+
+            basket_id = format_basket_id(pair.asset.symbol, label or "default")
             algo = self.signal_create_order_algo(
                 signal_chan_id=chan_id,
                 inst_ids=[pair.asset.symbol],
@@ -290,7 +292,7 @@ class TradingClient:
                 sl_pct=pair.okx.sl_pct,
                 sub_ord_type="9",
                 allow_multiple_entry=False,
-                algo_cl_ord_id=f"qooi{pair.asset.symbol.replace('-', '')}v1",
+                algo_cl_ord_id=format_okx_client_id(basket_id, "algo"),
             )
         except RuntimeError:
             bot = self._signal_resolve_bot(pair)

@@ -7,6 +7,7 @@ trail_high, trail_low, target_hit).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -36,6 +37,21 @@ class ExitReason(StrEnum):
     GRID_LEVEL = "grid_level"
     GLOBAL_LOSS_LIMIT = "global_loss_limit"
     SIGNAL_ZERO = "signal_zero"
+    STRATEGY_EXIT = "strategy_exit"
+    THESIS_FAILED = "thesis_failed"
+    BLOCKED_ENTRY = "blocked_entry"
+
+
+@dataclass(frozen=True)
+class SizingDecision:
+    contracts: int
+    risk_per_contract: float
+    risk_budget_usd: float
+    risk_sized_contracts: int
+    max_notional_usd: float
+    notional_sized_contracts: int
+    binding_cap: str
+    blocked_reason: str = ""
 
 
 @dataclass
@@ -92,6 +108,28 @@ class Basket:
         self.current_sz = total_sz
 
 
+@dataclass(frozen=True)
+class BasketSnapshot:
+    basket_id: str
+    symbol: str
+    strategy: str
+    side: str
+    entry_px: float
+    current_sz: float
+    stop_px: float
+    target_px: float
+    bars_in_pos: int
+    recovery_level: int
+    recovery_activated: bool
+
+
+@dataclass
+class BasketLimits:
+    max_total: int = 5
+    max_per_symbol: int = 3
+    max_per_strategy_symbol: int = 3
+
+
 @dataclass
 class BasketAction:
     basket_id: str
@@ -101,9 +139,15 @@ class BasketAction:
     px: float = 0.0
     stop_px: float = 0.0
     target_px: float = 0.0
+    entry_px: float = 0.0
     fraction: float = 1.0
     reason: str = ""
     order_type: str = "limit"
+    bars_held: int = 0
+    signal_id: str = ""
+    signal_strength: float = 1.0
+    sizing: SizingDecision | None = None
+    snapshot: BasketSnapshot | None = None
 
 
 @dataclass
@@ -135,16 +179,35 @@ class BasketManager:
     Basket state is owned by ``BasketBook`` or by legacy caller-owned lists.
     """
 
-    def __init__(self, max_baskets: int = 5, max_per_symbol: int = 1):
-        self.max_baskets = max_baskets
-        self.max_per_symbol = max_per_symbol
+    def __init__(
+        self,
+        max_baskets: int = 5,
+        max_per_symbol: int = 3,
+        max_per_strategy_symbol: int = 3,
+    ):
+        self.limits = BasketLimits(
+            max_total=max_baskets,
+            max_per_symbol=max_per_symbol,
+            max_per_strategy_symbol=max_per_strategy_symbol,
+        )
 
-    def can_open(self, symbol: str, active: list[Basket]) -> bool:
+    def can_open(
+        self, symbol: str, strategy: str | list[Basket] = "", active: list[Basket] | None = None
+    ) -> bool:
+        if active is None and isinstance(strategy, list):
+            active = strategy
+            strategy = ""
+        active = active or []
         active_baskets = [b for b in active if b.is_active]
-        if len(active_baskets) >= self.max_baskets:
+        if len(active_baskets) >= self.limits.max_total:
             return False
         symbol_count = sum(1 for b in active_baskets if b.symbol == symbol)
-        return symbol_count < self.max_per_symbol
+        if symbol_count >= self.limits.max_per_symbol:
+            return False
+        strategy_count = sum(
+            1 for b in active_baskets if b.symbol == symbol and b.strategy == str(strategy)
+        )
+        return strategy_count < self.limits.max_per_strategy_symbol
 
     def create(
         self,
@@ -155,9 +218,13 @@ class BasketManager:
         sz: float,
         stop_px: float,
         target_px: float,
+        entry_ts: int = 0,
+        sequence: int = 0,
     ) -> Basket:
-        # Reuse existing idle basket if present, otherwise create
-        bid = f"{symbol}-{strategy}"
+        direction = "long" if side == "buy" else "short"
+        unique = entry_ts if entry_ts else sequence or 1
+        suffix = sequence or 1
+        bid = f"{symbol}-{strategy}-{direction}-{unique}-{suffix}"
         return Basket(
             basket_id=bid,
             symbol=symbol,
@@ -185,15 +252,52 @@ class BasketManager:
         basket.current_sz = 0.0
 
     @staticmethod
-    def size_position(entry_px: float, stop_px: float, cfg) -> int:
+    def size_decision(
+        entry_px: float,
+        stop_px: float,
+        cfg,
+        *,
+        signal_strength: float = 1.0,
+        lot_multiplier: float = 1.0,
+    ) -> SizingDecision:
         risk_per_ct = abs(entry_px - stop_px) * cfg.ct_val
         if risk_per_ct <= 0:
-            return 0
-        max_risk = cfg.capital * cfg.max_risk_pct
-        sz = max(1, int(max_risk / risk_per_ct))
+            return SizingDecision(0, 0.0, 0.0, 0, 0.0, 0, "none", "zero_risk_distance")
+        strength = max(0.0, float(signal_strength or 0.0))
+        max_risk = cfg.capital * cfg.max_risk_pct * strength * max(0.0, lot_multiplier)
+        risk_sz = math.floor(max_risk / risk_per_ct)
         notional_per_ct = cfg.ct_val * entry_px
-        max_sz = int(cfg.capital * cfg.leverage / max(notional_per_ct, 1e-9))
-        return max(1, min(sz, max_sz))
+        notional_fraction = float(getattr(cfg, "max_notional_pct_per_basket", 1.0))
+        max_notional = cfg.capital * cfg.leverage * max(0.0, notional_fraction)
+        notional_sz = math.floor(max_notional / max(notional_per_ct, 1e-9))
+        raw_contracts = min(risk_sz, notional_sz)
+        min_contracts = int(getattr(cfg, "min_contracts", 1))
+        if raw_contracts < min_contracts:
+            binding = "risk" if risk_sz <= notional_sz else "notional"
+            return SizingDecision(
+                0,
+                risk_per_ct,
+                max_risk,
+                risk_sz,
+                max_notional,
+                notional_sz,
+                binding,
+                f"below_min_contracts_{min_contracts}",
+            )
+        binding = "risk" if risk_sz <= notional_sz else "notional"
+        return SizingDecision(
+            raw_contracts,
+            risk_per_ct,
+            max_risk,
+            risk_sz,
+            max_notional,
+            notional_sz,
+            binding,
+        )
+
+    @staticmethod
+    def size_position(entry_px: float, stop_px: float, cfg) -> int:
+        return BasketManager.size_decision(entry_px, stop_px, cfg).contracts
 
     @staticmethod
     def compute_stop_target(side: str, entry_px: float, atr: float, cfg) -> tuple[float, float]:
@@ -212,16 +316,38 @@ class BasketBook:
         baskets: list[Basket] | None = None,
         *,
         max_baskets: int = 5,
-        max_per_symbol: int = 1,
+        max_per_symbol: int = 3,
+        max_per_strategy_symbol: int = 3,
     ):
         self.baskets = baskets if baskets is not None else []
-        self.policy = BasketManager(max_baskets=max_baskets, max_per_symbol=max_per_symbol)
+        self.policy = BasketManager(
+            max_baskets=max_baskets,
+            max_per_symbol=max_per_symbol,
+            max_per_strategy_symbol=max_per_strategy_symbol,
+        )
 
     def get(self, basket_id: str) -> Basket | None:
         return next((b for b in self.baskets if b.basket_id == basket_id), None)
 
     def for_pair(self, symbol: str, strategy: str) -> Basket | None:
-        return self.get(f"{symbol}-{strategy}")
+        return next(
+            (
+                b
+                for b in self.baskets
+                if b.symbol == symbol and b.strategy == strategy and b.is_active
+            ),
+            None,
+        )
+
+    def active_for_symbol(self, symbol: str) -> list[Basket]:
+        return [b for b in self.baskets if b.symbol == symbol and b.is_active]
+
+    def active_for_strategy(self, symbol: str, strategy: str) -> list[Basket]:
+        return [
+            b
+            for b in self.baskets
+            if b.symbol == symbol and b.strategy == strategy and b.is_active
+        ]
 
     def active(self) -> list[Basket]:
         return [b for b in self.baskets if b.is_active]
@@ -229,8 +355,22 @@ class BasketBook:
     def active_exposure(self) -> float:
         return sum(abs(b.current_sz) for b in self.baskets if b.is_active)
 
-    def can_open(self, symbol: str) -> bool:
-        return self.policy.can_open(symbol, self.baskets)
+    def can_open(self, symbol: str, strategy: str = "", direction: str = "") -> bool:
+        return self.policy.can_open(symbol, strategy, self.baskets)
+
+    def open_block_reason(self, symbol: str, strategy: str = "") -> str:
+        active_baskets = self.active()
+        if len(active_baskets) >= self.policy.limits.max_total:
+            return "max_total"
+        symbol_count = sum(1 for b in active_baskets if b.symbol == symbol)
+        if symbol_count >= self.policy.limits.max_per_symbol:
+            return "max_per_symbol"
+        if (
+            sum(1 for b in active_baskets if b.symbol == symbol and b.strategy == strategy)
+            >= self.policy.limits.max_per_strategy_symbol
+        ):
+            return "max_per_strategy_symbol"
+        return ""
 
     def replace_or_add(self, basket: Basket) -> None:
         for i, existing in enumerate(self.baskets):
@@ -248,13 +388,103 @@ class BasketBook:
         sz: float,
         stop_px: float,
         target_px: float,
+        entry_ts: int = 0,
     ) -> Basket:
-        basket = self.policy.create(symbol, strategy, side, entry_px, sz, stop_px, target_px)
+        sequence = len(self.baskets) + 1
+        basket = self.policy.create(
+            symbol, strategy, side, entry_px, sz, stop_px, target_px, entry_ts, sequence
+        )
         self.replace_or_add(basket)
         return basket
 
     def close(self, basket: Basket) -> None:
         self.policy.remove(basket)
+
+    @staticmethod
+    def snapshot(basket: Basket) -> BasketSnapshot:
+        return BasketSnapshot(
+            basket_id=basket.basket_id,
+            symbol=basket.symbol,
+            strategy=basket.strategy,
+            side=basket.side,
+            entry_px=basket.entry_px,
+            current_sz=basket.current_sz,
+            stop_px=basket.stop_px,
+            target_px=basket.target_px,
+            bars_in_pos=basket.bars_in_pos,
+            recovery_level=basket.recovery_level,
+            recovery_activated=basket.recovery_activated,
+        )
+
+    def apply_action(self, action: BasketAction) -> None:
+        basket = self.get(action.basket_id)
+        if action.action == ActionKind.ENTER:
+            if basket is None:
+                basket = Basket(
+                    basket_id=action.basket_id,
+                    symbol=(action.snapshot.symbol if action.snapshot else ""),
+                    strategy=(action.snapshot.strategy if action.snapshot else ""),
+                    side=action.side,
+                    state=BasketState.ACTIVE,
+                    entry_px=action.entry_px or action.px,
+                    current_sz=action.sz,
+                    stop_px=action.stop_px,
+                    target_px=action.target_px,
+                )
+                self.replace_or_add(basket)
+            else:
+                basket.state = BasketState.ACTIVE
+                basket.side = action.side or basket.side
+                basket.entry_px = action.entry_px or action.px
+                basket.current_sz = action.sz
+                basket.stop_px = action.stop_px
+                basket.target_px = action.target_px
+            return
+        if basket is None:
+            return
+        if action.action == ActionKind.ADD_GRID:
+            basket.add_to_position(action.sz, action.px)
+            basket.recovery_level += 1
+            basket.recovery_activated = True
+        elif action.action == ActionKind.HEDGE:
+            hedge_id = f"{action.basket_id}_hedge"
+            self.replace_or_add(
+                Basket(
+                    basket_id=hedge_id,
+                    symbol=basket.symbol,
+                    strategy=basket.strategy,
+                    side=action.side,
+                    state=BasketState.ACTIVE,
+                    entry_px=action.entry_px or action.px,
+                    current_sz=action.sz,
+                    stop_px=action.stop_px,
+                    target_px=action.target_px,
+                    recovery_activated=True,
+                    recovery_level=basket.recovery_level + 1,
+                )
+            )
+            basket.recovery_level += 1
+            basket.recovery_activated = True
+        elif action.action == ActionKind.EXIT:
+            self.close(basket)
+
+    def apply_actions(self, actions: list[BasketAction]) -> None:
+        for action in actions:
+            self.apply_action(action)
+
+    def advance_bar(self, close: float, high: float, low: float, *, skip_ids: set[str]) -> None:
+        for basket in self.active():
+            if basket.basket_id in skip_ids:
+                continue
+            if high > basket.trail_high:
+                basket.trail_high = high
+            if low < basket.trail_low:
+                basket.trail_low = low
+            d = 1 if basket.side == "buy" else -1
+            target_hit = high >= basket.target_px if d > 0 else low <= basket.target_px
+            if basket.target_px > 0 and not basket.target_hit and target_hit:
+                basket.target_hit = True
+            basket.bars_in_pos += 1
 
 
 def evaluate_exits(
@@ -274,17 +504,18 @@ def evaluate_exits(
 
     trail.update(bar_high, bar_low)
 
-    stop_px = entry - d * config.stop_mult * atr
-    target_px = entry + d * config.target_mult * atr
+    stop_px = basket.stop_px if basket.stop_px > 0 else entry - d * config.stop_mult * atr
+    target_px = basket.target_px if basket.target_px > 0 else entry + d * config.target_mult * atr
 
     if not trail.target_hit:
-        if d * (stop_px - bar_close) >= 0:
+        stop_hit = bar_low <= stop_px if d > 0 else bar_high >= stop_px
+        if stop_hit:
             return BasketAction(
                 basket_id=basket.basket_id,
                 action=ActionKind.EXIT,
                 side=basket.side,
                 reason=ExitReason.STOP.value,
-                px=bar_close,
+                px=stop_px,
                 fraction=1.0,
             )
 
@@ -333,7 +564,8 @@ def evaluate_exits(
                 fraction=1.0,
             )
 
-    if not trail.target_hit and d * (bar_close - target_px) >= 0:
+    target_hit = bar_high >= target_px if d > 0 else bar_low <= target_px
+    if not trail.target_hit and target_hit:
         trail.target_hit = True
 
     if bars >= config.max_bars:

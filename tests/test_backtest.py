@@ -2,13 +2,13 @@
 
 import polars as pl
 
-from qooi.core.indicators import compute_dataframe
-from qooi.strategies.flow_pipeline import (
+from qooi.strategies.indicators import (
+    add_indicators,
     add_ofi_flow_columns,
     add_regime_features,
     apply_regime_gate,
+    compute_flow_pipeline_frame,
 )
-from qooi.strategies.indicators import add_indicators
 
 
 def _load(name: str) -> pl.DataFrame:
@@ -28,5 +28,5 @@ def test_flow_pipeline_matches_manual_composition():
     manual = manual.with_columns(
         pl.when(ofi.abs() >= 0.25).then(ofi).otherwise(0.0).alias("signal")
     )
-    computed = compute_dataframe(df.clone(), 0.25)
+    computed = compute_flow_pipeline_frame(df.clone(), 0.25)
     assert computed["signal"].to_list() == manual["signal"].to_list()

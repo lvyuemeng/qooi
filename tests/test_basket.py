@@ -1,6 +1,15 @@
 """Basket invariants."""
 
-from qooi.core.basket import Basket, BasketBook, BasketManager, BasketState, Position
+from qooi.core.basket import (
+    ActionKind,
+    Basket,
+    BasketAction,
+    BasketBook,
+    BasketManager,
+    BasketState,
+    Position,
+)
+from qooi.core.config import AssetConfig
 
 
 def test_create_basket_initializes_full_state():
@@ -14,7 +23,7 @@ def test_create_basket_initializes_full_state():
         stop_px=2950.0,
         target_px=3060.0,
     )
-    assert b.basket_id == "ETH-USDT-SWAP-momentum_burst"
+    assert b.basket_id == "ETH-USDT-SWAP-momentum_burst-long-1-1"
     assert b.state == BasketState.ACTIVE
     assert b.entry_px == 3000.0
     assert b.current_sz == 2.0
@@ -96,10 +105,38 @@ def test_basket_book_owns_lifecycle_state():
     book = BasketBook(max_per_symbol=1)
     basket = book.open("ETH", "momentum", "buy", 100.0, 2.0, 95.0, 110.0)
 
-    assert book.get("ETH-momentum") is basket
+    assert book.get(basket.basket_id) is basket
     assert book.active_exposure() == 2.0
     assert book.can_open("ETH") is False
 
     book.close(basket)
     assert basket.is_idle
     assert book.can_open("ETH") is True
+
+
+def test_apply_action_owns_recovery_state_mutation():
+    book = BasketBook()
+    basket = book.open("ETH", "momentum", "buy", 100.0, 2.0, 95.0, 110.0)
+
+    book.apply_action(BasketAction(basket.basket_id, ActionKind.ADD_GRID, sz=1.0, px=98.0))
+
+    assert basket.recovery_level == 1
+    assert basket.recovery_activated is True
+
+
+def test_size_decision_reports_binding_cap_and_can_block_min_contract():
+    cfg = AssetConfig(
+        symbol="ETH",
+        capital=100.0,
+        leverage=1.0,
+        ct_val=1.0,
+        max_risk_pct=0.01,
+        max_notional_pct_per_basket=0.01,
+        min_contracts=1,
+    )
+
+    decision = BasketManager.size_decision(100.0, 95.0, cfg)
+
+    assert decision.contracts == 0
+    assert decision.binding_cap == "risk"
+    assert decision.blocked_reason == "below_min_contracts_1"
