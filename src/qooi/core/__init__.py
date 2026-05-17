@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import polars as pl
@@ -15,8 +16,10 @@ from qooi.core.basket import (
     BasketSnapshot,
     ExitConfig,
     ExitReason,
+    SizingDecision,
     TrailTracker,
     evaluate_exits,
+    evaluate_hard_exits,
 )
 from qooi.core.config import PairConfig
 from qooi.core.recovery import NoRecovery, RecoveryPolicy
@@ -52,6 +55,14 @@ class BarSignal:
     exit: bool = False
     strength: float = 1.0
     signal_id: str = ""
+    zscore: float | None = None
+    zscore_delta: float | None = None
+    short_momentum_return: float | None = None
+    lower_wick_ratio: float | None = None
+    upper_wick_ratio: float | None = None
+    volatility_ratio: float | None = None
+    trend_return: float | None = None
+    adx: float | None = None
 
 
 @dataclass(frozen=True)
@@ -102,8 +113,18 @@ def process_bar(
             terminal_ids.add(basket.basket_id)
             continue
 
+        hard_exit_action = _evaluate_hard_basket_exit(
+            basket, market, signal, exit_cfg, book.snapshot(basket)
+        )
+        if hard_exit_action is not None:
+            actions.append(hard_exit_action)
+            terminal_ids.add(basket.basket_id)
+            continue
+
         recovery_actions = _build_recovery_actions(
+            book,
             basket,
+            pair,
             market,
             signal,
             book.snapshot(basket),
@@ -116,6 +137,14 @@ def process_bar(
                 ct_val=pair.asset.ct_val,
                 signal_position=signal.position,
                 signal_entry=signal.entry,
+                zscore=signal.zscore,
+                zscore_delta=signal.zscore_delta,
+                short_momentum_return=signal.short_momentum_return,
+                lower_wick_ratio=signal.lower_wick_ratio,
+                upper_wick_ratio=signal.upper_wick_ratio,
+                volatility_ratio=signal.volatility_ratio,
+                trend_return=signal.trend_return,
+                adx=signal.adx,
             ),
         )
         if recovery_actions:
@@ -163,7 +192,9 @@ def _evaluate_hold_thesis(
 
 
 def _build_recovery_actions(
+    book: BasketBook,
     basket: Basket,
+    pair: PairConfig,
     market: BarMarket,
     signal: BarSignal,
     snapshot: BasketSnapshot,
@@ -174,42 +205,148 @@ def _build_recovery_actions(
         if proposal.action == ActionKind.EXIT:
             actions.append(_exit_action(basket, market, signal, snapshot, proposal.reason))
         elif proposal.action == ActionKind.ENTER:
+            sz, stop_px, target_px, sizing = _size_recovery_proposal(
+                book, basket, pair, market, signal, proposal
+            )
             actions.append(
                 BasketAction(
                     basket_id=proposal.basket_id,
                     action=ActionKind.ENTER,
                     side=proposal.side,
-                    sz=proposal.sz,
+                    sz=sz,
                     px=proposal.px or market.close,
                     entry_px=proposal.entry_px or proposal.px or market.close,
-                    stop_px=proposal.stop_px,
-                    target_px=proposal.target_px,
+                    stop_px=stop_px,
+                    target_px=target_px,
                     reason=proposal.reason,
                     signal_id=proposal.signal_id or signal.signal_id,
                     signal_strength=signal.strength,
-                    sizing=proposal.sizing,
+                    sizing=sizing,
                     snapshot=snapshot,
                 )
             )
         else:
+            sz, stop_px, target_px, sizing = _size_recovery_proposal(
+                book, basket, pair, market, signal, proposal
+            )
             actions.append(
                 BasketAction(
                     basket_id=proposal.basket_id,
                     action=proposal.action,
                     side=proposal.side,
-                    sz=proposal.sz,
+                    sz=sz,
                     px=proposal.px or market.close,
                     entry_px=proposal.entry_px or proposal.px or market.close,
-                    stop_px=proposal.stop_px,
-                    target_px=proposal.target_px,
+                    stop_px=stop_px,
+                    target_px=target_px,
                     reason=proposal.reason,
                     signal_id=proposal.signal_id or signal.signal_id,
                     signal_strength=signal.strength,
-                    sizing=proposal.sizing,
+                    sizing=sizing,
                     snapshot=snapshot,
                 )
             )
     return actions
+
+
+def _size_recovery_proposal(
+    book: BasketBook,
+    basket: Basket,
+    pair: PairConfig,
+    market: BarMarket,
+    signal: BarSignal,
+    proposal: BasketAction,
+) -> tuple[float, float, float, SizingDecision | None]:
+    stop_px, target_px = _recovery_stop_target(book, basket, pair, market, proposal)
+    sizing = proposal.sizing or _recovery_sizing(
+        book,
+        basket,
+        pair,
+        market,
+        signal,
+        proposal,
+        stop_px,
+    )
+    sz = sizing.contracts if sizing is not None else proposal.sz
+    return sz, stop_px, target_px, sizing
+
+
+def _recovery_sizing(
+    book: BasketBook,
+    basket: Basket,
+    pair: PairConfig,
+    market: BarMarket,
+    signal: BarSignal,
+    proposal: BasketAction,
+    stop_px: float,
+) -> SizingDecision:
+    if proposal.action not in {ActionKind.ADD_GRID, ActionKind.HEDGE, ActionKind.ENTER}:
+        return SizingDecision(0, 0.0, 0.0, 0.0, 0.0, 0.0, "none", "not_sizable")
+
+    entry_px = proposal.entry_px or proposal.px or market.close
+    sizing = book.policy.size_decision(
+        entry_px,
+        stop_px,
+        pair.asset,
+        signal_strength=signal.strength,
+    )
+    requested_sz = _round_down_to_lot(proposal.sz, pair.asset)
+    if sizing.contracts <= 0 or requested_sz <= 0:
+        min_reason = f"below_min_contracts_{pair.asset.min_contracts:g}"
+        return replace(
+            sizing,
+            contracts=0.0,
+            blocked_reason=sizing.blocked_reason or min_reason,
+        )
+    capped_sz = _round_down_to_lot(min(requested_sz, sizing.contracts), pair.asset)
+    if capped_sz + 1e-9 < float(getattr(pair.asset, "min_contracts", 1.0)):
+        return replace(
+            sizing,
+            contracts=0.0,
+            blocked_reason=f"below_min_contracts_{pair.asset.min_contracts:g}",
+        )
+    return replace(sizing, contracts=capped_sz)
+
+
+def _recovery_stop_target(
+    book: BasketBook,
+    basket: Basket,
+    pair: PairConfig,
+    market: BarMarket,
+    proposal: BasketAction,
+) -> tuple[float, float]:
+    side = proposal.side or basket.side
+    entry_px = proposal.entry_px or proposal.px or market.close
+    stop_px = proposal.stop_px
+    target_px = proposal.target_px
+    if proposal.action == ActionKind.ADD_GRID:
+        stop_px = _valid_recovery_stop(side, entry_px, basket.stop_px)
+        target_px = target_px or basket.target_px
+    if stop_px <= 0:
+        stop_px, computed_target_px = book.policy.compute_stop_target(
+            side,
+            entry_px,
+            market.atr,
+            pair.asset,
+        )
+        target_px = target_px or computed_target_px
+    return stop_px, target_px
+
+
+def _valid_recovery_stop(side: str, entry_px: float, stop_px: float) -> float:
+    if stop_px <= 0:
+        return 0.0
+    if side == "buy" and stop_px < entry_px:
+        return stop_px
+    if side == "sell" and stop_px > entry_px:
+        return stop_px
+    return 0.0
+
+
+def _round_down_to_lot(size: float, cfg) -> float:
+    lot_size = max(float(getattr(cfg, "lot_size", 1.0)), 1e-9)
+    lots = math.floor(max(float(size or 0.0), 0.0) / lot_size + 1e-9)
+    return round(lots * lot_size, 10)
 
 
 def _evaluate_basket_exit(
@@ -233,6 +370,26 @@ def _evaluate_basket_exit(
         trail,
         exit_cfg,
         skip_trailing=basket.recovery_activated and basket.recovery_level > 0,
+    )
+    if action is None:
+        return None
+    return _exit_action(basket, market, signal, snapshot, action.reason, px=action.px)
+
+
+def _evaluate_hard_basket_exit(
+    basket: Basket,
+    market: BarMarket,
+    signal: BarSignal,
+    exit_cfg: ExitConfig,
+    snapshot: BasketSnapshot,
+) -> BasketAction | None:
+    action = evaluate_hard_exits(
+        basket,
+        market.close,
+        market.high,
+        market.low,
+        market.atr,
+        exit_cfg,
     )
     if action is None:
         return None

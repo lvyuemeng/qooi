@@ -7,6 +7,7 @@ from qooi.core.basket import (
     ExitReason,
     TrailTracker,
     evaluate_exits,
+    evaluate_hard_exits,
 )
 
 
@@ -33,6 +34,54 @@ def test_stop_hit_long():
     assert a.reason == ExitReason.STOP.value
 
 
+def test_hard_exit_stop_matches_normal_stop_for_long_and_short():
+    cfg = ExitConfig(stop_mult=1.0, target_mult=10.0, max_bars=100)
+    cases = [
+        (_b("buy", 100.0), 94.0, 100.0, 94.0),
+        (_b("sell", 100.0), 106.0, 106.0, 100.0),
+    ]
+
+    for basket, close, high, low in cases:
+        normal = evaluate_exits(
+            basket,
+            bar_close=close,
+            bar_high=high,
+            bar_low=low,
+            atr=5.0,
+            trail=TrailTracker(),
+            config=cfg,
+        )
+        hard = evaluate_hard_exits(
+            basket,
+            bar_close=close,
+            bar_high=high,
+            bar_low=low,
+            atr=5.0,
+            config=cfg,
+        )
+        assert normal is not None
+        assert hard is not None
+        assert normal.reason == hard.reason == ExitReason.STOP.value
+        assert normal.px == hard.px
+
+
+def test_hard_exit_ignores_stop_after_target_already_active():
+    basket = _b("buy", 100.0)
+    basket.target_hit = True
+    cfg = ExitConfig(stop_mult=1.0, target_mult=1.0, max_bars=100)
+
+    hard = evaluate_hard_exits(
+        basket,
+        bar_close=94.0,
+        bar_high=110.0,
+        bar_low=94.0,
+        atr=5.0,
+        config=cfg,
+    )
+
+    assert hard is None
+
+
 def test_stop_not_hit_if_target_first():
     b = _b("buy", 100.0)
     t = TrailTracker(target_hit=True)  # target already hit, trailing activated
@@ -46,6 +95,25 @@ def test_target_activates_trail():
     t = TrailTracker()
     cfg = ExitConfig(target_mult=1.0, trail_mult=2.0, max_bars=100)
     a = evaluate_exits(b, bar_close=106.0, bar_high=106, bar_low=105, atr=5.0, trail=t, config=cfg)
+    assert t.target_hit is True
+    assert a is None
+
+
+def test_target_activation_does_not_trail_exit_until_next_bar():
+    b = _b("buy", 100.0)
+    t = TrailTracker()
+    cfg = ExitConfig(stop_mult=10.0, target_mult=1.0, trail_mult=0.5, max_bars=100)
+
+    a = evaluate_exits(
+        b,
+        bar_close=101.0,
+        bar_high=106.0,
+        bar_low=100.0,
+        atr=5.0,
+        trail=t,
+        config=cfg,
+    )
+
     assert t.target_hit is True
     assert a is None
 

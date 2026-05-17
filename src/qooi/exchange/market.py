@@ -29,13 +29,24 @@ Usage::
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
+import httpx
 import polars as pl
+from tenacity import AsyncRetrying, Retrying, retry_if_exception_type, stop_after_attempt
+from tenacity.wait import wait_exponential_jitter
+
+CandleSource = Literal["trade", "mark", "index"]
+OKX_INDEX_INST_IDS = {
+    "BTC-USDT-SWAP": "BTC-USD",
+    "ETH-USDT-SWAP": "ETH-USD",
+    "SOL-USDT-SWAP": "SOL-USD",
+}
 
 # ---------------------------------------------------------------------------
 # Protocols — contracts for backend providers
@@ -46,12 +57,49 @@ class OhlcvProvider(Protocol):
     """Any backend that can fetch OHLCV candles."""
 
     def fetch_ohlcv(
-        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 500,
+        since: int | None = None,
+        source: CandleSource = "trade",
     ) -> list[list]: ...
 
     def fetch_ohlcv_range(
-        self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: str = "2020-01-01",
+        limit: int = 3000,
+        source: CandleSource = "trade",
     ) -> pl.DataFrame: ...
+
+
+class AsyncOhlcvProvider(Protocol):
+    """Any async REST backend that can fetch OHLCV candles."""
+
+    async def fetch_ohlcv_async(
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 500,
+        since: int | None = None,
+        source: CandleSource = "trade",
+    ) -> list[list]: ...
+
+    async def fetch_ohlcv_range_async(
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: str = "2020-01-01",
+        limit: int = 3000,
+        source: CandleSource = "trade",
+    ) -> pl.DataFrame: ...
+
+    @property
+    def last_ohlcv_audit(self) -> tuple[str, ...]: ...
+
+    async def close(self) -> None: ...
 
 
 class OrderBookProvider(Protocol):
@@ -60,7 +108,12 @@ class OrderBookProvider(Protocol):
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot: ...
 
     def fetch_ohlcv(
-        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 500,
+        since: int | None = None,
+        source: CandleSource = "trade",
     ) -> list[list]: ...
 
     def close(self) -> None: ...
@@ -165,19 +218,31 @@ class ExchangeBackend:
         return self._exchange_id
 
     def fetch_ohlcv(
-        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 500,
+        since: int | None = None,
+        source: CandleSource = "trade",
     ) -> list[list]:
         raise NotImplementedError
 
     def fetch_ohlcv_range(
-        self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: str = "2020-01-01",
+        limit: int = 3000,
+        source: CandleSource = "trade",
     ) -> pl.DataFrame:
+        if source != "trade":
+            raise ValueError(f"{self.exchange_id} does not support {source} candle source")
         data: list[list] = []
         since_ms = int(datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
         pages = 0
         stop_reason = "limit_reached"
         while len(data) < limit:
-            chunk = self.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=500)
+            chunk = self.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=500, source=source)
             if not chunk:
                 stop_reason = "empty_page"
                 break
@@ -197,7 +262,7 @@ class ExchangeBackend:
             f"fetch_stop={stop_reason}",
             "fetch_cursor=since",
         )
-        return _parse_ohlcv(data)
+        return _parse_ohlcv(data, source=source)
 
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot:
         raise NotImplementedError
@@ -257,8 +322,15 @@ class CcxtBackend(ExchangeBackend):
             raise ConnectionError(msg + (f" via proxy {self._proxy}" if self._proxy else "")) from e
 
     def fetch_ohlcv(
-        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 500,
+        since: int | None = None,
+        source: CandleSource = "trade",
     ) -> list[list]:
+        if source != "trade":
+            raise ValueError(f"CCXT backend does not support {source} candle source")
         self._ensure_markets()
         return self._ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)  # type: ignore[no-any-return]
 
@@ -292,8 +364,15 @@ class OkxSdkBackend(ExchangeBackend):
         self._ob_fallback: OrderBookProvider | None = order_book
 
     def fetch_ohlcv(
-        self, symbol: str, timeframe: str = "1d", limit: int = 500, since: int | None = None
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 500,
+        since: int | None = None,
+        source: CandleSource = "trade",
     ) -> list[list]:
+        if source != "trade":
+            return self._fetch_okx_public_candles(symbol, timeframe, limit=limit, source=source)
         try:
             resp = self._api.get_candlesticks(instId=symbol, bar=timeframe, limit=str(limit))
             if resp.get("code") != "0":
@@ -305,11 +384,16 @@ class OkxSdkBackend(ExchangeBackend):
         except Exception:
             pass
         if self._ob_fallback:
-            return self._ob_fallback.fetch_ohlcv(symbol, timeframe, limit=limit)
+            return self._ob_fallback.fetch_ohlcv(symbol, timeframe, limit=limit, source=source)
         raise RuntimeError(f"OKX SDK failed for {symbol}, no fallback configured")
 
     def fetch_ohlcv_range(
-        self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: str = "2020-01-01",
+        limit: int = 3000,
+        source: CandleSource = "trade",
     ) -> pl.DataFrame:
         """Use OKX native history candles for contiguous deep pagination."""
         since_ms = int(datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
@@ -325,19 +409,17 @@ class OkxSdkBackend(ExchangeBackend):
 
         while len(rows) < limit:
             try:
-                resp = self._api.get_history_candlesticks(
-                    instId=symbol,
-                    after=after,
-                    bar=_okx_timeframe(timeframe),
-                    limit=str(page_limit),
+                resp = self._fetch_okx_history_response_with_retry(
+                    symbol, timeframe, after, page_limit, source
                 )
             except Exception as exc:
                 stop_reason = f"page_error_{type(exc).__name__}"
-                if rows:
+                if rows or source != "trade":
                     break
                 self._last_ohlcv_audit = (
                     "fetch_backend=okx",
-                    "fetch_endpoint=history_candlesticks",
+                    f"fetch_endpoint={_okx_history_endpoint_name(source)}",
+                    f"fetch_source={source}",
                     f"fetch_pages={pages}",
                     f"fetch_page_limit={page_limit}",
                     f"fetch_stop={stop_reason}_fallback",
@@ -346,9 +428,13 @@ class OkxSdkBackend(ExchangeBackend):
                 )
                 return ExchangeBackend.fetch_ohlcv_range(self, symbol, timeframe, since, limit)
             if resp.get("code") != "0":
+                if source != "trade":
+                    stop_reason = f"okx_error_{resp.get('code', 'unknown')}"
+                    break
                 self._last_ohlcv_audit = (
                     "fetch_backend=okx",
-                    "fetch_endpoint=history_candlesticks",
+                    f"fetch_endpoint={_okx_history_endpoint_name(source)}",
+                    f"fetch_source={source}",
                     f"fetch_pages={pages}",
                     f"fetch_page_limit={page_limit}",
                     "fetch_stop=sdk_error_fallback",
@@ -356,6 +442,10 @@ class OkxSdkBackend(ExchangeBackend):
                     f"fetch_duplicates={duplicate_count}",
                 )
                 return ExchangeBackend.fetch_ohlcv_range(self, symbol, timeframe, since, limit)
+            if source == "index":
+                time.sleep(0.2)
+            elif source == "mark":
+                time.sleep(0.1)
 
             chunk = resp.get("data", [])
             if not chunk:
@@ -376,16 +466,7 @@ class OkxSdkBackend(ExchangeBackend):
                     duplicate_count += 1
                     continue
                 seen.add(ts)
-                rows.append(
-                    [
-                        ts,
-                        float(candle[1]),
-                        float(candle[2]),
-                        float(candle[3]),
-                        float(candle[4]),
-                        float(candle[5]),
-                    ]
-                )
+                rows.append(candle)
 
             if oldest_ts is None or oldest_ts <= since_ms or len(chunk) < page_limit:
                 if oldest_ts is None:
@@ -399,7 +480,8 @@ class OkxSdkBackend(ExchangeBackend):
 
         self._last_ohlcv_audit = (
             "fetch_backend=okx",
-            "fetch_endpoint=history_candlesticks",
+            f"fetch_endpoint={_okx_history_endpoint_name(source)}",
+            f"fetch_source={source}",
             f"fetch_pages={pages}",
             f"fetch_page_limit={page_limit}",
             f"fetch_stop={stop_reason}",
@@ -413,7 +495,93 @@ class OkxSdkBackend(ExchangeBackend):
         if not rows:
             return pl.DataFrame()
 
-        return _parse_ohlcv(rows).filter(pl.col("timestamp") >= since_ms).tail(limit)
+        return _parse_ohlcv(rows, source=source).filter(pl.col("timestamp") >= since_ms).tail(limit)
+
+    def _fetch_okx_history_response(
+        self,
+        symbol: str,
+        timeframe: str,
+        after: str,
+        limit: int,
+        source: CandleSource,
+    ) -> dict[str, Any]:
+        if source == "trade":
+            return self._api.get_history_candlesticks(
+                instId=symbol,
+                after=after,
+                bar=_okx_timeframe(timeframe),
+                limit=str(limit),
+            )
+        return self._request_okx_public(
+            _okx_history_endpoint_name(source),
+            symbol,
+            timeframe,
+            limit=limit,
+            after=after,
+        )
+
+    def _fetch_okx_public_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        limit: int,
+        source: CandleSource,
+    ) -> list[list]:
+        resp = self._request_okx_public(
+            _okx_recent_endpoint_name(source),
+            symbol,
+            timeframe,
+            limit=limit,
+        )
+        if resp.get("code") != "0":
+            raise RuntimeError(f"OKX {source} candle error: {resp.get('msg', resp)}")
+        return resp.get("data", [])
+
+    def _request_okx_public(
+        self,
+        endpoint: str,
+        symbol: str,
+        timeframe: str,
+        *,
+        limit: int,
+        after: str = "",
+    ) -> dict[str, Any]:
+        params = {
+            "instId": symbol,
+            "bar": _okx_timeframe(timeframe),
+            "limit": str(limit),
+        }
+        if after:
+            params["after"] = after
+        with httpx.Client(base_url="https://www.okx.com", timeout=20.0) as client:
+            response = client.get(endpoint, params=params)
+            response.raise_for_status()
+            data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected OKX response for {endpoint}: {data}")
+        return data
+
+    def _fetch_okx_history_response_with_retry(
+        self,
+        symbol: str,
+        timeframe: str,
+        after: str,
+        limit: int,
+        source: CandleSource,
+    ) -> dict[str, Any]:
+        retryer = Retrying(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential_jitter(initial=0.5, max=8.0),
+            retry=retry_if_exception_type(
+                (httpx.TimeoutException, httpx.TransportError, ConnectionError)
+            ),
+            reraise=True,
+        )
+        for attempt in retryer:
+            with attempt:
+                return self._fetch_okx_history_response(symbol, timeframe, after, limit, source)
+        raise RuntimeError("unreachable OKX history retry state")
 
     def fetch_order_book(self, symbol: str, limit: int = 25) -> ObSnapshot:
         try:
@@ -504,6 +672,158 @@ class OkxSdkBackend(ExchangeBackend):
 
 
 # ---------------------------------------------------------------------------
+# OkxAsyncBackend — async REST OHLCV
+# ---------------------------------------------------------------------------
+
+
+class OkxAsyncBackend:
+    """Async OKX public REST backend for OHLCV/cache refresh work."""
+
+    def __init__(self, proxy: str | None = None) -> None:
+        self._client = httpx.AsyncClient(
+            base_url="https://www.okx.com",
+            timeout=20.0,
+            proxy=proxy,
+        )
+        self._last_ohlcv_audit: tuple[str, ...] = ()
+
+    @property
+    def last_ohlcv_audit(self) -> tuple[str, ...]:
+        return self._last_ohlcv_audit
+
+    async def fetch_ohlcv_async(
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 500,
+        since: int | None = None,
+        source: CandleSource = "trade",
+    ) -> list[list]:
+        params: dict[str, str] = {
+            "instId": symbol,
+            "bar": _okx_timeframe(timeframe),
+            "limit": str(limit),
+        }
+        if since is not None:
+            params["before"] = str(since)
+        resp = await self._request_okx_public_async(_okx_recent_endpoint_path(source), params)
+        if resp.get("code") != "0":
+            raise RuntimeError(f"OKX {source} candle error: {resp.get('msg', resp)}")
+        return resp.get("data", [])
+
+    async def fetch_ohlcv_range_async(
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: str = "2020-01-01",
+        limit: int = 3000,
+        source: CandleSource = "trade",
+    ) -> pl.DataFrame:
+        since_ms = int(datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
+        page_limit = min(100, limit)
+        after = ""
+        rows: list[list] = []
+        seen: set[int] = set()
+        pages = 0
+        duplicate_count = 0
+        stop_reason = "limit_reached"
+        first_page_range = "fetch_first_page=n/a"
+        last_page_range = "fetch_last_page=n/a"
+
+        while len(rows) < limit:
+            params = {
+                "instId": symbol,
+                "bar": _okx_timeframe(timeframe),
+                "limit": str(page_limit),
+            }
+            if after:
+                params["after"] = after
+            try:
+                resp = await self._request_okx_public_async(
+                    _okx_history_endpoint_path(source), params
+                )
+            except Exception as exc:
+                stop_reason = f"page_error_{type(exc).__name__}"
+                break
+            if resp.get("code") != "0":
+                stop_reason = f"okx_error_{resp.get('code', 'unknown')}"
+                break
+
+            chunk = resp.get("data", [])
+            if not chunk:
+                stop_reason = "empty_page"
+                break
+            pages += 1
+            chunk_ts = [int(candle[0]) for candle in chunk]
+            page_range = f"{min(chunk_ts)}..{max(chunk_ts)}"
+            if pages == 1:
+                first_page_range = f"fetch_first_page={page_range}"
+            last_page_range = f"fetch_last_page={page_range}"
+
+            oldest_ts = None
+            for candle in chunk:
+                ts = int(candle[0])
+                oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
+                if ts in seen:
+                    duplicate_count += 1
+                    continue
+                seen.add(ts)
+                rows.append(candle)
+
+            if oldest_ts is None or oldest_ts <= since_ms or len(chunk) < page_limit:
+                if oldest_ts is None:
+                    stop_reason = "missing_oldest_ts"
+                elif oldest_ts <= since_ms:
+                    stop_reason = "reached_since"
+                else:
+                    stop_reason = "short_page"
+                break
+            after = str(oldest_ts)
+
+        self._last_ohlcv_audit = (
+            "fetch_backend=okx",
+            f"fetch_endpoint={_okx_history_endpoint_name(source)}",
+            f"fetch_source={source}",
+            f"fetch_pages={pages}",
+            f"fetch_page_limit={page_limit}",
+            f"fetch_stop={stop_reason}",
+            "fetch_cursor=after",
+            f"fetch_oldest_ts={min(seen) if seen else 'n/a'}",
+            f"fetch_since_ms={since_ms}",
+            f"fetch_duplicates={duplicate_count}",
+            "fetch_transport=async_httpx",
+            first_page_range,
+            last_page_range,
+        )
+        if not rows:
+            return pl.DataFrame()
+        return _parse_ohlcv(rows, source=source).filter(pl.col("timestamp") >= since_ms).tail(limit)
+
+    async def _request_okx_public_async(
+        self, endpoint: str, params: dict[str, str]
+    ) -> dict[str, Any]:
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential_jitter(initial=0.5, max=8.0),
+            retry=retry_if_exception_type(
+                (httpx.TimeoutException, httpx.TransportError, ConnectionError)
+            ),
+            reraise=True,
+        ):
+            with attempt:
+                response = await self._client.get(endpoint, params=params)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"Unexpected OKX response for {endpoint}: {data}")
+                return data
+        raise RuntimeError("unreachable OKX async retry state")
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+# ---------------------------------------------------------------------------
 # CcxtProBackend — async WebSocket overlay
 # ---------------------------------------------------------------------------
 
@@ -571,6 +891,7 @@ class MarketData:
     def __init__(self, exchange_id: str = "okx", proxy: str | None = None) -> None:
         self._backend: ExchangeBackend
         self._async_backend: CcxtProBackend | None = None
+        self._async_rest_backend: AsyncOhlcvProvider | None = None
         self._proxy = proxy
 
         backend_cls = self._registry.get(exchange_id, self._fallback)
@@ -596,6 +917,8 @@ class MarketData:
     async def __aexit__(self, *_: Any) -> None:
         if self._async_backend:
             await self._async_backend.close()
+        if self._async_rest_backend:
+            await self._async_rest_backend.close()
         self._backend.close()
 
     # -- compat: kept for existing callers, delegates to __aenter__ ------
@@ -604,6 +927,15 @@ class MarketData:
         """Create instance with async WS support.  Prefer ``async with``."""
         md = cls(exchange_id, proxy)
         return await md.__aenter__()
+
+    @classmethod
+    async def async_rest(cls, exchange_id: str = "okx", proxy: str | None = None) -> MarketData:
+        """Create instance with async REST OHLCV support for cache refresh work."""
+        if exchange_id != "okx":
+            raise ValueError(f"Async REST OHLCV is not implemented for {exchange_id}")
+        md = cls(exchange_id, proxy)
+        md._async_rest_backend = OkxAsyncBackend(proxy)
+        return md
 
     @property
     def exchange_id(self) -> str:
@@ -615,6 +947,8 @@ class MarketData:
 
     @property
     def last_ohlcv_audit(self) -> tuple[str, ...]:
+        if self._async_rest_backend is not None:
+            return self._async_rest_backend.last_ohlcv_audit
         return self._backend.last_ohlcv_audit
 
     # -- OHLCV -----------------------------------------------------------
@@ -626,14 +960,16 @@ class MarketData:
         limit: int = 300,
         since: int | None = None,
         cache: bool = False,
+        source: CandleSource = "trade",
     ) -> pl.DataFrame:
         raw = self._backend.fetch_ohlcv(
             symbol,
             _normalize_timeframe(timeframe),
             limit=limit,
             since=since,
+            source=source,
         )
-        df = _parse_ohlcv(raw)
+        df = _parse_ohlcv(raw, source=source)
 
         if cache and not df.is_empty():
             cache_path = _cache_path(symbol, timeframe)
@@ -651,13 +987,56 @@ class MarketData:
         return df
 
     def candles_range(
-        self, symbol: str, timeframe: str = "1d", since: str = "2020-01-01", limit: int = 3000
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: str = "2020-01-01",
+        limit: int = 3000,
+        source: CandleSource = "trade",
     ) -> pl.DataFrame:
         return self._backend.fetch_ohlcv_range(
             symbol,
             _normalize_timeframe(timeframe),
             since,
             limit,
+            source=source,
+        )
+
+    async def candles_async(
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        limit: int = 300,
+        since: int | None = None,
+        source: CandleSource = "trade",
+    ) -> pl.DataFrame:
+        if self._async_rest_backend is None:
+            raise RuntimeError("Use MarketData.async_rest() for async REST OHLCV access")
+        raw = await self._async_rest_backend.fetch_ohlcv_async(
+            symbol,
+            _normalize_timeframe(timeframe),
+            limit=limit,
+            since=since,
+            source=source,
+        )
+        return _parse_ohlcv(raw, source=source)
+
+    async def candles_range_async(
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: str = "2020-01-01",
+        limit: int = 3000,
+        source: CandleSource = "trade",
+    ) -> pl.DataFrame:
+        if self._async_rest_backend is None:
+            raise RuntimeError("Use MarketData.async_rest() for async REST OHLCV access")
+        return await self._async_rest_backend.fetch_ohlcv_range_async(
+            symbol,
+            _normalize_timeframe(timeframe),
+            since,
+            limit,
+            source=source,
         )
 
     # -- Order book ------------------------------------------------------
@@ -711,6 +1090,8 @@ class MarketData:
     async def close(self) -> None:
         if self._async_backend:
             await self._async_backend.close()
+        if self._async_rest_backend:
+            await self._async_rest_backend.close()
         self._backend.close()
 
 
@@ -719,22 +1100,68 @@ class MarketData:
 # ---------------------------------------------------------------------------
 
 
-def _parse_ohlcv(raw: list[list]) -> pl.DataFrame:
+def _parse_ohlcv(raw: list[list], *, source: CandleSource = "trade") -> pl.DataFrame:
     if not raw:
         return pl.DataFrame()
-    return pl.DataFrame(
-        [
+    rows = []
+    for r in raw:
+        confirm = str(r[5]) if source in {"mark", "index"} and len(r) > 5 else "1"
+        if source in {"mark", "index"} and confirm == "0":
+            continue
+        rows.append(
             {
                 "timestamp": int(r[0]),
                 "open": float(r[1]),
                 "high": float(r[2]),
                 "low": float(r[3]),
                 "close": float(r[4]),
-                "vol": float(r[5]),
+                "vol": 0.0 if source in {"mark", "index"} else float(r[5]),
             }
-            for r in raw
-        ]
+        )
+    if not rows:
+        return pl.DataFrame()
+    return pl.DataFrame(
+        rows
     ).sort("timestamp")
+
+
+def _okx_history_endpoint_name(source: CandleSource) -> str:
+    if source == "index":
+        return "/api/v5/market/history-index-candles"
+    if source == "mark":
+        return "/api/v5/market/history-mark-price-candles"
+    return "history_candlesticks"
+
+
+def _okx_history_endpoint_path(source: CandleSource) -> str:
+    if source == "index":
+        return "/api/v5/market/history-index-candles"
+    if source == "mark":
+        return "/api/v5/market/history-mark-price-candles"
+    return "/api/v5/market/history-candles"
+
+
+def _okx_recent_endpoint_name(source: CandleSource) -> str:
+    if source == "index":
+        return "/api/v5/market/index-candles"
+    if source == "mark":
+        return "/api/v5/market/mark-price-candles"
+    return "candlesticks"
+
+
+def _okx_recent_endpoint_path(source: CandleSource) -> str:
+    if source == "index":
+        return "/api/v5/market/index-candles"
+    if source == "mark":
+        return "/api/v5/market/mark-price-candles"
+    return "/api/v5/market/candles"
+
+
+def okx_index_inst_id(inst_id: str) -> str:
+    try:
+        return OKX_INDEX_INST_IDS[inst_id]
+    except KeyError as exc:
+        raise ValueError(f"No explicit OKX index instrument mapping for {inst_id}") from exc
 
 
 def _normalize_timeframe(timeframe: str) -> str:

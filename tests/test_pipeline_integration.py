@@ -13,7 +13,7 @@ from qooi.core.basket import (
     TrailTracker,
     evaluate_exits,
 )
-from qooi.core.config import AssetConfig, OkxSignalConfig, PairConfig
+from qooi.core.config import AssetConfig, PairConfig
 from qooi.core.recovery import GridRecovery, MartingaleRecovery, ReverseRecovery
 
 
@@ -29,8 +29,7 @@ def _pair(
             leverage=2.0,
             ct_val=0.1,
             signal_threshold=0.01,
-        ),
-        okx=OkxSignalConfig(),
+        )
     )
 
 
@@ -315,8 +314,8 @@ def test_reverse_recovery_requires_opposite_thesis():
     assert any(a.action == ActionKind.ENTER and a.side == "sell" for a in reverse)
 
 
-def test_recovery_preempts_exit_same_bar():
-    """Recovery actions return early; exit layer should not run same bar."""
+def test_hard_stop_preempts_recovery_same_bar():
+    """Hard stops outrank recovery when both are possible on the same bar."""
     pair = _pair(capital=500.0)
     baskets: list[Basket] = []
     rec = GridRecovery(zone_atr=1.0, multiplier=2.0)
@@ -331,7 +330,7 @@ def test_recovery_preempts_exit_same_bar():
         signal=1.0,
     )
     actions = _run_bar(
-        _df([100.0, 97.0], atr=3.0),
+        _df([100.0, 90.0], atr=3.0),
         baskets,
         pair,
         recovery_cfg=rec,
@@ -339,7 +338,8 @@ def test_recovery_preempts_exit_same_bar():
         signal=1.0,
     )
 
-    assert any(a.action == ActionKind.ADD_GRID for a in actions)
+    assert any(a.action == ActionKind.EXIT and a.reason == ExitReason.STOP.value for a in actions)
+    assert not any(a.action == ActionKind.ADD_GRID for a in actions)
     assert not any(a.reason == ExitReason.TIME.value for a in actions)
 
 

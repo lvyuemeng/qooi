@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from qooi.core.config import PAIRS, RESEARCH_PAIRS, PairConfig
@@ -21,6 +21,7 @@ class RiskGateConfig:
     min_trades: int = 0
     min_pf: float = 0.0
     min_expectancy_pct: float | None = None
+    min_execution_acceptance_pct: float = 0.0
     fail_on_risk: bool = False
 
 
@@ -31,7 +32,7 @@ class SizingOverrideConfig:
     max_notional_pct: float | None = None
     leverage: float | None = None
     capital: float | None = None
-    min_contracts: int | None = None
+    min_contracts: float | None = None
 
     @property
     def active(self) -> bool:
@@ -62,6 +63,33 @@ class SizingOverrideConfig:
 
 
 @dataclass(frozen=True)
+class SignalDebugFilterConfig:
+    side: str = "both"
+    include_signal_ids: tuple[str, ...] = ()
+    exclude_signal_ids: tuple[str, ...] = ()
+
+    @property
+    def active(self) -> bool:
+        return (
+            self.side != "both"
+            or bool(self.include_signal_ids)
+            or bool(self.exclude_signal_ids)
+        )
+
+    def metadata(self) -> tuple[str, ...]:
+        if not self.active:
+            return ("signal_debug_filter=none",)
+        include = ",".join(self.include_signal_ids) or "none"
+        exclude = ",".join(self.exclude_signal_ids) or "none"
+        return (
+            "signal_debug_filter=active",
+            f"signal_side={self.side}",
+            f"include_signal_id={include}",
+            f"exclude_signal_id={exclude}",
+        )
+
+
+@dataclass(frozen=True)
 class ResolvedBacktestConfig:
     profile: str
     days: int
@@ -71,6 +99,8 @@ class ResolvedBacktestConfig:
     style: str
     risk_gates: RiskGateConfig
     sizing: SizingOverrideConfig
+    max_per_strategy_symbol: int = 3
+    signal_filters: SignalDebugFilterConfig = field(default_factory=SignalDebugFilterConfig)
 
     def metadata(self) -> tuple[str, ...]:
         return (
@@ -80,8 +110,14 @@ class ResolvedBacktestConfig:
             f"universe={self.universe}",
             f"data_source={self.data_source}",
             f"style={self.style}",
+            f"max_per_strategy_symbol={self.max_per_strategy_symbol}",
             *self.sizing.metadata(),
+            *self.signal_filters.metadata(),
         )
+
+
+def _csv_tuple(value: Any) -> tuple[str, ...]:
+    return tuple(item.strip() for item in str(value or "").split(",") if item.strip())
 
 
 def resolve_config(args: Any) -> ResolvedBacktestConfig:
@@ -112,6 +148,14 @@ def resolve_config(args: Any) -> ResolvedBacktestConfig:
         min_trades = max(min_trades, 30)
         min_pf = max(min_pf, 1.10)
         min_expectancy = 0.0 if min_expectancy is None else min_expectancy
+    min_execution_acceptance = float(
+        getattr(args, "min_execution_acceptance_pct", 0.0) or 0.0
+    )
+    if profile == "safe":
+        min_execution_acceptance = max(min_execution_acceptance, 30.0)
+    max_per_strategy_symbol = int(getattr(args, "max_per_strategy_symbol", 0) or 0)
+    if max_per_strategy_symbol <= 0:
+        max_per_strategy_symbol = 1 if profile == "safe" else 3
 
     sizing = SizingOverrideConfig(
         normalize=normalize,
@@ -133,6 +177,16 @@ def resolve_config(args: Any) -> ResolvedBacktestConfig:
             min_contracts=sizing.min_contracts,
         )
 
+    long_only = bool(getattr(args, "long_only", False))
+    short_only = bool(getattr(args, "short_only", False))
+    if long_only and short_only:
+        raise ValueError("--long-only and --short-only are mutually exclusive")
+    signal_filters = SignalDebugFilterConfig(
+        side="long" if long_only else "short" if short_only else "both",
+        include_signal_ids=_csv_tuple(getattr(args, "include_signal_id", "")),
+        exclude_signal_ids=_csv_tuple(getattr(args, "exclude_signal_id", "")),
+    )
+
     return ResolvedBacktestConfig(
         profile=profile,
         days=days,
@@ -147,9 +201,12 @@ def resolve_config(args: Any) -> ResolvedBacktestConfig:
             min_trades=min_trades,
             min_pf=min_pf,
             min_expectancy_pct=float(min_expectancy) if min_expectancy is not None else None,
+            min_execution_acceptance_pct=min_execution_acceptance,
             fail_on_risk=bool(getattr(args, "fail_on_risk", False)),
         ),
         sizing=sizing,
+        max_per_strategy_symbol=max_per_strategy_symbol,
+        signal_filters=signal_filters,
     )
 
 
@@ -204,4 +261,5 @@ def risk_gate_metadata(gates: RiskGateConfig) -> tuple[str, ...]:
         f"min_trades={gates.min_trades}",
         f"min_pf={gates.min_pf}",
         f"min_expectancy_pct={min_expectancy}",
+        f"min_execution_acceptance_pct={gates.min_execution_acceptance_pct}",
     )

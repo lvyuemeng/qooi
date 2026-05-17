@@ -29,6 +29,14 @@ class RecoveryContext:
     ct_val: float = 1.0
     signal_position: float = 0.0
     signal_entry: float = 0.0
+    zscore: float | None = None
+    zscore_delta: float | None = None
+    short_momentum_return: float | None = None
+    lower_wick_ratio: float | None = None
+    upper_wick_ratio: float | None = None
+    volatility_ratio: float | None = None
+    trend_return: float | None = None
+    adx: float | None = None
 
 
 class RecoveryPolicy(Protocol):
@@ -112,6 +120,36 @@ class HedgeRecovery(RecoverySettings):
         return _hedge(basket, market.close, self, loss_pct)
 
 
+@dataclass(frozen=True)
+class ZScoreReversionRecovery(RecoverySettings):
+    multiplier: float = 1.0
+    max_levels: int = 1
+    wick_min: float = 0.35
+    volatility_ratio_max: float = 1.5
+    trend_return_max: float = 0.03
+    adx_max: float = 35.0
+
+    def evaluate(
+        self, basket: Basket, market: RecoveryMarket, ctx: RecoveryContext
+    ) -> list[BasketAction]:
+        shared = _shared_guard(basket, market.close, self)
+        if shared is not None:
+            return shared
+        d, loss_pct = _direction_and_loss(basket, market.close)
+        if not _zscore_recovery_allowed(basket, ctx, self, d):
+            return []
+        return _grid(
+            basket,
+            market.close,
+            market.atr,
+            self,
+            ctx.current_level,
+            loss_pct,
+            d,
+            reason_prefix="zscore_recovery_level",
+        )
+
+
 def evaluate(
     basket: Basket,
     bar_close: float,
@@ -122,6 +160,14 @@ def evaluate(
     ct_val: float = 1.0,
     signal_position: float = 0.0,
     signal_entry: float = 0.0,
+    zscore: float | None = None,
+    zscore_delta: float | None = None,
+    short_momentum_return: float | None = None,
+    lower_wick_ratio: float | None = None,
+    upper_wick_ratio: float | None = None,
+    volatility_ratio: float | None = None,
+    trend_return: float | None = None,
+    adx: float | None = None,
 ) -> list[BasketAction]:
     """Evaluate recovery behavior. Returns list of actions (may be empty)."""
     return config.evaluate(
@@ -132,6 +178,14 @@ def evaluate(
             ct_val=ct_val,
             signal_position=signal_position,
             signal_entry=signal_entry,
+            zscore=zscore,
+            zscore_delta=zscore_delta,
+            short_momentum_return=short_momentum_return,
+            lower_wick_ratio=lower_wick_ratio,
+            upper_wick_ratio=upper_wick_ratio,
+            volatility_ratio=volatility_ratio,
+            trend_return=trend_return,
+            adx=adx,
         ),
     )
 
@@ -171,6 +225,8 @@ def _grid(
     level: int,
     loss_pct: float,
     d: int,
+    *,
+    reason_prefix: str = "grid_level",
 ) -> list[BasketAction]:
     if level >= config.max_levels:
         return []
@@ -186,10 +242,56 @@ def _grid(
                 side=basket.side,
                 sz=basket.current_sz * config.multiplier,
                 px=bar_close,
-                reason=f"grid_level_{level + 1}",
+                reason=f"{reason_prefix}_{level + 1}",
             )
         ]
     return []
+
+
+def _zscore_recovery_allowed(
+    basket: Basket,
+    ctx: RecoveryContext,
+    config: ZScoreReversionRecovery,
+    d: int,
+) -> bool:
+    if ctx.current_level >= config.max_levels:
+        return False
+    if ctx.zscore is None or ctx.zscore_delta is None:
+        return False
+    if ctx.volatility_ratio is not None and ctx.volatility_ratio > config.volatility_ratio_max:
+        return False
+    if ctx.adx is not None and ctx.adx > config.adx_max:
+        return False
+
+    if basket.side == "buy":
+        if ctx.zscore >= 0:
+            return False
+        z_compressing = ctx.zscore_delta > 0
+        momentum_toward_mean = (
+            ctx.short_momentum_return is not None and ctx.short_momentum_return > 0
+        )
+        rejection = ctx.lower_wick_ratio is not None and ctx.lower_wick_ratio >= config.wick_min
+        trend_continuation = (
+            ctx.trend_return is not None
+            and ctx.trend_return < -config.trend_return_max
+            and ctx.zscore_delta < 0
+        )
+    else:
+        if ctx.zscore <= 0:
+            return False
+        z_compressing = ctx.zscore_delta < 0
+        momentum_toward_mean = (
+            ctx.short_momentum_return is not None and ctx.short_momentum_return < 0
+        )
+        rejection = ctx.upper_wick_ratio is not None and ctx.upper_wick_ratio >= config.wick_min
+        trend_continuation = (
+            ctx.trend_return is not None
+            and ctx.trend_return > config.trend_return_max
+            and ctx.zscore_delta > 0
+        )
+    if trend_continuation:
+        return False
+    return z_compressing and (momentum_toward_mean or rejection) and d != 0
 
 
 def _martingale(
@@ -220,7 +322,7 @@ def _martingale(
             basket_id=basket.basket_id + "_reversal",
             action=ActionKind.ENTER,
             side=reversal_side,
-            sz=max(1, reversal_sz),
+            sz=reversal_sz,
             px=bar_close,
             reason=ExitReason.MARTINGALE.value,
         ),

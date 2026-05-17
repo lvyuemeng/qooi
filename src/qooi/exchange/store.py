@@ -7,6 +7,7 @@ backtesting by avoiding network I/O on every run.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import polars as pl
 
-from qooi.exchange.market import MarketData
+from qooi.exchange.market import CandleSource, MarketData
 
 CACHE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "cache"
 
@@ -26,12 +27,38 @@ class HistoryRequest:
     days: int = 30
     min_bars: int = 400
     refresh: bool = False
+    source: CandleSource = "trade"
+
+
+@dataclass(frozen=True)
+class HistoryRefreshRequest(HistoryRequest):
+    incremental: bool = True
+    recent_limit: int = 300
+
+
+@dataclass(frozen=True)
+class HistoryRefreshResult:
+    request: HistoryRefreshRequest
+    coverage: HistoryCoverage
+    rows_written: int
+    refreshed: bool
+    path: Path
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class AsyncRefreshLimits:
+    target_concurrency: int = 3
+    trade_history_concurrency: int = 3
+    mark_history_concurrency: int = 2
+    index_history_concurrency: int = 1
 
 
 @dataclass(frozen=True)
 class HistoryTarget:
     inst_id: str
     bar: str
+    source: CandleSource
     requested_days: int
     requested_min_bars: int
     target_days: int
@@ -43,6 +70,7 @@ class HistoryTarget:
 class HistoryCoverage:
     inst_id: str
     bar: str
+    source: CandleSource
     target: HistoryTarget
     actual_bars: int
     actual_start_ms: int | None
@@ -56,7 +84,8 @@ class HistoryCoverage:
 
     def note(self) -> str:
         return (
-            f"{self.inst_id} {self.bar}: target_bars={self.target.target_bars} "
+            f"{self.inst_id} {self.bar} source={self.source}: "
+            f"target_bars={self.target.target_bars} "
             f"target_days={self.target.target_days} actual_bars={self.actual_bars} "
             f"coverage={self.coverage_pct:.1f}% "
             f"start={self.actual_start_ms or 'n/a'} end={self.actual_end_ms or 'n/a'} "
@@ -80,9 +109,11 @@ class CacheStore:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _path(inst_id: str, bar: str) -> Path:
+    def _path(inst_id: str, bar: str, source: CandleSource = "trade") -> Path:
         safe = inst_id.replace("-", "_").replace("/", "_").upper()
         timeframe = bar.replace(" ", "").upper()
+        if source != "trade":
+            return CACHE_DIR / f"{safe}_{source.upper()}_{timeframe}.parquet"
         return CACHE_DIR / f"{safe}_{timeframe}.parquet"
 
     @staticmethod
@@ -106,6 +137,7 @@ class CacheStore:
         days: int = 30,
         overwrite: bool = False,
         min_bars: int = 400,
+        source: CandleSource = "trade",
     ) -> pl.DataFrame:
         """Fetch OHLCV and cache as Parquet.
 
@@ -113,15 +145,21 @@ class CacheStore:
         with recent data from ``candles`` (OKX only).  Works with both
         OKX SDK and CCXT backends.
         """
-        target = plan_history(inst_id, bar, days=days, min_bars=min_bars)
+        target = plan_history(inst_id, bar, days=days, min_bars=min_bars, source=source)
         since = datetime.fromtimestamp(target.target_since_ms / 1000, tz=UTC).strftime("%Y-%m-%d")
-        hist = self._md.candles_range(inst_id, timeframe=bar, since=since, limit=target.target_bars)
-        path = self._path(inst_id, bar)
+        hist = self._md.candles_range(
+            inst_id,
+            timeframe=bar,
+            since=since,
+            limit=target.target_bars,
+            source=source,
+        )
+        path = self._path(inst_id, bar, source=source)
         if hist.is_empty() and path.exists():
-            return self.load(inst_id, bar=bar)
+            return self.load(inst_id, bar=bar, source=source)
         hist = self._normalize(hist)
         if path.exists():
-            existing = self.load(inst_id, bar=bar)
+            existing = self.load(inst_id, bar=bar, source=source)
             if not existing.is_empty():
                 common_cols = [col for col in existing.columns if col in hist.columns]
                 existing = existing.select(common_cols)
@@ -133,7 +171,7 @@ class CacheStore:
 
         recent = pl.DataFrame()
         try:
-            recent = self._md.candles(inst_id, timeframe=bar, limit=300)
+            recent = self._md.candles(inst_id, timeframe=bar, limit=300, source=source)
         except Exception:
             pass
 
@@ -142,7 +180,7 @@ class CacheStore:
             if not new_recent.is_empty():
                 hist = pl.concat([hist, new_recent]).unique(subset=["timestamp"]).sort("timestamp")
 
-        hist.write_parquet(path)
+        self._write_parquet_atomic(hist, path)
         return self._normalize(hist)
 
     def load_history(self, request: HistoryRequest) -> tuple[pl.DataFrame, HistoryCoverage]:
@@ -152,24 +190,31 @@ class CacheStore:
             request.bar,
             days=request.days,
             min_bars=request.min_bars,
+            source=request.source,
         )
-        refreshed = request.refresh or not self._path(request.inst_id, request.bar).exists()
+        refreshed = request.refresh or not self._path(
+            request.inst_id, request.bar, source=request.source
+        ).exists()
         df = self.load_or_refresh(
             request.inst_id,
             bar=request.bar,
             days=request.days,
             min_bars=request.min_bars,
             refresh=request.refresh,
+            source=request.source,
         )
-        fetch_notes = self._md.last_ohlcv_audit if refreshed else ()
+        fetch_notes = (
+            f"source={request.source}",
+            *(self._md.last_ohlcv_audit if refreshed else ()),
+        )
         return df, validate_history(df, target, refreshed=refreshed, extra_notes=fetch_notes)
 
     # ------------------------------------------------------------------
     # Load / list / clear
     # ------------------------------------------------------------------
 
-    def load(self, inst_id: str, bar: str = "1H") -> pl.DataFrame:
-        path = self._path(inst_id, bar)
+    def load(self, inst_id: str, bar: str = "1H", source: CandleSource = "trade") -> pl.DataFrame:
+        path = self._path(inst_id, bar, source=source)
         if not path.exists():
             raise FileNotFoundError(f"No cache for {inst_id} ({bar}). Run .refresh() first.")
         return self._normalize(pl.read_parquet(path))
@@ -182,11 +227,12 @@ class CacheStore:
         days: int = 30,
         min_bars: int = 400,
         refresh: bool = False,
+        source: CandleSource = "trade",
     ) -> pl.DataFrame:
         """Load one OHLCV cache, refreshing only when requested or missing."""
-        if refresh or not self._path(inst_id, bar).exists():
-            return self.refresh(inst_id, bar=bar, days=days, min_bars=min_bars)
-        return self.load(inst_id, bar=bar)
+        if refresh or not self._path(inst_id, bar, source=source).exists():
+            return self.refresh(inst_id, bar=bar, days=days, min_bars=min_bars, source=source)
+        return self.load(inst_id, bar=bar, source=source)
 
     def refresh_funding(self, inst_id: str, limit: int = 400) -> pl.DataFrame:
         """Fetch funding-rate history and cache it as Parquet."""
@@ -415,6 +461,13 @@ class CacheStore:
         return df.select(keep).sort("timestamp")
 
     @staticmethod
+    def _write_parquet_atomic(df: pl.DataFrame, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{id(df)}.tmp")
+        df.write_parquet(tmp)
+        tmp.replace(path)
+
+    @staticmethod
     def attach_funding_rate(df: pl.DataFrame, funding_df: pl.DataFrame) -> pl.DataFrame:
         """Point-in-time align funding history to each market-data bar."""
         if df.is_empty():
@@ -501,7 +554,226 @@ class CacheStore:
         return df.select(required).unique(subset=["timestamp"]).sort("timestamp")
 
 
-def plan_history(inst_id: str, bar: str, *, days: int, min_bars: int) -> HistoryTarget:
+class AsyncCacheStore(CacheStore):
+    """Async OHLCV cache store for bounded batch refreshes."""
+
+    def __init__(self, md: MarketData | None = None) -> None:
+        super().__init__(md)
+        self._owns_async_md = md is None
+        self._path_locks: dict[Path, asyncio.Lock] = {}
+
+    async def __aenter__(self) -> AsyncCacheStore:
+        await self._ensure_async_md()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close_async()
+
+    async def close_async(self) -> None:
+        if self._owns_async_md:
+            await self._md.close()
+
+    async def _ensure_async_md(self) -> None:
+        if self._owns_async_md and not hasattr(self._md, "_async_rest_backend"):
+            self._md = await MarketData.async_rest()
+        elif self._owns_async_md and getattr(self._md, "_async_rest_backend", None) is None:
+            self._md = await MarketData.async_rest()
+
+    async def load_history_async(
+        self, request: HistoryRequest
+    ) -> tuple[pl.DataFrame, HistoryCoverage]:
+        path = self._path(request.inst_id, request.bar, source=request.source)
+        refreshed = request.refresh or not path.exists()
+        if refreshed:
+            refresh_request = (
+                request
+                if isinstance(request, HistoryRefreshRequest)
+                else HistoryRefreshRequest(
+                    inst_id=request.inst_id,
+                    bar=request.bar,
+                    days=request.days,
+                    min_bars=request.min_bars,
+                    refresh=True,
+                    source=request.source,
+                )
+            )
+            result = await self.refresh_async(refresh_request)
+            df = await asyncio.to_thread(self.load, request.inst_id, request.bar, request.source)
+            return df, result.coverage
+        df = await asyncio.to_thread(self.load, request.inst_id, request.bar, request.source)
+        target = plan_history(
+            request.inst_id,
+            request.bar,
+            days=request.days,
+            min_bars=request.min_bars,
+            source=request.source,
+        )
+        return df, validate_history(df, target, extra_notes=(f"source={request.source}",))
+
+    async def refresh_async(self, request: HistoryRefreshRequest) -> HistoryRefreshResult:
+        await self._ensure_async_md()
+        path = self._path(request.inst_id, request.bar, source=request.source)
+        lock = self._path_locks.setdefault(path, asyncio.Lock())
+        async with lock:
+            try:
+                df, coverage, notes = await self._refresh_frame_async(request, path)
+                await asyncio.to_thread(self._write_parquet_atomic, df, path)
+                coverage = validate_history(
+                    df,
+                    coverage.target,
+                    refreshed=True,
+                    extra_notes=(*notes, *self._md.last_ohlcv_audit),
+                )
+                return HistoryRefreshResult(
+                    request=request,
+                    coverage=coverage,
+                    rows_written=df.height,
+                    refreshed=True,
+                    path=path,
+                )
+            except Exception as exc:
+                target = plan_history(
+                    request.inst_id,
+                    request.bar,
+                    days=request.days,
+                    min_bars=request.min_bars,
+                    source=request.source,
+                )
+                coverage = validate_history(
+                    pl.DataFrame(),
+                    target,
+                    refreshed=False,
+                    extra_notes=(f"refresh_error={type(exc).__name__}", str(exc)),
+                )
+                return HistoryRefreshResult(
+                    request=request,
+                    coverage=coverage,
+                    rows_written=0,
+                    refreshed=False,
+                    path=path,
+                    error=str(exc),
+                )
+
+    async def _refresh_frame_async(
+        self, request: HistoryRefreshRequest, path: Path
+    ) -> tuple[pl.DataFrame, HistoryCoverage, tuple[str, ...]]:
+        target = plan_history(
+            request.inst_id,
+            request.bar,
+            days=request.days,
+            min_bars=request.min_bars,
+            source=request.source,
+        )
+        existing = pl.DataFrame()
+        if path.exists():
+            try:
+                existing = await asyncio.to_thread(
+                    self.load, request.inst_id, request.bar, request.source
+                )
+            except Exception:
+                existing = pl.DataFrame()
+        existing_coverage = validate_history(existing, target) if not existing.is_empty() else None
+        starts_before_target = False
+        if existing_coverage and existing_coverage.actual_start_ms is not None:
+            starts_before_target = existing_coverage.actual_start_ms <= (
+                target.target_since_ms + _bar_interval_ms(target.bar)
+            )
+        skip_history = bool(
+            request.incremental
+            and existing_coverage is not None
+            and existing_coverage.actual_bars >= target.target_bars
+            and starts_before_target
+            and existing_coverage.duplicate_timestamps == 0
+            and existing_coverage.gap_count == 0
+        )
+
+        hist = existing if skip_history else pl.DataFrame()
+        since = datetime.fromtimestamp(target.target_since_ms / 1000, tz=UTC).strftime("%Y-%m-%d")
+        if not skip_history:
+            hist = await self._md.candles_range_async(
+                request.inst_id,
+                timeframe=request.bar,
+                since=since,
+                limit=target.target_bars,
+                source=request.source,
+            )
+            hist = self._normalize(hist)
+            hist = self._merge_history_frames(existing, hist, target.target_bars)
+
+        recent = pl.DataFrame()
+        try:
+            recent = await self._md.candles_async(
+                request.inst_id,
+                timeframe=request.bar,
+                limit=request.recent_limit,
+                source=request.source,
+            )
+        except Exception:
+            recent = pl.DataFrame()
+        hist = self._merge_history_frames(hist, recent, target.target_bars)
+        notes = (
+            f"source={request.source}",
+            "refresh_transport=async",
+            f"refresh_mode={'incremental' if request.incremental else 'full'}",
+            f"refresh_skipped_history={'yes' if skip_history else 'no'}",
+            f"refresh_existing_bars={existing.height}",
+            f"refresh_recent_bars={recent.height}",
+            f"refresh_older_bars={0 if skip_history else hist.height}",
+        )
+        return self._normalize(hist), validate_history(hist, target, refreshed=True), notes
+
+    async def refresh_many_async(
+        self,
+        requests: list[HistoryRefreshRequest] | tuple[HistoryRefreshRequest, ...],
+        *,
+        concurrency: int = 3,
+        fail_fast: bool = False,
+    ) -> tuple[HistoryRefreshResult, ...]:
+        unique = tuple(dict.fromkeys(requests))
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def _run(request: HistoryRefreshRequest) -> HistoryRefreshResult:
+            async with semaphore:
+                result = await self.refresh_async(request)
+                if fail_fast and result.error:
+                    raise RuntimeError(result.error)
+                return result
+
+        try:
+            return tuple(await asyncio.gather(*(_run(request) for request in unique)))
+        finally:
+            await self.close_async()
+
+    @staticmethod
+    def _merge_history_frames(
+        left: pl.DataFrame, right: pl.DataFrame, target_bars: int
+    ) -> pl.DataFrame:
+        frames = [frame for frame in (left, right) if not frame.is_empty()]
+        if not frames:
+            return pl.DataFrame()
+        common_cols = set(frames[0].columns)
+        for frame in frames[1:]:
+            common_cols &= set(frame.columns)
+        ordered_cols = [
+            col
+            for col in ("timestamp", "datetime", "open", "high", "low", "close", "vol")
+            if col in common_cols
+        ]
+        merged = pl.concat([frame.select(ordered_cols) for frame in frames])
+        merged = merged.unique(subset=["timestamp"]).sort("timestamp")
+        if merged.height > target_bars:
+            merged = merged.tail(target_bars)
+        return merged
+
+
+def plan_history(
+    inst_id: str,
+    bar: str,
+    *,
+    days: int,
+    min_bars: int,
+    source: CandleSource = "trade",
+) -> HistoryTarget:
     interval_ms = _bar_interval_ms(bar) or 86_400_000
     days_from_bars = max(1, int((min_bars * interval_ms + 86_400_000 - 1) / 86_400_000))
     target_bars = max(1, min_bars)
@@ -510,6 +782,7 @@ def plan_history(inst_id: str, bar: str, *, days: int, min_bars: int) -> History
     return HistoryTarget(
         inst_id=inst_id,
         bar=bar,
+        source=source,
         requested_days=days,
         requested_min_bars=min_bars,
         target_days=target_days,
@@ -529,6 +802,7 @@ def validate_history(
         return HistoryCoverage(
             inst_id=target.inst_id,
             bar=target.bar,
+            source=target.source,
             target=target,
             actual_bars=0,
             actual_start_ms=None,
@@ -561,6 +835,7 @@ def validate_history(
     return HistoryCoverage(
         inst_id=target.inst_id,
         bar=target.bar,
+        source=target.source,
         target=target,
         actual_bars=df.height,
         actual_start_ms=ts[0] if ts else None,

@@ -140,3 +140,31 @@ def test_size_decision_reports_binding_cap_and_can_block_min_contract():
     assert decision.contracts == 0
     assert decision.binding_cap == "risk"
     assert decision.blocked_reason == "below_min_contracts_1"
+
+
+def test_size_decision_supports_fractional_exchange_lots():
+    cfg = AssetConfig(
+        symbol="BTC",
+        capital=500.0,
+        leverage=2.0,
+        ct_val=0.01,
+        max_risk_pct=0.02,
+        max_notional_pct_per_basket=1.0,
+        min_contracts=0.01,
+        lot_size=0.01,
+    )
+
+    decision = BasketManager.size_decision(100000.0, 99500.0, cfg, signal_strength=0.25)
+
+    assert decision.contracts == 0.5
+    assert decision.blocked_reason == ""
+    assert decision.risk_sized_contracts == 0.5
+
+
+def test_stop_target_rounds_to_configured_tick_size():
+    cfg = AssetConfig(symbol="BTC", ct_val=0.01, tick_size=0.1)
+
+    stop_px, target_px = BasketManager.compute_stop_target("buy", 100.03, 1.04, cfg)
+
+    assert stop_px == 98.0
+    assert target_px == 103.2

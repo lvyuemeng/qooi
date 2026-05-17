@@ -111,6 +111,14 @@ Signal semantics:
 
 Strategies do not decide how many baskets may be active. Basket caps and lifecycle rules decide that.
 
+Strategy improvement rules:
+
+- Strategy improvements must be ex-ante thesis changes, not performance-selected side or symbol filters.
+- A regime filter is legitimate only if it uses information available before entry and has a stated market-behavior rationale.
+- Long-only, short-only, include-signal, and exclude-signal runs are diagnostic strata unless the strategy declares an asymmetric thesis before testing.
+- Symbol-aware changes are execution and microstructure normalization only, not performance-aware tuning.
+- Signal strength should encode quality or confidence only after base rule quality is stable under comparable mechanics.
+
 ## 3. Pipeline Context
 
 The per-bar pipeline is configured by domain objects instead of many scalar arguments.
@@ -216,6 +224,14 @@ Recovery rules:
 
 Reverse recovery is not a rescue for weak entries. It should only be tested on strategies with positive base expectancy and bounded exposure.
 
+Recovery acceptance rules:
+
+- Candidate strategy evaluation uses `NoRecovery` by default.
+- Recovery modes are mechanics stress tests until every exposure-creating recovery action has a risk sizing decision or equivalent accepted-risk metadata.
+- Unsized recovery exposure is blocked under research defaults.
+- Martingale and reverse recovery are atomic transformations: the original basket must not be closed if the paired reversal entry is blocked.
+- A hard stop outranks recovery by default.
+
 ## 7. Exit And Fill Layer
 
 Files:
@@ -229,6 +245,13 @@ Exit responsibilities:
 - Intrabar OHLC stop/target checks are used in backtests.
 - Trailing and breakeven logic read basket state but return proposals.
 - Same-bar ambiguity should use a documented conservative policy.
+
+Current conservative fill policy:
+
+- Hard stops are checked before recovery.
+- If a stop and target are both touched before target state is active, the backtest keeps stop-first behavior and reports a target-first counterfactual.
+- Target activation enables trailing or breakeven management after the target-touch bar, not earlier within that same OHLC bar.
+- Trailing and breakeven exits are disabled while recovery is active.
 
 Fill/accounting responsibilities:
 
@@ -338,7 +361,29 @@ Required report sections:
 
 Comparability warnings should appear when data horizon, source policy, strategy arguments, basket caps, fill policy, fee model, drawdown stop, or mark-to-market settings differ.
 
-## 12. Backtest Orchestration
+## 12. Diagnostics Principle
+
+Diagnostics are part of the strategy correctness model, not a flat collection of counters.
+
+Diagnostic data structures must provide information for four-layer strategy consistency, correctness, debugging, and improvement:
+
+1. Feature diagnostics prove indicators and input features are valid before judging signals.
+2. Signal/thesis diagnostics prove strategy rules express the intended directional thesis and entry/exit events.
+3. Basket/execution lifecycle diagnostics prove signals produce consistent basket and order behavior, including accepted entries, blocked entries, duplicate suppression, exit reasons, same-bar sequencing, multiple baskets, and recovery actions.
+4. Portfolio/sizing/risk diagnostics prove PnL, drawdown, exposure, fee drag, stop effectiveness, sizing caps, notional asymmetry, and recovery impact are acceptable.
+
+Every new diagnostic field should belong to one of these layers. Avoid adding unrelated top-level counters when a layer-owned structure can explain the behavior more clearly.
+
+Interpretation order:
+
+1. If feature diagnostics fail, fix data/features before tuning signals.
+2. If signal diagnostics fail, fix strategy rules before executor or risk changes.
+3. If lifecycle diagnostics fail, fix basket/order behavior before judging metrics.
+4. If portfolio/sizing/risk diagnostics fail while earlier layers pass, treat the problem as sizing, exposure, risk control, or recovery behavior rather than signal quality.
+
+Reports should summarize layer status first and show supporting counters only when they help explain a behavior or debugging path.
+
+## 13. Backtest Orchestration
 
 File:
 
@@ -355,7 +400,7 @@ Responsibilities:
 - Call the engine or styles layer.
 - Call evaluation formatting.
 
-## 13. Dynamic Statistics Research
+## 14. Dynamic Statistics Research
 
 The first adaptive-indicator slice is dependency-free and intentionally precedes HMM, PCA, Kalman, GARCH package fitting, or ML classifiers.
 
@@ -374,7 +419,7 @@ Research strategy variants:
 
 Signal strength remains `1.0` for entries in this slice. Strength-based sizing should not be enabled until base signal quality is measured under comparable data settings.
 
-## 14. Data Depth Research
+## 15. Data Depth Research
 
 Backtest research defaults target `730` days and `12,000` bars. These are requested targets, not guaranteed exchange availability.
 
@@ -386,27 +431,29 @@ Asset universes are explicit:
 - `RESEARCH_PAIRS` expands liquid swap research assets without changing live trading defaults.
 - `scripts/backtest.py --universe core|research` selects the orchestration universe.
 
-## 15. Current Strategy Recommendation
+## 16. Current Strategy Recommendation
 
-Representative cached ETH runs from the current comparable slice showed:
+Latest mechanics-normalized evaluation changed the interpretation of prior cached strategy results.
 
-| Strategy | Trades | Win Rate | Profit Factor | Expectancy | Return | Recommendation |
-|---|---:|---:|---:|---:|---:|---|
-| `rsi_bounce_reversion` | 7 | 71% | 2.31 | +0.49% | +5.89% | Keep as sparse quality baseline |
-| `zscore_mean_reversion` | 34 | 47% | 1.42 | +0.63% | +39.46% | Current research candidate, but weaker after corrected lifecycle accounting |
-| `rsi_macd_trend` | 104 | 30% | 0.33 | -1.36% | -253.14% | Reject in current form |
+Current recommendation:
 
-Recommendation:
+- No strategy is ready for allocation from the current evidence.
+- `zscore_mean_reversion` remains the primary research subject because it has enough trades to diagnose, not because it is a deployable candidate.
+- `rsi_bounce_reversion` remains a sparse quality baseline for comparison, not a deployable strategy.
+- `rsi_macd_trend` remains rejected in current form.
+- Recovery modes are stress tests only and must not be ranked as candidate strategy improvements.
+- BTC safe-profile runs with low acceptance and dominant min-contract blocks are execution-infeasible under the current intended account/risk profile; they should not be treated as signal-quality evidence.
+- Next strategy work is regime and thesis robustness diagnostics, not side-specific selection, symbol-aware performance tuning, or recovery.
 
-- Use `zscore_mean_reversion` as the current research candidate, not final allocation.
-- Keep `rsi_bounce_reversion` as a sparse baseline for comparison.
-- Do not allocate or recover `rsi_macd_trend` until entry quality is retuned.
-- Do not apply grid, martingale, or reverse recovery to a negative-expectancy base strategy.
-- Current ETH `zscore_mean_reversion` reverse-recovery run matched base metrics, indicating the gated reverse condition did not materially trigger on that cached slice.
-- Validate candidate strategies with rolling or walk-forward tests before increasing basket caps or notional budgets.
-- Treat cache coverage warnings as comparability limitations.
+Candidate evaluation baseline:
 
-## 14. Dead-Code Policy
+- Use swap execution data unless a strategy has an explicit spot-signal thesis.
+- Use `NoRecovery`.
+- Use safe-profile sizing and `max_per_strategy_symbol=1` unless explicitly testing basket stacking.
+- Treat `EXECUTION_INFEASIBLE`, `RECOVERY_EXPERIMENTAL`, `INTRABAR_AMBIGUITY`, and high stop-loss concentration as evidence gates before any strategy promotion.
+- Validate any candidate with rolling or walk-forward tests before increasing basket caps, notional budgets, or enabling recovery.
+
+## 17. Dead-Code Policy
 
 Removed or obsolete APIs should not be reintroduced unless a current caller requires them.
 

@@ -10,19 +10,18 @@ import polars as pl
 import qooi.strategies.conditions as c
 from qooi.strategies.features import (
     FeatureFn,
-    add_dynamic_z_blend,
-    add_ewma_z_score,
+    add_liquidity_sweep_features,
     add_macd_histogram,
     add_momentum_return,
+    add_none_context_diagnostics,
     add_price_structure,
-    add_robust_z_score,
+    add_price_structure_stage_features,
     add_trend_maturity,
     add_utc_hour,
-    add_volatility_regime,
     add_volume_average,
-    add_z_score,
 )
 from qooi.strategies.indicators import add_indicators, compute_flow_pipeline_frame
+from qooi.strategies.semantics import LiquidityEvent, StructureState
 
 Direction = Literal[-1, 1]
 
@@ -211,91 +210,6 @@ def rsi_bounce_reversion_spec(
     )
 
 
-def zscore_mean_reversion_spec(
-    *,
-    z_period: int = 20,
-    entry_z: float = 2.0,
-    exit_z: float = 0.25,
-    adx_max: float = 25.0,
-) -> StrategySpec:
-    return StrategySpec(
-        name="zscore_mean_reversion",
-        required_columns=("timestamp", "close", "high", "low", "atr_14", "adx_14"),
-        features=(add_z_score(z_period),),
-        entries=(
-            SignalRule("long_zscore_reversion", 1, c.zscore_below(-abs(entry_z))),
-            SignalRule("short_zscore_reversion", -1, c.zscore_above(abs(entry_z))),
-        ),
-        filters=(pl.col("adx_14") <= adx_max,),
-        hold=HoldPolicy(
-            exit_long_when=c.zscore_reverted_long(exit_z),
-            exit_short_when=c.zscore_reverted_short(exit_z),
-        ),
-    )
-
-
-def adaptive_zscore_mean_reversion_spec(
-    *,
-    ewma_span: int = 48,
-    robust_period: int = 96,
-    entry_z: float = 2.0,
-    exit_z: float = 0.25,
-    adx_max: float = 25.0,
-    volatility_ratio_max: float = 2.5,
-) -> StrategySpec:
-    return StrategySpec(
-        name="adaptive_zscore_mean_reversion",
-        required_columns=("timestamp", "close", "high", "low", "atr_14", "adx_14"),
-        features=(
-            add_z_score(robust_period),
-            add_ewma_z_score(ewma_span),
-            add_robust_z_score(robust_period),
-            add_volatility_regime(),
-            add_dynamic_z_blend(),
-        ),
-        entries=(
-            SignalRule("long_adaptive_zscore_reversion", 1, c.dynamic_z_below(-abs(entry_z))),
-            SignalRule("short_adaptive_zscore_reversion", -1, c.dynamic_z_above(abs(entry_z))),
-        ),
-        filters=(pl.col("adx_14") <= adx_max, c.volatility_ratio_below(volatility_ratio_max)),
-        hold=HoldPolicy(
-            exit_long_when=c.dynamic_z_reverted_long(exit_z),
-            exit_short_when=c.dynamic_z_reverted_short(exit_z),
-        ),
-    )
-
-
-def robust_zscore_mean_reversion_spec(
-    *,
-    robust_period: int = 96,
-    entry_z: float = 2.0,
-    exit_z: float = 0.25,
-    adx_max: float = 25.0,
-) -> StrategySpec:
-    return StrategySpec(
-        name="robust_zscore_mean_reversion",
-        required_columns=("timestamp", "close", "high", "low", "atr_14", "adx_14"),
-        features=(add_robust_z_score(robust_period),),
-        entries=(
-            SignalRule(
-                "long_robust_zscore_reversion",
-                1,
-                c.dynamic_z_below(-abs(entry_z), col="robust_z_score"),
-            ),
-            SignalRule(
-                "short_robust_zscore_reversion",
-                -1,
-                c.dynamic_z_above(abs(entry_z), col="robust_z_score"),
-            ),
-        ),
-        filters=(pl.col("adx_14") <= adx_max,),
-        hold=HoldPolicy(
-            exit_long_when=c.dynamic_z_reverted_long(exit_z, col="robust_z_score"),
-            exit_short_when=c.dynamic_z_reverted_short(exit_z, col="robust_z_score"),
-        ),
-    )
-
-
 def rsi_macd_trend_spec(
     *,
     rsi_period: int = 14,
@@ -348,6 +262,167 @@ def flow_pipeline_spec(*, threshold: float = 0.25) -> FlowPipelineSpec:
     return FlowPipelineSpec(threshold=threshold)
 
 
+def _failed_breakout_entry_conditions(
+    *,
+    event_quality_min: float,
+    require_volume_impulse: bool,
+) -> tuple[pl.Expr, pl.Expr]:
+    volume_gate = (
+        pl.col("volume_impulse").fill_null(False)
+        if require_volume_impulse
+        else pl.lit(True)
+    )
+    quality_gate = pl.col("event_quality_score").cast(pl.Float64) >= event_quality_min
+    long_entry = (
+        (pl.col("liquidity_event_type") == LiquidityEvent.FAILED_BREAKOUT_LOW)
+        & pl.col("failed_breakout_low").fill_null(False)
+        & pl.col("prior_liquidity_low").is_not_null()
+        & quality_gate
+        & volume_gate
+    )
+    short_entry = (
+        (pl.col("liquidity_event_type") == LiquidityEvent.FAILED_BREAKOUT_HIGH)
+        & pl.col("failed_breakout_high").fill_null(False)
+        & pl.col("prior_liquidity_high").is_not_null()
+        & quality_gate
+        & volume_gate
+    )
+    return long_entry, short_entry
+
+
+def _structural_feature_stack() -> tuple[FeatureFn, ...]:
+    return (
+        add_liquidity_sweep_features(),
+        add_none_context_diagnostics(),
+        add_price_structure_stage_features(),
+    )
+
+
+def structure_event_reversal_v1_spec(
+    *,
+    event_quality_min: float = 1.5,
+    require_volume_impulse: bool = True,
+    include_reclaim_sweeps: bool = False,
+    max_bars: int = 8,
+    name: str = "structure_event_reversal_v1",
+) -> StrategySpec:
+    """Failed-breakout reversal strategy for falsifying structural-event edge."""
+    if include_reclaim_sweeps:
+        raise ValueError(
+            "include_reclaim_sweeps is not implemented for structure_event_reversal_v1"
+        )
+
+    long_entry, short_entry = _failed_breakout_entry_conditions(
+        event_quality_min=event_quality_min,
+        require_volume_impulse=require_volume_impulse,
+    )
+    return StrategySpec(
+        name=name,
+        required_columns=("timestamp", "open", "high", "low", "close", "atr_14"),
+        features=_structural_feature_stack(),
+        entries=(
+            SignalRule("long_failed_breakout_low", 1, long_entry),
+            SignalRule("short_failed_breakout_high", -1, short_entry),
+        ),
+        hold=HoldPolicy(
+            exit_long_when=pl.col("breakout_acceptance_low").fill_null(False),
+            exit_short_when=pl.col("breakout_acceptance_high").fill_null(False),
+            max_bars=max_bars,
+        ),
+    )
+
+
+def structure_event_trend_aligned_v1_spec(
+    *,
+    event_quality_min: float = 1.5,
+    require_volume_impulse: bool = True,
+    include_reclaim_sweeps: bool = False,
+    max_bars: int = 8,
+    name: str = "structure_event_trend_aligned_v1",
+) -> StrategySpec:
+    """Trend-aligned failed-breakout pullback strategy."""
+    if include_reclaim_sweeps:
+        raise ValueError(
+            "include_reclaim_sweeps is not implemented for structure_event_trend_aligned_v1"
+        )
+
+    long_base, short_base = _failed_breakout_entry_conditions(
+        event_quality_min=event_quality_min,
+        require_volume_impulse=require_volume_impulse,
+    )
+    long_entry = long_base & (pl.col("structure_trend_state") == StructureState.UPTREND)
+    short_entry = short_base & (pl.col("structure_trend_state") == StructureState.DOWNTREND)
+    return StrategySpec(
+        name=name,
+        required_columns=("timestamp", "open", "high", "low", "close", "atr_14"),
+        features=_structural_feature_stack(),
+        entries=(
+            SignalRule("long_trend_aligned_failed_breakout_low", 1, long_entry),
+            SignalRule("short_trend_aligned_failed_breakout_high", -1, short_entry),
+        ),
+        hold=HoldPolicy(
+            exit_long_when=pl.col("breakout_acceptance_low").fill_null(False),
+            exit_short_when=pl.col("breakout_acceptance_high").fill_null(False),
+            max_bars=max_bars,
+        ),
+    )
+
+
+def structure_event_trend_aligned_mtf_confirm_v1_spec(
+    *,
+    event_quality_min: float = 1.5,
+    require_volume_impulse: bool = True,
+    include_reclaim_sweeps: bool = False,
+    max_bars: int = 8,
+    name: str = "structure_event_trend_aligned_mtf_confirm_v1",
+) -> StrategySpec:
+    """Trend-aligned structural events gated by immediate M15 confirmation."""
+    if include_reclaim_sweeps:
+        raise ValueError(
+            "include_reclaim_sweeps is not implemented for "
+            "structure_event_trend_aligned_mtf_confirm_v1"
+        )
+
+    long_base, short_base = _failed_breakout_entry_conditions(
+        event_quality_min=event_quality_min,
+        require_volume_impulse=require_volume_impulse,
+    )
+    long_entry = (
+        long_base
+        & (pl.col("structure_trend_state") == StructureState.UPTREND)
+        & pl.col("m15_confirm_long").fill_null(False)
+    )
+    short_entry = (
+        short_base
+        & (pl.col("structure_trend_state") == StructureState.DOWNTREND)
+        & pl.col("m15_confirm_short").fill_null(False)
+    )
+    return StrategySpec(
+        name=name,
+        required_columns=(
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "atr_14",
+            "m15_confirm_long",
+            "m15_confirm_short",
+            "m15_confirm_available",
+        ),
+        features=_structural_feature_stack(),
+        entries=(
+            SignalRule("long_trend_aligned_mtf_confirm_failed_breakout_low", 1, long_entry),
+            SignalRule("short_trend_aligned_mtf_confirm_failed_breakout_high", -1, short_entry),
+        ),
+        hold=HoldPolicy(
+            exit_long_when=pl.col("breakout_acceptance_low").fill_null(False),
+            exit_short_when=pl.col("breakout_acceptance_high").fill_null(False),
+            max_bars=max_bars,
+        ),
+    )
+
+
 def compute_signal_frame(df: pl.DataFrame, strategy: StrategyBehavior) -> pl.DataFrame:
     """Return ``df`` with a behavior-computed ``signal`` column."""
     if not isinstance(strategy, (StrategySpec, FlowPipelineSpec)):
@@ -368,7 +443,8 @@ def latest_signal(df: pl.DataFrame, strategy: StrategyBehavior) -> float:
 
 def strategy_signal_diagnostics(df: pl.DataFrame, strategy: StrategyBehavior) -> dict[str, float]:
     """Return signal/filter pass-rate diagnostics for a strategy behavior."""
-    signal_df = compute_signal_frame(df, strategy)
+    signal_columns = {"raw_entry_signal", "entry_signal", "position_signal", "exit_signal"}
+    signal_df = df if signal_columns.issubset(df.columns) else compute_signal_frame(df, strategy)
     bars = float(signal_df.height)
     if bars == 0:
         return {"bars": 0.0, "signal_pct": 0.0}
@@ -412,12 +488,6 @@ def strategy_signal_diagnostics(df: pl.DataFrame, strategy: StrategyBehavior) ->
         diagnostics[f"entry_{rule.name}_pct"] = _expr_pct(
             work, (filter_expr & rule.condition).fill_null(False)
         )
-    if "dynamic_z_score" in work.columns:
-        diagnostics["dynamic_z_extreme_pct"] = _expr_pct(
-            work, pl.col("dynamic_z_score").abs() >= 2.0
-        )
-    if "robust_z_score" in work.columns:
-        diagnostics["robust_z_extreme_pct"] = _expr_pct(work, pl.col("robust_z_score").abs() >= 2.0)
     if "volatility_regime" in work.columns:
         diagnostics["high_volatility_regime_pct"] = _expr_pct(work, pl.col("volatility_regime") > 0)
     if "signal_strength" in signal_df.columns:
@@ -499,15 +569,13 @@ def apply_strategy_spec(df: pl.DataFrame, spec: StrategySpec) -> pl.DataFrame:
         spec,
     )
     entry_events = _entry_events(work["raw_entry_signal"].to_list(), position, spec)
+    strength_expr = pl.when(pl.col("raw_entry_signal") != 0).then(1.0).otherwise(0.0)
     return (
         work.with_columns(
             pl.Series("entry_signal", entry_events, dtype=pl.Float64),
             pl.Series("position_signal", position, dtype=pl.Float64),
             pl.Series("exit_signal", exit_events, dtype=pl.Boolean),
-            pl.when(pl.col("raw_entry_signal") != 0)
-            .then(1.0)
-            .otherwise(0.0)
-            .alias("signal_strength"),
+            strength_expr.alias("signal_strength"),
             pl.Series("signal", position, dtype=pl.Float64),
         )
         .drop("_exit_long_signal", "_exit_short_signal")

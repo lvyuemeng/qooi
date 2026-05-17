@@ -1,7 +1,14 @@
 """Unit tests for recovery layer."""
 
 from qooi.core.basket import ActionKind, Basket, BasketState, ExitReason
-from qooi.core.recovery import GridRecovery, HedgeRecovery, MartingaleRecovery, NoRecovery, evaluate
+from qooi.core.recovery import (
+    GridRecovery,
+    HedgeRecovery,
+    MartingaleRecovery,
+    NoRecovery,
+    ZScoreReversionRecovery,
+    evaluate,
+)
 
 
 def _b(side="buy", entry_px=100.0, sz=10.0, level=0):
@@ -102,3 +109,66 @@ def test_idle_basket_skipped():
     cfg = GridRecovery(zone_atr=1.0)
     actions = evaluate(b, bar_close=0.0, atr=2.0, config=cfg, current_level=0)
     assert len(actions) == 0
+
+
+def test_zscore_recovery_adds_on_adverse_move_with_reversion_evidence():
+    b = _b("buy", 100.0, sz=1.0)
+    cfg = ZScoreReversionRecovery(zone_atr=1.0, multiplier=1.0, max_levels=1)
+    actions = evaluate(
+        b,
+        bar_close=97.0,
+        atr=2.0,
+        config=cfg,
+        current_level=0,
+        zscore=-2.2,
+        zscore_delta=0.2,
+        short_momentum_return=0.01,
+        lower_wick_ratio=0.2,
+        volatility_ratio=1.0,
+        trend_return=0.0,
+        adx=20.0,
+    )
+    a = _first(actions)
+    assert a.action == ActionKind.ADD_GRID
+    assert a.reason == "zscore_recovery_level_1"
+    assert a.sz == 1.0
+
+
+def test_zscore_recovery_blocks_expanding_zscore():
+    b = _b("buy", 100.0, sz=1.0)
+    cfg = ZScoreReversionRecovery(zone_atr=1.0, multiplier=1.0, max_levels=1)
+    actions = evaluate(
+        b,
+        bar_close=97.0,
+        atr=2.0,
+        config=cfg,
+        current_level=0,
+        zscore=-2.2,
+        zscore_delta=-0.2,
+        short_momentum_return=0.01,
+        lower_wick_ratio=0.5,
+        volatility_ratio=1.0,
+        trend_return=0.0,
+        adx=20.0,
+    )
+    assert actions == []
+
+
+def test_zscore_recovery_blocks_volatility_expansion():
+    b = _b("sell", 100.0, sz=1.0)
+    cfg = ZScoreReversionRecovery(zone_atr=1.0, multiplier=1.0, max_levels=1)
+    actions = evaluate(
+        b,
+        bar_close=103.0,
+        atr=2.0,
+        config=cfg,
+        current_level=0,
+        zscore=2.2,
+        zscore_delta=-0.2,
+        short_momentum_return=-0.01,
+        upper_wick_ratio=0.5,
+        volatility_ratio=2.0,
+        trend_return=0.0,
+        adx=20.0,
+    )
+    assert actions == []

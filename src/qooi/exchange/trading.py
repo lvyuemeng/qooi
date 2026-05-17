@@ -6,10 +6,27 @@ All strategy logic lives in qooi.core.  This file is pure I/O.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+
+@dataclass(frozen=True)
+class BotIdentity:
+    algo_id: str = ""
+    signal_chan_id: str = ""
+
+
+@dataclass(frozen=True)
+class PositionState:
+    has_position: bool = False
+    side: str = ""
+
+
+def _signal_channel_name(pair) -> str:
+    return f"qooi-{pair.asset.symbol.replace('-', '_')}"
 
 # ============================================================================
 # 0. Environment
@@ -250,16 +267,14 @@ class TradingClient:
 
         Returns ``BotIdentity`` or ``None`` on unrecoverable failure.
         """
-        from qooi.core.config import BotIdentity
-
         bot = self._signal_resolve_bot(pair)
         if bot is None:
-            print(f"    WARNING: signal_get_pending failed for {pair.chan_name}")
+            print(f"    WARNING: signal_get_pending failed for {_signal_channel_name(pair)}")
             return None
         if bot.algo_id:
             return bot
 
-        name = pair.chan_name
+        name = _signal_channel_name(pair)
         desc_label = f"{label} " if label else ""
         desc = f"{desc_label}signal for {pair.asset.symbol} {pair.asset.timeframe}"
         try:
@@ -267,7 +282,7 @@ class TradingClient:
         except RuntimeError:
             chan = self._signal_find_channel(name)
             if not chan:
-                print(f"    WARNING: channel exists but failed to find {pair.chan_name}")
+                print(f"    WARNING: channel exists but failed to find {name}")
                 return None
         chan_id = (
             chan.get("signalChanId", chan.get("data", [{}])[0].get("signalChanId", ""))
@@ -275,7 +290,7 @@ class TradingClient:
             else ""
         )
         if not chan_id:
-            print(f"    WARNING: failed to create channel for {pair.chan_name}")
+            print(f"    WARNING: failed to create channel for {name}")
             return None
 
         try:
@@ -288,8 +303,8 @@ class TradingClient:
                 lever=str(int(pair.asset.leverage)),
                 invest_amt=str(int(pair.asset.capital)),
                 entry_type="1",
-                tp_pct=pair.okx.tp_pct,
-                sl_pct=pair.okx.sl_pct,
+                tp_pct="2.0",
+                sl_pct="2.5",
                 sub_ord_type="9",
                 allow_multiple_entry=False,
                 algo_cl_ord_id=format_okx_client_id(basket_id, "algo"),
@@ -298,7 +313,7 @@ class TradingClient:
             bot = self._signal_resolve_bot(pair)
             if bot and bot.algo_id:
                 return bot
-            print(f"    WARNING: failed to create algo for {pair.chan_name}")
+            print(f"    WARNING: failed to create algo for {name}")
             return None
 
         algo_data = algo if isinstance(algo, dict) else {}
@@ -307,8 +322,6 @@ class TradingClient:
 
     def signal_query_position(self, bot, pair):
         """Query current position from OKX signal/positions."""
-        from qooi.core.config import PositionState
-
         try:
             resp = self.signal_get_positions(bot.algo_id)
             for pos in resp.get("data", []) if isinstance(resp, dict) else []:
@@ -349,12 +362,11 @@ class TradingClient:
           - ``BotIdentity()`` if not found (caller creates new bot)
           - ``None`` on network failure (caller skips, no creation)
         """
-        from qooi.core.config import BotIdentity
-
+        name = _signal_channel_name(pair)
         try:
             resp = self.signal_get_pending()
             for bot in resp.get("data", []) if isinstance(resp, dict) else []:
-                if bot.get("signalChanName") == pair.chan_name:
+                if bot.get("signalChanName") == name:
                     return BotIdentity(
                         algo_id=bot.get("algoId", ""),
                         signal_chan_id=bot.get("signalChanId", ""),

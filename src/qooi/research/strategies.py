@@ -8,18 +8,18 @@ from typing import Any, cast
 
 from qooi.strategies import (
     StrategyBehavior,
-    adaptive_zscore_mean_reversion_spec,
     ema_trend_baseline_spec,
     momentum_burst_spec,
-    robust_zscore_mean_reversion_spec,
     rsi_bounce_reversion_spec,
     rsi_macd_trend_spec,
-    zscore_mean_reversion_spec,
+    structure_event_reversal_v1_spec,
+    structure_event_trend_aligned_mtf_confirm_v1_spec,
+    structure_event_trend_aligned_v1_spec,
 )
 
 StrategyBuilder = Callable[[Any], StrategyBehavior]
 
-DEFAULT_STRATEGY = "zscore_mean_reversion"
+DEFAULT_STRATEGY = "ema_trend_baseline"
 
 
 @dataclass(frozen=True)
@@ -55,64 +55,54 @@ def _momentum(name: str, *, no_session: bool = False, soft_volume: bool = False)
     return _build
 
 
-def _fixed_z(args: Any) -> StrategyBehavior:
-    return zscore_mean_reversion_spec(
-        z_period=_int_arg(args, "z_period", 20),
-        entry_z=_float_arg(args, "entry_z", 2.0),
-        exit_z=_float_arg(args, "exit_z", 0.25),
-        adx_max=_float_arg(args, "adx_max", 25.0),
-    )
-
-
-def _adaptive_z(args: Any) -> StrategyBehavior:
-    return adaptive_zscore_mean_reversion_spec(
-        ewma_span=_int_arg(args, "ewma_span", 48),
-        robust_period=_int_arg(args, "robust_period", 96),
-        entry_z=_float_arg(args, "entry_z", 2.0),
-        exit_z=_float_arg(args, "exit_z", 0.25),
-        adx_max=_float_arg(args, "adx_max", 25.0),
-        volatility_ratio_max=_float_arg(args, "volatility_ratio_max", 2.5),
-    )
-
-
-def _robust_z(args: Any) -> StrategyBehavior:
-    return robust_zscore_mean_reversion_spec(
-        robust_period=_int_arg(args, "robust_period", 96),
-        entry_z=_float_arg(args, "entry_z", 2.0),
-        exit_z=_float_arg(args, "exit_z", 0.25),
-        adx_max=_float_arg(args, "adx_max", 25.0),
-    )
-
-
 STRATEGY_REGISTRY: dict[str, StrategyBuilder] = {
     "momentum_burst": _momentum("momentum_burst"),
     "momentum_burst_no_session": _momentum("momentum_burst_no_session", no_session=True),
     "momentum_burst_soft_volume": _momentum("momentum_burst_soft_volume", soft_volume=True),
     "ema_trend_baseline": lambda _args: ema_trend_baseline_spec(),
     "rsi_bounce_reversion": lambda _args: rsi_bounce_reversion_spec(),
-    "zscore_mean_reversion": _fixed_z,
-    "adaptive_zscore_mean_reversion": _adaptive_z,
-    "robust_zscore_mean_reversion": _robust_z,
     "rsi_macd_trend": lambda _args: rsi_macd_trend_spec(),
+    "structure_event_reversal_v1": lambda _args: structure_event_reversal_v1_spec(),
+    "structure_event_trend_aligned_v1": lambda _args: structure_event_trend_aligned_v1_spec(),
+    "structure_event_trend_aligned_mtf_confirm_v1": (
+        lambda _args: structure_event_trend_aligned_mtf_confirm_v1_spec()
+    ),
+    "structure_event_reversal_no_vol_v1": lambda _args: structure_event_reversal_v1_spec(
+        require_volume_impulse=False,
+        name="structure_event_reversal_no_vol_v1",
+    ),
+    "structure_event_trend_aligned_no_vol_v1": lambda _args: structure_event_trend_aligned_v1_spec(
+        require_volume_impulse=False,
+        name="structure_event_trend_aligned_no_vol_v1",
+    ),
 }
 
 STRATEGY_CHOICES = tuple(STRATEGY_REGISTRY)
 
 BENCHMARK_GROUPS: dict[str, tuple[str, ...]] = {
-    "zscore-family": (
-        "zscore_mean_reversion",
-        "adaptive_zscore_mean_reversion",
-        "robust_zscore_mean_reversion",
-    ),
     "baselines": (
         "ema_trend_baseline",
         "rsi_bounce_reversion",
-        "zscore_mean_reversion",
+        "rsi_macd_trend",
+        "momentum_burst",
     ),
     "candidate": (
-        "zscore_mean_reversion",
-        "adaptive_zscore_mean_reversion",
-        "robust_zscore_mean_reversion",
+        "ema_trend_baseline",
+        "rsi_bounce_reversion",
+        "rsi_macd_trend",
+        "momentum_burst",
+        "structure_event_reversal_v1",
+        "structure_event_trend_aligned_v1",
+    ),
+    "structure-development": (
+        "structure_event_reversal_v1",
+        "structure_event_trend_aligned_v1",
+        "structure_event_trend_aligned_mtf_confirm_v1",
+        "structure_event_reversal_no_vol_v1",
+        "structure_event_trend_aligned_no_vol_v1",
+        "ema_trend_baseline",
+        "momentum_burst",
+        "rsi_macd_trend",
     ),
     "all": STRATEGY_CHOICES,
 }
@@ -139,7 +129,7 @@ def selected_strategy_names(args: Any) -> tuple[str, ...]:
     if strategies:
         return parse_strategy_names(strategies)
     if bool(getattr(args, "benchmark", False)):
-        group = str(getattr(args, "benchmark_group", "zscore-family"))
+        group = str(getattr(args, "benchmark_group", "baselines"))
         return BENCHMARK_GROUPS[group]
     return (str(getattr(args, "strategy", DEFAULT_STRATEGY)),)
 
@@ -161,8 +151,12 @@ def strategy_args_metadata(args: Any, strategy_name: str | None = None) -> str:
         "robust_period",
         "volatility_ratio_max",
         "adx_max",
+        "zbasket_adx_max",
         "mom_threshold",
         "trend_maturity",
+        "trend_period",
+        "trend_return_max",
+        "trend_return_min",
         "volume_mult",
         "adx_threshold",
     ):

@@ -44,12 +44,12 @@ class ExitReason(StrEnum):
 
 @dataclass(frozen=True)
 class SizingDecision:
-    contracts: int
+    contracts: float
     risk_per_contract: float
     risk_budget_usd: float
-    risk_sized_contracts: int
+    risk_sized_contracts: float
     max_notional_usd: float
-    notional_sized_contracts: int
+    notional_sized_contracts: float
     binding_cap: str
     blocked_reason: str = ""
 
@@ -160,6 +160,9 @@ class ExitConfig:
     session_end_utc: int = 22
 
 
+HARD_EXIT_REASONS = {ExitReason.STOP.value, ExitReason.GLOBAL_LOSS_LIMIT.value}
+
+
 @dataclass
 class TrailTracker:
     trail_high: float = 0.0
@@ -265,14 +268,20 @@ class BasketManager:
             return SizingDecision(0, 0.0, 0.0, 0, 0.0, 0, "none", "zero_risk_distance")
         strength = max(0.0, float(signal_strength or 0.0))
         max_risk = cfg.capital * cfg.max_risk_pct * strength * max(0.0, lot_multiplier)
-        risk_sz = math.floor(max_risk / risk_per_ct)
+        lot_size = max(float(getattr(cfg, "lot_size", 1.0)), 1e-9)
+        min_contracts = max(float(getattr(cfg, "min_contracts", 1.0)), 0.0)
+
+        def _round_lot(size: float) -> float:
+            lots = math.floor(max(size, 0.0) / lot_size + 1e-9)
+            return round(lots * lot_size, 10)
+
+        risk_sz = _round_lot(max_risk / risk_per_ct)
         notional_per_ct = cfg.ct_val * entry_px
         notional_fraction = float(getattr(cfg, "max_notional_pct_per_basket", 1.0))
         max_notional = cfg.capital * cfg.leverage * max(0.0, notional_fraction)
-        notional_sz = math.floor(max_notional / max(notional_per_ct, 1e-9))
+        notional_sz = _round_lot(max_notional / max(notional_per_ct, 1e-9))
         raw_contracts = min(risk_sz, notional_sz)
-        min_contracts = int(getattr(cfg, "min_contracts", 1))
-        if raw_contracts < min_contracts:
+        if raw_contracts + 1e-9 < min_contracts:
             binding = "risk" if risk_sz <= notional_sz else "notional"
             return SizingDecision(
                 0,
@@ -282,11 +291,11 @@ class BasketManager:
                 max_notional,
                 notional_sz,
                 binding,
-                f"below_min_contracts_{min_contracts}",
+                f"below_min_contracts_{min_contracts:g}",
             )
         binding = "risk" if risk_sz <= notional_sz else "notional"
         return SizingDecision(
-            raw_contracts,
+            round(raw_contracts, 10),
             risk_per_ct,
             max_risk,
             risk_sz,
@@ -296,15 +305,20 @@ class BasketManager:
         )
 
     @staticmethod
-    def size_position(entry_px: float, stop_px: float, cfg) -> int:
+    def size_position(entry_px: float, stop_px: float, cfg) -> float:
         return BasketManager.size_decision(entry_px, stop_px, cfg).contracts
 
     @staticmethod
     def compute_stop_target(side: str, entry_px: float, atr: float, cfg) -> tuple[float, float]:
         d = 1 if side == "buy" else -1
+        tick_size = max(float(getattr(cfg, "tick_size", 0.01)), 1e-9)
+
+        def _round_tick(px: float) -> float:
+            return round(round(px / tick_size) * tick_size, 10)
+
         return (
-            round(entry_px - d * cfg.atr_stop_mult * atr, 2),
-            round(entry_px + d * cfg.atr_target_mult * atr, 2),
+            _round_tick(entry_px - d * cfg.atr_stop_mult * atr),
+            _round_tick(entry_px + d * cfg.atr_target_mult * atr),
         )
 
 
@@ -579,3 +593,30 @@ def evaluate_exits(
         )
 
     return None
+
+
+def evaluate_hard_exits(
+    basket: Basket,
+    bar_close: float,
+    bar_high: float,
+    bar_low: float,
+    atr: float,
+    config: ExitConfig,
+) -> BasketAction | None:
+    """Evaluate non-negotiable risk exits that must outrank recovery."""
+    entry = basket.entry_px
+    d = 1 if basket.side == "buy" else -1
+    stop_px = basket.stop_px if basket.stop_px > 0 else entry - d * config.stop_mult * atr
+    if basket.target_hit:
+        return None
+    stop_hit = bar_low <= stop_px if d > 0 else bar_high >= stop_px
+    if not stop_hit:
+        return None
+    return BasketAction(
+        basket_id=basket.basket_id,
+        action=ActionKind.EXIT,
+        side=basket.side,
+        reason=ExitReason.STOP.value,
+        px=stop_px,
+        fraction=1.0,
+    )
