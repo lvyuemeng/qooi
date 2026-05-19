@@ -7,12 +7,12 @@ import polars as pl
 from qooi.core.config import RESEARCH_PAIRS
 from qooi.exchange.store import HistoryCoverage, HistoryTarget
 from qooi.research.config import resolve_config
-from qooi.research.data import (
+from qooi.strategies.features import StructureClassifierConfig
+from qooi.strategies.preprocessing import (
     ClassifierContextConfig,
     ClassifierFramePipeline,
     prepare_classifier_frame,
 )
-from qooi.strategies.features import StructureClassifierConfig
 
 
 def _frame(rows: int = 240, step_ms: int = 3_600_000) -> pl.DataFrame:
@@ -34,7 +34,7 @@ def _coverage(inst_id: str, bar: str, rows: int) -> HistoryCoverage:
 
 
 class FakeStore:
-    def load_history(self, request):
+    def bars(self, request):
         if request.bar == "4H":
             return _frame(90, 4 * 3_600_000), _coverage(request.inst_id, request.bar, 90)
         if request.bar == "1D":

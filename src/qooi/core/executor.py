@@ -65,7 +65,7 @@ class LiveExecutor:
             print(f"    HEDGE {a.side} sz={a.sz} ({a.reason})")
 
     def _entry_px(self, side: str, symbol: str) -> float:
-        obi = self._md.ob_snapshot(symbol, limit=1)
+        obi = self._md.book(symbol, limit=1)
         if not obi:
             return 0.0
         return obi.ask_price if side == "buy" else obi.bid_price

@@ -46,12 +46,23 @@ Files:
 
 Responsibilities:
 
-- Fetch OHLCV, order-book, and funding data from exchange backends.
+- Fetch bars, book, funding, and archive metadata from exchange backends.
 - Normalize exchange schemas.
 - Store and load Parquet caches.
 - Plan historical fetch horizon from `days`, `min_bars`, and bar size.
 - Validate actual cache coverage against the planned horizon.
 - Return data-only metadata.
+
+Exchange API vocabulary is resource-first and async-first:
+
+- `bars()` and `bars_since()` replace public `ohlcv` / `candles` naming.
+- `book()` and `books()` replace public `order_book` / `ob_*` naming.
+- `funding()` returns funding-rate frames.
+- `archives()` returns OKX downloadable historical-market-data metadata.
+- Store APIs use uniform resource methods: `bars()`, `funding()`, `books()`, and `many()` for batch bar refreshes.
+- Exchange capability is expressed with `SyncExchange` and `AsyncExchange` protocols, not a facade or base-class hierarchy.
+- Concrete exchange clients are split by execution model: `OkxSyncExchange`, `OkxAsyncExchange`, `CcxtSyncExchange`, and `CcxtBooksStream`.
+- Preferred lifecycle management is context-manager based: `with CacheStore() as store: ...` and `async with AsyncCacheStore() as store: ...`.
 
 Canonical history types:
 
@@ -383,6 +394,73 @@ Interpretation order:
 
 Reports should summarize layer status first and show supporting counters only when they help explain a behavior or debugging path.
 
+### Modulation-Effect Diagnostics
+
+`--diagnostic-mode modulation-effect` is the current diagnostic path for testing whether higher-timeframe or endogenous regime context changes the meaning of H1 state/event/side labels.
+
+The diagnostic is post-trade only. It must not change strategy entries. It compares one base feature against one candidate modulator at a time to avoid full Cartesian MTF key sparsity.
+
+Current base features:
+
+- `entry_market_stage_bucket`
+- `entry_market_stage_reason_bucket`
+- `entry_liquidity_event_type_bucket`
+- `side`
+- `entry_structure_bucket`
+
+Current candidate modulators:
+
+- `entry_d1_structure_trend_state`
+- `entry_d1_market_stage`
+- `entry_h4_structure_trend_state`
+- `entry_h4_market_stage`
+- `entry_atr_percentile_bucket`
+- `entry_adx_bucket`
+
+Modulation rows must expose count thresholds and classification explicitly. A row is not actionable unless base and conditional sample counts pass, the expectancy delta exceeds the practical threshold, the confidence band excludes zero, and symbol-level signs are stable enough for the intended scope.
+
+Current 2026-05-18 evaluation:
+
+- Baseline: `1157` modulation rows, `0` significant effects, `0` global effects.
+- Full no-range: `874` modulation rows, `0` significant effects, `0` global effects.
+- No-range-longs: `1088` modulation rows, `0` significant effects, `0` global effects.
+- Decision: no MTF or modulation-gated strategy variant is authorized from current evidence.
+- Current diagnostic baseline: `structure_event_trend_aligned_no_range_v1`, diagnostic-only.
+
+Detailed report: `docs/modulation-effect-report.md`.
+
+Definitions and formulas for classifier labels, diagnostics, trade-record modulation, adaptive classifier settings, overlap-aware uncertainty metadata, classifier health gates, and market-state-forward evaluation are documented in `docs/evaluation-diagnostics-reference.md`.
+
+### Market-State-Forward Diagnostics
+
+`--diagnostic-mode market-state-forward` is the strategy-independent companion to trade-record modulation diagnostics.
+
+It prepares classifier H1 frames with H4/D1 closed-bar context and computes forward market behavior after every eligible H1 bar. It does not build strategies, run basket execution, or sample only executed trades.
+
+The diagnostic answers a different question from `modulation-effect`:
+
+- Trade-record modulation: what happened to strategy-sampled trades.
+- Market-state-forward: what happened after all eligible market states.
+
+Forward labels may use future OHLCV only as outcome columns. Grouping and state columns must remain known at the H1 bar close, including higher-timeframe context attached from the last fully closed HTF bar.
+
+Current output includes horizon-specific return, return-in-ATR, MFE/MAE, directional rates, count thresholds, sufficiency flags, market-state modulation rows, overlap/effective-sample metadata, robust standard-error fields, FDR fields, standardized effects, lower-tail metrics, cross-asset homogeneity, and time-split stability fields. Confidence bands remain exploratory because adjacent H1 rows use overlapping future windows.
+
+Current 2026-05-18 robust smoke, core universe excluding XAU:
+
+- Export: `F:\Stratum\TEMP\kilo\qooi-market-state-forward-robust.csv`.
+- Plots: `F:\Stratum\TEMP\kilo\qooi-market-state-forward-plots\`.
+- Forward summary rows: `12,395`.
+- Market-state modulation rows: `11,832`.
+- Robust significant modulation rows: `262`.
+- FDR-significant modulation rows: `46`.
+- Global and FDR-significant modulation rows: `9`.
+- Sufficient forward groups: `3,720`.
+- Directional forward groups: `1,279`.
+- Decision: hypothesis generation only; no strategy filter is authorized directly from this diagnostic.
+
+No entry filter or strategy variant is authorized directly from this diagnostic. Sufficient, FDR-significant, effect-size-material, cross-asset homogeneous, and time-stable effects become candidate hypotheses for later strategy tests with explicit entry timing, stops, targets, costs, and slippage.
+
 ## 13. Backtest Orchestration
 
 File:
@@ -393,7 +471,7 @@ Responsibilities:
 
 - Parse CLI.
 - Select pairs.
-- Construct strategies from arguments.
+- Select explicit strategy specs from `qooi.strategies.catalog`.
 - Choose data-source policy.
 - Ask the data layer for requested histories.
 - Prepare the final execution frame.

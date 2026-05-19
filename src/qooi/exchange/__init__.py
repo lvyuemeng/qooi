@@ -1,36 +1,25 @@
-"""OKX exchange adapter.
-
-Public market data (no API key needed):
-    >>> from qooi.exchange.market import MarketData
-    >>> md = MarketData()
-    >>> df = md.candles("BTC-USDT", bar="1H", limit=50)
-
-Trading (API key via env vars OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE):
-    >>> from qooi.exchange.trading import TradingClient
-    >>> tc = TradingClient()
-    >>> tc.balance()
-"""
+"""Exchange adapters for public market data and OKX trading."""
 
 from qooi.exchange.market import (
-    CcxtBackend,
-    FundingRateProvider,
-    MarketData,
-    ObSnapshot,
-    OhlcvProvider,
-    OkxSdkBackend,
-    OrderBookProvider,
-    StreamProvider,
+    AsyncExchange,
+    BookSnapshot,
+    CandleSource,
+    CcxtBooksStream,
+    CcxtSyncExchange,
+    OkxAsyncExchange,
+    OkxSyncExchange,
+    SyncExchange,
 )
 from qooi.exchange.trading import TradingClient
 
 __all__ = [
-    "MarketData",
+    "AsyncExchange",
+    "BookSnapshot",
+    "CandleSource",
+    "CcxtBooksStream",
+    "CcxtSyncExchange",
+    "OkxAsyncExchange",
+    "OkxSyncExchange",
+    "SyncExchange",
     "TradingClient",
-    "ObSnapshot",
-    "OhlcvProvider",
-    "OrderBookProvider",
-    "StreamProvider",
-    "FundingRateProvider",
-    "CcxtBackend",
-    "OkxSdkBackend",
 ]

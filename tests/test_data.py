@@ -4,27 +4,29 @@ import asyncio
 
 import polars as pl
 
+import qooi.exchange.market as market
 from qooi.core.config import PAIRS, RESEARCH_PAIRS
-from qooi.exchange.market import _cache_path as market_cache_path
-from qooi.exchange.market import _parse_ohlcv, okx_index_inst_id
+from qooi.exchange.market import _parse_bars, okx_index_inst_id
 from qooi.exchange.store import (
     AsyncCacheStore,
+    BooksRequest,
     CacheStore,
+    FundingRequest,
     HistoryRefreshRequest,
+    _resource_path,
     plan_history,
     validate_history,
 )
-from qooi.research.data import (
+from qooi.strategies.features import add_price_structure_stage_features
+from qooi.strategies.indicators import add_indicators, attach_order_book_features
+from qooi.strategies.preprocessing import (
     _add_missing_context_columns,
     _compact_higher_timeframe_context,
     _context_min_bars,
     _mark_higher_context_available,
     add_mtf_state_keys,
     attach_higher_timeframe_context,
-    attach_lower_timeframe_confirmation,
 )
-from qooi.strategies.features import add_price_structure_stage_features
-from qooi.strategies.indicators import add_indicators, attach_order_book_features
 
 
 class TestIndicators:
@@ -56,15 +58,62 @@ class TestIndicators:
         )
 
 
-def test_cache_store_path_matches_market_cache_path():
-    assert CacheStore._path("BTC-USDT", "1H") == market_cache_path("BTC-USDT", "1H")
-    assert CacheStore._path("XAU/USDT", "1h") == market_cache_path("XAU/USDT", "1h")
-    assert CacheStore._path("BTC-USDT-SWAP", "1H", source="mark").name == (
+def test_cache_store_path_is_source_aware():
+    assert _resource_path("BTC-USDT", bar="1H").name == "BTC_USDT_1H.parquet"
+    assert _resource_path("XAU/USDT", bar="1h").name == "XAU_USDT_1H.parquet"
+    assert _resource_path("BTC-USDT-SWAP", bar="1H", source="mark").name == (
         "BTC_USDT_SWAP_MARK_1H.parquet"
     )
-    assert CacheStore._path("BTC-USD", "1H", source="index").name == "BTC_USD_INDEX_1H.parquet"
+    assert _resource_path("BTC-USD", bar="1H", source="index").name == "BTC_USD_INDEX_1H.parquet"
+    assert not hasattr(CacheStore, "_path")
     assert not hasattr(CacheStore, "validate_ohlcv")
     assert not hasattr(CacheStore, "describe_ohlcv")
+    assert not hasattr(CacheStore, "load")
+    assert not hasattr(CacheStore, "load_history")
+    assert not hasattr(CacheStore, "load_or_refresh")
+    assert not hasattr(CacheStore, "intraday_frame")
+    assert not hasattr(CacheStore, "refresh_sync")
+    assert not hasattr(CacheStore, "refresh_funding")
+    assert not hasattr(CacheStore, "load_funding")
+    assert not hasattr(CacheStore, "cache_order_book")
+    assert not hasattr(CacheStore, "record_order_book")
+    assert not hasattr(CacheStore, "load_order_book")
+    assert hasattr(CacheStore, "bars")
+    assert hasattr(CacheStore, "funding")
+    assert hasattr(CacheStore, "books")
+    assert not hasattr(AsyncCacheStore, "load_history_async")
+    assert not hasattr(AsyncCacheStore, "refresh_async")
+    assert not hasattr(AsyncCacheStore, "refresh_many_async")
+
+
+def test_market_exports_resource_first_exchange_api():
+    for removed in (
+        "MarketData",
+        "ExchangeBackend",
+        "OhlcvProvider",
+        "AsyncOhlcvProvider",
+        "OrderBookProvider",
+        "StreamProvider",
+        "FundingRateProvider",
+        "CcxtBackend",
+        "OkxSdkBackend",
+        "OkxAsyncBackend",
+        "CcxtProBackend",
+        "ObSnapshot",
+        "_parse_ohlcv",
+    ):
+        assert not hasattr(market, removed)
+    for exposed in (
+        "SyncExchange",
+        "AsyncExchange",
+        "OkxSyncExchange",
+        "OkxAsyncExchange",
+        "CcxtSyncExchange",
+        "CcxtBooksStream",
+        "BookSnapshot",
+        "_parse_bars",
+    ):
+        assert hasattr(market, exposed)
 
 
 def test_research_pairs_do_not_change_live_pairs():
@@ -121,7 +170,7 @@ def test_history_coverage_preserves_fetch_audit_notes():
 
 
 def test_source_aware_index_mark_parser_uses_confirm_not_volume():
-    parsed = _parse_ohlcv(
+    parsed = _parse_bars(
         [
             [1_000, "100", "101", "99", "100.5", "1"],
             [2_000, "101", "102", "100", "101.5", "0"],
@@ -162,6 +211,11 @@ def test_structure_stage_unknown_semantics_are_split():
     assert out["stage_unknown_reason"][0] == "warmup"
     assert "wide_range" in out["market_stage"].to_list()
     assert "wide_range" in out["stage_unknown_reason"].to_list()
+    transition_conflicts = out.filter(
+        (pl.col("stage_unknown_reason") == "transition")
+        & (pl.col("market_stage") != "transition")
+    )
+    assert transition_conflicts.is_empty()
 
 
 def test_raw_unknown_is_not_used_for_normal_warmup_or_wide_range():
@@ -207,26 +261,26 @@ def test_async_refresh_skips_deep_history_for_complete_incremental_cache(tmp_pat
             "vol": [1.0, 1.0, 1.0],
         }
     )
-    existing.write_parquet(CacheStore._path(request.inst_id, request.bar))
+    existing.write_parquet(_resource_path(request.inst_id, bar=request.bar))
 
-    class FakeMarketData:
-        last_ohlcv_audit = ("fetch_backend=fake",)
+    class FakeAsyncExchange:
+        last_bars_audit = ("fetch_backend=fake",)
 
         def __init__(self):
             self.deep_calls = 0
 
-        async def candles_range_async(self, *args, **kwargs):
+        async def bars_since(self, *args, **kwargs):
             self.deep_calls += 1
             return pl.DataFrame()
 
-        async def candles_async(self, *args, **kwargs):
+        async def bars(self, *args, **kwargs):
             return pl.DataFrame()
 
-    md = FakeMarketData()
-    result = asyncio.run(AsyncCacheStore(md).refresh_async(request))
+    exchange = FakeAsyncExchange()
+    result = asyncio.run(AsyncCacheStore(exchange).many((request,)))[0]
 
     assert result.error is None
-    assert md.deep_calls == 0
+    assert exchange.deep_calls == 0
     assert "refresh_skipped_history=yes" in result.coverage.notes
 
 
@@ -238,10 +292,10 @@ def test_async_refresh_many_dedupes_requests_and_honors_concurrency(tmp_path, mo
     active = 0
     max_active = 0
 
-    class FakeMarketData:
-        last_ohlcv_audit = ("fetch_backend=fake",)
+    class FakeAsyncExchange:
+        last_bars_audit = ("fetch_backend=fake",)
 
-        async def candles_range_async(self, symbol, timeframe, since, limit, source="trade"):
+        async def bars_since(self, symbol, bar, since, limit, source="trade"):
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
@@ -258,7 +312,7 @@ def test_async_refresh_many_dedupes_requests_and_honors_concurrency(tmp_path, mo
                 }
             )
 
-        async def candles_async(self, *args, **kwargs):
+        async def bars(self, *args, **kwargs):
             return pl.DataFrame()
 
     requests = (
@@ -268,15 +322,37 @@ def test_async_refresh_many_dedupes_requests_and_honors_concurrency(tmp_path, mo
     )
 
     results = asyncio.run(
-        AsyncCacheStore(FakeMarketData()).refresh_many_async(requests, concurrency=1)
+        AsyncCacheStore(FakeAsyncExchange()).many(requests, concurrency=1)
     )
 
     assert len(results) == 2
     assert max_active == 1
 
 
+def test_sync_store_books_requires_async_for_ws():
+    try:
+        CacheStore().books(BooksRequest("BTC-USDT-SWAP", samples=1, transport="ws"))
+    except RuntimeError as exc:
+        assert "AsyncCacheStore.books" in str(exc)
+    else:
+        raise AssertionError("sync websocket books collection should fail clearly")
+
+
+def test_sync_store_funding_reads_existing_cache(tmp_path, monkeypatch):
+    import qooi.exchange.store as store_module
+
+    monkeypatch.setattr(store_module, "CACHE_DIR", tmp_path)
+    frame = pl.DataFrame(
+        {"timestamp": [1_000], "funding_rate": [0.01], "funding_time": [1_000]}
+    )
+    frame.write_parquet(store_module._resource_path("BTC-USDT-SWAP", resource="funding"))
+
+    out = CacheStore().funding(FundingRequest("BTC-USDT-SWAP"))
+
+    assert out["funding_rate"].to_list() == [0.01]
+
+
 def test_mtf_context_min_bars_are_timeframe_specific():
-    assert _context_min_bars("15m", 730, role="lower_confirmation") == 70_080
     assert _context_min_bars("4H", 730, role="higher_context") == 4_630
     assert _context_min_bars("1D", 730, role="higher_context") == 980
 
@@ -458,64 +534,3 @@ def test_missing_higher_timeframe_context_marks_unavailable():
     out = _add_missing_context_columns(base, "d1")
 
     assert out["d1_context_available"].to_list() == [False]
-
-
-def test_lower_timeframe_confirmation_only_scans_after_h1_close():
-    base = pl.DataFrame(
-        {
-            "timestamp": [0],
-            "open": [100.0],
-            "high": [105.0],
-            "low": [95.0],
-            "close": [100.0],
-            "vol": [10.0],
-        }
-    )
-    ltf = pl.DataFrame(
-        {
-            "timestamp": [45 * 60 * 1000, 60 * 60 * 1000, 75 * 60 * 1000],
-            "open": [100.0, 100.0, 100.0],
-            "high": [110.0, 106.0, 104.0],
-            "low": [99.0, 99.0, 94.0],
-            "close": [110.0, 106.0, 94.0],
-            "vol": [10.0, 10.0, 10.0],
-        }
-    )
-
-    out = attach_lower_timeframe_confirmation(base, ltf, horizon_bars=1)
-
-    assert out.height == base.height
-    assert out["m15_confirm_available"].to_list() == [True]
-    assert out["m15_confirm_long"].to_list() == [True]
-    assert out["m15_confirm_short"].to_list() == [False]
-    assert out["m15_confirm_reason"].to_list() == ["breakout"]
-
-
-def test_lower_timeframe_confirmation_missing_bars_do_not_pass():
-    base = pl.DataFrame(
-        {
-            "timestamp": [0],
-            "open": [100.0],
-            "high": [105.0],
-            "low": [95.0],
-            "close": [100.0],
-            "vol": [10.0],
-        }
-    )
-    ltf = pl.DataFrame(
-        {
-            "timestamp": [15 * 60 * 1000],
-            "open": [100.0],
-            "high": [110.0],
-            "low": [99.0],
-            "close": [110.0],
-            "vol": [10.0],
-        }
-    )
-
-    out = attach_lower_timeframe_confirmation(base, ltf, horizon_bars=3)
-
-    assert out["m15_confirm_available"].to_list() == [False]
-    assert out["m15_confirm_long"].to_list() == [False]
-    assert out["m15_confirm_short"].to_list() == [False]
-    assert out["m15_confirm_reason"].to_list() == ["none"]
