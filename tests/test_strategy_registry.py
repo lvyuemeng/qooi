@@ -89,8 +89,7 @@ def _structural_event_frame(**overrides) -> pl.DataFrame:
     data.update(overrides)
     rows = max(len(value) for value in data.values())
     data = {
-        key: value * rows if len(value) == 1 and rows > 1 else value
-        for key, value in data.items()
+        key: value * rows if len(value) == 1 and rows > 1 else value for key, value in data.items()
     }
     return pl.DataFrame(data)
 
@@ -453,7 +452,6 @@ def test_structure_event_reversal_enters_short_failed_breakout_high():
 
     out = apply_strategy_spec(frame, _featureless_structural_spec())
 
-
     assert out["entry_signal"].to_list() == [-1.0]
     assert out["signal_id"].to_list() == ["short_failed_breakout_high"]
 
@@ -461,12 +459,12 @@ def test_structure_event_reversal_enters_short_failed_breakout_high():
 def test_structure_event_reversal_volume_and_quality_gates_block_entries():
     spec = _featureless_structural_spec()
 
-    assert apply_strategy_spec(
-        _structural_event_frame(volume_impulse=[False]), spec
-    )["entry_signal"].to_list() == [0.0]
-    assert apply_strategy_spec(
-        _structural_event_frame(event_quality_score=[1.49]), spec
-    )["entry_signal"].to_list() == [0.0]
+    assert apply_strategy_spec(_structural_event_frame(volume_impulse=[False]), spec)[
+        "entry_signal"
+    ].to_list() == [0.0]
+    assert apply_strategy_spec(_structural_event_frame(event_quality_score=[1.49]), spec)[
+        "entry_signal"
+    ].to_list() == [0.0]
 
 
 def test_structure_event_reversal_can_disable_volume_gate_explicitly():
@@ -537,9 +535,7 @@ def test_structure_event_trend_aligned_no_range_variant_is_registered():
     spec = strategy_selection(("structure_event_trend_aligned_no_range_v1",)).strategies[0]
 
     assert spec.name == "structure_event_trend_aligned_no_range_v1"
-    assert "structure_event_trend_aligned_no_range_v1" in BENCHMARK_GROUPS[
-        "structure-development"
-    ]
+    assert "structure_event_trend_aligned_no_range_v1" in BENCHMARK_GROUPS["structure-development"]
     assert "structure_event_trend_aligned_no_range_v1" not in BENCHMARK_GROUPS["candidate"]
 
 
@@ -547,12 +543,11 @@ def test_structure_event_trend_aligned_no_range_longs_variant_is_registered():
     spec = strategy_selection(("structure_event_trend_aligned_no_range_longs_v1",)).strategies[0]
 
     assert spec.name == "structure_event_trend_aligned_no_range_longs_v1"
-    assert "structure_event_trend_aligned_no_range_longs_v1" in BENCHMARK_GROUPS[
-        "structure-development"
-    ]
-    assert "structure_event_trend_aligned_no_range_longs_v1" not in BENCHMARK_GROUPS[
-        "candidate"
-    ]
+    assert (
+        "structure_event_trend_aligned_no_range_longs_v1"
+        in BENCHMARK_GROUPS["structure-development"]
+    )
+    assert "structure_event_trend_aligned_no_range_longs_v1" not in BENCHMARK_GROUPS["candidate"]
 
 
 @pytest.mark.parametrize(
@@ -712,12 +707,12 @@ def test_structure_event_trend_aligned_no_range_longs_allows_non_range_long():
 def test_structure_event_trend_aligned_volume_and_quality_gates_block_entries():
     spec = _featureless_trend_aligned_spec()
 
-    assert apply_strategy_spec(
-        _structural_event_frame(volume_impulse=[False]), spec
-    )["entry_signal"].to_list() == [0.0]
-    assert apply_strategy_spec(
-        _structural_event_frame(event_quality_score=[1.49]), spec
-    )["entry_signal"].to_list() == [0.0]
+    assert apply_strategy_spec(_structural_event_frame(volume_impulse=[False]), spec)[
+        "entry_signal"
+    ].to_list() == [0.0]
+    assert apply_strategy_spec(_structural_event_frame(event_quality_score=[1.49]), spec)[
+        "entry_signal"
+    ].to_list() == [0.0]
 
 
 def test_structure_event_trend_aligned_can_disable_volume_gate_explicitly():

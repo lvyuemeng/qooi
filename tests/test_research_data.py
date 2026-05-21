@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import polars as pl
+import pytest
 
 from qooi.exchange.store import HistoryCoverage, HistoryTarget
 from qooi.research.config import ResearchCommandConfig
 from qooi.research.instruments import RESEARCH_UNIVERSE
-from qooi.research.workflows import FrameRequest, prepare_classifier_frame
+from qooi.research.run import _resolve_research_outputs
+from qooi.research.workflows import DEFAULT_CONTEXTS, FrameRequest, prepare_classifier_frame
 from qooi.strategies.features import StructureClassifierConfig
 
 
@@ -28,11 +30,17 @@ def _coverage(inst_id: str, bar: str, rows: int) -> HistoryCoverage:
 
 
 class FakeStore:
+    def __init__(self) -> None:
+        self.requests = []
+
     def bars(self, request):
+        self.requests.append(request)
         if request.bar == "4H":
             return _frame(90, 4 * 3_600_000), _coverage(request.inst_id, request.bar, 90)
         if request.bar == "1D":
             return _frame(60, 24 * 3_600_000), _coverage(request.inst_id, request.bar, 60)
+        if request.bar == "15m":
+            return _frame(240, 15 * 60_000), _coverage(request.inst_id, request.bar, 240)
         return _frame(), _coverage(request.inst_id, request.bar, 240)
 
 
@@ -52,6 +60,7 @@ def _request(pair, command: ResearchCommandConfig) -> FrameRequest:
     return FrameRequest(
         pair=pair,
         data_source=command.run.data_source,
+        bar=pair.asset.timeframe,
         days=command.days,
         min_bars=command.min_bars,
         refresh=command.cache.refresh,
@@ -64,7 +73,10 @@ def test_prepare_classifier_frame_does_not_run_backtest():
     command = _command()
 
     prepared = prepare_classifier_frame(
-        FakeStore(), _request(RESEARCH_UNIVERSE[0], command), StructureClassifierConfig.fixed()
+        FakeStore(),
+        _request(RESEARCH_UNIVERSE[0], command),
+        StructureClassifierConfig.fixed(),
+        contexts=DEFAULT_CONTEXTS,
     )
 
     assert "market_stage" in prepared.frame.columns
@@ -80,13 +92,132 @@ def test_prepare_classifier_frame_is_deterministic():
     pair = RESEARCH_UNIVERSE[0]
 
     first = prepare_classifier_frame(
-        FakeStore(), _request(pair, command), StructureClassifierConfig.fixed()
+        FakeStore(),
+        _request(pair, command),
+        StructureClassifierConfig.fixed(),
+        contexts=DEFAULT_CONTEXTS,
     )
     second = prepare_classifier_frame(
-        FakeStore(), _request(pair, command), StructureClassifierConfig.fixed()
+        FakeStore(),
+        _request(pair, command),
+        StructureClassifierConfig.fixed(),
+        contexts=DEFAULT_CONTEXTS,
     )
 
     assert first.signal_inst_id == second.signal_inst_id
     assert first.frame.select("mtf_state_key", "h4_market_stage", "d1_market_stage").equals(
         second.frame.select("mtf_state_key", "h4_market_stage", "d1_market_stage")
     )
+
+
+def test_prepare_classifier_frame_uses_requested_bar_without_default_context():
+    command = _command()
+    pair = RESEARCH_UNIVERSE[0]
+    request = _request(pair, command)
+    request = FrameRequest(
+        pair=pair,
+        data_source=request.data_source,
+        bar="15m",
+        days=request.days,
+        min_bars=request.min_bars,
+        refresh=request.refresh,
+        min_coverage_pct=request.min_coverage_pct,
+        allow_swap_signal_fallback=request.allow_swap_signal_fallback,
+    )
+    store = FakeStore()
+
+    prepared = prepare_classifier_frame(store, request, StructureClassifierConfig.fixed())
+
+    assert store.requests[0].bar == "15m"
+    assert "timeframe" in prepared.frame.columns
+    assert prepared.frame.select("timeframe").item(0, 0) == "15m"
+    assert "h4_market_stage" not in prepared.frame.columns
+    assert "d1_market_stage" not in prepared.frame.columns
+    assert "mtf_state_key" not in prepared.frame.columns
+
+
+def test_timeframe_config_resolves_defaults_and_overrides():
+    config = ResearchCommandConfig.model_validate(
+        {
+            "timeframes": {
+                "bars": ["15m", "1H", "1H"],
+                "specs": [
+                    {"bar": "15m", "min_bars": 120, "liquidity_lookback": 44},
+                    {"bar": "1H", "horizons": [2, 4, 4]},
+                ],
+            }
+        }
+    )
+
+    specs = config.timeframes.resolved_specs(config)
+
+    assert [spec.bar for spec in specs] == ["15m", "1H"]
+    assert specs[0].horizons == (4, 8, 16)
+    assert specs[0].min_bars == 120
+    assert specs[0].liquidity_lookback == 44
+    assert specs[1].horizons == (2, 4)
+
+
+def test_diagnostic_mode_accepts_only_backtest_and_research_evaluation():
+    assert ResearchCommandConfig.model_validate({"diagnostics": {"mode": "backtest"}})
+    assert ResearchCommandConfig.model_validate({"diagnostics": {"mode": "research-evaluation"}})
+    for mode in (
+        "classifier",
+        "state",
+        "state-profitability",
+        "state-filter-delta",
+        "modulation-effect",
+        "market-state-forward",
+        "tradability",
+    ):
+        with pytest.raises(ValueError):
+            ResearchCommandConfig.model_validate({"diagnostics": {"mode": mode}})
+
+
+def test_joint_forward_quality_config_defaults_disabled_and_validates():
+    default = ResearchCommandConfig()
+    assert default.research_evaluation.outputs == (
+        "timeframe-classifier",
+        "joint-forward-quality",
+    )
+    assert default.research_evaluation.include_backtest_report is False
+    assert default.research_evaluation.joint_forward_quality.enabled is False
+
+    config = ResearchCommandConfig.model_validate(
+        {
+            "research_evaluation": {
+                "outputs": ["joint-forward-quality"],
+                "joint_forward_quality": {
+                    "enabled": True,
+                    "min_rows": 12,
+                    "transition_min_rows": 8,
+                },
+            }
+        }
+    )
+
+    assert config.research_evaluation.outputs == ("joint-forward-quality",)
+    assert config.research_evaluation.joint_forward_quality.enabled is True
+    assert config.research_evaluation.joint_forward_quality.transition_min_rows == 8
+
+
+def test_research_evaluation_rejects_removed_outputs():
+    removed = [
+        "classifier",
+        "tradability",
+        "market-state-forward",
+        "market-state-modulation",
+        "timeframe-tradability",
+        "timeframe-forward-quality",
+        "resonance-candidates",
+    ]
+
+    for output in removed:
+        with pytest.raises(ValueError):
+            ResearchCommandConfig.model_validate({"research_evaluation": {"outputs": [output]}})
+
+
+def test_research_evaluation_resolves_reduced_outputs_only():
+    assert _resolve_research_outputs(
+        ("joint-forward-quality", "timeframe-classifier", "trade-record-modulation")
+    ) == ("timeframe-classifier", "joint-forward-quality", "trade-record-modulation")

@@ -10,11 +10,7 @@ from qooi.research.config import ResearchCommandConfig
 from qooi.research.run import (
     run_backtest_workflow,
     run_cache_audit,
-    run_classifier_diagnostics,
-    run_market_state_forward,
     run_research_evaluation,
-    run_state_filter_delta,
-    run_tradability_diagnostics,
 )
 
 
@@ -93,35 +89,12 @@ def build_cache_audit_plan(_command: ResearchCommandConfig) -> ResearchWorkflowP
     return _single_stage_plan("cache-audit", run_cache_audit)
 
 
-def build_classifier_plan(_command: ResearchCommandConfig) -> ResearchWorkflowPlan:
-    return _single_stage_plan("classifier", run_classifier_diagnostics)
-
-
-def build_market_state_forward_plan(_command: ResearchCommandConfig) -> ResearchWorkflowPlan:
-    return _single_stage_plan("market-state-forward", run_market_state_forward)
-
-
-def build_tradability_plan(_command: ResearchCommandConfig) -> ResearchWorkflowPlan:
-    return _single_stage_plan("tradability", run_tradability_diagnostics)
-
-
-def build_state_filter_delta_plan(_command: ResearchCommandConfig) -> ResearchWorkflowPlan:
-    return _single_stage_plan("state-filter-delta", run_state_filter_delta)
-
-
 def build_research_evaluation_plan(_command: ResearchCommandConfig) -> ResearchWorkflowPlan:
     return _single_stage_plan("research-evaluation", run_research_evaluation)
 
 
 WORKFLOW_BUILDERS: dict[str, Callable[[ResearchCommandConfig], ResearchWorkflowPlan]] = {
     "backtest": build_backtest_plan,
-    "classifier": build_classifier_plan,
-    "state": build_backtest_plan,
-    "state-profitability": build_backtest_plan,
-    "state-filter-delta": build_state_filter_delta_plan,
-    "modulation-effect": build_backtest_plan,
-    "market-state-forward": build_market_state_forward_plan,
-    "tradability": build_tradability_plan,
     "research-evaluation": build_research_evaluation_plan,
 }
 

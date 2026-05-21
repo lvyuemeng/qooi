@@ -128,6 +128,7 @@ def test_okx_state_provider_reconstructs_branch_from_okx_client_id():
     pair = CORE_UNIVERSE[0]
     strategy_id = "momentum_burst"
     hedge_id = format_basket_id(pair.asset.symbol, strategy_id, "hedge")
+
     class BranchTradingClient(FlatTradingClient):
         def orders(self, inst_id, inst_type="SWAP"):
             return [

@@ -1,10 +1,10 @@
 # Research Evaluation API Reference
 
-Date: 2026-05-18
+Date: 2026-05-21
 
 ## Purpose
 
-This document defines the layered `research-evaluation` API and the classifier, tradability, market-state, and trade-record diagnostics used for qooi strategy evaluation.
+This document defines the reduced layered `research-evaluation` API centered on classifier health, `joint-forward-quality`, and optional trade-record control diagnostics.
 
 It is a methodology reference, not a run report. For current empirical results, see `docs/research-evaluation-report.md`.
 
@@ -21,38 +21,60 @@ export_dir = "F:\\Stratum\\TEMP\\kilo\\qooi-research-evaluation-expanded"
 
 [research_evaluation]
 outputs = [
-  "classifier",
-  "tradability",
-  "market-state-forward",
-  "market-state-modulation",
-  "trade-record-modulation",
+  "timeframe-classifier",
+  "joint-forward-quality",
 ]
-include_backtest_report = true
+include_backtest_report = false
 write_exports = true
 fail_fast = false
+
+[research_evaluation.joint_forward_quality]
+enabled = true
+min_rows = 30
+transition_min_rows = 50
+omega_threshold = 1.5
+pwpr_threshold = 2.0
 ```
 
-Output dependencies are resolved as a graph:
+Output dependencies are resolved as a reduced graph:
 
 | Output | Required Upstream Evidence | Notes |
 |---|---|---|
-| `classifier` | Cache-backed prepared classifier frame | Validates state labels and supporting tables |
-| `tradability` | `classifier` | Adds market-state reductions and state-prior scores |
-| `market-state-forward` | `classifier` | Computes future market outcomes after every eligible bar |
-| `market-state-modulation` | `market-state-forward` | Tests conditional forward-outcome deltas |
+| `timeframe-classifier` | Cache-backed independent classifier frames per configured bar | Health and no-lookahead evidence only |
+| `joint-forward-quality` | Prepared market classifier frames and internal forward outcome service | Core side-normalized joint state/event/side bucket quality, reduction diagnostics, and transition-event quality |
 | `trade-record-modulation` | Strategy signal/backtest branch | Uses executed trades only, separate from classifier/market-state branches |
 
-Dependency expansion is automatic. Requesting `market-state-modulation` also requests `market-state-forward`; requesting `tradability`, `market-state-forward`, or `market-state-modulation` also requests `classifier`.
+The old expanded `research-evaluation` outputs and former direct diagnostic modes were removed from the public API. The diagnostics API now has only two modes: `backtest` and `research-evaluation`.
 
-State-leakage rule: classifier, tradability, market-state-forward, and market-state-modulation paths must not apply strategy signal filters. Strategy filters, entries, exits, basket lifecycle, and trade records belong only to the backtest and trade-record modulation branch.
+State-leakage rule: classifier health and joint-quality paths must not apply strategy signal filters. Strategy filters, entries, exits, basket lifecycle, and trade records belong only to the backtest and trade-record modulation branch.
+
+Focused joint-quality config shape:
+
+```toml
+[diagnostics]
+mode = "research-evaluation"
+export_dir = "F:\\Stratum\\TEMP\\kilo\\qooi-research-evaluation-joint-quality"
+
+[research_evaluation]
+outputs = ["timeframe-classifier", "joint-forward-quality"]
+include_backtest_report = false
+write_exports = true
+
+[research_evaluation.joint_forward_quality]
+enabled = true
+min_rows = 30
+transition_min_rows = 50
+omega_threshold = 1.5
+pwpr_threshold = 2.0
+```
 
 ## Evaluation Layers
 
 Diagnostics are interpreted in this order:
 
 1. Classifier and feature validity: are the per-bar state labels internally consistent and known without lookahead?
-2. Strategy-sampled trade diagnostics: did the existing strategy perform differently in the states it actually entered?
-3. Strategy-independent market diagnostics: what happened after every eligible market state, even when no strategy entered?
+2. Joint-forward-quality endogenous bucket ranking: which configured joint state/event/side buckets have stable side-normalized forward quality?
+3. Dynamic and reduction support diagnostics: which configuration dimensions should be preserved, reduced, or rejected?
 4. Strategy promotion tests: can a hypothesis be expressed as executable entries/exits and survive backtests with costs and risk controls?
 
 A market-state finding is not automatically a strategy filter. It must first become an explicit trading hypothesis and then pass strategy-level validation.
@@ -68,11 +90,11 @@ The diagnostics operate on OHLCV klines.
 | `vol` or `volume` | Candle volume when available |
 | `atr_14` | 14-bar average true range after indicator enrichment |
 
-Default research evaluation uses swap OHLCV unless a run explicitly selects another source policy. The base classifier timeframe is H1. Higher-timeframe classifier context uses H4 and D1.
+Default research evaluation uses swap OHLCV unless a run explicitly selects another source policy. The default peer bars are `1H`, `4H`, and `1D`; configs may add `15m` through `[timeframes] bars = ["15m", "1H", "4H", "1D"]`. Contextual joins are internal preparation details for `joint-forward-quality`, not separate public outputs.
 
 ## No-Lookahead Contract
 
-Classifier and grouping columns must be known by the H1 bar close.
+Classifier and grouping columns must be known by the source bar close.
 
 Allowed for classifier features:
 
@@ -92,21 +114,18 @@ Forward outcome columns may use future OHLCV, but they are never allowed back in
 
 ## Classifier Frame Preparation
 
-The strategy-independent classifier frame is prepared by `prepare_classifier_frame(...)`.
+The strategy-independent classifier frame is prepared by `prepare_classifier_frame(...)`. It is timeframe-native: callers pass `FrameRequest.bar`, and no H4/D1 context is attached unless `contexts=DEFAULT_CONTEXTS` is supplied explicitly.
 
 Pipeline stages:
 
-1. Load H1 cache for the selected symbol.
+1. Load cache for `FrameRequest.bar` and the selected symbol.
 2. Add indicators with `add_indicators(...)`.
 3. Add MACD histogram with `add_macd_histogram(...)`.
 4. Add structure and stage features with `add_price_structure_stage_features(...)`.
-5. Attach H1 aliases such as `h1_market_stage` and `h1_structure_trend_state`.
-6. Load H4 and D1 context caches.
-7. Build compact H4/D1 classifier context frames.
-8. Attach higher-timeframe context with an as-of backward join.
-9. Add compressed MTF state keys with `add_mtf_state_keys(...)`.
+5. Add `timeframe` metadata.
+6. Optionally attach explicit context frames and MTF state keys for the internal joint-quality preparation path.
 
-`market-state-forward` additionally ensures liquidity and none-context diagnostics are available:
+The joint-quality preparation path additionally ensures liquidity and none-context columns are available:
 
 - `add_liquidity_sweep_features(...)` for `liquidity_event_type` and related event columns.
 - `add_none_context_diagnostics(...)` for `atr_percentile_bucket` and `key_level_proximity_bucket`.
@@ -296,6 +315,61 @@ If a component is missing, it is rendered as `data_error`. `mtf_event_state_key`
 
 MTF keys are not filters by themselves. They are diagnostic descriptors that must pass count and stability requirements before becoming candidate hypotheses.
 
+## Configuration Column Sets
+
+Configuration column sets are reusable research-only grouping specs. They describe how market-state context is projected before diagnostics compute intrinsic quality, conditional information, or side-normalized forward quality.
+
+Configuration specs are shared; workflow adapters resolve each spec to columns available in the current dataframe. Missing columns are skipped schema-stably. Strategy code must not consume these specs directly.
+
+Current configuration roles:
+
+| Role | Meaning | Typical Use |
+|---|---|---|
+| `static_state` | Raw or audit-level state keys such as `mtf_structure_key` | Static baseline and sparsity comparison |
+| `reduced_static_state` | Lower-cardinality semantic projections such as D1/H4/H1 reduced state | Configuration reduction and joint buckets |
+| `inner_connection` | D1-to-H4 or H4-to-H1 relationships | Tests whether timeframe links should be preserved or merged |
+| `transition_state` | Previous-to-current state paths | Dynamic state-transition diagnostics |
+| `transition_inner_connection` | Previous-to-current inner-connection paths | Dynamic multi-timeframe relationship diagnostics |
+| `event_side_joint` | Event-derived side plus state context | Side-normalized joint forward quality |
+
+Initial named configuration specs:
+
+| Configuration | Role | Source Columns |
+|---|---|---|
+| `config_static_raw_mtf` | `static_state` | `mtf_structure_key` |
+| `config_reduced_d1_event` | `reduced_static_state` | `d1_market_stage_reduced` |
+| `config_reduced_d1_structure_event` | `reduced_static_state` | `d1_structure_trend_state` |
+| `config_reduced_d1_h4_h1_event` | `reduced_static_state` | `d1_structure_trend_state`, `h4_market_stage_reduced`, `market_stage_reduced` |
+| `config_dynamic_stage_transition_event` | `transition_state` | `d1_market_stage_reduced_transition`, `h4_market_stage_reduced_transition`, `market_stage_reduced_transition` |
+| `config_dynamic_inner_connection_event` | `transition_inner_connection` | `reduced_inner_connection_path_transition` |
+
+Inner-connection columns are deterministic no-lookahead descriptions of relationships among already-known timeframe states:
+
+| Column | Formula |
+|---|---|
+| `d1_to_h4_stage_connection` | `d1_market_stage_reduced->h4_market_stage_reduced` |
+| `h4_to_h1_stage_connection` | `h4_market_stage_reduced->market_stage_reduced` |
+| `d1_to_h4_structure_connection` | `d1_structure_trend_state->h4_structure_trend_state` |
+| `h4_to_h1_structure_connection` | `h4_structure_trend_state->structure_trend_state` |
+| `reduced_inner_connection_path` | `d1_to_h4_stage_connection|h4_to_h1_stage_connection` |
+
+Transition columns use previous-to-current paths within each symbol:
+
+```text
+state_transition = state[t-1] + "->" + state[t]
+connection_transition = connection[t-1] + "->" + connection[t]
+```
+
+Configuration sets feed the reduced workflow:
+
+| Workflow | Reuse Rule |
+|---|---|
+| `joint-forward-quality` | Canonical owner for configured joint state/event/side buckets and support artifacts |
+| `timeframe-classifier` | Health-only view of independent timeframe classifier outputs |
+| Internal forward outcome service | Outcome labels used by `joint-forward-quality`; not a runnable diagnostic mode |
+| Dynamic support rows | Configuration-design evidence embedded in joint-quality work |
+| `trade-record-modulation` | Requires an `entry_*` adapter and remains post-trade control evidence only |
+
 ## Classifier Diagnostics
 
 Classifier diagnostics evaluate label coverage, consistency, cardinality, transition behavior, and right-edge drift.
@@ -340,9 +414,9 @@ Common entry-state fields in trade records use the `entry_` prefix:
 
 State profitability diagnostics group actual trades and compute outcome statistics such as trade count, expectancy, net PnL, and risk flags. They identify where strategy PnL happened, not why the market state itself is predictive.
 
-## Trade-Record Modulation Effect
+## Trade-Record Control
 
-`modulation-effect` tests whether a modulator changes the outcome of a base feature among executed trades.
+`trade-record-modulation` tests whether a modulator changes the outcome of a base feature among executed trades. It is optional control evidence under `research-evaluation`, not a direct diagnostic mode.
 
 Default base features:
 
@@ -407,11 +481,11 @@ Classifier version matters for trade-record modulation. Trade entry-state bucket
 
 Aggregate significant rows are not sufficient for authorization. A row can have `significant=true` but remain `classification=unstable` when symbol-level signs are sparse or inconsistent. Alias-equivalent rows, such as `side=long`, `entry_structure_bucket=uptrend`, and `entry_liquidity_event_type_bucket=failed_breakout_low` for a long-only failed-breakout pocket, should be interpreted as one underlying observation rather than multiple independent discoveries.
 
-Trade-record modulation uses dollar expectancy by default. Until normalized trade return or R-multiple fields are available, `practical_delta_threshold` is dollar-based in this path and should not be compared directly with market-state-forward percentage-point thresholds.
+Trade-record modulation uses dollar expectancy by default. Until normalized trade return or R-multiple fields are available, `practical_delta_threshold` is dollar-based in this path and should not be compared directly with market forward percentage-point thresholds.
 
-## Market-State-Forward Diagnostics
+## Internal Forward Outcome Service
 
-`market-state-forward` uses every eligible H1 classifier row instead of trade rows.
+The reduced API does not expose `market-state-forward` as a runnable diagnostic mode. `joint-forward-quality` uses an internal forward outcome service to label every eligible classifier row before side-normalized joint buckets are computed.
 
 For horizon `N`:
 
@@ -443,6 +517,11 @@ Forward summary rows group by state fields and compute:
 | `rows` | Complete future windows in the group |
 | `up_count`, `down_count`, `flat_count` | Direction labels using return threshold |
 | `mean_return_pct`, `median_return_pct` | Forward return central tendency |
+| `positive_mean`, `negative_mean_abs` | Average positive return and absolute average negative return |
+| `positive_rate`, `negative_rate` | Positive/negative outcome percentages |
+| `omega_ratio` | `sum(max(return, 0)) / abs(sum(min(return, 0)))` |
+| `sortino_zero` | `mean_return_pct / sqrt(mean(min(return, 0)^2))` |
+| `pwpr` | Probability-weighted payoff ratio: `(positive_mean * positive_rate) / (negative_mean_abs * negative_rate)` |
 | `mean_return_atr` | ATR-normalized close-to-close movement |
 | `mean_mfe_*_atr`, `mean_mae_*_atr` | Long/short path opportunity and adversity |
 | `return_ci_low`, `return_ci_high` | Exploratory standard-error band |
@@ -463,94 +542,233 @@ This is deterministic metadata for robustness review, not a formal proof of inde
 
 Robust calculations are dataframe-first. Grouping, aggregation, FDR annotation, and summaries are represented as `pl.DataFrame` artifacts; NumPy is used only for numeric kernels such as Newey-West standard errors and standardized effect sizes.
 
-## Market-State Modulation Effect
+### Removed Support Artifacts
 
-Market-state modulation compares a base H1 state against a higher-timeframe context using forward market returns.
+Standalone conditional dependency, transition-quality, and continuous-condition exports were removed from the reduced API. Their useful role is now configuration design support inside `joint-forward-quality` artifacts such as `configuration-intrinsic-quality`, `transition-event-quality`, `joint-reduction-comparison`, and `inner-connection-reduction-quality`.
 
-Default base columns:
+Artifact families:
 
-| Base Column | Meaning |
+| Artifact | Purpose |
 |---|---|
-| `market_stage` | H1 stage |
-| `market_stage_reason` | H1 stage reason |
-| `liquidity_event_type` | H1 event |
-| `structure_trend_state` | H1 structure |
-| `atr_percentile_bucket` | H1 volatility bucket |
+| `conditional-information` | Measures empirical information gain from state variables about forward direction, optionally conditioned on another state variable |
+| `state-transition-quality` | Reuses forward-summary metrics on previous-to-current state paths such as `range->markup` |
+| `continuous-condition-quality` | Reuses forward-summary metrics on deterministic continuous-structure buckets such as range-width-to-threshold or range-position buckets |
 
-Default modulator columns:
-
-| Modulator Column | Meaning |
-|---|---|
-| `d1_structure_trend_state` | D1 structure known at H1 close |
-| `d1_market_stage` | D1 stage known at H1 close |
-| `h4_structure_trend_state` | H4 structure known at H1 close |
-| `h4_market_stage` | H4 stage known at H1 close |
-| `h4_market_stage_reason` | H4 stage reason known at H1 close |
-
-For outcome `fwd_10_return_pct`:
+Conditional information uses plug-in empirical entropy:
 
 ```text
-base_rows = rows where base_column = base_value and fwd_10_return_pct is complete
-conditional_rows = rows where base_column = base_value and modulator_column = modulator_value
-base_mean_return_pct = mean(fwd_10_return_pct in base_rows)
-conditional_mean_return_pct = mean(fwd_10_return_pct in conditional_rows)
-delta_return_pct = conditional_mean_return_pct - base_mean_return_pct
+H(Y) = -sum_y p(y) log2 p(y)
+H(Y | Z) = sum_z p(z) H(Y | Z=z)
+H(Y | X,Z) = sum_xz p(x,z) H(Y | X=x,Z=z)
+I(Y; X) = H(Y) - H(Y | X)
+I(Y; X | Z) = H(Y | Z) - H(Y | X,Z)
+normalized_cmi = I(Y; X | Z) / max(H(Y | Z), eps)
 ```
 
-The standard-error band uses the same deterministic formula as trade-record modulation, but the outcome is forward return percent rather than trade PnL dollars.
+Default outcome is `fwd_N_direction`. CMI is association evidence, not causal proof. Promotion review must still require sufficient cells, stability, materiality, and execution-aware backtests.
 
-Default smoke thresholds:
+Dependency rows include support and sparsity controls: `rows`, `min_rows`, `min_cell_rows`, `unique_x`, `unique_z`, `cells`, `sufficient_cells`, `cell_coverage_pct`, `bias_warning`, `sufficient`, and `classification`.
 
-| Threshold | Value |
-|---|---:|
-| `market_state_min_rows` | 30 for forward summaries |
-| `market_state_min_base_rows` | 100 for modulation base groups |
-| `market_state_min_cell_rows` | 30 for modulation conditional cells |
-| `market_state_delta_threshold_pct` | 0.15 percentage points |
+Transition paths and continuous buckets obey the no-lookahead contract. They use current or previous known state/structure columns only; forward outcome columns are labels and are never fed back into grouping construction.
 
-The practical delta threshold can be fixed or cost-linked:
+## Joint-Forward-Quality Diagnostics
+
+`joint-forward-quality` builds the missing endogenous-quality table for side-normalized joint buckets. It answers:
 
 ```text
---market-state-delta-mode fixed
---market-state-delta-mode cost_multiple
-practical_delta_threshold_pct = market_state_cost_pct * market_state_cost_multiple
+historically, for this known-at-close joint market context + liquidity event + side,
+what was the side-normalized forward return distribution?
 ```
 
-Defaults preserve the fixed `0.15` percentage-point behavior. Cost-linked mode is opt-in and does not infer spread or slippage from data.
+It is strategy-independent. It does not create entries, exits, stops, targets, basket actions, or strategy filters.
 
-Custom market-state modulation columns can be supplied with `--market-state-base-columns` and `--market-state-modulator-columns`. Trade-record modulation has analogous `--modulation-base-columns` and `--modulation-modulator-columns`. Missing custom columns resolve through existing aliases when possible and otherwise produce schema-stable empty or partial outputs.
+### Event Side Mapping
 
-Cross-asset classification:
+Only explicit directional liquidity events are converted into side-normalized rows. Ambiguous or `none` events are excluded from candidate side-normalized rows.
 
-| Scope | Rule |
+| Event | Side |
 |---|---|
-| `ALL` row | Uses all symbols together |
-| Symbol row | Uses one symbol only |
-| Stable across symbols | Sufficient symbol-level rows mostly agree in delta sign |
-| `global` | Aggregate row significant and stable across symbols |
-| `asset_specific` | Significant effect not established as global |
+| `failed_breakout_low` | `long` |
+| `bullish_reclaim` | `long` |
+| `breakout_acceptance_high` | `long` |
+| `failed_breakout_high` | `short` |
+| `bearish_reclaim` | `short` |
+| `breakout_acceptance_low` | `short` |
 
-Market-state modulation rows include overlap-aware delta metadata: `effective_base_rows`, `effective_conditional_rows`, `overlap_adjusted_delta_ci_low`, `overlap_adjusted_delta_ci_high`, and `overlap_warning`. Existing `delta_ci_low` and `delta_ci_high` remain for compatibility.
+Side-normalized return:
 
-Robust market-state modulation exports append stricter fields without removing existing columns:
+```text
+side_return_pct = fwd_N_return_pct for long
+side_return_pct = -fwd_N_return_pct for short
+```
+
+This lets long and short opportunities use the same favorable-is-positive metric vocabulary.
+
+### Artifact Families
+
+`joint-forward-quality.csv` can contain multiple artifact families under one output:
+
+| Artifact | Purpose |
+|---|---|
+| `configuration-intrinsic-quality` | Scores whether a configuration is structurally usable before inspecting returns |
+| `joint-forward-quality` | Scores static/reduced joint state + event + side buckets |
+| `transition-event-quality` | Scores dynamic previous-to-current state/connection paths + event + side buckets |
+| `joint-reduction-comparison` | Compares raw, reduced, and dynamic configuration families |
+| `inner-connection-reduction-quality` | Diagnoses whether D1/H4/H1 inner connections should be preserved, merged, reduced, or rejected |
+
+### Joint Bucket Metrics
+
+Joint quality rows use return-distribution vocabulary on side-normalized returns:
 
 | Field | Meaning |
 |---|---|
-| `outcome_column`, `outcome_kind` | Active forward outcome, such as `fwd_10_return_pct` / `return_pct` |
-| `se_method` | Robustness method: `iid`, `effective_n`, `newey_west`, or `bootstrap` |
-| `robust_delta_ci_low`, `robust_delta_ci_high` | Delta band from the selected standard-error method |
-| `robust_significant` | Count, effective-count, practical-delta, and robust-band gate |
-| `delta_return_atr` | Companion ATR-normalized mean delta when available |
-| `delta_cohens_d` | Standardized effect size for the active outcome |
-| `base_q10`, `conditional_q10`, `delta_q10` | Lower-tail quantile comparison |
-| `base_cvar10`, `conditional_cvar10`, `delta_cvar10` | Lower-tail conditional mean comparison |
-| `p_value`, `fdr_alpha`, `fdr_significant` | Normal-approximation p-value and optional Benjamini-Hochberg result |
-| `time_stable` | Time-split sign agreement plus segment materiality/significance check |
-| `cross_asset_homogeneous`, `partially_replicable` | Symbol-level effect consistency metadata |
+| `bucket_family` | Configuration role such as `reduced_static_state` or `transition_state` |
+| `configuration_name` | Named configuration spec used to form the bucket |
+| `configuration_kind` | Static, reduced, transition, or inner-connection class |
+| `joint_group` | Pipe-delimited state/configuration value |
+| `joint_group_columns` | Source columns used to construct `joint_group` |
+| `liquidity_event_type` | Directional event in the bucket |
+| `side` | Event-implied `long` or `short` |
+| `rows` | Complete forward windows in the bucket |
+| `mean_side_return_pct` | Mean side-normalized forward return |
+| `positive_rate`, `negative_rate` | Side-normalized positive/negative percentages |
+| `positive_mean`, `negative_mean_abs` | Average favorable and adverse return magnitudes |
+| `omega_ratio` | Favorable return mass divided by adverse return mass |
+| `pwpr` | Probability-weighted payoff ratio on side-normalized returns |
+| `sortino_zero` | Mean side return divided by downside deviation around zero |
+| `directional_bias` | `up`, `flat_or_mixed`, or `insufficient` for side-normalized direction |
+| `invalid_state_present` | Whether the group contains invalid state labels such as `warmup`, `unknown`, or `data_error` |
+| `passes_candidate_gate` | Diagnostic gate result; not strategy authorization |
+| `gate_failure_reasons` | Comma-separated failed gates such as `rows`, `omega`, `pwpr`, `direction`, or `invalid_state` |
 
-Rows also include time-split stability fields: `time_splits`, `sufficient_time_splits`, `time_split_sign_agreement_pct`, and `meta_stable`. The first implementation splits complete forward rows into chronological quantile segments and checks whether sufficient segments agree in delta sign. `meta_stable` is a promotion-gate aid, not an automatic strategy authorization.
+Initial diagnostic candidate gate:
 
-Visualization is generated from exported dataframe artifacts through `src/qooi/core/plot.py`. Plot functions do not recompute diagnostics; they render already-exported modulation fields such as `delta_cohens_d`, `delta_return_pct`, `fdr_significant`, `time_stable`, and `horizon`.
+```text
+rows >= min_rows
+omega_ratio > omega_threshold
+pwpr > pwpr_threshold
+directional_bias == up
+invalid_state_present == false
+```
+
+Default values in the focused config are `min_rows=30`, `omega_threshold=1.5`, and `pwpr_threshold=2.0`.
+
+### Intrinsic Configuration Quality
+
+Intrinsic rows are emitted before return quality is judged. They answer whether a configuration is usable as a partition of market states.
+
+| Field | Meaning |
+|---|---|
+| `bucket_count` | Number of unique configuration buckets |
+| `valid_bucket_count`, `invalid_bucket_count`, `invalid_bucket_pct` | Invalid-state leakage checks |
+| `median_bucket_rows`, `p10_bucket_rows`, `p90_bucket_rows` | Bucket support distribution |
+| `entropy`, `normalized_entropy` | Concentration or over-fragmentation of buckets |
+| `compression_ratio_vs_raw_mtf` | Bucket count versus raw MTF baseline |
+| `coverage_rows`, `coverage_pct` | Rows covered by the configuration |
+| `dominant_bucket_pct` | Share of rows in the largest bucket |
+| `transition_changed_rate`, `self_transition_pct` | Dynamic churn for transition-like configurations |
+| `intrinsic_quality_bucket` | `high`, `medium`, `low`, or `insufficient` |
+| `intrinsic_warnings` | Warnings such as `invalid_leakage`, `sparse_buckets`, `over_merged`, `high_entropy_sparse`, or `dominant_bucket` |
+
+Interpretation:
+
+- Low entropy can mean over-merged states.
+- High entropy with low median bucket rows can mean sparse high-cardinality fragmentation.
+- A strong forward-quality row from a poor intrinsic configuration should not be promoted.
+
+### Transition-Event Quality
+
+`transition-event-quality` is the preferred Phase 2 dynamic ranking surface. It uses previous-to-current state paths rather than static labels.
+
+Examples:
+
+```text
+market_stage_reduced_transition + liquidity_event_type + side
+d1_market_stage_reduced_transition + h4_market_stage_reduced_transition + market_stage_reduced_transition + liquidity_event_type + side
+reduced_inner_connection_path_transition + liquidity_event_type + side
+```
+
+Transition rows include static-baseline comparison fields when available:
+
+| Field | Meaning |
+|---|---|
+| `static_baseline_rows` | Rows in the corresponding static baseline, if computed |
+| `static_baseline_omega_ratio` | Omega of the static baseline |
+| `dynamic_lift_vs_static_omega` | Dynamic transition Omega minus static baseline Omega |
+| `dynamic_lift_vs_static_mean_return_pct` | Dynamic transition mean side return minus static baseline mean side return |
+
+Dynamic rows should be ranked with stability and lift ahead of raw Omega:
+
+```text
+1. invalid_state_present == false
+2. rows >= transition_min_rows
+3. symbol/time agreement when available
+4. dynamic lift versus static baseline
+5. omega_ratio
+```
+
+This prevents isolated static-like high-Omega pockets from dominating the dynamic candidate list.
+
+### Reduction And Inner-Connection Decisions
+
+`joint-reduction-comparison` summarizes each configuration family:
+
+| Field | Meaning |
+|---|---|
+| `total_buckets` | Number of emitted quality buckets |
+| `sufficient_buckets` | Buckets passing row-count sufficiency |
+| `candidate_gate_buckets` | Buckets passing the diagnostic candidate gate |
+| `median_bucket_rows`, `p90_bucket_rows` | Support distribution |
+| `median_omega`, `p90_omega` | Omega distribution |
+| `time_stable_buckets` | Time-stable buckets when available |
+| `cross_asset_consistent_buckets` | Cross-asset-consistent buckets when available |
+| `invalid_bucket_count` | Buckets containing invalid labels |
+
+`inner-connection-reduction-quality` compares preserving, merging, reducing, or rejecting multi-timeframe inner connections.
+
+| Field | Meaning |
+|---|---|
+| `merge_policy` | Evaluated policy such as `merge_adjacent` |
+| `connection_family` | Connection family such as stage or structure connection |
+| `raw_bucket_count`, `reduced_bucket_count` | Cardinality before and after reduction |
+| `compression_ratio` | Reduced/raw bucket count |
+| `information_retention_proxy` | Deterministic proxy for retained detail |
+| `merge_decision` | `preserve`, `merge`, `reduce`, or `reject` |
+| `decision_reason` | Diagnostic reason for the decision |
+
+These decisions choose what to test next. They do not authorize strategy logic.
+
+### Empirical Shrinkage Fields
+
+The MVP uses deterministic empirical shrinkage, not full hierarchical Bayesian posterior modeling.
+
+| Field | Meaning |
+|---|---|
+| `global_mean_side_return_pct` | Mean side-normalized return across the scope |
+| `bucket_mean_side_return_pct` | Raw bucket mean side-normalized return |
+| `shrinkage_weight` | `rows / (rows + prior_strength)` |
+| `shrunk_mean_side_return_pct` | Bucket mean shrunk toward global mean |
+| `shrunk_positive_rate` | Positive rate shrunk toward a neutral prior |
+| `shrunk_omega_proxy` | Ranking proxy derived from shrunk mean |
+| `rank_raw_omega`, `rank_shrunk_omega_proxy`, `rank_delta` | Raw-vs-shrunk ranking diagnostics |
+
+Shrinkage is a ranking regularizer for sparse buckets. It is not proof of edge.
+
+## Removed Outputs
+
+Former public outputs and modes were removed rather than kept as compatibility aliases. Removed names include `classifier`, `tradability`, `market-state-forward`, `market-state-modulation`, `timeframe-tradability`, `timeframe-forward-quality`, `resonance-candidates`, `state`, `state-profitability`, `state-filter-delta`, and `modulation-effect`.
+
+Replacement mapping:
+
+| Removed surface | Replacement |
+|---|---|
+| Standalone classifier diagnostics | `timeframe-classifier` health rows |
+| Tradability / ETI | Support concepts folded into classifier health and configuration intrinsic quality |
+| Market-state forward/modulation | Internal forward labels plus `joint-forward-quality` rows |
+| Timeframe forward quality | Side-normalized joint-quality rows |
+| Resonance candidates | Configuration scanning and joint bucket quality |
+| State/profitability/filter-delta modes | Backtest reports and explicit strategy analysis outside research diagnostics |
+| Modulation-effect mode | Optional `trade-record-modulation` control output inside `research-evaluation` |
 
 ## Interpretation Rules
 
@@ -559,20 +777,12 @@ Use these rules when evaluating diagnostic outputs:
 1. Missing classifier columns invalidate downstream state conclusions.
 2. High-cardinality MTF keys are audit evidence, not immediate filters.
 3. Trade-record modulation is strategy-conditioned and cannot discover skipped-state behavior.
-4. Market-state-forward is strategy-independent but not executable PnL.
-5. Confidence bands on forward summaries are exploratory because forward windows overlap.
-6. Prefer robust CI, FDR, standardized effect, overlap-adjusted, cross-asset, and time-split stability fields when judging promotion readiness.
-7. Semantic aliases, such as `market_stage=wide_range` and `market_stage_reason=wide_range_no_stage`, should not be counted as independent discoveries.
-8. Any candidate filter must be converted into explicit entry/exit mechanics and backtested with costs, slippage, stops, targets, basket constraints, and risk gates.
-
-## Tradability And Validity Artifacts
-
-The `tradability` diagnostic mode emits strategy-independent artifacts:
-
-- `state-tradability`: endogenous state scores built from transition entropy, return autocorrelation, and volatility efficiency. The resulting ETI is a hypothesis-prior diagnostic, not a strategy signal.
-- `classifier-validity`: classifier audit rows for label coverage, transition stability, regime separation, and liquidity-event enrichment.
-
-These artifacts are dependency-ordered evidence layers rather than independent proofs. Forward rows answer what happened after states, modulation rows test conditional deltas, tradability rows score state structure, and validity rows audit the classifier partition itself.
+4. Internal forward labels are strategy-independent but not executable PnL.
+5. Semantic aliases, such as `market_stage=wide_range` and `market_stage_reason=wide_range_no_stage`, should not be counted as independent discoveries.
+6. Joint-forward-quality candidate gates are diagnostic gates only; they are not strategy authorization.
+7. Dynamic transition-event rows should be compared against static-state baselines before being treated as candidate signal-generation patterns.
+8. Empirical shrinkage is a sparse-bucket ranking regularizer, not a Bayesian proof of edge.
+9. Any candidate filter must be converted into explicit entry/exit mechanics and backtested with costs, slippage, stops, targets, basket constraints, and risk gates.
 
 ## Promotion Gate
 
@@ -580,6 +790,9 @@ A diagnostic finding may become a strategy hypothesis only if all conditions hol
 
 - State features are no-lookahead and classifier diagnostics are consistent.
 - Semantic aliases are collapsed before counting discoveries or promotion candidates.
+- Joint buckets use side-normalized returns and explicit event-to-side mapping.
+- Configuration intrinsic quality is acceptable; poor-coverage, over-merged, or high-entropy sparse configurations are rejected before performance review.
+- Dynamic transition rows beat their static baseline or have a stated reason for being evaluated independently.
 - Counts pass thresholds at both aggregate and symbol levels, with market-state conditional rows above `100` before promotion.
 - The forward effect is economically material, such as `abs(delta_return_pct) > 0.5` percentage points and `abs(delta_cohens_d) > 0.3` before execution testing.
 - Direction or delta is stable across assets or intentionally scoped to one asset with a stated reason.

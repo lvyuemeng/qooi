@@ -394,80 +394,21 @@ Interpretation order:
 
 Reports should summarize layer status first and show supporting counters only when they help explain a behavior or debugging path.
 
-### Modulation-Effect Diagnostics
+### Research-Evaluation Diagnostics
 
-`--diagnostic-mode modulation-effect` is the current diagnostic path for testing whether higher-timeframe or endogenous regime context changes the meaning of H1 state/event/side labels.
+The exposed diagnostics API has two modes: `backtest` and `research-evaluation`.
 
-The diagnostic is post-trade only. It must not change strategy entries. It compares one base feature against one candidate modulator at a time to avoid full Cartesian MTF key sparsity.
+`research-evaluation` exposes only:
 
-Current base features:
+- `timeframe-classifier`: classifier health evidence.
+- `joint-forward-quality`: the core side-normalized joint bucket candidate table.
+- `trade-record-modulation`: optional post-trade control evidence.
 
-- `entry_market_stage_bucket`
-- `entry_market_stage_reason_bucket`
-- `entry_liquidity_event_type_bucket`
-- `side`
-- `entry_structure_bucket`
+Former direct diagnostic modes such as `modulation-effect`, `market-state-forward`, `tradability`, `state`, `state-profitability`, and `state-filter-delta` were removed. Their useful concepts were either embedded in `joint-forward-quality` support artifacts or left to normal backtest reports.
 
-Current candidate modulators:
+Forward labels may use future OHLCV only as outcome columns. Grouping and state columns must remain known at bar close. `joint-forward-quality` is diagnostic-only: no entry filter or strategy variant is authorized until an explicit strategy hypothesis passes execution-aware backtests.
 
-- `entry_d1_structure_trend_state`
-- `entry_d1_market_stage`
-- `entry_h4_structure_trend_state`
-- `entry_h4_market_stage`
-- `entry_atr_percentile_bucket`
-- `entry_adx_bucket`
-
-Modulation rows must expose count thresholds and classification explicitly. A row is not actionable unless base and conditional sample counts pass, the expectancy delta exceeds the practical threshold, the confidence band excludes zero, and symbol-level signs are stable enough for the intended scope.
-
-Current 2026-05-18 evaluation:
-
-- Baseline: `1157` modulation rows, `0` significant effects, `0` global effects.
-- Full no-range: `874` modulation rows, `0` significant effects, `0` global effects.
-- No-range-longs: `1088` modulation rows, `0` significant effects, `0` global effects.
-- Decision: no MTF or modulation-gated strategy variant is authorized from current evidence.
-- Current diagnostic baseline: `structure_event_trend_aligned_no_range_v1`, diagnostic-only.
-
-Detailed report: `docs/research-evaluation-report.md`.
-
-Definitions and formulas for the layered research-evaluation API, classifier labels, diagnostics, trade-record modulation, adaptive classifier settings, overlap-aware uncertainty metadata, classifier health gates, and market-state-forward evaluation are documented in `docs/research-evaluation-api-reference.md`.
-
-### Market-State-Forward Diagnostics
-
-`--diagnostic-mode market-state-forward` is the strategy-independent companion to trade-record modulation diagnostics.
-
-It prepares classifier H1 frames with H4/D1 closed-bar context and computes forward market behavior after every eligible H1 bar. It does not build strategies, run basket execution, or sample only executed trades.
-
-The diagnostic answers a different question from `modulation-effect`:
-
-- Trade-record modulation: what happened to strategy-sampled trades.
-- Market-state-forward: what happened after all eligible market states.
-
-Forward labels may use future OHLCV only as outcome columns. Grouping and state columns must remain known at the H1 bar close, including higher-timeframe context attached from the last fully closed HTF bar.
-
-Current output includes horizon-specific return, return-in-ATR, MFE/MAE, directional rates, count thresholds, sufficiency flags, market-state modulation rows, overlap/effective-sample metadata, robust standard-error fields, FDR fields, standardized effects, lower-tail metrics, cross-asset homogeneity, and time-split stability fields. Confidence bands remain exploratory because adjacent H1 rows use overlapping future windows.
-
-Current 2026-05-18 robust smoke, core universe excluding XAU:
-
-- Export: `F:\Stratum\TEMP\kilo\qooi-market-state-forward-robust.csv`.
-- Plots: `F:\Stratum\TEMP\kilo\qooi-market-state-forward-plots\`.
-- Forward summary rows: `12,395`.
-- Market-state modulation rows: `11,832`.
-- Robust significant modulation rows: `262`.
-- FDR-significant modulation rows: `46`.
-- Global and FDR-significant modulation rows: `9`.
-- Sufficient forward groups: `3,720`.
-- Directional forward groups: `1,279`.
-- Decision: hypothesis generation only; no strategy filter is authorized directly from this diagnostic.
-
-No entry filter or strategy variant is authorized directly from this diagnostic. Sufficient, FDR-significant, effect-size-material, cross-asset homogeneous, and time-stable effects become candidate hypotheses for later strategy tests with explicit entry timing, stops, targets, costs, and slippage.
-
-Promotion rule: FDR/global status is necessary but not sufficient. A market-state row may be considered for strategy work only after semantic reduction and only when conditional rows are above `100`, absolute forward delta is plausibly above `0.5` percentage points, standardized effect is materially stronger than the current weak rows such as `abs(Cohen's d) > 0.3`, time-split and cross-asset evidence agree, and an executable entry/exit hypothesis can be backtested with fees, slippage assumptions, stops, targets, sizing, and basket constraints.
-
-Semantic reduction is distinct from physical aliases. Reduced columns such as `market_stage_reduced` are deterministic analytical projections that lower duplicate hypothesis counts while preserving raw classifier labels for audit.
-
-The `tradability` diagnostic emits `state-tradability` and `classifier-validity` artifacts. These identify stable, internally structured states and audit classifier separation, but they remain hypothesis-prior diagnostics and do not authorize direct strategy activation.
-
-MTF state keys remain audit descriptors. They describe market context and may generate hypotheses, but they are not authorization features and must not be wired directly into strategy filters.
+Detailed formulas and the reduced graph contract are documented in `docs/research-evaluation-api-reference.md`.
 
 ## 13. Backtest Orchestration
 

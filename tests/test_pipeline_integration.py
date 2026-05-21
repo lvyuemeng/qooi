@@ -17,9 +17,7 @@ from qooi.core.instruments import AssetConfig, PairConfig
 from qooi.core.recovery import GridRecovery, MartingaleRecovery, ReverseRecovery
 
 
-def _pair(
-    symbol: str = "TEST-USDT-SWAP", capital: float = 500.0
-) -> PairConfig:
+def _pair(symbol: str = "TEST-USDT-SWAP", capital: float = 500.0) -> PairConfig:
     return PairConfig(
         asset=AssetConfig(
             symbol=symbol,
@@ -298,18 +296,13 @@ def test_reverse_recovery_requires_opposite_thesis():
     rec = ReverseRecovery(zone_atr=1.0, max_levels=3)
 
     _run_bar(_df([100.0, 100.0], atr=3.0), baskets, pair, recovery_cfg=rec, signal=1.0)
-    no_reverse = _run_bar(
-        _df([100.0, 97.0], atr=3.0), baskets, pair, recovery_cfg=rec, signal=1.0
-    )
+    no_reverse = _run_bar(_df([100.0, 97.0], atr=3.0), baskets, pair, recovery_cfg=rec, signal=1.0)
     assert not any(a.reason == ExitReason.MARTINGALE.value for a in no_reverse)
 
-    reverse = _run_bar(
-        _df([100.0, 97.0], atr=3.0), baskets, pair, recovery_cfg=rec, signal=-1.0
-    )
+    reverse = _run_bar(_df([100.0, 97.0], atr=3.0), baskets, pair, recovery_cfg=rec, signal=-1.0)
 
     assert any(
-        a.action == ActionKind.EXIT and a.reason == ExitReason.MARTINGALE.value
-        for a in reverse
+        a.action == ActionKind.EXIT and a.reason == ExitReason.MARTINGALE.value for a in reverse
     )
     assert any(a.action == ActionKind.ENTER and a.side == "sell" for a in reverse)
 

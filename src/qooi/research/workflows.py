@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -26,6 +27,8 @@ from qooi.strategies.features import (
 from qooi.strategies.indicators import add_indicators, add_macd_histogram
 from qooi.strategies.specs import StrategyBehavior, compute_signal_frame
 
+logger = logging.getLogger(__name__)
+
 
 class DataCoverageError(RuntimeError):
     def __init__(self, coverage: HistoryCoverage, required_pct: float) -> None:
@@ -41,6 +44,7 @@ class DataCoverageError(RuntimeError):
 class FrameRequest:
     pair: PairConfig
     data_source: str
+    bar: str
     days: int
     min_bars: int
     refresh: bool = False
@@ -55,6 +59,7 @@ class CacheAuditRequest:
     days: int
     min_bars: int
     min_coverage_pct: float
+    bars: tuple[str, ...] = ()
     refresh: bool = False
     async_refresh: bool = False
     refresh_concurrency: int = 3
@@ -128,18 +133,19 @@ def build_history_refresh_requests(
     contexts = tuple(context for context in DEFAULT_CONTEXTS if context.role == "higher_context")
     for pair in request.pairs:
         signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
-        for inst_id in dict.fromkeys((signal_inst_id, execution_inst_id)):
-            requests.append(
-                HistoryRefreshRequest(
-                    inst_id=inst_id,
-                    bar=pair.asset.timeframe,
-                    days=request.days,
-                    min_bars=request.min_bars,
-                    refresh=request.refresh,
-                    source="trade",
-                    incremental=request.incremental,
+        for bar in request.bars or (pair.asset.timeframe,):
+            for inst_id in dict.fromkeys((signal_inst_id, execution_inst_id)):
+                requests.append(
+                    HistoryRefreshRequest(
+                        inst_id=inst_id,
+                        bar=bar,
+                        days=request.days,
+                        min_bars=request.min_bars,
+                        refresh=request.refresh,
+                        source="trade",
+                        incremental=request.incremental,
+                    )
                 )
-            )
         for context in contexts:
             requests.append(
                 HistoryRefreshRequest(
@@ -217,7 +223,8 @@ async def _stream_cache_refresh(
     async with AsyncCacheStore() as store:
         async for event in store.stream_many(requests, concurrency=concurrency):
             if event.kind in {"completed", "failed", "summary"}:
-                print(event.message)
+                logger.info("%s", event.message)
+
 
 SIGNAL_CONTEXT_COLUMNS: tuple[str, ...] = (
     "timestamp",
@@ -300,10 +307,7 @@ def apply_signal_debug_filters(
         keep_entry = keep_entry & ~pl.col("signal_id").is_in(list(filters.exclude_signal_ids))
 
     expressions = [
-        pl.when(keep_entry)
-        .then(pl.col("entry_signal"))
-        .otherwise(0.0)
-        .alias("entry_signal")
+        pl.when(keep_entry).then(pl.col("entry_signal")).otherwise(0.0).alias("entry_signal")
     ]
     if "raw_entry_signal" in frame.columns:
         expressions.append(
@@ -373,6 +377,7 @@ def load_context_for_request(
 ) -> tuple[pl.DataFrame, HistoryCoverage]:
     context_request = replace(
         request,
+        bar=context.bar,
         min_bars=_context_min_bars(context.bar, request.days, role="higher_context"),
     )
     return load_cache_for_request(
@@ -445,12 +450,13 @@ def attach_higher_timeframe_context(
             *(pl.col(column).alias(f"{prefix}_{column}") for column in context_cols),
         )
     )
-    return base_df.sort("timestamp").join_asof(
+    joined = base_df.sort("timestamp").join_asof(
         context,
         left_on="timestamp",
         right_on="_known_ts",
         strategy="backward",
     )
+    return joined.drop("_known_ts") if "_known_ts" in joined.columns else joined
 
 
 def _trend_state_expr(prefix: str = "") -> pl.Expr:
@@ -751,18 +757,18 @@ def prepare_classifier_frame(
     request: FrameRequest,
     classifier: StructureClassifierConfig | None = None,
     *,
-    contexts: tuple[ContextSpec, ...] = DEFAULT_CONTEXTS,
+    contexts: tuple[ContextSpec, ...] = (),
 ) -> PreparedClassifierFrame:
     classifier = classifier or StructureClassifierConfig.default()
     pair = request.pair
     signal_inst_id, _execution_inst_id = source_inst_ids(pair, request.data_source)
     try:
-        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, "1H", request)
+        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, request.bar, request)
     except FileNotFoundError:
         if not request.allow_swap_signal_fallback or signal_inst_id == pair.asset.symbol:
             raise
         signal_inst_id = pair.asset.symbol
-        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, "1H", request)
+        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, request.bar, request)
 
     work = add_macd_histogram()(add_indicators(base_df))
     work = add_price_structure_stage_features(config=classifier)(work)
@@ -770,8 +776,14 @@ def prepare_classifier_frame(
         store, work, signal_inst_id, request, contexts, classifier
     )
     coverage = (base_coverage, *context_coverage)
-    work = add_mtf_state_keys(work)
-    metadata = (f"signal_inst={signal_inst_id}", *(summary.note() for summary in coverage))
+    if contexts:
+        work = add_mtf_state_keys(work)
+    work = work.with_columns(pl.lit(request.bar).alias("timeframe"))
+    metadata = (
+        f"signal_inst={signal_inst_id}",
+        f"classifier_bar={request.bar}",
+        *(summary.note() for summary in coverage),
+    )
     return PreparedClassifierFrame(
         pair=pair,
         frame=work,
@@ -801,7 +813,7 @@ def prepare_signal_frame(
 ) -> PreparedBacktestFrame:
     pair = request.pair
     signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
-    timeframe = pair.asset.timeframe
+    timeframe = request.bar
     try:
         signal_df, signal_summary = load_cache_for_request(
             store, signal_inst_id, timeframe, request
@@ -857,7 +869,7 @@ def prepare_signal_frame(
         f"execution_inst={execution_inst_id}",
         *(summary.note() for summary in coverage),
     )
-    _print_cache_warnings(coverage, signal_inst_id, execution_inst_id)
+    log_cache_warnings(coverage, signal_inst_id, execution_inst_id)
     return PreparedBacktestFrame(
         pair=pair,
         frame=frame,
@@ -871,7 +883,7 @@ def prepare_signal_frame(
     )
 
 
-def _print_cache_warnings(
+def log_cache_warnings(
     coverage: tuple[HistoryCoverage, ...], signal_inst_id: str, execution_inst_id: str
 ) -> None:
     for summary in coverage:
@@ -882,4 +894,4 @@ def _print_cache_warnings(
             if summary.inst_id in {signal_inst_id, execution_inst_id}
             else f"{summary.inst_id} {summary.bar}"
         )
-        print(f"cache warning {label}: {', '.join(summary.notes)}")
+        logger.warning("cache warning %s: %s", label, ", ".join(summary.notes))

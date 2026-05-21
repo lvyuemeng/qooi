@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 from qooi.research.config import (
@@ -69,6 +70,7 @@ def _command_config(cli_args: argparse.Namespace) -> ResearchCommandConfig:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     command = _command_config(_parse_args())
     plan = compile_research_plan(command)
     result = execute_research_plan(plan, command)

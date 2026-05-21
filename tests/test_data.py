@@ -220,8 +220,7 @@ def test_structure_stage_unknown_semantics_are_split():
     assert "wide_range" in out["market_stage"].to_list()
     assert "wide_range" in out["stage_unknown_reason"].to_list()
     transition_conflicts = out.filter(
-        (pl.col("stage_unknown_reason") == "transition")
-        & (pl.col("market_stage") != "transition")
+        (pl.col("stage_unknown_reason") == "transition") & (pl.col("market_stage") != "transition")
     )
     assert transition_conflicts.is_empty()
 
@@ -329,9 +328,7 @@ def test_async_refresh_many_dedupes_requests_and_honors_concurrency(tmp_path, mo
         HistoryRefreshRequest("ETH-USDT-SWAP", "1H", min_bars=2),
     )
 
-    results = asyncio.run(
-        AsyncCacheStore(FakeAsyncExchange()).many(requests, concurrency=1)
-    )
+    results = asyncio.run(AsyncCacheStore(FakeAsyncExchange()).many(requests, concurrency=1))
 
     assert len(results) == 2
     assert max_active == 1
@@ -350,9 +347,7 @@ def test_sync_store_funding_reads_existing_cache(tmp_path, monkeypatch):
     import qooi.exchange.store as store_module
 
     monkeypatch.setattr(store_module, "CACHE_DIR", tmp_path)
-    frame = pl.DataFrame(
-        {"timestamp": [1_000], "funding_rate": [0.01], "funding_time": [1_000]}
-    )
+    frame = pl.DataFrame({"timestamp": [1_000], "funding_rate": [0.01], "funding_time": [1_000]})
     frame.write_parquet(store_module._resource_path("BTC-USDT-SWAP", resource="funding"))
 
     out = CacheStore().funding(FundingRequest("BTC-USDT-SWAP"))
@@ -478,9 +473,7 @@ def test_higher_timeframe_compact_context_marks_availability():
         attach_higher_timeframe_context(base, compact, prefix="h4"), "h4"
     )
 
-    assert {"h4_close", "h4_ema_20", "h4_trend_state", "h4_context_available"} <= set(
-        out.columns
-    )
+    assert {"h4_close", "h4_ema_20", "h4_trend_state", "h4_context_available"} <= set(out.columns)
     assert out["h4_context_available"].to_list() == [True]
 
 
@@ -499,9 +492,7 @@ def test_higher_timeframe_compact_context_adds_structure_columns():
 
     compact = _compact_higher_timeframe_context(h4)
 
-    assert {"structure_trend_state", "market_stage", "range_compression"} <= set(
-        compact.columns
-    )
+    assert {"structure_trend_state", "market_stage", "range_compression"} <= set(compact.columns)
 
 
 def test_mtf_state_key_normalizes_missing_context_as_data_error():

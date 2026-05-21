@@ -25,27 +25,17 @@ DataSource = Literal["swap", "spot_signal_swap_exec", "spot"]
 RunStyle = Literal["single", "rolling", "walk-forward", "cross-validate"]
 DiagnosticMode = Literal[
     "backtest",
-    "classifier",
-    "state",
-    "state-profitability",
-    "state-filter-delta",
-    "modulation-effect",
-    "market-state-forward",
-    "tradability",
     "research-evaluation",
 ]
 ResearchOutputName = Literal[
-    "classifier",
-    "tradability",
-    "market-state-forward",
-    "market-state-modulation",
     "trade-record-modulation",
+    "joint-forward-quality",
+    "timeframe-classifier",
 ]
+BarName = Literal["15m", "1H", "4H", "1D"]
 ClassifierProfile = Literal["default", "fixed", "rolling"]
 RangeThresholdMode = Literal["rolling_quantile", "fixed"]
 RangeThresholdFallback = Literal["fixed", "data_error"]
-MarketStateDeltaMode = Literal["fixed", "cost_multiple"]
-ModulationSeMethod = Literal["iid", "effective_n", "newey_west", "bootstrap"]
 
 
 class StrictConfigModel(BaseModel):
@@ -105,9 +95,7 @@ class StrategyConfig(StrictConfigModel):
     def _benchmark_group_choice(cls, value: str) -> str:
         if value not in BENCHMARK_GROUP_CHOICES:
             choices = ", ".join(BENCHMARK_GROUP_CHOICES)
-            raise ValueError(
-                f"strategy.benchmark_group={value!r} must be one of: {choices}"
-            )
+            raise ValueError(f"strategy.benchmark_group={value!r} must be one of: {choices}")
         return value
 
     @model_validator(mode="after")
@@ -164,32 +152,47 @@ class DiagnosticsConfig(StrictConfigModel):
 
 
 class ModulationEffectConfig(StrictConfigModel):
-    base_columns: tuple[str, ...] = ()
-    modulator_columns: tuple[str, ...] = ()
     min_base_trades: int = 20
     min_cell_trades: int = 10
     practical_delta_threshold: float = 0.15
 
 
+class JointForwardQualityConfig(StrictConfigModel):
+    enabled: bool = False
+    min_rows: int = 30
+    min_symbol_rows: int = 20
+    min_time_split_rows: int = 15
+    time_splits: int = 2
+    omega_threshold: float = 1.5
+    pwpr_threshold: float = 2.0
+    transition_min_rows: int = 50
+    transition_omega_threshold: float = 3.0
+    include_raw_mtf: bool = True
+    include_reduced: bool = True
+    include_transitions: bool = True
+    prior_strength: int = 50
+    invalid_values: tuple[str, ...] = ("warmup", "unknown", "data_error")
+
+
 class ResearchEvaluationConfig(StrictConfigModel):
     outputs: tuple[ResearchOutputName, ...] = (
-        "classifier",
-        "tradability",
-        "market-state-forward",
-        "market-state-modulation",
-        "trade-record-modulation",
+        "timeframe-classifier",
+        "joint-forward-quality",
     )
-    include_backtest_report: bool = True
+    include_backtest_report: bool = False
     write_exports: bool = True
     fail_fast: bool = False
     modulation_effect: ModulationEffectConfig = Field(default_factory=ModulationEffectConfig)
+    joint_forward_quality: JointForwardQualityConfig = Field(
+        default_factory=JointForwardQualityConfig
+    )
 
     @field_validator("outputs")
     @classmethod
     def _outputs_non_empty(
         cls, value: tuple[ResearchOutputName, ...]
     ) -> tuple[ResearchOutputName, ...]:
-        return tuple(dict.fromkeys(value)) or ("classifier",)
+        return tuple(dict.fromkeys(value)) or ("timeframe-classifier",)
 
 
 class ClassifierConfigRequest(StrictConfigModel):
@@ -251,32 +254,127 @@ class ClassifierConfigRequest(StrictConfigModel):
         )
 
 
-class MarketStateRobustnessConfig(StrictConfigModel):
-    se_method: ModulationSeMethod = "iid"
-    fdr: bool = False
-    fdr_alpha: float = 0.1
-    cohens_d_threshold: float = 0.2
-    n_eff_min: float = 20.0
+class TimeframeClassifierConfig(StrictConfigModel):
+    profile: ClassifierProfile | None = None
+    swing_lookback: int | None = None
+    range_lookback: int | None = None
+    trend_window: int | None = None
+    range_threshold_mode: RangeThresholdMode | None = None
+    range_threshold_quantile: float | None = None
+    range_threshold_window: int | None = None
+    range_threshold_min_samples: int | None = None
+    range_threshold_fallback: RangeThresholdFallback | None = None
+    fixed_range_width_atr: float | None = None
+    level_proximity_atr: float | None = None
+
+    def to_structure_config(self, base: ClassifierConfigRequest) -> StructureClassifierConfig:
+        request = ClassifierConfigRequest(
+            profile=self.profile or base.profile,
+            swing_lookback=self.swing_lookback
+            if self.swing_lookback is not None
+            else base.swing_lookback,
+            range_lookback=self.range_lookback
+            if self.range_lookback is not None
+            else base.range_lookback,
+            trend_window=self.trend_window if self.trend_window is not None else base.trend_window,
+            range_threshold_mode=self.range_threshold_mode
+            if self.range_threshold_mode is not None
+            else base.range_threshold_mode,
+            range_threshold_quantile=self.range_threshold_quantile
+            if self.range_threshold_quantile is not None
+            else base.range_threshold_quantile,
+            range_threshold_window=self.range_threshold_window
+            if self.range_threshold_window is not None
+            else base.range_threshold_window,
+            range_threshold_min_samples=self.range_threshold_min_samples
+            if self.range_threshold_min_samples is not None
+            else base.range_threshold_min_samples,
+            range_threshold_fallback=self.range_threshold_fallback
+            if self.range_threshold_fallback is not None
+            else base.range_threshold_fallback,
+            fixed_range_width_atr=self.fixed_range_width_atr
+            if self.fixed_range_width_atr is not None
+            else base.fixed_range_width_atr,
+            level_proximity_atr=self.level_proximity_atr
+            if self.level_proximity_atr is not None
+            else base.level_proximity_atr,
+        )
+        return request.to_structure_config()
+
+
+class TimeframeSpecConfig(StrictConfigModel):
+    bar: str
+    horizons: tuple[int, ...] = ()
+    days: int | None = None
+    min_bars: int | None = None
+    liquidity_lookback: int | None = None
+    classifier: TimeframeClassifierConfig = Field(default_factory=TimeframeClassifierConfig)
+
+    @field_validator("horizons")
+    @classmethod
+    def _horizons_positive(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(horizon <= 0 for horizon in value):
+            raise ValueError("timeframes.specs.horizons values must be positive")
+        return tuple(dict.fromkeys(value))
+
+
+@dataclass(frozen=True)
+class ResolvedTimeframeSpec:
+    bar: str
+    horizons: tuple[int, ...]
+    days: int
+    min_bars: int
+    liquidity_lookback: int
+    classifier: StructureClassifierConfig
+
+
+class TimeframeResearchConfig(StrictConfigModel):
+    bars: tuple[str, ...] = ("1H", "4H", "1D")
+    specs: tuple[TimeframeSpecConfig, ...] = ()
+
+    @field_validator("bars")
+    @classmethod
+    def _bars_non_empty(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(value)) or ("1H", "4H", "1D")
+
+    def resolved_specs(self, command: ResearchCommandConfig) -> tuple[ResolvedTimeframeSpec, ...]:
+        overrides = {spec.bar: spec for spec in self.specs}
+        resolved: list[ResolvedTimeframeSpec] = []
+        for bar in self.bars:
+            override = overrides.get(bar, TimeframeSpecConfig(bar=bar))
+            resolved.append(
+                ResolvedTimeframeSpec(
+                    bar=bar,
+                    horizons=override.horizons or _default_timeframe_horizons(bar),
+                    days=override.days if override.days is not None else command.days,
+                    min_bars=override.min_bars
+                    if override.min_bars is not None
+                    else command.min_bars,
+                    liquidity_lookback=override.liquidity_lookback
+                    if override.liquidity_lookback is not None
+                    else _default_timeframe_liquidity_lookback(bar),
+                    classifier=override.classifier.to_structure_config(command.classifier),
+                )
+            )
+        return tuple(resolved)
+
+
+def _default_timeframe_horizons(bar: str) -> tuple[int, ...]:
+    return {
+        "15m": (4, 8, 16),
+        "1H": (3, 5, 10),
+        "4H": (2, 3, 5),
+        "1D": (1, 2, 3),
+    }.get(bar, (3, 5, 10))
+
+
+def _default_timeframe_liquidity_lookback(bar: str) -> int:
+    return 40 if bar == "15m" else 20
 
 
 class MarketStateConfig(StrictConfigModel):
     horizons: tuple[int, ...] = (3, 5, 10)
     outcomes: tuple[str, ...] = ("return_pct",)
-    min_rows: int = 30
-    min_base_rows: int = 100
-    min_cell_rows: int = 30
-    delta_threshold_pct: float = 0.15
-    delta_mode: MarketStateDeltaMode = "fixed"
-    cost_pct: float = 0.10
-    cost_multiple: float = 1.5
-    base_columns: tuple[str, ...] = ()
-    modulator_columns: tuple[str, ...] = ()
-    time_splits: int = 2
-    min_segment_months: int = 6
-    min_segment_base_rows: int = 50
-    min_segment_cell_rows: int = 15
-    plot_dir: str = ""
-    robustness: MarketStateRobustnessConfig = Field(default_factory=MarketStateRobustnessConfig)
 
     @field_validator("horizons")
     @classmethod
@@ -290,15 +388,6 @@ class MarketStateConfig(StrictConfigModel):
     def _outcomes_non_empty(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return value or ("return_pct",)
 
-    def delta_threshold(self) -> tuple[float, str]:
-        if self.delta_mode == "cost_multiple":
-            threshold = self.cost_pct * self.cost_multiple
-            return (
-                threshold,
-                f"cost_multiple cost_pct={self.cost_pct:.2f} multiple={self.cost_multiple:.2f}",
-            )
-        return self.delta_threshold_pct, "fixed"
-
 
 class ResearchCommandConfig(StrictConfigModel):
     run: RunConfig = Field(default_factory=RunConfig)
@@ -310,9 +399,8 @@ class ResearchCommandConfig(StrictConfigModel):
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     classifier: ClassifierConfigRequest = Field(default_factory=ClassifierConfigRequest)
     market_state: MarketStateConfig = Field(default_factory=MarketStateConfig)
-    research_evaluation: ResearchEvaluationConfig = Field(
-        default_factory=ResearchEvaluationConfig
-    )
+    timeframes: TimeframeResearchConfig = Field(default_factory=TimeframeResearchConfig)
+    research_evaluation: ResearchEvaluationConfig = Field(default_factory=ResearchEvaluationConfig)
 
     @property
     def days(self) -> int:
@@ -481,11 +569,7 @@ class SignalDebugFilterConfig:
 
     @property
     def active(self) -> bool:
-        return (
-            self.side != "both"
-            or bool(self.include_signal_ids)
-            or bool(self.exclude_signal_ids)
-        )
+        return self.side != "both" or bool(self.include_signal_ids) or bool(self.exclude_signal_ids)
 
     def metadata(self) -> tuple[str, ...]:
         if not self.active:
@@ -519,13 +603,9 @@ def apply_sizing_overrides(pair: PairConfig, sizing: SizingOverrideConfig) -> Pa
 
 def risk_gate_metadata(gates: RiskGateConfig) -> tuple[str, ...]:
     max_notional = (
-        gates.max_notional_exposure_pct
-        if gates.max_notional_exposure_pct is not None
-        else "none"
+        gates.max_notional_exposure_pct if gates.max_notional_exposure_pct is not None else "none"
     )
-    min_expectancy = (
-        gates.min_expectancy_pct if gates.min_expectancy_pct is not None else "none"
-    )
+    min_expectancy = gates.min_expectancy_pct if gates.min_expectancy_pct is not None else "none"
     return (
         f"min_coverage_pct={gates.min_coverage_pct}",
         f"max_dd_pct={gates.max_dd_pct if gates.max_dd_pct is not None else 'none'}",
