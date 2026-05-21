@@ -37,6 +37,7 @@ data/cache/
 data/charts/
 data/signals/
 data/logs/
+data/output/
 
 # Logs
 *.log

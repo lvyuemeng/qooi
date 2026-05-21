@@ -56,7 +56,7 @@ qooi/
 │       ├── trading.py     ← OKX orders & balance (API key via .env)
 │       ├── store.py       ← OHLCV cache (Parquet)
 │       ├── indicator.py   ← SMA, RSI, ATR, Bollinger
-│       ├── backtest.py    ← vectorized backtest + walk-forward
+│       ├── research.py    ← config-first research + backtest orchestration
 │       ├── chart.py       ← standalone charting (equity curve, signals)
 │       └── eval.py        ← strategy evaluation (Sharpe, win rate, IC, IR, drawdown…)
 │   └── strategies/

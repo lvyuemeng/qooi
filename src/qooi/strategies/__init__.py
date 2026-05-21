@@ -1,15 +1,27 @@
 """Composable strategy package.
 
-Strategies are built from reusable features, conditions, filters, and hold policies.
+Strategies are built from reusable features, predicates, filters, and hold policies.
 """
 
 from __future__ import annotations
 
+from qooi.strategies.catalog import (
+    BENCHMARK_GROUP_CHOICES,
+    BENCHMARK_GROUPS,
+    DEFAULT_STRATEGY,
+    STRATEGY_CHOICES,
+    StrategySelection,
+    strategy_metadata,
+    strategy_selection,
+)
 from qooi.strategies.indicators import (
     ORDER_BOOK_FEATURE_SCHEMA,
     IndicatorSources,
+    add_garch_like_volatility,
+    add_macd_histogram,
     add_ofi_flow_columns,
     add_regime_features,
+    add_volatility_regime,
     apply_regime_gate,
     attach_order_book_features,
     compute_flow_pipeline_frame,
@@ -23,7 +35,6 @@ from qooi.strategies.portfolio import (
     qualify_asset,
 )
 from qooi.strategies.specs import (
-    FlowPipelineSpec,
     HoldPolicy,
     SignalRule,
     StrategyBehavior,
@@ -48,7 +59,6 @@ __all__ = [
     "latest_signal",
     "HoldPolicy",
     "SignalRule",
-    "FlowPipelineSpec",
     "StrategyBehavior",
     "StrategySpec",
     "ema_trend_baseline_spec",
@@ -62,8 +72,11 @@ __all__ = [
     "flow_pipeline_spec",
     "IndicatorSources",
     "ORDER_BOOK_FEATURE_SCHEMA",
+    "add_garch_like_volatility",
+    "add_macd_histogram",
     "add_ofi_flow_columns",
     "add_regime_features",
+    "add_volatility_regime",
     "attach_order_book_features",
     "apply_regime_gate",
     "compute_indicator_frame",
@@ -73,4 +86,11 @@ __all__ = [
     "PortfolioLimits",
     "allocate_portfolio_weights",
     "qualify_asset",
+    "BENCHMARK_GROUP_CHOICES",
+    "BENCHMARK_GROUPS",
+    "DEFAULT_STRATEGY",
+    "STRATEGY_CHOICES",
+    "StrategySelection",
+    "strategy_metadata",
+    "strategy_selection",
 ]

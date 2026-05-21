@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.strategies.features import add_volatility_regime
+from qooi.strategies.indicators import add_volatility_regime
 
 
 def test_flow_feature_volatility_regime_is_synthetic_and_hermetic():

@@ -42,10 +42,10 @@ count, win rate, profit factor, avg win/loss, and expectancy first.
 Backtest profiles:
 
 ```bash
-uv run python scripts/backtest.py --mode base
-uv run python scripts/backtest.py --mode grid
-uv run python scripts/backtest.py --mode martingale
-uv run python scripts/backtest.py --mode hedge
+uv run python scripts/research.py --config configs/research/base-backtest.toml
+uv run python scripts/research.py --config configs/research/grid-backtest.toml
+uv run python scripts/research.py --config configs/research/martingale-backtest.toml
+uv run python scripts/research.py --config configs/research/hedge-backtest.toml
 ```
 
 Use profile sweep to separate weak edge from weak exposure / conservative sizing.
@@ -81,7 +81,7 @@ Use profile sweep to separate weak edge from weak exposure / conservative sizing
 uv run python scripts/trade.py test
 
 # Backtest (all cached data)
-uv run python scripts/backtest.py
+uv run python scripts/research.py
 
 # Live trading — production
 uv run python scripts/trade.py live dry    # dry run

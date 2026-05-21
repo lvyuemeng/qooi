@@ -1,0 +1,12 @@
+[run]
+profile = "research"
+universe = "core"
+data_source = "swap"
+
+[strategy]
+mode = "base"
+strategy = "ema_trend_baseline"
+diagnostics = true
+
+[diagnostics]
+mode = "backtest"

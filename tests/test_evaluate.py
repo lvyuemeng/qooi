@@ -1,6 +1,5 @@
 """Evaluation layer tests."""
 
-from qooi.core.config import PAIRS
 from qooi.core.evaluate import (
     Report,
     _trades_frame,
@@ -10,6 +9,7 @@ from qooi.core.evaluate import (
     format_symbol_rankings,
 )
 from qooi.core.metrics import compute_metrics
+from qooi.research.instruments import CORE_UNIVERSE
 
 
 def _trade(**overrides):
@@ -29,7 +29,7 @@ def _report(trades=None, equity=None, *, label=None, metadata=()):
     return Report.from_raw(
         trades or [],
         equity or [100.0, 100.0],
-        PAIRS[0],
+        CORE_UNIVERSE[0],
         label=label,
         metadata=metadata,
     )
@@ -95,7 +95,7 @@ def test_regime_buckets_include_mtf_state_keys():
 def test_active_bar_sharpe_uses_active_exposure():
     equity = [100.0, 100.5, 100.5, 101.0, 101.0]
     active_exposure = [0.0, 1.0, 0.0, 2.0, 0.0]
-    report = Report.from_raw([], equity, PAIRS[0], active_exposure=active_exposure)
+    report = Report.from_raw([], equity, CORE_UNIVERSE[0], active_exposure=active_exposure)
     assert report.active_bar_pct > 0
     assert report.active_bar_sharpe != 0 or report.active_bar_pct > 0
 
@@ -128,7 +128,7 @@ def test_strategy_recommendation_prioritizes_primary_metrics():
 
 
 def test_yield_attribution_reconciles_price_edge_and_dollar_loss():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {
             "side": "buy",
@@ -195,7 +195,7 @@ def test_yield_attribution_reconciles_price_edge_and_dollar_loss():
 
 
 def test_stop_effectiveness_identifies_worst_side_and_signal():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {
             "side": "buy",
@@ -248,7 +248,7 @@ def test_stop_effectiveness_identifies_worst_side_and_signal():
 
 
 def test_report_buckets_liquidity_event_type_and_quality():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {
             "side": "buy",
@@ -273,7 +273,7 @@ def test_report_buckets_liquidity_event_type_and_quality():
 
 
 def test_report_buckets_stage_reasons_and_cross_attribution():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {
             "side": "sell",
@@ -317,14 +317,14 @@ def test_report_buckets_stage_reasons_and_cross_attribution():
 
 
 def test_pair_attribution_safely_omits_missing_columns():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     report = Report.from_raw([{"pnl": 0.01, "pnl_usd": 1.0}], [100.0, 101.0], pair)
 
     assert format_pair_attribution(report.trades, "missing", "also_missing") == ""
 
 
 def test_drawdown_path_diagnostics_from_trade_rows():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {
             "side": "buy",
@@ -361,7 +361,7 @@ def test_drawdown_path_diagnostics_from_trade_rows():
 
 
 def test_report_derives_exit_family_when_missing_from_trade_rows():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {"pnl": -0.01, "pnl_usd": -1.0, "reason": "stop"},
         {"pnl": 0.02, "pnl_usd": 2.0, "reason": "strategy_exit"},
@@ -378,7 +378,7 @@ def test_report_derives_exit_family_when_missing_from_trade_rows():
 
 
 def test_report_derives_entry_regime_buckets_from_trade_rows():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {
             "pnl": -0.01,
@@ -412,7 +412,7 @@ def test_report_derives_entry_regime_buckets_from_trade_rows():
 
 
 def test_report_derives_none_context_buckets_from_trade_rows():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     trades = [
         {
             "pnl": -0.01,
@@ -446,7 +446,7 @@ def test_report_derives_none_context_buckets_from_trade_rows():
 
 
 def test_symbol_rankings_skip_data_incomplete_placeholders():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     traded = Report.from_raw(
         [{"pnl": 0.01, "pnl_usd": 1.0}],
         [100.0, 101.0],

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Protocol
 
 from qooi.core.basket import Basket, BasketState, Position
-from qooi.core.config import PairConfig
+from qooi.core.instruments import PairConfig
 
 STATE_DIR = Path("data") / "state"
 DEFAULT_SOFT_STATE_PATH = STATE_DIR / "baskets.json"

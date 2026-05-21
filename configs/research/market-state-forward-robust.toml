@@ -1,0 +1,16 @@
+[run]
+profile = "research"
+universe = "core"
+exclude_symbol = ["XAU-USDT-SWAP"]
+
+[diagnostics]
+mode = "market-state-forward"
+export = "data/output/qooi-market-state-forward-robust.csv"
+
+[market_state]
+outcomes = ["return_pct"]
+plot_dir = "data/output/qooi-market-state-forward-plots"
+
+[market_state.robustness]
+se_method = "newey_west"
+fdr = true

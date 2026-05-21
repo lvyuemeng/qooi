@@ -62,29 +62,29 @@ fast when data is too shallow.
 uv run python scripts/trade.py test
 
 # Backtest a strategy on cached data
-uv run python scripts/backtest.py --strategy robust_zscore_mean_reversion --symbol ETH-USDT-SWAP --diagnostics
+uv run python scripts/research.py --config configs/research/base-backtest.toml --symbol ETH-USDT-SWAP
 
 # Refresh cache and require at least 90% target coverage
-uv run python scripts/backtest.py --strategy robust_zscore_mean_reversion --symbol ETH-USDT-SWAP --refresh-cache --min-coverage-pct 90
+uv run python scripts/research.py --config configs/research/base-backtest.toml --symbol ETH-USDT-SWAP --refresh-cache
 
 # Compare current benchmark set
-uv run python scripts/backtest.py --benchmark --diagnostics --data-source swap
+uv run python scripts/research.py --config configs/research/benchmark.toml
 
 # Sweep recovery profiles
-uv run python scripts/backtest.py --mode base
-uv run python scripts/backtest.py --mode grid
-uv run python scripts/backtest.py --mode martingale
-uv run python scripts/backtest.py --mode hedge
+uv run python scripts/research.py --config configs/research/base-backtest.toml
+uv run python scripts/research.py --config configs/research/grid-backtest.toml
+uv run python scripts/research.py --config configs/research/martingale-backtest.toml
+uv run python scripts/research.py --config configs/research/hedge-backtest.toml
 
 # Custom backtest:
 uv run python -c "
 from qooi.core.executor import BacktestExecutor
-from qooi.core.config import PAIRS
+from qooi.research.instruments import CORE_UNIVERSE
 from qooi.strategies import robust_zscore_mean_reversion_spec
 import polars as pl
 
 df = pl.read_parquet('data/cache/ETH_USDT_SWAP_1H.parquet')
-pair = PAIRS[0]
+pair = CORE_UNIVERSE[0]
 bt = BacktestExecutor(initial_capital=pair.asset.capital)
 report = bt.run_report(df, pair, strategy=robust_zscore_mean_reversion_spec())
 print(report.summary())
@@ -119,11 +119,11 @@ src/qooi/
                        executor.py, evaluate.py, metrics.py, recovery.py,
                        state.py, styles.py
   exchange/          ← market.py, trading.py, store.py
-  strategies/        ← specs.py, features.py, conditions.py, indicators.py,
+  strategies/        ← specs.py, features.py, indicators.py,
                        portfolio.py
 scripts/
   trade.py           ← live trading entry point (auto-creates bot on first run)
-  backtest.py        ← CLI backtest runner
+  research.py        ← config-first research runner
 docs/
   okx-api.md         ← OKX API reference
   testnet.md         ← test validation workflow

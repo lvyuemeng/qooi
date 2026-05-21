@@ -9,7 +9,7 @@ from qooi.core.basket import (
     BasketState,
     Position,
 )
-from qooi.core.config import AssetConfig
+from qooi.core.instruments import AssetConfig
 
 
 def test_create_basket_initializes_full_state():

@@ -13,7 +13,7 @@ from qooi.core.basket import (
     TrailTracker,
     evaluate_exits,
 )
-from qooi.core.config import AssetConfig, PairConfig
+from qooi.core.instruments import AssetConfig, PairConfig
 from qooi.core.recovery import GridRecovery, MartingaleRecovery, ReverseRecovery
 
 

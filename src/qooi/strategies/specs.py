@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, cast
 
 import polars as pl
 
-import qooi.strategies.conditions as c
+import qooi.strategies.indicators as c
 from qooi.strategies.features import (
     FeatureFn,
     add_liquidity_sweep_features,
-    add_macd_histogram,
     add_momentum_return,
     add_none_context_diagnostics,
     add_price_structure,
@@ -20,7 +20,11 @@ from qooi.strategies.features import (
     add_utc_hour,
     add_volume_average,
 )
-from qooi.strategies.indicators import add_indicators, compute_flow_pipeline_frame
+from qooi.strategies.indicators import (
+    add_indicators,
+    add_macd_histogram,
+    compute_flow_pipeline_frame,
+)
 from qooi.strategies.semantics import LiquidityEvent, StructureState
 
 Direction = Literal[-1, 1]
@@ -50,18 +54,10 @@ class StrategySpec:
     filters: tuple[pl.Expr, ...] = ()
     hold: HoldPolicy = HoldPolicy()
     continuous_entries: bool = False
+    signal_frame: Callable[[pl.DataFrame], pl.DataFrame] | None = None
 
 
-@dataclass(frozen=True)
-class FlowPipelineSpec:
-    name: str = "flow_pipeline"
-    threshold: float = 0.25
-
-    def compute(self, df: pl.DataFrame) -> pl.DataFrame:
-        return compute_flow_pipeline_frame(df, threshold=self.threshold)
-
-
-StrategyBehavior = StrategySpec | FlowPipelineSpec
+StrategyBehavior = StrategySpec
 
 
 def momentum_burst_spec(
@@ -258,8 +254,17 @@ def rsi_macd_trend_spec(
     )
 
 
-def flow_pipeline_spec(*, threshold: float = 0.25) -> FlowPipelineSpec:
-    return FlowPipelineSpec(threshold=threshold)
+def flow_pipeline_spec(*, threshold: float = 0.25) -> StrategySpec:
+    def _compute(df: pl.DataFrame) -> pl.DataFrame:
+        return _with_flow_signal_columns(compute_flow_pipeline_frame(df, threshold=threshold))
+
+    return StrategySpec(
+        name="flow_pipeline",
+        required_columns=("timestamp", "open", "high", "low", "close", "vol"),
+        features=(),
+        entries=(),
+        signal_frame=_compute,
+    )
 
 
 def _failed_breakout_entry_conditions(
@@ -296,6 +301,23 @@ def _structural_feature_stack() -> tuple[FeatureFn, ...]:
         add_none_context_diagnostics(),
         add_price_structure_stage_features(),
     )
+
+
+def _market_stage_exclusion_filter(
+    *,
+    exclude_market_stages: tuple[str, ...],
+    exclude_market_stage_reasons: tuple[str, ...],
+) -> pl.Expr:
+    stage_filter = pl.lit(True)
+    if exclude_market_stages:
+        stage_filter = stage_filter & ~pl.col("market_stage").fill_null("unknown").is_in(
+            list(exclude_market_stages)
+        )
+    if exclude_market_stage_reasons:
+        stage_filter = stage_filter & ~pl.col("market_stage_reason").fill_null("unknown").is_in(
+            list(exclude_market_stage_reasons)
+        )
+    return stage_filter
 
 
 def structure_event_reversal_v1_spec(
@@ -336,6 +358,12 @@ def structure_event_trend_aligned_v1_spec(
     *,
     event_quality_min: float = 1.5,
     require_volume_impulse: bool = True,
+    exclude_market_stages: tuple[str, ...] = (),
+    exclude_market_stage_reasons: tuple[str, ...] = (),
+    exclude_long_market_stages: tuple[str, ...] = (),
+    exclude_long_market_stage_reasons: tuple[str, ...] = (),
+    exclude_short_market_stages: tuple[str, ...] = (),
+    exclude_short_market_stage_reasons: tuple[str, ...] = (),
     include_reclaim_sweeps: bool = False,
     max_bars: int = 8,
     name: str = "structure_event_trend_aligned_v1",
@@ -350,8 +378,30 @@ def structure_event_trend_aligned_v1_spec(
         event_quality_min=event_quality_min,
         require_volume_impulse=require_volume_impulse,
     )
-    long_entry = long_base & (pl.col("structure_trend_state") == StructureState.UPTREND)
-    short_entry = short_base & (pl.col("structure_trend_state") == StructureState.DOWNTREND)
+    stage_filter = _market_stage_exclusion_filter(
+        exclude_market_stages=exclude_market_stages,
+        exclude_market_stage_reasons=exclude_market_stage_reasons,
+    )
+    long_stage_filter = _market_stage_exclusion_filter(
+        exclude_market_stages=exclude_long_market_stages,
+        exclude_market_stage_reasons=exclude_long_market_stage_reasons,
+    )
+    short_stage_filter = _market_stage_exclusion_filter(
+        exclude_market_stages=exclude_short_market_stages,
+        exclude_market_stage_reasons=exclude_short_market_stage_reasons,
+    )
+    long_entry = (
+        long_base
+        & (pl.col("structure_trend_state") == StructureState.UPTREND)
+        & stage_filter
+        & long_stage_filter
+    )
+    short_entry = (
+        short_base
+        & (pl.col("structure_trend_state") == StructureState.DOWNTREND)
+        & stage_filter
+        & short_stage_filter
+    )
     return StrategySpec(
         name=name,
         required_columns=("timestamp", "open", "high", "low", "close", "atr_14"),
@@ -425,10 +475,10 @@ def structure_event_trend_aligned_mtf_confirm_v1_spec(
 
 def compute_signal_frame(df: pl.DataFrame, strategy: StrategyBehavior) -> pl.DataFrame:
     """Return ``df`` with a behavior-computed ``signal`` column."""
-    if not isinstance(strategy, (StrategySpec, FlowPipelineSpec)):
-        raise TypeError("strategy must be a strategy behavior object")
-    if isinstance(strategy, FlowPipelineSpec):
-        return _with_flow_signal_columns(strategy.compute(df))
+    if not isinstance(strategy, StrategySpec):
+        raise TypeError("strategy must be a strategy spec")
+    if strategy.signal_frame is not None:
+        return strategy.signal_frame(df)
     df = add_indicators(df)
     return apply_strategy_spec(df, strategy)
 
@@ -449,14 +499,14 @@ def strategy_signal_diagnostics(df: pl.DataFrame, strategy: StrategyBehavior) ->
     if bars == 0:
         return {"bars": 0.0, "signal_pct": 0.0}
 
-    if isinstance(strategy, FlowPipelineSpec):
+    if strategy.name == "flow_pipeline":
         diagnostics: dict[str, float] = {
             "bars": bars,
             "held_signal_pct": _expr_pct(signal_df, pl.col("signal") != 0),
         }
         if "ofi_flow_score" in signal_df.columns:
             diagnostics["ofi_threshold_pct"] = _expr_pct(
-                signal_df, pl.col("ofi_flow_score").abs() >= strategy.threshold
+                signal_df, pl.col("signal") != 0
             )
         if "regime_score" in signal_df.columns:
             diagnostics["regime_gate_pass_pct"] = _expr_pct(

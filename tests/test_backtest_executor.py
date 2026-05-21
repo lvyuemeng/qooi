@@ -4,10 +4,11 @@ import polars as pl
 import pytest
 
 from qooi.core.basket import Basket, BasketState, ExitConfig
-from qooi.core.config import PAIRS, AssetConfig, PairConfig
 from qooi.core.evaluate import Report
 from qooi.core.executor import BacktestExecutor
+from qooi.core.instruments import AssetConfig, PairConfig
 from qooi.core.recovery import GridRecovery, HedgeRecovery, MartingaleRecovery
+from qooi.research.instruments import CORE_UNIVERSE
 
 
 def _load(sig_symbol: str) -> pl.DataFrame:
@@ -122,7 +123,7 @@ def _ambiguous_frame() -> pl.DataFrame:
     )
 
 
-@pytest.mark.parametrize("pair", PAIRS[:2])
+@pytest.mark.parametrize("pair", CORE_UNIVERSE[:2])
 def test_run_generates_multiple_trades_from_cached_data(pair):
     df = _load(pair.asset.sig_symbol)
     trades, equity = BacktestExecutor(initial_capital=pair.asset.capital).run(df, pair)
@@ -132,7 +133,7 @@ def test_run_generates_multiple_trades_from_cached_data(pair):
 
 
 def test_trade_pnl_sign_matches_direction():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     df = _load(pair.asset.sig_symbol)
     trades, _ = BacktestExecutor(initial_capital=pair.asset.capital).run(df, pair)
     assert trades
@@ -148,7 +149,7 @@ def test_trade_pnl_sign_matches_direction():
 
 
 def test_trade_rows_include_richer_fields():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     df = _load(pair.asset.sig_symbol)
     trades, _ = BacktestExecutor(initial_capital=pair.asset.capital).run(df, pair)
     assert trades
@@ -167,7 +168,7 @@ def test_trade_rows_include_richer_fields():
 
 
 def test_trade_pnl_usd_uses_exit_size_snapshot():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     df = _load(pair.asset.sig_symbol)
     trades, equity = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run(
         df, pair
@@ -178,7 +179,7 @@ def test_trade_pnl_usd_uses_exit_size_snapshot():
 
 
 def test_run_report_returns_report():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     df = _load(pair.asset.sig_symbol)
     report = BacktestExecutor(initial_capital=pair.asset.capital).run_report(df, pair)
     assert isinstance(report, Report)
@@ -187,7 +188,7 @@ def test_run_report_returns_report():
 
 
 def test_drawdown_stop_halts_loop():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     df = _load(pair.asset.sig_symbol)
     # tiny capital + normal costs should stop early on DD if losses occur
     trades, equity = BacktestExecutor(initial_capital=50.0).run(df, pair)
@@ -195,7 +196,7 @@ def test_drawdown_stop_halts_loop():
 
 
 def test_executor_populates_grouped_lifecycle_and_risk_diagnostics():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
         _signal_frame(),
         pair,
@@ -221,7 +222,7 @@ def test_executor_populates_grouped_lifecycle_and_risk_diagnostics():
 
 
 def test_executor_records_drawdown_path_trade_metadata():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
         _signal_frame(),
         pair,
@@ -412,7 +413,7 @@ def test_same_bar_terminal_entry_block_reports_sizing_not_duplicate():
 
 
 def test_same_bar_stop_target_ambiguity_is_diagnosed():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
         _ambiguous_frame(),
         pair,
@@ -430,7 +431,7 @@ def test_same_bar_stop_target_ambiguity_is_diagnosed():
 
 
 def test_loss_cooldown_blocks_same_side_entries_after_loss():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     report = BacktestExecutor(
         initial_capital=pair.asset.capital,
         cost_pct=0.0,

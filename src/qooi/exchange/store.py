@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -73,6 +73,16 @@ class HistoryRefreshResult:
     refreshed: bool
     path: Path
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class CacheRefreshEvent:
+    kind: Literal["started", "completed", "failed", "summary"]
+    request: HistoryRefreshRequest | None
+    result: HistoryRefreshResult | None
+    completed: int
+    total: int
+    message: str
 
 
 @dataclass(frozen=True)
@@ -407,7 +417,28 @@ class AsyncCacheStore:
         concurrency: int = 3,
         fail_fast: bool = False,
     ) -> tuple[HistoryRefreshResult, ...]:
+        results = []
+        async for event in self.stream_many(
+            requests,
+            concurrency=concurrency,
+            fail_fast=fail_fast,
+        ):
+            if event.result is not None:
+                results.append(event.result)
+        return tuple(results)
+
+    async def stream_many(
+        self,
+        requests: list[HistoryRefreshRequest] | tuple[HistoryRefreshRequest, ...],
+        *,
+        concurrency: int = 3,
+        fail_fast: bool = False,
+    ) -> AsyncIterator[CacheRefreshEvent]:
         unique = tuple(dict.fromkeys(requests))
+        total = len(unique)
+        if not unique:
+            yield CacheRefreshEvent("summary", None, None, 0, 0, "cache refresh: no requests")
+            return
         semaphore = asyncio.Semaphore(max(1, concurrency))
 
         async def _run(request: HistoryRefreshRequest) -> HistoryRefreshResult:
@@ -420,7 +451,37 @@ class AsyncCacheStore:
                     raise RuntimeError(result.error)
                 return result
 
-        return tuple(await asyncio.gather(*(_run(request) for request in unique)))
+        for request in unique:
+            yield CacheRefreshEvent(
+                "started",
+                request,
+                None,
+                0,
+                total,
+                f"cache refresh queued {request.inst_id} {request.bar} source={request.source}",
+            )
+        completed = 0
+        tasks = [asyncio.create_task(_run(request)) for request in unique]
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            completed += 1
+            kind = "failed" if result.error else "completed"
+            yield CacheRefreshEvent(
+                kind,
+                result.request,
+                result,
+                completed,
+                total,
+                _refresh_event_message(result, completed, total),
+            )
+        yield CacheRefreshEvent(
+            "summary",
+            None,
+            None,
+            completed,
+            total,
+            f"cache refresh complete {completed}/{total}",
+        )
 
     async def _update_bars(
         self, request: HistoryRefreshRequest, path: Path
@@ -639,6 +700,42 @@ def validate_history(
         refreshed=refreshed,
         notes=(*notes, *extra_notes),
     )
+
+
+def _refresh_event_message(
+    result: HistoryRefreshResult, completed: int, total: int
+) -> str:
+    coverage = result.coverage
+    fetch_pages = _note_value(coverage.notes, "fetch_pages")
+    fetch_stop = _note_value(coverage.notes, "fetch_stop")
+    oldest_ts = _note_value(coverage.notes, "fetch_oldest_ts")
+    since_ms = _note_value(coverage.notes, "fetch_since_ms")
+    status = "failed" if result.error else "done"
+    parts = [
+        f"cache refresh {completed}/{total} {status}",
+        f"{result.request.inst_id} {result.request.bar} source={result.request.source}",
+        f"rows={result.rows_written}",
+        f"coverage={coverage.coverage_pct:.1f}%",
+    ]
+    if fetch_pages:
+        parts.append(f"pages={fetch_pages}")
+    if fetch_stop:
+        parts.append(f"stop={fetch_stop}")
+    if oldest_ts:
+        parts.append(f"oldest={oldest_ts}")
+    if since_ms:
+        parts.append(f"since={since_ms}")
+    if result.error:
+        parts.append(f"error={result.error}")
+    return " ".join(parts)
+
+
+def _note_value(notes: tuple[str, ...], key: str) -> str:
+    prefix = f"{key}="
+    for note in notes:
+        if note.startswith(prefix):
+            return note.removeprefix(prefix)
+    return ""
 
 
 def _bar_interval_ms(bar: str) -> int:

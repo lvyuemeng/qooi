@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.core.config import PAIRS
 from qooi.core.evaluate import Report
 from qooi.research.diagnostics import evaluate_state_attribution, format_state_attribution
+from qooi.research.instruments import CORE_UNIVERSE
 
 
 def _report(trades=None, equity=None):
-    return Report.from_raw(trades or [], equity or [100.0, 100.0], PAIRS[0])
+    return Report.from_raw(trades or [], equity or [100.0, 100.0], CORE_UNIVERSE[0])
 
 
 def _trade(**overrides):

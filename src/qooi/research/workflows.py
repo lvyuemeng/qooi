@@ -1,21 +1,24 @@
-"""Strategy-owned frame preprocessing for research backtests and diagnostics."""
+"""Research-owned frame preparation workflows."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+import asyncio
+from dataclasses import dataclass, replace
+from typing import Literal
 
 import polars as pl
 
-from qooi.core.config import PairConfig
+from qooi.core.instruments import PairConfig
 from qooi.exchange.market import CandleSource
 from qooi.exchange.store import (
+    AsyncCacheStore,
     CacheStore,
     HistoryCoverage,
+    HistoryRefreshRequest,
     HistoryRequest,
     validate_history,
 )
-from qooi.research.config import ResolvedBacktestConfig
+from qooi.research.config import SignalDebugFilterConfig
 from qooi.strategies.features import (
     StructureClassifierConfig,
     add_price_structure_stage_features,
@@ -35,49 +38,236 @@ class DataCoverageError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class PreparedBacktestFrame:
+class FrameRequest:
+    pair: PairConfig
+    data_source: str
+    days: int
+    min_bars: int
+    refresh: bool = False
+    min_coverage_pct: float = 0.0
+    allow_swap_signal_fallback: bool = False
+
+
+@dataclass(frozen=True)
+class CacheAuditRequest:
+    pairs: tuple[PairConfig, ...]
+    data_source: str
+    days: int
+    min_bars: int
+    min_coverage_pct: float
+    refresh: bool = False
+    async_refresh: bool = False
+    refresh_concurrency: int = 3
+    incremental: bool = True
+
+
+@dataclass(frozen=True)
+class BacktestFrameOptions:
+    signal_filters: SignalDebugFilterConfig
+    metadata: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FrameResult:
     pair: PairConfig
     frame: pl.DataFrame
-    precomputed_signal: bool
     signal_inst_id: str
-    execution_inst_id: str
+    execution_inst_id: str | None
+    coverage: tuple[HistoryCoverage, ...]
+    metadata: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreparedBacktestFrame(FrameResult):
+    precomputed_signal: bool
     signal_coverage: HistoryCoverage
     execution_coverage: HistoryCoverage
-    metadata: tuple[str, ...]
+
+
+PreparedClassifierFrame = FrameResult
 
 
 @dataclass(frozen=True)
-class PreparedClassifierFrame:
-    pair: PairConfig
+class CacheAuditResult:
     frame: pl.DataFrame
-    signal_inst_id: str
-    metadata: tuple[str, ...]
+
+
+CACHE_AUDIT_SCHEMA = {
+    "status": pl.Utf8,
+    "instrument": pl.Utf8,
+    "bar": pl.Utf8,
+    "actual_bars": pl.Int64,
+    "target_bars": pl.Int64,
+    "coverage_pct": pl.Float64,
+    "start_ms": pl.Int64,
+    "end_ms": pl.Int64,
+    "notes": pl.Utf8,
+}
 
 
 @dataclass(frozen=True)
-class TimeframeContextSpec:
-    timeframe: str
+class ContextSpec:
+    bar: str
     prefix: str
     source: CandleSource = "trade"
     role: Literal["base", "higher_context"] = "higher_context"
     required: bool = True
 
 
-@dataclass(frozen=True)
-class ClassifierContextConfig:
-    base_timeframe: str = "1H"
-    higher_timeframes: tuple[TimeframeContextSpec, ...] = (
-        TimeframeContextSpec("1H", "h1", role="base"),
-        TimeframeContextSpec("4H", "h4", role="higher_context"),
-        TimeframeContextSpec("1D", "d1", role="higher_context"),
-    )
-    classifier: StructureClassifierConfig = field(default_factory=StructureClassifierConfig.default)
+DEFAULT_CONTEXTS: tuple[ContextSpec, ...] = (
+    ContextSpec("1H", "h1", role="base"),
+    ContextSpec("4H", "h4", role="higher_context"),
+    ContextSpec("1D", "d1", role="higher_context"),
+)
 
 
-DEFAULT_MTF_CONTEXT_BUNDLE: tuple[TimeframeContextSpec, ...] = (
-    TimeframeContextSpec("1H", "h1", role="base"),
-    TimeframeContextSpec("4H", "h4", role="higher_context"),
-    TimeframeContextSpec("1D", "d1", role="higher_context"),
+def build_history_refresh_requests(
+    request: CacheAuditRequest,
+) -> tuple[HistoryRefreshRequest, ...]:
+    requests: list[HistoryRefreshRequest] = []
+    contexts = tuple(context for context in DEFAULT_CONTEXTS if context.role == "higher_context")
+    for pair in request.pairs:
+        signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
+        for inst_id in dict.fromkeys((signal_inst_id, execution_inst_id)):
+            requests.append(
+                HistoryRefreshRequest(
+                    inst_id=inst_id,
+                    bar=pair.asset.timeframe,
+                    days=request.days,
+                    min_bars=request.min_bars,
+                    refresh=request.refresh,
+                    source="trade",
+                    incremental=request.incremental,
+                )
+            )
+        for context in contexts:
+            requests.append(
+                HistoryRefreshRequest(
+                    inst_id=signal_inst_id,
+                    bar=context.bar,
+                    days=request.days,
+                    min_bars=_context_min_bars(
+                        context.bar,
+                        request.days,
+                        role="higher_context",
+                    ),
+                    refresh=request.refresh,
+                    source=context.source,
+                    incremental=request.incremental,
+                )
+            )
+    return tuple(dict.fromkeys(requests))
+
+
+def run_cache_audit_workflow(request: CacheAuditRequest) -> CacheAuditResult:
+    store = CacheStore()
+    if request.refresh and request.async_refresh:
+        requests = build_history_refresh_requests(request)
+        asyncio.run(_stream_cache_refresh(requests, request.refresh_concurrency))
+    refresh_local = request.refresh and not request.async_refresh
+    local_request = replace(request, refresh=refresh_local)
+    rows: list[dict[str, object]] = []
+    for history_request in build_history_refresh_requests(local_request):
+        try:
+            _df, coverage = store.bars(
+                HistoryRequest(
+                    inst_id=history_request.inst_id,
+                    bar=history_request.bar,
+                    days=history_request.days,
+                    min_bars=history_request.min_bars,
+                    refresh=refresh_local,
+                    source=history_request.source,
+                )
+            )
+            rows.append(
+                {
+                    "status": "PASS"
+                    if coverage.coverage_pct >= request.min_coverage_pct
+                    else "LOW",
+                    "instrument": history_request.inst_id,
+                    "bar": history_request.bar,
+                    "actual_bars": coverage.actual_bars,
+                    "target_bars": coverage.target.target_bars,
+                    "coverage_pct": coverage.coverage_pct,
+                    "start_ms": coverage.actual_start_ms,
+                    "end_ms": coverage.actual_end_ms,
+                    "notes": ",".join(coverage.notes),
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "status": "ERROR",
+                    "instrument": history_request.inst_id,
+                    "bar": history_request.bar,
+                    "actual_bars": 0,
+                    "target_bars": 0,
+                    "coverage_pct": 0.0,
+                    "start_ms": None,
+                    "end_ms": None,
+                    "notes": str(exc),
+                }
+            )
+    return CacheAuditResult(pl.DataFrame(rows, schema=CACHE_AUDIT_SCHEMA))
+
+
+async def _stream_cache_refresh(
+    requests: tuple[HistoryRefreshRequest, ...], concurrency: int
+) -> None:
+    async with AsyncCacheStore() as store:
+        async for event in store.stream_many(requests, concurrency=concurrency):
+            if event.kind in {"completed", "failed", "summary"}:
+                print(event.message)
+
+SIGNAL_CONTEXT_COLUMNS: tuple[str, ...] = (
+    "timestamp",
+    "raw_entry_signal",
+    "entry_signal",
+    "position_signal",
+    "exit_signal",
+    "signal_strength",
+    "signal_id",
+    "signal",
+    "h1_close",
+    "h1_trend_state",
+    "h1_structure_trend_state",
+    "h1_market_stage",
+    "h1_structure_reason",
+    "h1_market_stage_reason",
+    "h1_stage_unknown_reason",
+    "h1_range_width_atr",
+    "h1_range_compression",
+    "h1_near_range_high",
+    "h1_near_range_low",
+    "h1_context_available",
+    "h4_close",
+    "h4_trend_state",
+    "h4_structure_trend_state",
+    "h4_market_stage",
+    "h4_structure_reason",
+    "h4_market_stage_reason",
+    "h4_stage_unknown_reason",
+    "h4_range_width_atr",
+    "h4_range_compression",
+    "h4_near_range_high",
+    "h4_near_range_low",
+    "h4_context_available",
+    "d1_close",
+    "d1_trend_state",
+    "d1_structure_trend_state",
+    "d1_market_stage",
+    "d1_structure_reason",
+    "d1_market_stage_reason",
+    "d1_stage_unknown_reason",
+    "d1_range_width_atr",
+    "d1_range_compression",
+    "d1_near_range_high",
+    "d1_near_range_low",
+    "d1_context_available",
+    "mtf_state_key",
+    "mtf_structure_key",
+    "mtf_stage_key",
+    "mtf_event_state_key",
 )
 
 
@@ -91,10 +281,9 @@ def source_inst_ids(pair: PairConfig, data_source: str) -> tuple[str, str]:
 
 def apply_signal_debug_filters(
     frame: pl.DataFrame,
-    config: ResolvedBacktestConfig,
+    filters: SignalDebugFilterConfig,
 ) -> pl.DataFrame:
     """Suppress diagnostic entry buckets without mutating cached strategy output."""
-    filters = config.signal_filters
     if not filters.active:
         return frame
     if "entry_signal" not in frame.columns:
@@ -149,13 +338,12 @@ def apply_signal_debug_filters(
     return frame.with_columns(expressions)
 
 
-def load_cache(
+def load_cache_for_request(
     store: CacheStore,
     inst_id: str,
     timeframe: str,
-    config: ResolvedBacktestConfig,
+    request: FrameRequest,
     *,
-    refresh: bool,
     trim_to_target: bool = True,
     source: CandleSource = "trade",
 ) -> tuple[pl.DataFrame, HistoryCoverage]:
@@ -163,43 +351,36 @@ def load_cache(
         HistoryRequest(
             inst_id=inst_id,
             bar=timeframe,
-            days=config.days,
-            min_bars=config.min_bars,
-            refresh=refresh,
+            days=request.days,
+            min_bars=request.min_bars,
+            refresh=request.refresh,
             source=source,
         )
     )
     if trim_to_target and df.height > coverage.target.target_bars:
         df = df.tail(coverage.target.target_bars)
         coverage = validate_history(df, coverage.target, refreshed=coverage.refreshed)
-    if config.risk_gates.min_coverage_pct > 0 and (
-        coverage.coverage_pct < config.risk_gates.min_coverage_pct
-    ):
-        raise DataCoverageError(coverage, config.risk_gates.min_coverage_pct)
+    if request.min_coverage_pct > 0 and coverage.coverage_pct < request.min_coverage_pct:
+        raise DataCoverageError(coverage, request.min_coverage_pct)
     return df, coverage
 
 
-def load_timeframe_context(
+def load_context_for_request(
     store: CacheStore,
     inst_id: str,
-    timeframe: str,
-    config: ResolvedBacktestConfig,
-    args: Any,
-    source: CandleSource = "trade",
-    role: Literal["higher_context"] = "higher_context",
+    context: ContextSpec,
+    request: FrameRequest,
 ) -> tuple[pl.DataFrame, HistoryCoverage]:
-    """Load a research-only context timeframe through the normal cache policy."""
-    context_config = replace(
-        config,
-        min_bars=_context_min_bars(timeframe, config.days, role=role),
+    context_request = replace(
+        request,
+        min_bars=_context_min_bars(context.bar, request.days, role="higher_context"),
     )
-    return load_cache(
+    return load_cache_for_request(
         store,
         inst_id,
-        timeframe,
-        context_config,
-        refresh=bool(getattr(args, "refresh_cache", False)),
-        source=source,
+        context.bar,
+        context_request,
+        source=context.source,
     )
 
 
@@ -397,6 +578,17 @@ def _mark_higher_context_available(base_df: pl.DataFrame, prefix: str) -> pl.Dat
     return base_df.with_columns(pl.col(close_col).is_not_null().alias(available_col))
 
 
+def _attach_higher_context(
+    base_df: pl.DataFrame,
+    context_df: pl.DataFrame,
+    prefix: str,
+    classifier_config: StructureClassifierConfig | None = None,
+) -> pl.DataFrame:
+    compact = _compact_higher_timeframe_context(context_df, classifier_config)
+    attached = attach_higher_timeframe_context(base_df, compact, prefix=prefix)
+    return _mark_higher_context_available(attached, prefix)
+
+
 def _attach_base_context_aliases(
     base_df: pl.DataFrame,
     prefix: str,
@@ -491,14 +683,34 @@ def add_mtf_state_keys(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns(expressions)
 
 
-def _context_bundle_for_strategy(strategy: StrategyBehavior) -> tuple[TimeframeContextSpec, ...]:
+def _context_bundle_for_strategy(strategy: StrategyBehavior) -> tuple[ContextSpec, ...]:
     required_columns = getattr(strategy, "required_columns", ())
     strategy_name = str(getattr(strategy, "name", ""))
     if strategy_name.startswith("structure_event_") or any(
         column.startswith(("h1_", "h4_", "d1_")) for column in required_columns
     ):
-        return DEFAULT_MTF_CONTEXT_BUNDLE
+        return DEFAULT_CONTEXTS
     return ()
+
+
+def _attach_contexts(
+    store: CacheStore,
+    frame: pl.DataFrame,
+    signal_inst_id: str,
+    request: FrameRequest,
+    contexts: tuple[ContextSpec, ...],
+    classifier_config: StructureClassifierConfig | None = None,
+) -> tuple[pl.DataFrame, tuple[HistoryCoverage, ...]]:
+    context_summaries: list[HistoryCoverage] = []
+    work = frame
+    for spec in contexts:
+        if spec.role == "base":
+            work = _attach_base_context_aliases(work, spec.prefix, classifier_config)
+            continue
+        context_df, summary = load_context_for_request(store, signal_inst_id, spec, request)
+        context_summaries.append(summary)
+        work = _attach_higher_context(work, context_df, spec.prefix, classifier_config)
+    return work, tuple(context_summaries)
 
 
 def _attach_strategy_context(
@@ -506,32 +718,14 @@ def _attach_strategy_context(
     signal_df: pl.DataFrame,
     signal_inst_id: str,
     strategy: StrategyBehavior,
-    args: Any,
-    config: ResolvedBacktestConfig,
+    request: FrameRequest,
+    *,
+    contexts: tuple[ContextSpec, ...] | None = None,
 ) -> tuple[pl.DataFrame, tuple[HistoryCoverage, ...]]:
-    bundle = _context_bundle_for_strategy(strategy)
+    bundle = _context_bundle_for_strategy(strategy) if contexts is None else contexts
     if not bundle:
         return signal_df, ()
-    context_summaries: list[HistoryCoverage] = []
-    work = signal_df
-    for spec in bundle:
-        if spec.role == "base":
-            work = _attach_base_context_aliases(work, spec.prefix)
-            continue
-        context_df, summary = load_timeframe_context(
-            store,
-            signal_inst_id,
-            spec.timeframe,
-            config,
-            args,
-            source=spec.source,
-            role=spec.role,
-        )
-        context_summaries.append(summary)
-        compact = _compact_higher_timeframe_context(context_df)
-        work = attach_higher_timeframe_context(work, compact, prefix=spec.prefix)
-        work = _mark_higher_context_available(work, spec.prefix)
-    return work, tuple(context_summaries)
+    return _attach_contexts(store, signal_df, signal_inst_id, request, bundle)
 
 
 def coverage_metadata(
@@ -552,265 +746,140 @@ def coverage_metadata(
     )
 
 
-class ClassifierFramePipeline:
-    def __init__(
-        self,
-        store: CacheStore,
-        args: Any,
-        config: ResolvedBacktestConfig,
-        classifier_context: ClassifierContextConfig | None = None,
-    ) -> None:
-        self.store = store
-        self.args = args
-        self.config = config
-        self.classifier_context = classifier_context or ClassifierContextConfig()
-
-    def load_base(self, pair: PairConfig) -> tuple[pl.DataFrame, HistoryCoverage, str]:
-        signal_inst_id, _execution_inst_id = source_inst_ids(pair, self.config.data_source)
-        try:
-            frame, coverage = load_cache(
-                self.store,
-                signal_inst_id,
-                self.classifier_context.base_timeframe or pair.asset.timeframe,
-                self.config,
-                refresh=bool(getattr(self.args, "refresh_cache", False)),
-            )
-        except FileNotFoundError:
-            if not bool(getattr(self.args, "allow_swap_signal_fallback", False)) or (
-                signal_inst_id == pair.asset.symbol
-            ):
-                raise
-            signal_inst_id = pair.asset.symbol
-            frame, coverage = load_cache(
-                self.store,
-                signal_inst_id,
-                self.classifier_context.base_timeframe or pair.asset.timeframe,
-                self.config,
-                refresh=bool(getattr(self.args, "refresh_cache", False)),
-            )
-        return frame, coverage, signal_inst_id
-
-    def load_contexts(
-        self,
-        signal_inst_id: str,
-    ) -> tuple[tuple[TimeframeContextSpec, pl.DataFrame, HistoryCoverage], ...]:
-        contexts = []
-        for spec in self.classifier_context.higher_timeframes:
-            if spec.role != "higher_context":
-                continue
-            context_df, coverage = load_timeframe_context(
-                self.store,
-                signal_inst_id,
-                spec.timeframe,
-                self.config,
-                self.args,
-                source=spec.source,
-                role=spec.role,
-            )
-            contexts.append((spec, context_df, coverage))
-        return tuple(contexts)
-
-    def attach_contexts(
-        self,
-        base_df: pl.DataFrame,
-        contexts: tuple[tuple[TimeframeContextSpec, pl.DataFrame, HistoryCoverage], ...],
-    ) -> pl.DataFrame:
-        work = base_df
-        for spec in self.classifier_context.higher_timeframes:
-            if spec.role == "base":
-                work = _attach_base_context_aliases(
-                    work,
-                    spec.prefix,
-                    self.classifier_context.classifier,
-                )
-        for spec, context_df, _coverage in contexts:
-            compact = _compact_higher_timeframe_context(
-                context_df,
-                self.classifier_context.classifier,
-            )
-            work = attach_higher_timeframe_context(work, compact, prefix=spec.prefix)
-            work = _mark_higher_context_available(work, spec.prefix)
-        return work
-
-    def add_state_keys(self, frame: pl.DataFrame) -> pl.DataFrame:
-        return add_mtf_state_keys(frame)
-
-    def prepare(self, pair: PairConfig) -> PreparedClassifierFrame:
-        base_df, base_coverage, signal_inst_id = self.load_base(pair)
-        work = add_macd_histogram()(add_indicators(base_df))
-        work = add_price_structure_stage_features(config=self.classifier_context.classifier)(work)
-        contexts = self.load_contexts(signal_inst_id)
-        work = self.add_state_keys(self.attach_contexts(work, contexts))
-        metadata = (
-            *self.config.metadata(),
-            f"signal_inst={signal_inst_id}",
-            base_coverage.note(),
-            *(coverage.note() for _spec, _frame, coverage in contexts),
-        )
-        return PreparedClassifierFrame(
-            pair=pair,
-            frame=work,
-            signal_inst_id=signal_inst_id,
-            metadata=metadata,
-        )
-
-
 def prepare_classifier_frame(
     store: CacheStore,
-    pair: PairConfig,
-    args: Any,
-    config: ResolvedBacktestConfig,
-    classifier_context: ClassifierContextConfig | None = None,
+    request: FrameRequest,
+    classifier: StructureClassifierConfig | None = None,
+    *,
+    contexts: tuple[ContextSpec, ...] = DEFAULT_CONTEXTS,
 ) -> PreparedClassifierFrame:
-    return ClassifierFramePipeline(store, args, config, classifier_context).prepare(pair)
+    classifier = classifier or StructureClassifierConfig.default()
+    pair = request.pair
+    signal_inst_id, _execution_inst_id = source_inst_ids(pair, request.data_source)
+    try:
+        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, "1H", request)
+    except FileNotFoundError:
+        if not request.allow_swap_signal_fallback or signal_inst_id == pair.asset.symbol:
+            raise
+        signal_inst_id = pair.asset.symbol
+        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, "1H", request)
 
-
-class BacktestFramePipeline:
-    def __init__(
-        self,
-        store: CacheStore,
-        args: Any,
-        config: ResolvedBacktestConfig,
-    ) -> None:
-        self.store = store
-        self.args = args
-        self.config = config
-
-    def prepare(self, pair: PairConfig, strategy: StrategyBehavior) -> PreparedBacktestFrame:
-        signal_inst_id, execution_inst_id = source_inst_ids(pair, self.config.data_source)
-        timeframe = pair.asset.timeframe
-        refresh = bool(getattr(self.args, "refresh_cache", False))
-        try:
-            signal_df, signal_summary = load_cache(
-                self.store, signal_inst_id, timeframe, self.config, refresh=refresh
-            )
-        except FileNotFoundError:
-            if not bool(getattr(self.args, "allow_swap_signal_fallback", False)) or (
-                signal_inst_id == pair.asset.symbol
-            ):
-                raise
-            signal_inst_id = pair.asset.symbol
-            signal_df, signal_summary = load_cache(
-                self.store, signal_inst_id, timeframe, self.config, refresh=refresh
-            )
-
-        signal_df, context_summaries = _attach_strategy_context(
-            self.store,
-            signal_df,
-            signal_inst_id,
-            strategy,
-            self.args,
-            self.config,
-        )
-        has_context = bool(context_summaries)
-
-        if execution_inst_id == signal_inst_id:
-            execution_summary = signal_summary
-            if self.config.signal_filters.active or has_context:
-                signal_frame = compute_signal_frame(signal_df, strategy)
-                frame = add_mtf_state_keys(
-                    apply_signal_debug_filters(signal_frame, self.config)
-                )
-                precomputed_signal = True
-            else:
-                frame = signal_df
-                precomputed_signal = False
-        else:
-            execution_df, execution_summary = load_cache(
-                self.store, execution_inst_id, timeframe, self.config, refresh=refresh
-            )
-            signal_frame = add_mtf_state_keys(
-                apply_signal_debug_filters(compute_signal_frame(signal_df, strategy), self.config)
-            )
-            signal_cols = [
-                "timestamp",
-                "raw_entry_signal",
-                "entry_signal",
-                "position_signal",
-                "exit_signal",
-                "signal_strength",
-                "signal_id",
-                "signal",
-                "h1_close",
-                "h1_trend_state",
-                "h1_structure_trend_state",
-                "h1_market_stage",
-                "h1_structure_reason",
-                "h1_market_stage_reason",
-                "h1_stage_unknown_reason",
-                "h1_range_width_atr",
-                "h1_range_compression",
-                "h1_near_range_high",
-                "h1_near_range_low",
-                "h1_context_available",
-                "h4_close",
-                "h4_trend_state",
-                "h4_structure_trend_state",
-                "h4_market_stage",
-                "h4_structure_reason",
-                "h4_market_stage_reason",
-                "h4_stage_unknown_reason",
-                "h4_range_width_atr",
-                "h4_range_compression",
-                "h4_near_range_high",
-                "h4_near_range_low",
-                "h4_context_available",
-                "d1_close",
-                "d1_trend_state",
-                "d1_structure_trend_state",
-                "d1_market_stage",
-                "d1_structure_reason",
-                "d1_market_stage_reason",
-                "d1_stage_unknown_reason",
-                "d1_range_width_atr",
-                "d1_range_compression",
-                "d1_near_range_high",
-                "d1_near_range_low",
-                "d1_context_available",
-                "mtf_state_key",
-                "mtf_structure_key",
-                "mtf_stage_key",
-                "mtf_event_state_key",
-            ]
-            signal_frame = signal_frame.select(
-                *(column for column in signal_cols if column in signal_frame.columns)
-            )
-            frame = add_indicators(execution_df).join(signal_frame, on="timestamp", how="inner")
-            precomputed_signal = True
-
-        metadata = (
-            *self.config.metadata(),
-            f"signal_inst={signal_inst_id}",
-            f"execution_inst={execution_inst_id}",
-            signal_summary.note(),
-            execution_summary.note(),
-            *(summary.note() for summary in context_summaries),
-        )
-        if signal_summary.notes:
-            print(f"cache warning {signal_inst_id}: {', '.join(signal_summary.notes)}")
-        if execution_summary.notes and execution_inst_id != signal_inst_id:
-            print(f"cache warning {execution_inst_id}: {', '.join(execution_summary.notes)}")
-        for summary in context_summaries:
-            if summary.notes:
-                print(f"cache warning {summary.inst_id} {summary.bar}: {', '.join(summary.notes)}")
-
-        return PreparedBacktestFrame(
-            pair=pair,
-            frame=frame,
-            precomputed_signal=precomputed_signal,
-            signal_inst_id=signal_inst_id,
-            execution_inst_id=execution_inst_id,
-            signal_coverage=signal_summary,
-            execution_coverage=execution_summary,
-            metadata=metadata,
-        )
+    work = add_macd_histogram()(add_indicators(base_df))
+    work = add_price_structure_stage_features(config=classifier)(work)
+    work, context_coverage = _attach_contexts(
+        store, work, signal_inst_id, request, contexts, classifier
+    )
+    coverage = (base_coverage, *context_coverage)
+    work = add_mtf_state_keys(work)
+    metadata = (f"signal_inst={signal_inst_id}", *(summary.note() for summary in coverage))
+    return PreparedClassifierFrame(
+        pair=pair,
+        frame=work,
+        signal_inst_id=signal_inst_id,
+        execution_inst_id=None,
+        coverage=coverage,
+        metadata=metadata,
+    )
 
 
 def prepare_backtest_frame(
     store: CacheStore,
-    pair: PairConfig,
+    request: FrameRequest,
     strategy: StrategyBehavior,
-    args: Any,
-    config: ResolvedBacktestConfig,
+    options: BacktestFrameOptions,
 ) -> PreparedBacktestFrame:
-    return BacktestFramePipeline(store, args, config).prepare(pair, strategy)
+    return prepare_signal_frame(store, request, strategy, options=options)
+
+
+def prepare_signal_frame(
+    store: CacheStore,
+    request: FrameRequest,
+    strategy: StrategyBehavior,
+    *,
+    options: BacktestFrameOptions,
+    contexts: tuple[ContextSpec, ...] | None = None,
+) -> PreparedBacktestFrame:
+    pair = request.pair
+    signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
+    timeframe = pair.asset.timeframe
+    try:
+        signal_df, signal_summary = load_cache_for_request(
+            store, signal_inst_id, timeframe, request
+        )
+    except FileNotFoundError:
+        if not request.allow_swap_signal_fallback or signal_inst_id == pair.asset.symbol:
+            raise
+        signal_inst_id = pair.asset.symbol
+        signal_df, signal_summary = load_cache_for_request(
+            store, signal_inst_id, timeframe, request
+        )
+
+    signal_df, context_summaries = _attach_strategy_context(
+        store,
+        signal_df,
+        signal_inst_id,
+        strategy,
+        request,
+        contexts=contexts,
+    )
+    has_context = bool(context_summaries)
+    if execution_inst_id == signal_inst_id:
+        execution_summary = signal_summary
+        if options.signal_filters.active or has_context:
+            signal_frame = compute_signal_frame(signal_df, strategy)
+            frame = add_mtf_state_keys(
+                apply_signal_debug_filters(signal_frame, options.signal_filters)
+            )
+            precomputed_signal = True
+        else:
+            frame = signal_df
+            precomputed_signal = False
+    else:
+        execution_df, execution_summary = load_cache_for_request(
+            store, execution_inst_id, timeframe, request
+        )
+        signal_frame = add_mtf_state_keys(
+            apply_signal_debug_filters(
+                compute_signal_frame(signal_df, strategy),
+                options.signal_filters,
+            )
+        )
+        signal_frame = signal_frame.select(
+            *(column for column in SIGNAL_CONTEXT_COLUMNS if column in signal_frame.columns)
+        )
+        frame = add_indicators(execution_df).join(signal_frame, on="timestamp", how="inner")
+        precomputed_signal = True
+
+    coverage = (signal_summary, execution_summary, *context_summaries)
+    metadata = (
+        *options.metadata,
+        f"signal_inst={signal_inst_id}",
+        f"execution_inst={execution_inst_id}",
+        *(summary.note() for summary in coverage),
+    )
+    _print_cache_warnings(coverage, signal_inst_id, execution_inst_id)
+    return PreparedBacktestFrame(
+        pair=pair,
+        frame=frame,
+        signal_inst_id=signal_inst_id,
+        execution_inst_id=execution_inst_id,
+        coverage=coverage,
+        metadata=metadata,
+        precomputed_signal=precomputed_signal,
+        signal_coverage=signal_summary,
+        execution_coverage=execution_summary,
+    )
+
+
+def _print_cache_warnings(
+    coverage: tuple[HistoryCoverage, ...], signal_inst_id: str, execution_inst_id: str
+) -> None:
+    for summary in coverage:
+        if not summary.notes:
+            continue
+        label = (
+            summary.inst_id
+            if summary.inst_id in {signal_inst_id, execution_inst_id}
+            else f"{summary.inst_id} {summary.bar}"
+        )
+        print(f"cache warning {label}: {', '.join(summary.notes)}")

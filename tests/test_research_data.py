@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import polars as pl
 
-from qooi.core.config import RESEARCH_PAIRS
 from qooi.exchange.store import HistoryCoverage, HistoryTarget
-from qooi.research.config import resolve_config
+from qooi.research.config import ResearchCommandConfig
+from qooi.research.instruments import RESEARCH_UNIVERSE
+from qooi.research.workflows import FrameRequest, prepare_classifier_frame
 from qooi.strategies.features import StructureClassifierConfig
-from qooi.strategies.preprocessing import (
-    ClassifierContextConfig,
-    ClassifierFramePipeline,
-    prepare_classifier_frame,
-)
 
 
 def _frame(rows: int = 240, step_ms: int = 3_600_000) -> pl.DataFrame:
@@ -42,27 +36,36 @@ class FakeStore:
         return _frame(), _coverage(request.inst_id, request.bar, 240)
 
 
-def _args():
-    return SimpleNamespace(
-        profile="smoke",
-        days=10,
-        min_bars=10,
-        min_coverage_pct=0.0,
-        universe="core",
-        data_source="swap",
-        style="single",
-        refresh_cache=False,
-        allow_swap_signal_fallback=False,
-        max_per_strategy_symbol=0,
+def _command():
+    config = ResearchCommandConfig()
+    return config.model_copy(
+        update={
+            "run": config.run.model_copy(update={"profile": "smoke"}),
+            "cache": config.cache.model_copy(
+                update={"days": 10, "min_bars": 10, "min_coverage_pct": 0.0}
+            ),
+        }
+    )
+
+
+def _request(pair, command: ResearchCommandConfig) -> FrameRequest:
+    return FrameRequest(
+        pair=pair,
+        data_source=command.run.data_source,
+        days=command.days,
+        min_bars=command.min_bars,
+        refresh=command.cache.refresh,
+        min_coverage_pct=command.min_coverage_pct,
+        allow_swap_signal_fallback=command.run.allow_swap_signal_fallback,
     )
 
 
 def test_prepare_classifier_frame_does_not_run_backtest():
-    args = _args()
-    config = resolve_config(args)
-    context = ClassifierContextConfig(classifier=StructureClassifierConfig.fixed())
+    command = _command()
 
-    prepared = prepare_classifier_frame(FakeStore(), RESEARCH_PAIRS[0], args, config, context)
+    prepared = prepare_classifier_frame(
+        FakeStore(), _request(RESEARCH_UNIVERSE[0], command), StructureClassifierConfig.fixed()
+    )
 
     assert "market_stage" in prepared.frame.columns
     assert "h4_market_stage" in prepared.frame.columns
@@ -72,16 +75,18 @@ def test_prepare_classifier_frame_does_not_run_backtest():
     assert "h4_range_width_atr_threshold" in prepared.frame.columns
 
 
-def test_classifier_frame_pipeline_prepare_matches_tail_composed_steps():
-    args = _args()
-    config = resolve_config(args)
-    context = ClassifierContextConfig(classifier=StructureClassifierConfig.fixed())
-    pair = RESEARCH_PAIRS[0]
+def test_prepare_classifier_frame_is_deterministic():
+    command = _command()
+    pair = RESEARCH_UNIVERSE[0]
 
-    wrapper = prepare_classifier_frame(FakeStore(), pair, args, config, context)
-    method = ClassifierFramePipeline(FakeStore(), args, config, context).prepare(pair)
+    first = prepare_classifier_frame(
+        FakeStore(), _request(pair, command), StructureClassifierConfig.fixed()
+    )
+    second = prepare_classifier_frame(
+        FakeStore(), _request(pair, command), StructureClassifierConfig.fixed()
+    )
 
-    assert wrapper.signal_inst_id == method.signal_inst_id
-    assert wrapper.frame.select("mtf_state_key", "h4_market_stage", "d1_market_stage").equals(
-        method.frame.select("mtf_state_key", "h4_market_stage", "d1_market_stage")
+    assert first.signal_inst_id == second.signal_inst_id
+    assert first.frame.select("mtf_state_key", "h4_market_stage", "d1_market_stage").equals(
+        second.frame.select("mtf_state_key", "h4_market_stage", "d1_market_stage")
     )

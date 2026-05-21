@@ -18,12 +18,6 @@ class StructureState:
     DOWNTREND = "downtrend"
     RANGE = "range"
     UNKNOWN = "unknown"
-
-
-class StructureTrendState(StructureState):
-    """Canonical structure-trend labels emitted by the classifier."""
-
-
 class MarketStage:
     WARMUP = "warmup"
     DATA_ERROR = "data_error"

@@ -4,7 +4,6 @@ import polars as pl
 
 from qooi.research.diagnostics import (
     ClassifierDiagnosticsBuilder,
-    classifier_diagnostics_export_frame,
     evaluate_classifier_frame,
 )
 
@@ -67,7 +66,7 @@ def test_classifier_diagnostics_builder_matches_wrapper():
 
 def test_classifier_diagnostics_export_is_long_form():
     diagnostics = evaluate_classifier_frame("TEST", _classifier_frame())
-    export = classifier_diagnostics_export_frame(diagnostics)
+    export = diagnostics.to_export_frame()
 
     assert {"label", "artifact", "table", "layer", "name", "field", "value"} <= set(export.columns)
     assert export.filter(pl.col("artifact") == "table").height > 0

@@ -90,13 +90,13 @@ Only planned-history vocabulary should remain for cache validity.
 Files:
 
 - `src/qooi/strategies/specs.py`
-- `src/qooi/strategies/conditions.py`
 - `src/qooi/strategies/features.py`
 - `src/qooi/strategies/indicators.py`
 
 Responsibilities:
 
 - Compute indicators and reusable features.
+- Keep predicate expression builders with indicators and frame transforms with features.
 - Apply filters and entry rules.
 - Emit explicit signal columns.
 - Express strategy-owned exit intent.
@@ -427,9 +427,9 @@ Current 2026-05-18 evaluation:
 - Decision: no MTF or modulation-gated strategy variant is authorized from current evidence.
 - Current diagnostic baseline: `structure_event_trend_aligned_no_range_v1`, diagnostic-only.
 
-Detailed report: `docs/modulation-effect-report.md`.
+Detailed report: `docs/research-evaluation-report.md`.
 
-Definitions and formulas for classifier labels, diagnostics, trade-record modulation, adaptive classifier settings, overlap-aware uncertainty metadata, classifier health gates, and market-state-forward evaluation are documented in `docs/evaluation-diagnostics-reference.md`.
+Definitions and formulas for the layered research-evaluation API, classifier labels, diagnostics, trade-record modulation, adaptive classifier settings, overlap-aware uncertainty metadata, classifier health gates, and market-state-forward evaluation are documented in `docs/research-evaluation-api-reference.md`.
 
 ### Market-State-Forward Diagnostics
 
@@ -461,11 +461,21 @@ Current 2026-05-18 robust smoke, core universe excluding XAU:
 
 No entry filter or strategy variant is authorized directly from this diagnostic. Sufficient, FDR-significant, effect-size-material, cross-asset homogeneous, and time-stable effects become candidate hypotheses for later strategy tests with explicit entry timing, stops, targets, costs, and slippage.
 
+Promotion rule: FDR/global status is necessary but not sufficient. A market-state row may be considered for strategy work only after semantic reduction and only when conditional rows are above `100`, absolute forward delta is plausibly above `0.5` percentage points, standardized effect is materially stronger than the current weak rows such as `abs(Cohen's d) > 0.3`, time-split and cross-asset evidence agree, and an executable entry/exit hypothesis can be backtested with fees, slippage assumptions, stops, targets, sizing, and basket constraints.
+
+Semantic reduction is distinct from physical aliases. Reduced columns such as `market_stage_reduced` are deterministic analytical projections that lower duplicate hypothesis counts while preserving raw classifier labels for audit.
+
+The `tradability` diagnostic emits `state-tradability` and `classifier-validity` artifacts. These identify stable, internally structured states and audit classifier separation, but they remain hypothesis-prior diagnostics and do not authorize direct strategy activation.
+
+MTF state keys remain audit descriptors. They describe market context and may generate hypotheses, but they are not authorization features and must not be wired directly into strategy filters.
+
 ## 13. Backtest Orchestration
 
 File:
 
-- `scripts/backtest.py`
+- `scripts/research.py`
+- `src/qooi/research/workflows.py`
+- `src/qooi/research/classifier_config.py`
 
 Responsibilities:
 
@@ -473,6 +483,8 @@ Responsibilities:
 - Select pairs.
 - Select explicit strategy specs from `qooi.strategies.catalog`.
 - Choose data-source policy.
+- Translate CLI-derived classifier settings and debug filters outside the strategy layer.
+- Plan context frames and cache-backed classifier/signal frame preparation outside the strategy layer.
 - Ask the data layer for requested histories.
 - Prepare the final execution frame.
 - Call the engine or styles layer.
@@ -505,9 +517,9 @@ Cache coverage must be interpreted with `HistoryCoverage.notes`, which may inclu
 
 Asset universes are explicit:
 
-- `PAIRS` remains the live/core universe.
-- `RESEARCH_PAIRS` expands liquid swap research assets without changing live trading defaults.
-- `scripts/backtest.py --universe core|research` selects the orchestration universe.
+- `CORE_UNIVERSE` remains the live/core universe in `qooi.research.instruments`.
+- `RESEARCH_UNIVERSE` expands liquid swap research assets without changing live trading defaults.
+- `scripts/research.py --config ...` selects the orchestration universe through config `run.universe = "core"|"research"`.
 
 ## 16. Current Strategy Recommendation
 
@@ -546,9 +558,9 @@ Known removed branches/modules:
 Active code should use:
 
 - `HistoryRequest`, `HistoryTarget`, `HistoryCoverage`
-- `strategies/specs.py`, `features.py`, `conditions.py`, `indicators.py`
+- `strategies/specs.py`, `features.py`, `indicators.py`
 - `core/styles.py` for temporal validation styles
-- `scripts/backtest.py` for orchestration
+- `scripts/research.py` for orchestration
 
 ## Validation Commands
 
@@ -556,11 +568,11 @@ Active code should use:
 uv run ruff check src/qooi/core src/qooi/strategies src/qooi/exchange scripts tests
 uv run ty check src/qooi/core
 uv run ty check src/qooi/strategies
-uv run ty check src/qooi/exchange/market.py src/qooi/exchange/store.py src/qooi/exchange/trading.py scripts/backtest.py scripts/trade.py
+uv run ty check src/qooi/exchange/market.py src/qooi/exchange/store.py src/qooi/exchange/trading.py scripts/research.py scripts/trade.py
 uv run pytest
-uv run python scripts/backtest.py --mode base --strategy rsi_bounce_reversion --diagnostics --data-source swap --style single
-uv run python scripts/backtest.py --mode base --strategy zscore_mean_reversion --diagnostics --data-source swap --style single
-uv run python scripts/backtest.py --mode reverse --strategy zscore_mean_reversion --diagnostics --data-source swap --style single
+uv run python scripts/research.py --config configs/research/rsi-bounce.toml
+uv run python scripts/research.py --config configs/research/zscore-mean-reversion.toml
+uv run python scripts/research.py --config configs/research/zscore-reverse.toml
 ```
 
 ## Glossary

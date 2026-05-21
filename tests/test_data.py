@@ -5,7 +5,6 @@ import asyncio
 import polars as pl
 
 import qooi.exchange.market as market
-from qooi.core.config import PAIRS, RESEARCH_PAIRS
 from qooi.exchange.market import _parse_bars, okx_index_inst_id
 from qooi.exchange.store import (
     AsyncCacheStore,
@@ -17,9 +16,8 @@ from qooi.exchange.store import (
     plan_history,
     validate_history,
 )
-from qooi.strategies.features import add_price_structure_stage_features
-from qooi.strategies.indicators import add_indicators, attach_order_book_features
-from qooi.strategies.preprocessing import (
+from qooi.research.instruments import CORE_UNIVERSE, RESEARCH_UNIVERSE
+from qooi.research.workflows import (
     _add_missing_context_columns,
     _compact_higher_timeframe_context,
     _context_min_bars,
@@ -27,6 +25,8 @@ from qooi.strategies.preprocessing import (
     add_mtf_state_keys,
     attach_higher_timeframe_context,
 )
+from qooi.strategies.features import add_price_structure_stage_features
+from qooi.strategies.indicators import add_indicators, attach_order_book_features
 
 
 class TestIndicators:
@@ -117,21 +117,29 @@ def test_market_exports_resource_first_exchange_api():
 
 
 def test_research_pairs_do_not_change_live_pairs():
-    live_symbols = {pair.asset.symbol for pair in PAIRS}
-    research_symbols = {pair.asset.symbol for pair in RESEARCH_PAIRS}
+    live_symbols = {pair.asset.symbol for pair in CORE_UNIVERSE}
+    research_symbols = {pair.asset.symbol for pair in RESEARCH_UNIVERSE}
 
     assert live_symbols < research_symbols
     assert "XRP-USDT-SWAP" in research_symbols
+    assert {
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "BNB-USDT-SWAP",
+        "XRP-USDT-SWAP",
+        "ADA-USDT-SWAP",
+    } <= research_symbols
 
 
 def test_xau_contract_value_matches_okx_metadata():
-    xau = next(pair for pair in PAIRS if pair.asset.symbol == "XAU-USDT-SWAP")
+    xau = next(pair for pair in CORE_UNIVERSE if pair.asset.symbol == "XAU-USDT-SWAP")
 
     assert xau.asset.ct_val == 0.001
 
 
 def test_core_swap_lot_sizes_match_okx_metadata():
-    by_symbol = {pair.asset.symbol: pair.asset for pair in PAIRS}
+    by_symbol = {pair.asset.symbol: pair.asset for pair in CORE_UNIVERSE}
 
     assert by_symbol["ETH-USDT-SWAP"].min_contracts == 0.01
     assert by_symbol["ETH-USDT-SWAP"].lot_size == 0.01

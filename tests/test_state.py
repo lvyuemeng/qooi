@@ -1,7 +1,6 @@
 """State provider tests."""
 
 from qooi.core.basket import Basket, BasketState
-from qooi.core.config import PAIRS
 from qooi.core.state import (
     BacktestStateProvider,
     BasketStateSource,
@@ -15,6 +14,7 @@ from qooi.core.state import (
     format_okx_client_id,
     parse_basket_id,
 )
+from qooi.research.instruments import CORE_UNIVERSE
 
 
 class MemorySoftStore:
@@ -51,7 +51,7 @@ def test_backtest_state_provider_is_memory_only():
     basket = Basket("x", "X", "s", "buy", state=BasketState.ACTIVE, current_sz=1.0)
     provider = BacktestStateProvider([basket])
 
-    loaded = provider.load(PAIRS)
+    loaded = provider.load(CORE_UNIVERSE)
     assert loaded == [basket]
 
     provider.save_soft([])
@@ -59,7 +59,7 @@ def test_backtest_state_provider_is_memory_only():
 
 
 def test_okx_state_provider_reconstructs_from_okx_only():
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     strategy_id = "momentum_burst"
     provider = OkxStateProvider(FakeTradingClient())
 
@@ -105,7 +105,7 @@ def test_okx_state_provider_ignores_local_state_by_default():
         def orders(self, inst_id, inst_type="SWAP"):
             return []
 
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     strategy_id = "momentum_burst"
     provider = OkxStateProvider(FlatTradingClient())
 
@@ -125,7 +125,7 @@ def test_okx_state_provider_reconstructs_branch_from_okx_client_id():
         def orders(self, inst_id, inst_type="SWAP"):
             return []
 
-    pair = PAIRS[0]
+    pair = CORE_UNIVERSE[0]
     strategy_id = "momentum_burst"
     hedge_id = format_basket_id(pair.asset.symbol, strategy_id, "hedge")
     class BranchTradingClient(FlatTradingClient):

@@ -15,13 +15,13 @@ from qooi.strategies import (
     structure_event_trend_aligned_mtf_confirm_v1_spec,
     structure_event_trend_aligned_v1_spec,
 )
+from qooi.strategies.catalog import BENCHMARK_GROUPS, strategy_selection
 from qooi.strategies.features import (
-    add_garch_like_volatility,
     add_liquidity_sweep_features,
     add_none_context_diagnostics,
     add_price_structure_stage_features,
-    add_volatility_regime,
 )
+from qooi.strategies.indicators import add_garch_like_volatility, add_volatility_regime
 from qooi.strategies.specs import HoldPolicy, SignalRule, StrategySpec, apply_strategy_spec
 
 
@@ -78,6 +78,8 @@ def _structural_event_frame(**overrides) -> pl.DataFrame:
         "event_quality_score": [2.0],
         "volume_impulse": [True],
         "structure_trend_state": ["uptrend"],
+        "market_stage": ["accumulation"],
+        "market_stage_reason": ["compressed_near_low"],
         "breakout_acceptance_low": [False],
         "breakout_acceptance_high": [False],
         "m15_confirm_long": [True],
@@ -100,6 +102,26 @@ def _featureless_structural_spec(**kwargs):
 
 def _featureless_trend_aligned_spec(**kwargs):
     spec = structure_event_trend_aligned_v1_spec(**kwargs)
+    return _featureless_structural_copy(spec)
+
+
+def _featureless_trend_aligned_no_range_spec(**kwargs):
+    spec = structure_event_trend_aligned_v1_spec(
+        exclude_market_stages=("range",),
+        exclude_market_stage_reasons=("compressed_mid_range",),
+        name="structure_event_trend_aligned_no_range_v1",
+        **kwargs,
+    )
+    return _featureless_structural_copy(spec)
+
+
+def _featureless_trend_aligned_no_range_longs_spec(**kwargs):
+    spec = structure_event_trend_aligned_v1_spec(
+        exclude_long_market_stages=("range",),
+        exclude_long_market_stage_reasons=("compressed_mid_range",),
+        name="structure_event_trend_aligned_no_range_longs_v1",
+        **kwargs,
+    )
     return _featureless_structural_copy(spec)
 
 
@@ -128,6 +150,8 @@ def _featureless_structural_copy(spec):
             "event_quality_score",
             "volume_impulse",
             "structure_trend_state",
+            "market_stage",
+            "market_stage_reason",
             "breakout_acceptance_low",
             "breakout_acceptance_high",
             "m15_confirm_long",
@@ -509,6 +533,28 @@ def test_structure_event_trend_aligned_computes_explicit_signal_columns():
     } <= set(out.columns)
 
 
+def test_structure_event_trend_aligned_no_range_variant_is_registered():
+    spec = strategy_selection(("structure_event_trend_aligned_no_range_v1",)).strategies[0]
+
+    assert spec.name == "structure_event_trend_aligned_no_range_v1"
+    assert "structure_event_trend_aligned_no_range_v1" in BENCHMARK_GROUPS[
+        "structure-development"
+    ]
+    assert "structure_event_trend_aligned_no_range_v1" not in BENCHMARK_GROUPS["candidate"]
+
+
+def test_structure_event_trend_aligned_no_range_longs_variant_is_registered():
+    spec = strategy_selection(("structure_event_trend_aligned_no_range_longs_v1",)).strategies[0]
+
+    assert spec.name == "structure_event_trend_aligned_no_range_longs_v1"
+    assert "structure_event_trend_aligned_no_range_longs_v1" in BENCHMARK_GROUPS[
+        "structure-development"
+    ]
+    assert "structure_event_trend_aligned_no_range_longs_v1" not in BENCHMARK_GROUPS[
+        "candidate"
+    ]
+
+
 @pytest.mark.parametrize(
     ("trend_state", "expected"),
     [
@@ -547,6 +593,120 @@ def test_structure_event_trend_aligned_short_requires_downtrend(trend_state, exp
     out = apply_strategy_spec(frame, _featureless_trend_aligned_spec())
 
     assert out["entry_signal"].to_list() == [expected]
+
+
+def test_structure_event_trend_aligned_baseline_allows_compressed_range_entry():
+    out = apply_strategy_spec(
+        _structural_event_frame(
+            market_stage=["range"],
+            market_stage_reason=["compressed_mid_range"],
+        ),
+        _featureless_trend_aligned_spec(),
+    )
+
+    assert out["entry_signal"].to_list() == [1.0]
+
+
+def test_structure_event_trend_aligned_baseline_allows_compressed_range_short():
+    frame = _structural_event_frame(
+        liquidity_event_type=["failed_breakout_high"],
+        failed_breakout_low=[False],
+        failed_breakout_high=[True],
+        structure_trend_state=["downtrend"],
+        market_stage=["range"],
+        market_stage_reason=["compressed_mid_range"],
+    )
+
+    out = apply_strategy_spec(frame, _featureless_trend_aligned_spec())
+
+    assert out["entry_signal"].to_list() == [-1.0]
+
+
+def test_structure_event_trend_aligned_no_range_blocks_compressed_range_long():
+    out = apply_strategy_spec(
+        _structural_event_frame(
+            market_stage=["range"],
+            market_stage_reason=["compressed_mid_range"],
+        ),
+        _featureless_trend_aligned_no_range_spec(),
+    )
+
+    assert out["entry_signal"].to_list() == [0.0]
+
+
+def test_structure_event_trend_aligned_no_range_blocks_compressed_range_short():
+    frame = _structural_event_frame(
+        liquidity_event_type=["failed_breakout_high"],
+        failed_breakout_low=[False],
+        failed_breakout_high=[True],
+        structure_trend_state=["downtrend"],
+        market_stage=["range"],
+        market_stage_reason=["compressed_mid_range"],
+    )
+
+    out = apply_strategy_spec(frame, _featureless_trend_aligned_no_range_spec())
+
+    assert out["entry_signal"].to_list() == [0.0]
+
+
+def test_structure_event_trend_aligned_no_range_longs_blocks_compressed_range_long():
+    out = apply_strategy_spec(
+        _structural_event_frame(
+            market_stage=["range"],
+            market_stage_reason=["compressed_mid_range"],
+        ),
+        _featureless_trend_aligned_no_range_longs_spec(),
+    )
+
+    assert out["entry_signal"].to_list() == [0.0]
+
+
+def test_structure_event_trend_aligned_no_range_longs_allows_compressed_range_short():
+    frame = _structural_event_frame(
+        liquidity_event_type=["failed_breakout_high"],
+        failed_breakout_low=[False],
+        failed_breakout_high=[True],
+        structure_trend_state=["downtrend"],
+        market_stage=["range"],
+        market_stage_reason=["compressed_mid_range"],
+    )
+
+    out = apply_strategy_spec(frame, _featureless_trend_aligned_no_range_longs_spec())
+
+    assert out["entry_signal"].to_list() == [-1.0]
+
+
+@pytest.mark.parametrize(
+    ("market_stage", "market_stage_reason"),
+    [
+        ("accumulation", "compressed_near_low"),
+        ("trend_continuation", "trend_without_range_break"),
+    ],
+)
+def test_structure_event_trend_aligned_no_range_allows_non_range_long(
+    market_stage, market_stage_reason
+):
+    out = apply_strategy_spec(
+        _structural_event_frame(
+            market_stage=[market_stage],
+            market_stage_reason=[market_stage_reason],
+        ),
+        _featureless_trend_aligned_no_range_spec(),
+    )
+
+    assert out["entry_signal"].to_list() == [1.0]
+
+
+def test_structure_event_trend_aligned_no_range_longs_allows_non_range_long():
+    out = apply_strategy_spec(
+        _structural_event_frame(
+            market_stage=["accumulation"],
+            market_stage_reason=["compressed_near_low"],
+        ),
+        _featureless_trend_aligned_no_range_longs_spec(),
+    )
+
+    assert out["entry_signal"].to_list() == [1.0]
 
 
 def test_structure_event_trend_aligned_volume_and_quality_gates_block_entries():

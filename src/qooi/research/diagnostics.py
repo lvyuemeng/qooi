@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Literal, TypedDict, cast
 
+import numpy as np
 import polars as pl
 
 from qooi.core.evaluate import Report, format_table
@@ -39,6 +40,70 @@ class ClassifierDiagnostics:
     label: str
     rows: tuple[DiagnosticRow, ...]
     tables: tuple[DiagnosticTable, ...]
+
+    def to_text(self) -> str:
+        return f"{self.label}\n" + format_table(
+            ["Classifier diagnostic", "Severity", "Summary"],
+            [[row.name, row.severity, row.summary] for row in self.rows],
+        )
+
+    def to_export_frame(self) -> pl.DataFrame:
+        records = [
+            {
+                "label": self.label,
+                "artifact": "row",
+                "table": "rows",
+                "layer": row.layer,
+                "name": row.name,
+                "severity": row.severity,
+                "summary": row.summary,
+                "field": "",
+                "value": "",
+            }
+            for row in self.rows
+        ]
+        for table in self.tables:
+            for record in table.frame.iter_rows(named=True):
+                for field, value in record.items():
+                    records.append(
+                        {
+                            "label": self.label,
+                            "artifact": "table",
+                            "table": table.name,
+                            "layer": "classifier",
+                            "name": table.name,
+                            "severity": "info",
+                            "summary": "",
+                            "field": str(field),
+                            "value": "" if value is None else str(value),
+                        }
+                    )
+        return pl.DataFrame(records)
+
+
+@dataclass(frozen=True)
+class ModulationRobustnessConfig:
+    se_method: Literal["iid", "effective_n", "newey_west", "bootstrap"] = "iid"
+    fdr: bool = False
+    fdr_alpha: float = 0.1
+    cohens_d_threshold: float = 0.2
+    n_eff_min: float = 20.0
+    bootstrap_samples: int = 0
+    bootstrap_seed: int = 0
+
+
+@dataclass(frozen=True)
+class TradabilityConfig:
+    state_columns: tuple[str, ...] = (
+        "market_stage_reduced",
+        "structure_trend_state",
+        "atr_percentile_bucket",
+        "mtf_stage_key",
+    )
+    min_rows: int = 100
+    entropy_weight: float = 1.0 / 3.0
+    autocorr_weight: float = 1.0 / 3.0
+    volatility_efficiency_weight: float = 1.0 / 3.0
 
 
 @dataclass(frozen=True)
@@ -259,6 +324,17 @@ class ClassifierDiagnosticsBuilder:
                 _format_mtf_right_edge_drift_row(frame)[1],
             )
         )
+        health_table = classifier_health_frame(frame)
+        worst_status = _worst_health_status(health_table)
+        rows.append(
+            DiagnosticRow(
+                "classifier_health",
+                "Classifier health gate",
+                _summarize_classifier_health(health_table),
+                worst_status,
+            )
+        )
+        tables.append(DiagnosticTable("health", health_table))
         return ClassifierDiagnostics(label, tuple(rows), tuple(tables))
 
 
@@ -282,6 +358,166 @@ def evaluate_classifier_frame(label: str, frame: pl.DataFrame) -> ClassifierDiag
     return ClassifierDiagnosticsBuilder().evaluate(label, frame)
 
 
+def classifier_health_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    schema = {
+        "health_check": pl.Utf8,
+        "status": pl.Utf8,
+        "value": pl.Float64,
+        "threshold": pl.Float64,
+        "reason": pl.Utf8,
+    }
+    required = (
+        ClassifierColumn.STRUCTURE_TREND_STATE,
+        ClassifierColumn.MARKET_STAGE,
+        ClassifierColumn.STRUCTURE_REASON,
+        ClassifierColumn.STAGE_UNKNOWN_REASON,
+    )
+    rows: list[dict[str, object]] = []
+    present = [column for column in required if column in frame.columns]
+    coverage_pct = len(present) / max(len(required), 1) * 100.0
+    rows.append(
+        {
+            "health_check": "required_classifier_columns",
+            "status": "pass" if len(present) == len(required) else "fail",
+            "value": coverage_pct,
+            "threshold": 100.0,
+            "reason": f"present={len(present)}/{len(required)}",
+        }
+    )
+
+    unknown_table = _classifier_unknown_consistency_table(frame)
+    total = (
+        int(unknown_table.select(pl.col("count").sum()).item() or 0)
+        if not unknown_table.is_empty()
+        else 0
+    )
+    contradiction_count = (
+        int(
+            unknown_table.filter(pl.col("verdict").str.starts_with("contradiction"))
+            .select(pl.col("count").sum())
+            .item()
+            or 0
+        )
+        if not unknown_table.is_empty()
+        else 0
+    )
+    raw_unknown_none = (
+        int(
+            unknown_table.filter(pl.col("verdict") == "watch_raw_unknown_resolved_none")
+            .select(pl.col("count").sum())
+            .item()
+            or 0
+        )
+        if not unknown_table.is_empty()
+        else 0
+    )
+    raw_unknown_share = raw_unknown_none / max(total, 1) * 100.0
+    rows.extend(
+        [
+            {
+                "health_check": "contradiction_count",
+                "status": "fail" if contradiction_count > 0 else "pass",
+                "value": float(contradiction_count),
+                "threshold": 0.0,
+                "reason": f"contradictions={contradiction_count}/{total}",
+            },
+            {
+                "health_check": "raw_unknown_resolved_none_share",
+                "status": "warn" if raw_unknown_share > 1.0 else "pass",
+                "value": raw_unknown_share,
+                "threshold": 1.0,
+                "reason": f"raw_unknown_with_none={raw_unknown_none}/{total}",
+            },
+        ]
+    )
+
+    state_columns = [
+        column
+        for column in ("mtf_state_key", "mtf_structure_key", "mtf_stage_key")
+        if column in frame.columns
+    ]
+    max_cardinality = max(
+        (int(frame.select(pl.col(column).n_unique()).item() or 0) for column in state_columns),
+        default=0,
+    )
+    cardinality_threshold = max(20.0, frame.height / 10.0)
+    rows.append(
+        {
+            "health_check": "mtf_key_cardinality",
+            "status": "warn" if max_cardinality > cardinality_threshold else "pass",
+            "value": float(max_cardinality),
+            "threshold": cardinality_threshold,
+            "reason": f"max_unique={max_cardinality} rows={frame.height}",
+        }
+    )
+
+    transition_tables = [_classifier_transition_table(frame, column) for column in state_columns]
+    transition_table = _concat_or_empty(
+        transition_tables,
+        ["state_column", "from_state", "to_state", "count", "pct", "self_transition"],
+    )
+    transitions = (
+        int(transition_table.select(pl.col("count").sum()).item() or 0)
+        if not transition_table.is_empty()
+        else 0
+    )
+    changed = (
+        int(
+            transition_table.filter(~pl.col("self_transition")).select(pl.col("count").sum()).item()
+            or 0
+        )
+        if not transition_table.is_empty()
+        else 0
+    )
+    changed_rate = changed / max(transitions, 1) * 100.0
+    rows.append(
+        {
+            "health_check": "transition_changed_rate",
+            "status": "warn" if changed_rate > 30.0 else "pass",
+            "value": changed_rate,
+            "threshold": 30.0,
+            "reason": f"changed={changed}/{transitions}",
+        }
+    )
+
+    drift_summary = _format_mtf_right_edge_drift_row(frame)[1]
+    rows.append(
+        {
+            "health_check": "right_edge_drift",
+            "status": "warn" if "right_edge_drift" in drift_summary else "pass",
+            "value": 1.0 if "right_edge_drift" in drift_summary else 0.0,
+            "threshold": 0.0,
+            "reason": drift_summary,
+        }
+    )
+    return pl.DataFrame(rows, schema=schema)
+
+
+def _worst_health_status(frame: pl.DataFrame) -> str:
+    statuses = set(frame["status"].to_list()) if "status" in frame.columns else set()
+    if "fail" in statuses:
+        return "fail"
+    if "warn" in statuses:
+        return "warn"
+    return "info"
+
+
+def _summarize_classifier_health(frame: pl.DataFrame) -> str:
+    if frame.is_empty():
+        return "n/a"
+    counts = {status: 0 for status in ("pass", "warn", "fail")}
+    for status in frame["status"].to_list():
+        counts[str(status)] = counts.get(str(status), 0) + 1
+    notable = frame.filter(pl.col("status") != "pass")
+    notable_checks = (
+        ",".join(str(row["health_check"]) for row in notable.iter_rows(named=True)) or "none"
+    )
+    return (
+        f"pass={counts.get('pass', 0)} warn={counts.get('warn', 0)} "
+        f"fail={counts.get('fail', 0)} notable={notable_checks}"
+    )
+
+
 def evaluate_state_attribution(
     label: str,
     report: Report,
@@ -290,52 +526,11 @@ def evaluate_state_attribution(
     return StateAttributionDiagnosticsBuilder().evaluate(label, report, frame)
 
 
-def format_classifier_diagnostics(diagnostics: ClassifierDiagnostics) -> str:
-    return f"{diagnostics.label}\n" + format_table(
-        ["Classifier diagnostic", "Severity", "Summary"],
-        [[row.name, row.severity, row.summary] for row in diagnostics.rows],
-    )
-
-
 def format_state_attribution(diagnostics: StateAttributionDiagnostics) -> str:
     return f"{diagnostics.label}\n" + format_table(
         ["State diagnostic", "Summary"],
         [[row.name, row.summary] for row in diagnostics.rows],
     )
-
-
-def classifier_diagnostics_export_frame(diagnostics: ClassifierDiagnostics) -> pl.DataFrame:
-    records = [
-        {
-            "label": diagnostics.label,
-            "artifact": "row",
-            "table": "rows",
-            "layer": row.layer,
-            "name": row.name,
-            "severity": row.severity,
-            "summary": row.summary,
-            "field": "",
-            "value": "",
-        }
-        for row in diagnostics.rows
-    ]
-    for table in diagnostics.tables:
-        for record in table.frame.iter_rows(named=True):
-            for field, value in record.items():
-                records.append(
-                    {
-                        "label": diagnostics.label,
-                        "artifact": "table",
-                        "table": table.name,
-                        "layer": "classifier",
-                        "name": table.name,
-                        "severity": "info",
-                        "summary": "",
-                        "field": str(field),
-                        "value": "" if value is None else str(value),
-                    }
-                )
-    return pl.DataFrame(records)
 
 
 def _concat_or_empty(frames: list[pl.DataFrame], columns: list[str]) -> pl.DataFrame:
@@ -541,9 +736,7 @@ def _summarize_matrix(table: pl.DataFrame) -> str:
 def _classifier_threshold_table(frame: pl.DataFrame) -> pl.DataFrame:
     numeric_col = ClassifierColumn.RANGE_WIDTH_ATR_THRESHOLD
     if frame.is_empty() or numeric_col not in frame.columns:
-        return pl.DataFrame(
-            {"metric": [], "value": [], "source": [], "ready": [], "rows": []}
-        )
+        return pl.DataFrame({"metric": [], "value": [], "source": [], "ready": [], "rows": []})
     source_col = ClassifierColumn.RANGE_WIDTH_THRESHOLD_SOURCE
     ready_col = ClassifierColumn.RANGE_WIDTH_THRESHOLD_READY
     stats = frame.select(
@@ -707,9 +900,7 @@ def _classifier_time_distribution_table(frame: pl.DataFrame, column: str) -> pl.
     if grouped.is_empty():
         return pl.DataFrame(empty)
     state_totals = grouped.group_by("state").agg(pl.col("count").sum().alias("state_total"))
-    bucket_totals = grouped.group_by("time_bucket").agg(
-        pl.col("count").sum().alias("bucket_total")
-    )
+    bucket_totals = grouped.group_by("time_bucket").agg(pl.col("count").sum().alias("bucket_total"))
     return (
         grouped.join(state_totals, on="state")
         .join(bucket_totals, on="time_bucket")
@@ -749,48 +940,196 @@ class CandidateReportStatus:
 
 
 @dataclass(frozen=True)
-class BucketSummary:
-    key: tuple[str, ...]
-    trades: int
-    net: float
-    expectancy: float
+class ReportConsistencyResult:
+    reports: tuple[Report, ...]
+    gates: RiskGateConfig
 
+    def status_text(self) -> str:
+        rows = []
+        for report in self.reports:
+            status = report_status(report, self.gates)
+            d = report.diagnostics
+            rows.append(
+                [
+                    status.status,
+                    report.label,
+                    str(report.metrics.num_trades),
+                    f"{report.metrics.profit_factor:.2f}",
+                    f"{report.trade_expectancy_pct:+.2f}",
+                    f"{report.metrics.max_drawdown_pct:.1f}",
+                    f"{d.max_notional_exposure_pct:.1f}" if d is not None else "n/a",
+                    ",".join(status.reasons) or "-",
+                ]
+            )
+        return format_table(
+            ["Status", "Label", "Trades", "PF", "Exp%", "DD%", "MaxNot%", "Reasons"],
+            rows,
+        )
 
-@dataclass(frozen=True)
-class TimeClusterSummary:
-    segments: int
-    rows: tuple[BucketSummary, ...]
-    best_share_pct: float
-    clustered: bool
+    def candidate_text(
+        self,
+        candidate_gates: CandidateGateConfig = CandidateGateConfig(),
+    ) -> str:
+        rows = []
+        for report in self.reports:
+            status = candidate_report_status(report, self.gates, candidate_gates)
+            rows.append(
+                [
+                    status.status,
+                    status.classification,
+                    report.label,
+                    str(report.metrics.num_trades),
+                    f"{report.metrics.max_drawdown_pct:.1f}",
+                    f"{candidate_gates.target_max_dd_pct:.1f}",
+                    f"{candidate_gates.hard_max_dd_pct:.1f}",
+                    f"{report.stop_effectiveness.stop_loss_share_pct:.1f}",
+                    ",".join(status.reasons) or "-",
+                ]
+            )
+        return format_table(
+            [
+                "Status",
+                "Class",
+                "Label",
+                "Trades",
+                "DD%",
+                "TargetDD%",
+                "HardDD%",
+                "StopLoss%",
+                "Reasons",
+            ],
+            rows,
+        )
 
+    def to_text(self) -> str:
+        grouped: dict[str, list[Report]] = {}
+        for report in self.reports:
+            grouped.setdefault(self._strategy_key(report), []).append(report)
+        if len(grouped) > 1:
+            return "\n\n".join(
+                f"{strategy}\n" + self._group_text(strategy_reports)
+                for strategy, strategy_reports in grouped.items()
+            )
+        return self._group_text(list(self.reports))
 
-@dataclass(frozen=True)
-class StructuralEventOpportunity:
-    failed_breakout_low: int
-    failed_breakout_high: int
-    bullish_reclaim: int
-    bearish_reclaim: int
-    breakout_acceptance_high: int
-    breakout_acceptance_low: int
-    after_volume: int
-    after_quality: int
-    after_both: int
+    def _group_text(self, reports: list[Report]) -> str:
+        report_statuses = [
+            (report, candidate_report_status(report, self.gates)) for report in reports
+        ]
+        feasible = [
+            report for report, status in report_statuses if status.classification == "FEASIBLE"
+        ]
+        rows = [
+            [
+                report.label,
+                status.classification,
+                f"{report.metrics.profit_factor:.2f}",
+                f"{report.trade_expectancy_pct:+.2f}",
+                f"{report.metrics.max_drawdown_pct:.1f}",
+                f"{report.stop_effectiveness.stop_loss_share_pct:.1f}",
+                f"{report.diagnostics.lifecycle.entry_acceptance_rate_pct:.1f}"
+                if report.diagnostics is not None
+                else "n/a",
+            ]
+            for report, status in report_statuses
+        ]
+        reasons = ["INSUFFICIENT_FEASIBLE_ASSETS"] if len(feasible) < 2 else []
+        if len(feasible) >= 2 and any(
+            report.trade_expectancy_pct < 0.0 or report.metrics.profit_factor < 1.0
+            for report in feasible
+        ):
+            reasons.append("CROSS_ASSET_INCONSISTENT")
+        trend_buckets, negative_trends, worst_trend_exp = self._trade_bucket_summary(
+            feasible, "entry_trend_bucket"
+        )
+        volatility_buckets, negative_volatility, worst_vol_exp = self._trade_bucket_summary(
+            feasible, "entry_volatility_bucket"
+        )
+        if trend_buckets >= 2 and negative_trends > 0:
+            reasons.append("CROSS_TREND_INCONSISTENT")
+        if volatility_buckets >= 2 and negative_volatility > 0:
+            reasons.append("CROSS_VOLATILITY_INCONSISTENT")
+        status = "PASS" if not reasons else "FAIL"
+        worst_stage_event = self._worst_pair_bucket(
+            feasible,
+            ("entry_market_stage_bucket", "entry_liquidity_event_type_bucket"),
+        )
+        worst_side_structure = self._worst_pair_bucket(
+            feasible, ("side", "entry_structure_bucket")
+        )
+        summary = (
+            f"Cross-run consistency: {status}  feasible={len(feasible)}  "
+            f"diagnostic_only={len(reports) - len(feasible)}  "
+            f"reasons={','.join(reasons) or '-'}  worst_trend_exp=${worst_trend_exp:+.2f}  "
+            f"worst_vol_exp=${worst_vol_exp:+.2f}  "
+            f"worst_side_structure={worst_side_structure}  "
+            f"worst_stage_event={worst_stage_event}"
+        )
+        return (
+            summary
+            + "\n"
+            + format_table(
+                ["Label", "Class", "PF", "Exp%", "DD%", "StopLoss%", "EntryAccept%"],
+                rows,
+            )
+        )
 
+    @staticmethod
+    def _trade_bucket_summary(reports: list[Report], bucket_col: str) -> tuple[int, int, float]:
+        frames = [
+            report.trades
+            for report in reports
+            if not report.trades.is_empty() and bucket_col in report.trades.columns
+        ]
+        if not frames:
+            return 0, 0, 0.0
+        trades = pl.concat(frames, how="diagonal_relaxed")
+        net_col = "net_pnl_usd" if "net_pnl_usd" in trades.columns else "pnl_usd"
+        grouped = (
+            trades.filter(pl.col(bucket_col).is_not_null())
+            .group_by(bucket_col)
+            .agg(
+                pl.len().alias("trades"),
+                pl.col(net_col).cast(pl.Float64).mean().alias("expectancy"),
+            )
+        )
+        qualified = grouped.filter(pl.col("trades") >= 2) if not grouped.is_empty() else grouped
+        if grouped.is_empty() or qualified.is_empty():
+            return grouped.height, 0, 0.0
+        worst = qualified.select(pl.col("expectancy").min()).item()
+        return (
+            grouped.height,
+            qualified.filter(pl.col("expectancy") < 0).height,
+            float(worst or 0.0),
+        )
 
-@dataclass(frozen=True)
-class ReclaimExtensionStatus:
-    include_reclaim_sweeps: bool
-    reclaim_extension_trades: int
+    @staticmethod
+    def _strategy_key(report: Report) -> str:
+        for item in report.metadata:
+            if item.startswith("strategy_args="):
+                for part in item.removeprefix("strategy_args=").split(","):
+                    if part.startswith("strategy="):
+                        return part.removeprefix("strategy=")
+        return "reports"
+
+    @staticmethod
+    def _worst_pair_bucket(reports: list[Report], columns: tuple[str, str]) -> str:
+        pairs = [(report, *_worst_pair_bucket_value(report, columns)) for report in reports]
+        pairs = [item for item in pairs if item[1] != "n/a"]
+        if not pairs:
+            return "n/a"
+        report, label, value = min(pairs, key=lambda item: item[2])
+        return f"{report.label}:{label}/${value:+.2f}"
 
 
 def report_status(report: Report, gates: RiskGateConfig) -> ReportStatus:
     reasons: list[str] = []
     if _metadata_value(report, "data_quality") == "data_incomplete":
-        incomplete_reason = _metadata_value(report, "data_incomplete_reason")
-        if incomplete_reason == "listing_age":
-            reasons.append("DATA_INCOMPLETE_LISTING_AGE")
-        else:
-            reasons.append("DATA_INCOMPLETE")
+        reasons.append(
+            "DATA_INCOMPLETE_LISTING_AGE"
+            if _metadata_value(report, "data_incomplete_reason") == "listing_age"
+            else "DATA_INCOMPLETE"
+        )
     metrics = report.metrics
     diagnostics = report.diagnostics
     y = report.yield_attribution
@@ -818,63 +1157,61 @@ def report_status(report: Report, gates: RiskGateConfig) -> ReportStatus:
         report.trade_expectancy_usd <= 0 or metrics.total_return_pct <= 0
     ):
         reasons.append("YIELD_DIVERGENCE")
-    sparse_floor = gates.min_trades if gates.min_trades > 0 else 20
-    if math.isinf(metrics.profit_factor) and metrics.num_trades < sparse_floor:
+    if math.isinf(metrics.profit_factor) and metrics.num_trades < (gates.min_trades or 20):
         reasons.append("SPARSE_INF_PF")
-    if y.fee_drag_pct > 20.0 and y.gross_profit_usd > 0:
-        reasons.append("FEE_DRAG")
-    if y.worst_exit_reason != "n/a" and y.worst_exit_expectancy_usd < 0:
-        reasons.append("EXIT_LEAK")
-    if y.worst_side != "n/a" and y.worst_side_expectancy_usd < 0:
-        reasons.append("SIDE_LEAK")
-    if y.worst_signal_id != "n/a" and y.worst_signal_expectancy_usd < 0:
-        reasons.append("SIGNAL_LEAK")
-    if y.loss_to_win_notional_ratio > 1.25:
-        reasons.append("LOSS_OVERSIZED")
-    if stop.stop_trades > 0 and stop.stop_loss_share_pct > 60.0:
-        reasons.append("STOP_DOMINATED_LOSSES")
-    if stop.worst_stop_signal_share_pct > 60.0:
-        reasons.append("STOP_SIGNAL_LEAK")
-    if stop.worst_stop_side_share_pct > 60.0:
-        reasons.append("STOP_SIDE_LEAK")
+    checks = (
+        (y.fee_drag_pct > 20.0 and y.gross_profit_usd > 0, "FEE_DRAG"),
+        (y.worst_exit_reason != "n/a" and y.worst_exit_expectancy_usd < 0, "EXIT_LEAK"),
+        (y.worst_side != "n/a" and y.worst_side_expectancy_usd < 0, "SIDE_LEAK"),
+        (y.worst_signal_id != "n/a" and y.worst_signal_expectancy_usd < 0, "SIGNAL_LEAK"),
+        (y.loss_to_win_notional_ratio > 1.25, "LOSS_OVERSIZED"),
+        (stop.stop_trades > 0 and stop.stop_loss_share_pct > 60.0, "STOP_DOMINATED_LOSSES"),
+        (stop.worst_stop_signal_share_pct > 60.0, "STOP_SIGNAL_LEAK"),
+        (stop.worst_stop_side_share_pct > 60.0, "STOP_SIDE_LEAK"),
+    )
+    reasons.extend(reason for failed, reason in checks if failed)
     if diagnostics is not None:
         risk = diagnostics.risk
         lifecycle = diagnostics.lifecycle
-        if metrics.max_drawdown_pct > 25.0 and (
-            risk.stop_exit_count > 0 or risk.drawdown_stop_pct is not None
-        ):
-            reasons.append("DD_CONTROL_FAILED")
-        if (
-            risk.stop_exit_count > 0
-            and risk.stop_exit_net_pnl_usd < 0
-            and metrics.max_drawdown_pct > 25.0
-        ):
-            reasons.append("STOP_LOSS_INEFFECTIVE")
-        if lifecycle.max_simultaneous_baskets > 1 and metrics.max_drawdown_pct > 25.0:
-            reasons.append("BASKET_STACKING_RISK")
-        if lifecycle.recovery_actions > 0 and risk.recovery_net_pnl_usd < 0:
-            reasons.append("RECOVERY_LOSS_AMPLIFIED")
-        if lifecycle.recovery_actions > 0 or risk.recovery_blocked_actions > 0:
-            reasons.append("RECOVERY_EXPERIMENTAL")
-        if lifecycle.blocked_entry_signals > 0:
-            reasons.append("ENTRY_BLOCKED")
-        if (
-            gates.min_execution_acceptance_pct > 0
-            and lifecycle.entry_signals > 0
-            and lifecycle.entry_acceptance_rate_pct < gates.min_execution_acceptance_pct
-            and lifecycle.min_contract_block_count
-            / max(lifecycle.blocked_entry_signals, 1)
-            >= 0.5
-        ):
-            reasons.append("EXECUTION_INFEASIBLE")
-        if risk.recovery_cap_breach_actions > 0:
-            reasons.append("RECOVERY_CAP_BREACH")
-        if risk.recovery_unsized_actions > 0:
-            reasons.append("RECOVERY_UNSIZED")
-        if risk.recovery_preempted_stop_count > 0:
-            reasons.append("RECOVERY_PREEMPTED_STOP")
-        if risk.ambiguous_stop_target_count > 0:
-            reasons.append("INTRABAR_AMBIGUITY")
+        risk_checks = (
+            (
+                metrics.max_drawdown_pct > 25.0
+                and (risk.stop_exit_count > 0 or risk.drawdown_stop_pct is not None),
+                "DD_CONTROL_FAILED",
+            ),
+            (
+                risk.stop_exit_count > 0
+                and risk.stop_exit_net_pnl_usd < 0
+                and metrics.max_drawdown_pct > 25.0,
+                "STOP_LOSS_INEFFECTIVE",
+            ),
+            (
+                lifecycle.max_simultaneous_baskets > 1 and metrics.max_drawdown_pct > 25.0,
+                "BASKET_STACKING_RISK",
+            ),
+            (
+                lifecycle.recovery_actions > 0 and risk.recovery_net_pnl_usd < 0,
+                "RECOVERY_LOSS_AMPLIFIED",
+            ),
+            (
+                lifecycle.recovery_actions > 0 or risk.recovery_blocked_actions > 0,
+                "RECOVERY_EXPERIMENTAL",
+            ),
+            (lifecycle.blocked_entry_signals > 0, "ENTRY_BLOCKED"),
+            (
+                gates.min_execution_acceptance_pct > 0
+                and lifecycle.entry_signals > 0
+                and lifecycle.entry_acceptance_rate_pct < gates.min_execution_acceptance_pct
+                and lifecycle.min_contract_block_count / max(lifecycle.blocked_entry_signals, 1)
+                >= 0.5,
+                "EXECUTION_INFEASIBLE",
+            ),
+            (risk.recovery_cap_breach_actions > 0, "RECOVERY_CAP_BREACH"),
+            (risk.recovery_unsized_actions > 0, "RECOVERY_UNSIZED"),
+            (risk.recovery_preempted_stop_count > 0, "RECOVERY_PREEMPTED_STOP"),
+            (risk.ambiguous_stop_target_count > 0, "INTRABAR_AMBIGUITY"),
+        )
+        reasons.extend(reason for failed, reason in risk_checks if failed)
     if not reasons:
         return ReportStatus("PASS", ())
     fail_reasons = {
@@ -894,9 +1231,9 @@ def report_status(report: Report, gates: RiskGateConfig) -> ReportStatus:
         "DATA_INCOMPLETE",
         "DATA_INCOMPLETE_LISTING_AGE",
     }
-    if any(reason in reasons for reason in fail_reasons):
-        return ReportStatus("FAIL", tuple(reasons))
-    return ReportStatus("WARN", tuple(reasons))
+    return ReportStatus(
+        "FAIL" if any(reason in reasons for reason in fail_reasons) else "WARN", tuple(reasons)
+    )
 
 
 def candidate_report_status(
@@ -943,81 +1280,36 @@ def candidate_report_status(
             and ambiguity_pct > candidate_gates.max_ambiguity_impact_pct
         ):
             reasons.append("AMBIGUITY_MATERIAL")
+    if classification == "DIAGNOSTIC_ONLY":
+        diagnostic_status_reasons = [
+            reason for reason in operational.reasons if reason in diagnostic_reasons
+        ]
+        return CandidateReportStatus(
+            "WARN",
+            classification,
+            tuple(
+                dict.fromkeys([*diagnostic_status_reasons, *reasons] or ["DIAGNOSTIC_ONLY"])
+            ),
+        )
     fail_reasons = {
         "DD_TARGET_HIGH",
         "DD_HARD_FAIL",
         "STOP_SIGNAL_CONCENTRATED",
         "STOP_SIDE_CONCENTRATED",
     }
-    if classification == "DIAGNOSTIC_ONLY":
-        diagnostic_status_reasons = [
-            reason for reason in operational.reasons if reason in diagnostic_reasons
-        ]
-        diagnostic_report_reasons = [*diagnostic_status_reasons, *reasons]
-        return CandidateReportStatus(
-            "WARN",
-            classification,
-            tuple(dict.fromkeys(diagnostic_report_reasons or ["DIAGNOSTIC_ONLY"])),
-        )
-    if any(reason in reasons for reason in fail_reasons):
-        return CandidateReportStatus("FAIL", classification, tuple(reasons))
-    if reasons:
-        return CandidateReportStatus("WARN", classification, tuple(reasons))
-    return CandidateReportStatus("PASS", classification, ())
-
-
-def _feasible_reports(reports: list[Report], gates: RiskGateConfig) -> list[Report]:
-    return [
-        report
-        for report in reports
-        if candidate_report_status(report, gates).classification == "FEASIBLE"
-    ]
-
-
-def _trade_bucket_summary(reports: list[Report], bucket_col: str) -> tuple[int, int, float]:
-    frames = []
-    for report in reports:
-        if not report.trades.is_empty() and bucket_col in report.trades.columns:
-            frames.append(report.trades)
-    if not frames:
-        return 0, 0, 0.0
-    trades = pl.concat(frames, how="diagonal_relaxed")
-    net_col = "net_pnl_usd" if "net_pnl_usd" in trades.columns else "pnl_usd"
-    grouped = (
-        trades.filter(pl.col(bucket_col).is_not_null())
-        .group_by(bucket_col)
-        .agg(
-            pl.len().alias("trades"),
-            pl.col(net_col).cast(pl.Float64).mean().alias("expectancy"),
-        )
+    return CandidateReportStatus(
+        "FAIL"
+        if any(reason in reasons for reason in fail_reasons)
+        else "WARN"
+        if reasons
+        else "PASS",
+        classification,
+        tuple(reasons),
     )
-    if grouped.is_empty():
-        return 0, 0, 0.0
-    qualified = grouped.filter(pl.col("trades") >= 2)
-    if qualified.is_empty():
-        return grouped.height, 0, 0.0
-    negative = qualified.filter(pl.col("expectancy") < 0).height
-    worst = float(qualified["expectancy"].min() or 0.0)
-    return grouped.height, negative, worst
 
 
-def _strategy_key(report: Report) -> str:
-    for item in report.metadata:
-        if not item.startswith("strategy_args="):
-            continue
-        args = item.removeprefix("strategy_args=")
-        for part in args.split(","):
-            if part.startswith("strategy="):
-                return part.removeprefix("strategy=")
-    return "reports"
-
-
-def _metadata_value(report: Report, key: str) -> str:
-    prefix = f"{key}="
-    for item in report.metadata:
-        if item.startswith(prefix):
-            return item.removeprefix(prefix)
-    return ""
+def format_status_table(reports: list[Report], gates: RiskGateConfig) -> str:
+    return ReportConsistencyResult(tuple(reports), gates).status_text()
 
 
 def format_candidate_status_table(
@@ -1025,111 +1317,86 @@ def format_candidate_status_table(
     gates: RiskGateConfig,
     candidate_gates: CandidateGateConfig = CandidateGateConfig(),
 ) -> str:
-    rows = []
-    for report in reports:
-        status = candidate_report_status(report, gates, candidate_gates)
-        rows.append(
-            [
-                status.status,
-                status.classification,
-                report.label,
-                str(report.metrics.num_trades),
-                f"{report.metrics.max_drawdown_pct:.1f}",
-                f"{candidate_gates.target_max_dd_pct:.1f}",
-                f"{candidate_gates.hard_max_dd_pct:.1f}",
-                f"{report.stop_effectiveness.stop_loss_share_pct:.1f}",
-                ",".join(status.reasons) or "-",
-            ]
+    return ReportConsistencyResult(tuple(reports), gates).candidate_text(candidate_gates)
+
+
+def format_cross_run_consistency(reports: list[Report], gates: RiskGateConfig) -> str:
+    return ReportConsistencyResult(tuple(reports), gates).to_text()
+
+
+def assert_reports_pass(reports: list[Report], gates: RiskGateConfig) -> None:
+    failed = [
+        status
+        for status in (report_status(report, gates) for report in reports)
+        if status.status == "FAIL"
+    ]
+    if gates.fail_on_risk and failed:
+        raise SystemExit(
+            "risk gates failed: " + "; ".join(",".join(status.reasons) for status in failed)
         )
-    return format_table(
-        [
-            "Status",
-            "Class",
-            "Label",
-            "Trades",
-            "DD%",
-            "TargetDD%",
-            "HardDD%",
-            "StopLoss%",
-            "Reasons",
-        ],
-        rows,
+
+
+def _metadata_value(report: Report, key: str) -> str:
+    prefix = f"{key}="
+    return next(
+        (item.removeprefix(prefix) for item in report.metadata if item.startswith(prefix)), ""
     )
 
 
-def format_cross_run_consistency(
-    reports: list[Report],
-    gates: RiskGateConfig,
-) -> str:
-    grouped_reports: dict[str, list[Report]] = {}
-    for report in reports:
-        grouped_reports.setdefault(_strategy_key(report), []).append(report)
-    if len(grouped_reports) > 1:
-        sections = []
-        for strategy, strategy_reports in grouped_reports.items():
-            sections.append(
-                f"{strategy}\n" + _format_cross_run_consistency_group(strategy_reports, gates)
-            )
-        return "\n\n".join(sections)
-    return _format_cross_run_consistency_group(reports, gates)
-
-
-def _format_cross_run_consistency_group(
-    reports: list[Report],
-    gates: RiskGateConfig,
-) -> str:
-    feasible = _feasible_reports(reports, gates)
-    diagnostic_only = len(reports) - len(feasible)
-    rows = []
-    for report in reports:
-        status = candidate_report_status(report, gates)
-        rows.append(
-            [
-                report.label,
-                status.classification,
-                f"{report.metrics.profit_factor:.2f}",
-                f"{report.trade_expectancy_pct:+.2f}",
-                f"{report.metrics.max_drawdown_pct:.1f}",
-                f"{report.stop_effectiveness.stop_loss_share_pct:.1f}",
-                f"{report.diagnostics.lifecycle.entry_acceptance_rate_pct:.1f}"
-                if report.diagnostics is not None
-                else "n/a",
-            ]
+def _worst_pair_bucket_value(report: Report, columns: tuple[str, str]) -> tuple[str, float]:
+    if report.trades.is_empty() or not set(columns) <= set(report.trades.columns):
+        return "n/a", 0.0
+    net_col = "net_pnl_usd" if "net_pnl_usd" in report.trades.columns else "pnl_usd"
+    grouped = (
+        report.trades.group_by(list(columns))
+        .agg(
+            pl.len().alias("trades"),
+            pl.col(net_col).cast(pl.Float64).mean().alias("expectancy"),
         )
-    reasons = []
-    if len(feasible) < 2:
-        reasons.append("INSUFFICIENT_FEASIBLE_ASSETS")
-    if len(feasible) >= 2:
-        negative_expectancy = sum(1 for report in feasible if report.trade_expectancy_pct < 0.0)
-        low_pf = sum(1 for report in feasible if report.metrics.profit_factor < 1.0)
-        if negative_expectancy > 0 or low_pf > 0:
-            reasons.append("CROSS_ASSET_INCONSISTENT")
-    trend_buckets, negative_trends, worst_trend_exp = _trade_bucket_summary(
-        feasible, "entry_trend_bucket"
+        .filter(pl.col("trades") >= 2)
+        .sort("expectancy")
     )
-    volatility_buckets, negative_volatility, worst_vol_exp = _trade_bucket_summary(
-        feasible, "entry_volatility_bucket"
+    if grouped.is_empty():
+        return "n/a", 0.0
+    row = grouped.row(0, named=True)
+    return "/".join(str(row[column] or "n/a") for column in columns), float(
+        row["expectancy"] or 0.0
     )
-    if trend_buckets >= 2 and negative_trends > 0:
-        reasons.append("CROSS_TREND_INCONSISTENT")
-    if volatility_buckets >= 2 and negative_volatility > 0:
-        reasons.append("CROSS_VOLATILITY_INCONSISTENT")
-    worst_side_structure = _worst_pair_bucket(feasible, ("side", "entry_structure_bucket"))
-    worst_stage_event = _worst_pair_bucket(
-        feasible,
-        ("entry_market_stage_bucket", "entry_liquidity_event_type_bucket"),
-    )
-    status = "PASS" if not reasons else "FAIL"
-    summary = (
-        f"Cross-run consistency: {status}  feasible={len(feasible)}  "
-        f"diagnostic_only={diagnostic_only}  reasons={','.join(reasons) or '-'}  "
-        f"worst_trend_exp=${worst_trend_exp:+.2f}  worst_vol_exp=${worst_vol_exp:+.2f}  "
-        f"worst_side_structure={worst_side_structure}  "
-        f"worst_stage_event={worst_stage_event}"
-    )
-    return summary + "\n" + format_table(
-        ["Label", "Class", "PF", "Exp%", "DD%", "StopLoss%", "EntryAccept%"], rows
-    )
+
+
+@dataclass(frozen=True)
+class BucketSummary:
+    key: tuple[str, ...]
+    trades: int
+    net: float
+    expectancy: float
+
+
+@dataclass(frozen=True)
+class TimeClusterSummary:
+    segments: int
+    rows: tuple[BucketSummary, ...]
+    best_share_pct: float
+    clustered: bool
+
+
+@dataclass(frozen=True)
+class StructuralEventOpportunity:
+    failed_breakout_low: int
+    failed_breakout_high: int
+    bullish_reclaim: int
+    bearish_reclaim: int
+    breakout_acceptance_high: int
+    breakout_acceptance_low: int
+    after_volume: int
+    after_quality: int
+    after_both: int
+
+
+@dataclass(frozen=True)
+class ReclaimExtensionStatus:
+    include_reclaim_sweeps: bool
+    reclaim_extension_trades: int
 
 
 def _hypothesis_rejection_reasons(reports: list[Report]) -> list[str]:
@@ -1282,37 +1549,6 @@ def _stage_event_inconsistent(reports: list[Report]) -> bool:
     return negative > 0 and positive > 0
 
 
-def _worst_pair_bucket(reports: list[Report], columns: tuple[str, str]) -> str:
-    worst_label = "n/a"
-    worst_value = 0.0
-    for report in reports:
-        label, value = _worst_pair_bucket_value(report, columns)
-        if label != "n/a" and (worst_label == "n/a" or value < worst_value):
-            worst_label = f"{report.label}:{label}"
-            worst_value = value
-    return f"{worst_label}/${worst_value:+.2f}" if worst_label != "n/a" else "n/a"
-
-
-def _worst_pair_bucket_value(report: Report, columns: tuple[str, str]) -> tuple[str, float]:
-    if report.trades.is_empty() or not set(columns) <= set(report.trades.columns):
-        return "n/a", 0.0
-    net_col = "net_pnl_usd" if "net_pnl_usd" in report.trades.columns else "pnl_usd"
-    grouped = (
-        report.trades.group_by(list(columns))
-        .agg(
-            pl.len().alias("trades"),
-            pl.col(net_col).cast(pl.Float64).mean().alias("expectancy"),
-        )
-        .filter(pl.col("trades") >= 2)
-        .sort("expectancy")
-    )
-    if grouped.is_empty():
-        return "n/a", 0.0
-    row = grouped.row(0, named=True)
-    label = "/".join(str(row[column] or "n/a") for column in columns)
-    return label, float(row["expectancy"] or 0.0)
-
-
 def feature_layer(frame: pl.DataFrame) -> tuple[str, str]:
     candidates = [
         col
@@ -1373,9 +1609,10 @@ def lifecycle_layer(report: Report) -> tuple[str, str]:
         return "LIFECYCLE", "n/a"
     reasons = ",".join(f"{key}:{value}" for key, value in sorted(d.exit_reasons.items())) or "none"
     lifecycle = d.lifecycle
-    block_reasons = ",".join(
-        f"{key}:{value}" for key, value in sorted(lifecycle.blocked_entry_reasons.items())
-    ) or "none"
+    block_reasons = (
+        ",".join(f"{key}:{value}" for key, value in sorted(lifecycle.blocked_entry_reasons.items()))
+        or "none"
+    )
     return (
         "LIFECYCLE",
         f"entry_signals={lifecycle.entry_signals} entries={d.entries} "
@@ -1441,6 +1678,81 @@ def strategy_development_rows(
     return rows
 
 
+def _market_state_time_split_stability(
+    base_group: pl.DataFrame,
+    *,
+    modulator_col: str,
+    modulator_value: str,
+    time_splits: int,
+    min_segment_base_rows: int,
+    min_segment_cell_rows: int,
+) -> dict[str, object]:
+    if time_splits < 2 or base_group.is_empty():
+        return {
+            "sufficient_time_splits": 0,
+            "time_split_sign_agreement_pct": 0.0,
+            "time_stable": False,
+            "time_split_significant_segments": 0,
+            "time_split_material_segments": 0,
+            "meta_stable": False,
+        }
+    order_expr = (
+        pl.col("timestamp").cast(pl.Int64)
+        if "timestamp" in base_group.columns
+        else pl.int_range(0, pl.len())
+    )
+    work = base_group.with_columns(order_expr.alias("_split_order")).sort("_split_order")
+    segment_size = math.ceil(work.height / time_splits)
+    signs: list[int] = []
+    significant_segments = 0
+    material_segments = 0
+    for idx in range(time_splits):
+        segment = work.slice(idx * segment_size, segment_size)
+        if segment.height < min_segment_base_rows:
+            continue
+        segment_values = [float(value or 0.0) for value in segment["_mod_return"].to_list()]
+        segment_base_mean = sum(segment_values) / max(len(segment_values), 1)
+        cell = segment.with_columns(
+            _market_state_value_expr(modulator_col, modulator_col).alias("_split_modulator_value")
+        ).filter(pl.col("_split_modulator_value") == modulator_value)
+        if cell.height < min_segment_cell_rows:
+            continue
+        cell_values = [float(value or 0.0) for value in cell["_mod_return"].to_list()]
+        cell_mean = sum(cell_values) / max(len(cell_values), 1)
+        delta = cell_mean - segment_base_mean
+        signs.append(_sign(delta))
+        ci_low, ci_high = _delta_adjusted_standard_error_band(
+            segment_values,
+            cell_values,
+            delta,
+            max_lag=None,
+        )
+        if ci_low > 0.0 or ci_high < 0.0:
+            significant_segments += 1
+        if abs(delta) > 0.0:
+            material_segments += 1
+    signs = [sign for sign in signs if sign]
+    if len(signs) < 2:
+        return {
+            "sufficient_time_splits": len(signs),
+            "time_split_sign_agreement_pct": 0.0,
+            "time_stable": False,
+            "time_split_significant_segments": significant_segments,
+            "time_split_material_segments": material_segments,
+            "meta_stable": False,
+        }
+    agreement = max(signs.count(1), signs.count(-1)) / len(signs) * 100.0
+    time_stable = agreement >= 100.0 and (significant_segments >= 2 or material_segments >= 2)
+    return {
+        "sufficient_time_splits": len(signs),
+        "time_split_sign_agreement_pct": agreement,
+        "time_stable": time_stable,
+        "time_split_significant_segments": significant_segments,
+        "time_split_material_segments": material_segments,
+        "meta_stable": time_stable,
+    }
+
+
 def format_strategy_development_summary(
     label: str,
     report: Report,
@@ -1496,6 +1808,2128 @@ def state_diagnostics_export_frame(
     )
 
 
+STATE_PROFITABILITY_EXPORT_SCHEMA: dict[str, type[pl.DataType]] = {
+    "label": pl.Utf8,
+    "state_key": pl.Utf8,
+    "structure_key": pl.Utf8,
+    "stage_key": pl.Utf8,
+    "market_stage": pl.Utf8,
+    "market_stage_reason": pl.Utf8,
+    "event_type": pl.Utf8,
+    "side": pl.Utf8,
+    "trades": pl.Int64,
+    "wins": pl.Int64,
+    "losses": pl.Int64,
+    "win_rate_pct": pl.Float64,
+    "gross_profit_usd": pl.Float64,
+    "gross_loss_usd": pl.Float64,
+    "net_pnl_usd": pl.Float64,
+    "expectancy_usd": pl.Float64,
+    "profit_factor": pl.Float64,
+    "best_trade_positive_pnl_share_pct": pl.Float64,
+    "time_bucket_count": pl.Int64,
+    "best_time_bucket_positive_pnl_share_pct": pl.Float64,
+    "clustered": pl.Boolean,
+    "fragile": pl.Boolean,
+    "actionable": pl.Boolean,
+    "high_risk": pl.Boolean,
+}
+
+
+def state_profitability_export_frame(
+    label: str,
+    report: Report,
+    signal_frame: pl.DataFrame,
+    *,
+    min_trades: int = 10,
+    min_win_rate_pct: float = 30.0,
+) -> pl.DataFrame:
+    del signal_frame
+    trades = report.trades
+    state_col = _first_column(trades, ("entry_mtf_state_bucket", "entry_mtf_state_key"))
+    event_col = _event_column(trades)
+    if trades.is_empty() or not state_col or not event_col or "side" not in trades.columns:
+        return pl.DataFrame(schema=STATE_PROFITABILITY_EXPORT_SCHEMA)
+    net_col = _net_col(trades)
+    prepared = trades.with_columns(
+        pl.col(state_col).cast(pl.Utf8).fill_null("unknown").alias("_state_key"),
+        pl.col(event_col).cast(pl.Utf8).fill_null("none").alias("_event_type"),
+        pl.col("side")
+        .cast(pl.Utf8)
+        .fill_null("unknown")
+        .map_elements(_normalize_side, return_dtype=pl.Utf8)
+        .alias("_side"),
+        pl.col(net_col).cast(pl.Float64).fill_null(0.0).alias("_net_pnl"),
+    )
+    group_columns = ("_state_key", "_event_type", "_side")
+    rows = []
+    for key, group in prepared.group_by(list(group_columns), maintain_order=True):
+        state_key, event_type, side = (str(value or "unknown") for value in key)
+        net_values = [float(value or 0.0) for value in group["_net_pnl"].to_list()]
+        trades_count = len(net_values)
+        wins = sum(1 for value in net_values if value > 0.0)
+        losses = sum(1 for value in net_values if value < 0.0)
+        gross_profit = sum(value for value in net_values if value > 0.0)
+        gross_loss = abs(sum(value for value in net_values if value < 0.0))
+        net = sum(net_values)
+        expectancy = net / max(trades_count, 1)
+        win_rate = wins / max(trades_count, 1) * 100.0
+        profit_factor = gross_profit / gross_loss if gross_loss > 1e-9 else float("inf")
+        best_win = max((value for value in net_values if value > 0.0), default=0.0)
+        best_trade_share = best_win / gross_profit * 100.0 if gross_profit > 1e-9 else 0.0
+        time_bucket_count, best_time_share = _time_bucket_positive_share(group)
+        clustered = time_bucket_count > 1 and best_time_share > 60.0
+        fragile = gross_profit > 1e-9 and best_trade_share > 50.0
+        actionable = (
+            trades_count >= min_trades
+            and expectancy > 0.0
+            and win_rate >= min_win_rate_pct
+            and not clustered
+            and not fragile
+        )
+        high_risk = trades_count >= min_trades and (expectancy < 0.0 or clustered or fragile)
+        rows.append(
+            {
+                "label": label,
+                "state_key": state_key,
+                "structure_key": _first_group_value(
+                    group, ("entry_mtf_structure_bucket", "entry_mtf_structure_key")
+                ),
+                "stage_key": _first_group_value(
+                    group, ("entry_mtf_stage_bucket", "entry_mtf_stage_key")
+                ),
+                "market_stage": _first_group_value(
+                    group, ("entry_market_stage_bucket", "entry_market_stage")
+                ),
+                "market_stage_reason": _first_group_value(
+                    group,
+                    ("entry_market_stage_reason_bucket", "entry_market_stage_reason"),
+                ),
+                "event_type": event_type,
+                "side": side,
+                "trades": trades_count,
+                "wins": wins,
+                "losses": losses,
+                "win_rate_pct": win_rate,
+                "gross_profit_usd": gross_profit,
+                "gross_loss_usd": gross_loss,
+                "net_pnl_usd": net,
+                "expectancy_usd": expectancy,
+                "profit_factor": profit_factor,
+                "best_trade_positive_pnl_share_pct": best_trade_share,
+                "time_bucket_count": time_bucket_count,
+                "best_time_bucket_positive_pnl_share_pct": best_time_share,
+                "clustered": clustered,
+                "fragile": fragile,
+                "actionable": actionable,
+                "high_risk": high_risk,
+            }
+        )
+    if not rows:
+        return pl.DataFrame(schema=STATE_PROFITABILITY_EXPORT_SCHEMA)
+    return pl.DataFrame(rows, schema=STATE_PROFITABILITY_EXPORT_SCHEMA).sort(
+        ["actionable", "high_risk", "trades", "expectancy_usd"],
+        descending=[True, True, True, True],
+    )
+
+
+def state_profitability_rows(report: Report, signal_frame: pl.DataFrame) -> list[list[str]]:
+    frame = state_profitability_export_frame(report.label, report, signal_frame)
+    if frame.is_empty():
+        return [["State profitability", "no state-event-side trades"]]
+    actionable = frame.filter(pl.col("actionable"))
+    high_risk = frame.filter(pl.col("high_risk"))
+    positive = frame.filter((pl.col("trades") >= 10) & (pl.col("expectancy_usd") > 0.0))
+    negative = frame.filter((pl.col("trades") >= 10) & (pl.col("expectancy_usd") < 0.0))
+    return [
+        [
+            "State profitability coverage",
+            f"groups={frame.height} actionable={actionable.height} "
+            f"positive_ge10={positive.height} negative_ge10={negative.height} "
+            f"high_risk={high_risk.height}",
+        ],
+        [
+            "Actionable state-event-side",
+            _format_state_profitability_groups(actionable, limit=6),
+        ],
+        [
+            "High-risk state-event-side",
+            _format_state_profitability_groups(high_risk, limit=6),
+        ],
+    ]
+
+
+def format_state_profitability_summary(
+    label: str,
+    report: Report,
+    signal_frame: pl.DataFrame,
+) -> str:
+    return f"{label}\n" + format_table(
+        ["State profitability diagnostic", "Summary"],
+        state_profitability_rows(report, signal_frame),
+    )
+
+
+MODULATION_BASE_COLUMNS: tuple[str, ...] = (
+    "entry_market_stage_bucket",
+    "entry_market_stage_reason_bucket",
+    "entry_liquidity_event_type_bucket",
+    "side",
+    "entry_structure_bucket",
+)
+
+
+MODULATION_MODULATOR_COLUMNS: tuple[str, ...] = (
+    "entry_d1_structure_trend_state",
+    "entry_d1_market_stage",
+    "entry_h4_structure_trend_state",
+    "entry_h4_market_stage",
+    "entry_atr_percentile_bucket",
+    "entry_adx_bucket",
+)
+
+
+MODULATION_EFFECT_SCHEMA: dict[str, type[pl.DataType]] = {
+    "symbol": pl.Utf8,
+    "base_feature": pl.Utf8,
+    "base_value": pl.Utf8,
+    "modulator": pl.Utf8,
+    "modulator_value": pl.Utf8,
+    "min_base_trades": pl.Int64,
+    "min_cell_trades": pl.Int64,
+    "base_trades": pl.Int64,
+    "conditional_trades": pl.Int64,
+    "base_expectancy": pl.Float64,
+    "conditional_expectancy": pl.Float64,
+    "delta_expectancy": pl.Float64,
+    "base_profit_factor": pl.Float64,
+    "conditional_profit_factor": pl.Float64,
+    "delta_ci_low": pl.Float64,
+    "delta_ci_high": pl.Float64,
+    "practical_delta_threshold": pl.Float64,
+    "sufficient_base": pl.Boolean,
+    "sufficient_cell": pl.Boolean,
+    "significant": pl.Boolean,
+    "stable_across_symbols": pl.Boolean,
+    "classification": pl.Utf8,
+}
+
+
+MARKET_STATE_FORWARD_SUMMARY_SCHEMA: dict[str, type[pl.DataType]] = {
+    "artifact": pl.Utf8,
+    "symbol": pl.Utf8,
+    "horizon": pl.Int64,
+    "group_key": pl.Utf8,
+    "group_columns": pl.Utf8,
+    "rows": pl.Int64,
+    "up_count": pl.Int64,
+    "down_count": pl.Int64,
+    "flat_count": pl.Int64,
+    "up_rate_pct": pl.Float64,
+    "down_rate_pct": pl.Float64,
+    "flat_rate_pct": pl.Float64,
+    "mean_return_pct": pl.Float64,
+    "median_return_pct": pl.Float64,
+    "mean_return_atr": pl.Float64,
+    "mean_mfe_long_atr": pl.Float64,
+    "mean_mae_long_atr": pl.Float64,
+    "mean_mfe_short_atr": pl.Float64,
+    "mean_mae_short_atr": pl.Float64,
+    "return_ci_low": pl.Float64,
+    "return_ci_high": pl.Float64,
+    "effective_rows": pl.Float64,
+    "overlap_lag": pl.Int64,
+    "overlap_adjusted_ci_low": pl.Float64,
+    "overlap_adjusted_ci_high": pl.Float64,
+    "overlap_warning": pl.Utf8,
+    "sufficient_rows": pl.Boolean,
+    "directional_bias": pl.Utf8,
+}
+
+
+MARKET_STATE_MODULATION_SCHEMA: dict[str, type[pl.DataType]] = {
+    "artifact": pl.Utf8,
+    "symbol": pl.Utf8,
+    "horizon": pl.Int64,
+    "outcome_column": pl.Utf8,
+    "outcome_kind": pl.Utf8,
+    "base_feature": pl.Utf8,
+    "base_value": pl.Utf8,
+    "modulator": pl.Utf8,
+    "modulator_value": pl.Utf8,
+    "min_base_rows": pl.Int64,
+    "min_cell_rows": pl.Int64,
+    "base_rows": pl.Int64,
+    "conditional_rows": pl.Int64,
+    "base_mean_return_pct": pl.Float64,
+    "conditional_mean_return_pct": pl.Float64,
+    "delta_return_pct": pl.Float64,
+    "delta_ci_low": pl.Float64,
+    "delta_ci_high": pl.Float64,
+    "effective_base_rows": pl.Float64,
+    "effective_conditional_rows": pl.Float64,
+    "overlap_lag": pl.Int64,
+    "overlap_adjusted_delta_ci_low": pl.Float64,
+    "overlap_adjusted_delta_ci_high": pl.Float64,
+    "overlap_warning": pl.Utf8,
+    "se_method": pl.Utf8,
+    "robust_delta_ci_low": pl.Float64,
+    "robust_delta_ci_high": pl.Float64,
+    "robust_significant": pl.Boolean,
+    "n_eff_min": pl.Float64,
+    "base_mean_return_atr": pl.Float64,
+    "conditional_mean_return_atr": pl.Float64,
+    "delta_return_atr": pl.Float64,
+    "delta_cohens_d": pl.Float64,
+    "cohens_d_threshold": pl.Float64,
+    "effect_size_material": pl.Boolean,
+    "base_q10": pl.Float64,
+    "conditional_q10": pl.Float64,
+    "delta_q10": pl.Float64,
+    "base_q25": pl.Float64,
+    "conditional_q25": pl.Float64,
+    "delta_q25": pl.Float64,
+    "base_median": pl.Float64,
+    "conditional_median": pl.Float64,
+    "delta_median": pl.Float64,
+    "base_q75": pl.Float64,
+    "conditional_q75": pl.Float64,
+    "delta_q75": pl.Float64,
+    "base_cvar10": pl.Float64,
+    "conditional_cvar10": pl.Float64,
+    "delta_cvar10": pl.Float64,
+    "p_value": pl.Float64,
+    "fdr_alpha": pl.Float64,
+    "fdr_significant": pl.Boolean,
+    "practical_delta_threshold": pl.Float64,
+    "significant": pl.Boolean,
+    "stable_across_symbols": pl.Boolean,
+    "time_splits": pl.Int64,
+    "sufficient_time_splits": pl.Int64,
+    "time_split_sign_agreement_pct": pl.Float64,
+    "time_stable": pl.Boolean,
+    "time_split_significant_segments": pl.Int64,
+    "time_split_material_segments": pl.Int64,
+    "symbol_effect_count": pl.Int64,
+    "cross_asset_effect_mean": pl.Float64,
+    "cross_asset_effect_std": pl.Float64,
+    "cross_asset_homogeneous": pl.Boolean,
+    "partially_replicable": pl.Boolean,
+    "interaction_order": pl.Int64,
+    "meta_stable": pl.Boolean,
+    "classification": pl.Utf8,
+}
+
+
+MARKET_STATE_FORWARD_EXPORT_SCHEMA: dict[str, type[pl.DataType]] = {
+    **MARKET_STATE_FORWARD_SUMMARY_SCHEMA,
+    **MARKET_STATE_MODULATION_SCHEMA,
+}
+
+
+MARKET_STATE_BASE_COLUMNS: tuple[str, ...] = (
+    "market_stage_reduced",
+    "liquidity_event_type",
+    "structure_trend_state",
+    "atr_percentile_bucket",
+)
+
+
+MARKET_STATE_MODULATOR_COLUMNS: tuple[str, ...] = (
+    "d1_structure_trend_state",
+    "d1_market_stage",
+    "h4_structure_trend_state",
+    "h4_market_stage",
+    "h4_market_stage_reason",
+)
+
+
+_MARKET_STATE_ALIASES: dict[str, tuple[str, ...]] = {
+    "market_stage": ("market_stage", "h1_market_stage"),
+    "market_stage_reduced": ("market_stage_reduced", "h1_market_stage_reduced"),
+    "market_stage_reason": ("market_stage_reason", "h1_market_stage_reason"),
+    "liquidity_event_type": ("liquidity_event_type",),
+    "structure_trend_state": ("structure_trend_state", "h1_structure_trend_state"),
+    "atr_percentile_bucket": ("atr_percentile_bucket", "h1_atr_percentile_bucket"),
+    "d1_structure_trend_state": ("d1_structure_trend_state", "d1_trend_state"),
+    "d1_market_stage": ("d1_market_stage",),
+    "d1_market_stage_reduced": ("d1_market_stage_reduced",),
+    "h4_structure_trend_state": ("h4_structure_trend_state", "h4_trend_state"),
+    "h4_market_stage": ("h4_market_stage",),
+    "h4_market_stage_reduced": ("h4_market_stage_reduced",),
+    "h4_market_stage_reason": ("h4_market_stage_reason",),
+}
+
+
+STATE_TRADABILITY_SCHEMA: dict[str, type[pl.DataType]] = {
+    "artifact": pl.Utf8,
+    "symbol": pl.Utf8,
+    "state_column": pl.Utf8,
+    "state_value": pl.Utf8,
+    "rows": pl.Int64,
+    "transition_entropy": pl.Float64,
+    "transition_entropy_norm": pl.Float64,
+    "self_transition_pct": pl.Float64,
+    "median_dwell_bars": pl.Float64,
+    "autocorr_1": pl.Float64,
+    "autocorr_3": pl.Float64,
+    "autocorr_score": pl.Float64,
+    "autocorr_score_norm": pl.Float64,
+    "return_mean": pl.Float64,
+    "return_variance": pl.Float64,
+    "cv2": pl.Float64,
+    "cv2_norm": pl.Float64,
+    "eti": pl.Float64,
+    "tradability_bucket": pl.Utf8,
+}
+
+
+CLASSIFIER_VALIDITY_SCHEMA: dict[str, type[pl.DataType]] = {
+    "artifact": pl.Utf8,
+    "check": pl.Utf8,
+    "status": pl.Utf8,
+    "value": pl.Float64,
+    "threshold": pl.Float64,
+    "reason": pl.Utf8,
+    "state_column": pl.Utf8,
+}
+
+
+_MODULATION_ALIASES: dict[str, tuple[str, ...]] = {
+    "entry_market_stage_bucket": ("entry_market_stage_bucket", "entry_market_stage"),
+    "entry_market_stage_reason_bucket": (
+        "entry_market_stage_reason_bucket",
+        "entry_market_stage_reason",
+    ),
+    "entry_liquidity_event_type_bucket": (
+        "entry_liquidity_event_type_bucket",
+        "entry_liquidity_event_type",
+    ),
+    "entry_structure_bucket": ("entry_structure_bucket", "entry_structure_trend_state"),
+    "entry_d1_structure_trend_state": (
+        "entry_d1_structure_trend_state",
+        "entry_d1_trend_state",
+    ),
+    "entry_d1_market_stage": ("entry_d1_market_stage",),
+    "entry_h4_structure_trend_state": (
+        "entry_h4_structure_trend_state",
+        "entry_h4_trend_state",
+    ),
+    "entry_h4_market_stage": ("entry_h4_market_stage",),
+    "entry_h1_atr_percentile_bucket": (
+        "entry_h1_atr_percentile_bucket",
+        "entry_atr_percentile_bucket",
+    ),
+    "entry_atr_percentile_bucket": (
+        "entry_atr_percentile_bucket",
+        "entry_h1_atr_percentile_bucket",
+    ),
+    "entry_adx_regime": ("entry_adx_regime", "entry_adx_bucket"),
+    "entry_adx_bucket": ("entry_adx_bucket", "entry_adx_regime"),
+    "side": ("side",),
+}
+
+
+def add_market_state_reductions(frame: pl.DataFrame) -> pl.DataFrame:
+    """Add canonical analytical state projections without mutating raw labels."""
+    if frame.is_empty():
+        return frame
+    work = frame
+    for prefix in ("", "h1_", "h4_", "d1_"):
+        stage_col = f"{prefix}market_stage"
+        reason_col = f"{prefix}market_stage_reason"
+        output_col = f"{prefix}market_stage_reduced"
+        if output_col in work.columns or not ({stage_col, reason_col} & set(work.columns)):
+            continue
+        stage = pl.col(stage_col).cast(pl.Utf8) if stage_col in work.columns else pl.lit(None)
+        reason = pl.col(reason_col).cast(pl.Utf8) if reason_col in work.columns else pl.lit(None)
+        work = work.with_columns(_market_stage_reduction_expr(stage, reason).alias(output_col))
+    return work
+
+
+def _market_stage_reduction_expr(stage: pl.Expr, reason: pl.Expr) -> pl.Expr:
+    return (
+        pl.when(reason == "wide_range_no_stage")
+        .then(pl.lit("wide_range"))
+        .when(reason == "trend_without_range_break")
+        .then(pl.lit("trend_continuation"))
+        .when(reason == "compressed_mid_range")
+        .then(pl.lit("range"))
+        .when(reason == "compressed_near_low")
+        .then(pl.lit("accumulation"))
+        .when(reason == "compressed_near_high")
+        .then(pl.lit("distribution_or_reversal"))
+        .when(reason == "markup_breakout")
+        .then(pl.lit("markup"))
+        .when(reason == "markdown_breakout")
+        .then(pl.lit("markdown"))
+        .otherwise(stage.fill_null(reason).fill_null("unknown"))
+    )
+
+
+def market_state_forward_frame(
+    frame: pl.DataFrame,
+    *,
+    symbol: str = "ALL",
+    horizons: tuple[int, ...] = (3, 5, 10),
+    direction_flat_threshold_pct: float = 0.05,
+) -> pl.DataFrame:
+    required = {"close", "high", "low", "atr_14"}
+    if frame.is_empty() or not required <= set(frame.columns):
+        return _empty_market_state_forward_frame(horizons)
+    work = frame.with_columns(pl.lit(symbol).alias("symbol"))
+    for horizon in tuple(dict.fromkeys(horizons)):
+        if horizon <= 0:
+            continue
+        future_high = pl.max_horizontal(
+            *[pl.col("high").shift(-idx) for idx in range(1, horizon + 1)]
+        )
+        future_low = pl.min_horizontal(
+            *[pl.col("low").shift(-idx) for idx in range(1, horizon + 1)]
+        )
+        future_close = pl.col("close").shift(-horizon)
+        safe_atr = pl.when(pl.col("atr_14").abs() > 1e-10).then(pl.col("atr_14"))
+        return_pct = (future_close / pl.col("close") - 1.0) * 100.0
+        return_atr = (future_close - pl.col("close")) / safe_atr
+        max_up_pct = (future_high / pl.col("close") - 1.0) * 100.0
+        max_down_pct = (future_low / pl.col("close") - 1.0) * 100.0
+        mfe_long_atr = (future_high - pl.col("close")) / safe_atr
+        mae_long_atr = (pl.col("close") - future_low) / safe_atr
+        direction = (
+            pl.when(return_pct.is_null())
+            .then(pl.lit(None, dtype=pl.Utf8))
+            .when(return_pct > direction_flat_threshold_pct)
+            .then(pl.lit("up"))
+            .when(return_pct < -direction_flat_threshold_pct)
+            .then(pl.lit("down"))
+            .otherwise(pl.lit("flat"))
+        )
+        continuation_up = (
+            (future_high.is_not_null())
+            & (pl.col("high").is_not_null())
+            & (future_high > pl.col("high") * (1.0 + direction_flat_threshold_pct / 100.0))
+        ).fill_null(False)
+        continuation_down = (
+            (future_low.is_not_null())
+            & (pl.col("low").is_not_null())
+            & (future_low < pl.col("low") * (1.0 - direction_flat_threshold_pct / 100.0))
+        ).fill_null(False)
+        work = work.with_columns(
+            return_pct.alias(f"fwd_{horizon}_return_pct"),
+            return_atr.alias(f"fwd_{horizon}_return_atr"),
+            max_up_pct.alias(f"fwd_{horizon}_max_up_pct"),
+            max_down_pct.alias(f"fwd_{horizon}_max_down_pct"),
+            mfe_long_atr.alias(f"fwd_{horizon}_mfe_long_atr"),
+            mae_long_atr.alias(f"fwd_{horizon}_mae_long_atr"),
+            mae_long_atr.alias(f"fwd_{horizon}_mfe_short_atr"),
+            mfe_long_atr.alias(f"fwd_{horizon}_mae_short_atr"),
+            direction.alias(f"fwd_{horizon}_direction"),
+            continuation_up.alias(f"fwd_{horizon}_trend_continuation_up"),
+            continuation_down.alias(f"fwd_{horizon}_trend_continuation_down"),
+            (continuation_down & (return_pct > direction_flat_threshold_pct)).alias(
+                f"fwd_{horizon}_reversal_up"
+            ),
+            (continuation_up & (return_pct < -direction_flat_threshold_pct)).alias(
+                f"fwd_{horizon}_reversal_down"
+            ),
+        )
+    return work
+
+
+def market_state_forward_summary(
+    frame: pl.DataFrame,
+    *,
+    group_columns: tuple[str, ...],
+    horizon: int = 10,
+    min_rows: int = 30,
+) -> pl.DataFrame:
+    return_col = f"fwd_{horizon}_return_pct"
+    direction_col = f"fwd_{horizon}_direction"
+    required = {
+        return_col,
+        direction_col,
+        f"fwd_{horizon}_return_atr",
+        f"fwd_{horizon}_mfe_long_atr",
+        f"fwd_{horizon}_mae_long_atr",
+        f"fwd_{horizon}_mfe_short_atr",
+        f"fwd_{horizon}_mae_short_atr",
+    }
+    resolved = _resolve_market_state_columns(frame, group_columns)
+    if frame.is_empty() or not required <= set(frame.columns) or not resolved:
+        return pl.DataFrame(schema=MARKET_STATE_FORWARD_SUMMARY_SCHEMA)
+    group_names = [name for name, _source in resolved]
+    work = frame.filter(pl.col(return_col).is_not_null()).with_columns(
+        *[_market_state_value_expr(source, name).alias(name) for name, source in resolved]
+    )
+    if work.is_empty():
+        return pl.DataFrame(schema=MARKET_STATE_FORWARD_SUMMARY_SCHEMA)
+    symbol_expr = (
+        pl.when(pl.col("symbol").n_unique() == 1)
+        .then(pl.col("symbol").first())
+        .otherwise(pl.lit("ALL"))
+        if "symbol" in work.columns
+        else pl.lit("ALL")
+    )
+    group_key_expr = pl.concat_str([pl.col(name) for name in group_names], separator="|")
+    grouped = (
+        work.group_by(group_names)
+        .agg(
+            symbol_expr.alias("symbol"),
+            group_key_expr.first().alias("group_key"),
+            pl.len().alias("rows"),
+            (pl.col(direction_col) == "up").sum().alias("up_count"),
+            (pl.col(direction_col) == "down").sum().alias("down_count"),
+            (pl.col(direction_col) == "flat").sum().alias("flat_count"),
+            pl.col(return_col).cast(pl.Float64).mean().alias("mean_return_pct"),
+            pl.col(return_col).cast(pl.Float64).median().alias("median_return_pct"),
+            pl.col(return_col).cast(pl.Float64).std(ddof=1).fill_null(0.0).alias("return_std"),
+            pl.col(f"fwd_{horizon}_return_atr").cast(pl.Float64).mean().alias("mean_return_atr"),
+            pl.col(f"fwd_{horizon}_mfe_long_atr")
+            .cast(pl.Float64)
+            .mean()
+            .alias("mean_mfe_long_atr"),
+            pl.col(f"fwd_{horizon}_mae_long_atr")
+            .cast(pl.Float64)
+            .mean()
+            .alias("mean_mae_long_atr"),
+            pl.col(f"fwd_{horizon}_mfe_short_atr")
+            .cast(pl.Float64)
+            .mean()
+            .alias("mean_mfe_short_atr"),
+            pl.col(f"fwd_{horizon}_mae_short_atr")
+            .cast(pl.Float64)
+            .mean()
+            .alias("mean_mae_short_atr"),
+        )
+        .with_columns(
+            (pl.col("up_count") / pl.col("rows") * 100.0).alias("up_rate_pct"),
+            (pl.col("down_count") / pl.col("rows") * 100.0).alias("down_rate_pct"),
+            (pl.col("flat_count") / pl.col("rows") * 100.0).alias("flat_rate_pct"),
+            (pl.col("return_std") / pl.col("rows").sqrt()).alias("return_se"),
+            (pl.col("rows") >= min_rows).alias("sufficient_rows"),
+            pl.lit(max(0, horizon - 1)).alias("overlap_lag"),
+        )
+        .with_columns(
+            (pl.col("mean_return_pct") - 1.96 * pl.col("return_se")).alias("return_ci_low"),
+            (pl.col("mean_return_pct") + 1.96 * pl.col("return_se")).alias("return_ci_high"),
+            pl.col("rows").cast(pl.Float64).alias("effective_rows"),
+            (pl.col("mean_return_pct") - 1.96 * pl.col("return_se")).alias(
+                "overlap_adjusted_ci_low"
+            ),
+            (pl.col("mean_return_pct") + 1.96 * pl.col("return_se")).alias(
+                "overlap_adjusted_ci_high"
+            ),
+            pl.when(pl.col("overlap_lag") > 0)
+            .then(pl.lit("overlapping_forward_windows"))
+            .otherwise(pl.lit("none"))
+            .alias("overlap_warning"),
+        )
+        .with_columns(
+            pl.when(~pl.col("sufficient_rows"))
+            .then(pl.lit("insufficient"))
+            .when(
+                (pl.col("mean_return_pct") > 0.0)
+                & ((pl.col("return_ci_low") > 0.0) | (pl.col("up_rate_pct") >= 60.0))
+            )
+            .then(pl.lit("up"))
+            .when(
+                (pl.col("mean_return_pct") < 0.0)
+                & ((pl.col("return_ci_high") < 0.0) | (pl.col("down_rate_pct") >= 60.0))
+            )
+            .then(pl.lit("down"))
+            .otherwise(pl.lit("flat_or_mixed"))
+            .alias("directional_bias"),
+            pl.lit("forward-summary").alias("artifact"),
+            pl.lit(horizon).alias("horizon"),
+            pl.lit("+".join(group_names)).alias("group_columns"),
+        )
+        .select(list(MARKET_STATE_FORWARD_SUMMARY_SCHEMA))
+    )
+    return grouped.sort(
+        ["horizon", "group_columns", "rows", "group_key"],
+        descending=[False, False, True, False],
+    )
+
+
+def market_state_modulation_matrix(
+    frame: pl.DataFrame,
+    *,
+    base_columns: tuple[str, ...] = MARKET_STATE_BASE_COLUMNS,
+    modulator_columns: tuple[str, ...] = MARKET_STATE_MODULATOR_COLUMNS,
+    outcome_column: str = "fwd_10_return_pct",
+    min_base_rows: int = 100,
+    min_cell_rows: int = 30,
+    practical_delta_threshold: float = 0.15,
+    time_splits: int = 2,
+    min_segment_base_rows: int = 50,
+    min_segment_cell_rows: int = 15,
+    robustness: ModulationRobustnessConfig | None = None,
+) -> pl.DataFrame:
+    robustness = robustness or ModulationRobustnessConfig()
+    if frame.is_empty() or outcome_column not in frame.columns:
+        return pl.DataFrame(schema=MARKET_STATE_MODULATION_SCHEMA)
+    horizon = _horizon_from_outcome(outcome_column)
+    outcome_kind = _outcome_kind_from_column(outcome_column)
+    atr_column = _companion_return_atr_column(outcome_column)
+    prepared = frame.filter(pl.col(outcome_column).is_not_null()).with_columns(
+        pl.col(outcome_column).cast(pl.Float64).alias("_mod_return"),
+        (
+            pl.col(atr_column).cast(pl.Float64)
+            if atr_column in frame.columns
+            else pl.lit(None, dtype=pl.Float64)
+        ).alias("_mod_return_atr"),
+        (
+            pl.col("symbol").cast(pl.Utf8).fill_null("UNKNOWN")
+            if "symbol" in frame.columns
+            else pl.lit("ALL")
+        ).alias("_mod_symbol"),
+    )
+    bases = _resolve_market_state_columns(prepared, base_columns)
+    modulators = _resolve_market_state_columns(prepared, modulator_columns)
+    if prepared.is_empty() or not bases or not modulators:
+        return pl.DataFrame(schema=MARKET_STATE_MODULATION_SCHEMA)
+    rows: list[dict[str, object]] = []
+    for symbol, symbol_frame in [("ALL", prepared), *_modulation_symbol_frames(prepared)]:
+        rows.extend(
+            _market_state_modulation_rows_for_frame(
+                symbol_frame,
+                symbol=str(symbol),
+                horizon=horizon,
+                outcome_column=outcome_column,
+                outcome_kind=outcome_kind,
+                resolved_bases=bases,
+                resolved_modulators=modulators,
+                min_base_rows=min_base_rows,
+                min_cell_rows=min_cell_rows,
+                practical_delta_threshold=practical_delta_threshold,
+                time_splits=time_splits,
+                min_segment_base_rows=min_segment_base_rows,
+                min_segment_cell_rows=min_segment_cell_rows,
+                robustness=robustness,
+            )
+        )
+    if not rows:
+        return pl.DataFrame(schema=MARKET_STATE_MODULATION_SCHEMA)
+    result = _classify_market_state_modulation_rows(
+        pl.DataFrame(rows, schema=MARKET_STATE_MODULATION_SCHEMA)
+    )
+    if robustness.fdr:
+        result = _append_market_state_fdr(result, alpha=robustness.fdr_alpha)
+    return result.sort(
+        ["classification", "symbol", "base_feature", "base_value", "modulator", "modulator_value"],
+        descending=[False, False, False, False, False, False],
+    )
+
+
+@dataclass(frozen=True)
+class MarketStateAnalysisResult:
+    summary_frames: tuple[pl.DataFrame, ...] = ()
+    modulation_frames: tuple[pl.DataFrame, ...] = ()
+
+    def export_frame(self) -> pl.DataFrame:
+        frames = [*self.summary_frames, *self.modulation_frames]
+        frames = [frame for frame in frames if not frame.is_empty()]
+        if not frames:
+            return pl.DataFrame(schema=MARKET_STATE_FORWARD_EXPORT_SCHEMA)
+        return pl.concat(frames, how="diagonal_relaxed")
+
+    def to_text(self, *, limit: int = 8) -> str:
+        frame = self.export_frame()
+        if frame.is_empty():
+            return "Market-state forward diagnostics\nno market-state forward rows"
+        summaries = frame.filter(pl.col("artifact") == "forward-summary")
+        modulation = frame.filter(pl.col("artifact") == "market-state-modulation")
+        sufficient = (
+            summaries.filter(pl.col("sufficient_rows"))
+            if "sufficient_rows" in summaries.columns
+            else summaries
+        )
+        biased = (
+            sufficient.filter(pl.col("directional_bias").is_in(["up", "down"]))
+            if "directional_bias" in sufficient.columns
+            else sufficient
+        )
+        significant_mod = (
+            modulation.filter(pl.col("significant"))
+            if "significant" in modulation.columns
+            else modulation
+        )
+        rows = [
+            [
+                "Coverage",
+                f"summary_rows={summaries.height} modulation_rows={modulation.height} "
+                f"sufficient_groups={sufficient.height} directional_groups={biased.height} "
+                "confidence_bands=exploratory_overlapping_windows",
+            ],
+            [
+                "Top positive states",
+                _format_market_state_groups(summaries, limit=limit, descending=True),
+            ],
+            [
+                "Top negative states",
+                _format_market_state_groups(summaries, limit=limit, descending=False),
+            ],
+            [
+                "Significant modulation",
+                _format_market_state_modulation(significant_mod, limit=limit),
+            ],
+        ]
+        if sufficient.is_empty():
+            rows.append(["Actionability warning", "all actionable groups are sparse"])
+        return "Market-state forward diagnostics\n" + format_table(["Diagnostic", "Summary"], rows)
+
+
+def format_market_state_forward_summary(frame: pl.DataFrame, *, limit: int = 8) -> str:
+    return MarketStateAnalysisResult((frame,), ()).to_text(limit=limit)
+
+
+def state_tradability_frame(
+    frame: pl.DataFrame,
+    config: TradabilityConfig | None = None,
+) -> pl.DataFrame:
+    config = config or TradabilityConfig()
+    if frame.is_empty() or "close" not in frame.columns:
+        return pl.DataFrame(schema=STATE_TRADABILITY_SCHEMA)
+    work = (
+        add_market_state_reductions(frame)
+        .with_row_index("_row_nr")
+        .with_columns(
+            (pl.col("close") / pl.col("close").shift(1) - 1.0).fill_null(0.0).alias("_eti_return"),
+            (
+                pl.col("symbol").cast(pl.Utf8).fill_null("ALL")
+                if "symbol" in frame.columns
+                else pl.lit("ALL")
+            ).alias("_eti_symbol"),
+        )
+    )
+    long_frames = []
+    for logical_column, source_column in _resolve_market_state_columns(work, config.state_columns):
+        long_frames.append(
+            work.select(
+                "_row_nr",
+                "_eti_return",
+                pl.col("_eti_symbol").alias("symbol"),
+                pl.lit(logical_column).alias("state_column"),
+                pl.col(source_column).cast(pl.Utf8).fill_null("unknown").alias("state_value"),
+            )
+        )
+    if not long_frames:
+        return pl.DataFrame(schema=STATE_TRADABILITY_SCHEMA)
+    long = pl.concat(long_frames, how="diagonal_relaxed")
+    base = long.group_by("symbol", "state_column", "state_value").agg(
+        pl.len().alias("rows"),
+        pl.col("_eti_return").mean().alias("return_mean"),
+        pl.col("_eti_return").var().fill_null(0.0).alias("return_variance"),
+    )
+    transitions = (
+        long.sort("state_column", "_row_nr")
+        .with_columns(pl.col("state_value").shift(-1).over("state_column").alias("next_state"))
+        .drop_nulls("next_state")
+    )
+    transition_metrics = _native_transition_metrics(transitions)
+    dwell_metrics = _native_dwell_metrics(long)
+    result = (
+        base.join(transition_metrics, on=["symbol", "state_column", "state_value"], how="left")
+        .join(dwell_metrics, on=["symbol", "state_column", "state_value"], how="left")
+        .with_columns(
+            pl.col("transition_entropy").fill_null(0.0),
+            pl.col("transition_entropy_norm").fill_null(0.0),
+            pl.col("self_transition_pct").fill_null(0.0),
+            pl.col("median_dwell_bars").fill_null(0.0),
+            pl.lit(0.0).alias("autocorr_1"),
+            pl.lit(0.0).alias("autocorr_3"),
+            pl.lit(0.0).alias("autocorr_score"),
+            (pl.col("return_variance") / (pl.col("return_mean") ** 2 + 1e-12)).alias("cv2"),
+            pl.when(pl.col("rows") < config.min_rows)
+            .then(pl.lit("insufficient"))
+            .otherwise(pl.lit("pending"))
+            .alias("tradability_bucket"),
+            pl.lit("state-tradability").alias("artifact"),
+        )
+    )
+    return _with_tradability_scores(result, config).select(list(STATE_TRADABILITY_SCHEMA))
+
+
+def _native_transition_metrics(transitions: pl.DataFrame) -> pl.DataFrame:
+    if transitions.is_empty():
+        return pl.DataFrame(
+            {
+                "symbol": [],
+                "state_column": [],
+                "state_value": [],
+                "transition_entropy": [],
+                "transition_entropy_norm": [],
+                "self_transition_pct": [],
+            }
+        )
+    counts = transitions.group_by("symbol", "state_column", "state_value", "next_state").agg(
+        pl.len().alias("count")
+    )
+    totals = counts.group_by("symbol", "state_column", "state_value").agg(
+        pl.col("count").sum().alias("total"),
+        pl.col("next_state").n_unique().alias("next_unique"),
+        pl.when(pl.col("next_state") == pl.col("state_value"))
+        .then(pl.col("count"))
+        .otherwise(0)
+        .sum()
+        .alias("self_count"),
+        (
+            -(pl.col("count") / pl.col("count").sum())
+            * (pl.col("count") / pl.col("count").sum()).log(2)
+        )
+        .sum()
+        .alias("transition_entropy"),
+    )
+    return totals.with_columns(
+        (pl.col("transition_entropy") / pl.max_horizontal(pl.col("next_unique"), 2).log(2))
+        .clip(0.0, 1.0)
+        .alias("transition_entropy_norm"),
+        (pl.col("self_count") / pl.col("total") * 100.0).alias("self_transition_pct"),
+    ).select(
+        "symbol",
+        "state_column",
+        "state_value",
+        "transition_entropy",
+        "transition_entropy_norm",
+        "self_transition_pct",
+    )
+
+
+def _native_dwell_metrics(long: pl.DataFrame) -> pl.DataFrame:
+    if long.is_empty():
+        return pl.DataFrame(
+            {"symbol": [], "state_column": [], "state_value": [], "median_dwell_bars": []}
+        )
+    runs = (
+        long.sort("state_column", "_row_nr")
+        .with_columns(
+            (
+                (pl.col("state_value") != pl.col("state_value").shift(1).over("state_column"))
+                | pl.col("state_value").shift(1).over("state_column").is_null()
+            )
+            .cast(pl.Int64)
+            .cum_sum()
+            .over("state_column")
+            .alias("run_id")
+        )
+        .group_by("symbol", "state_column", "state_value", "run_id")
+        .agg(pl.len().alias("run_length"))
+    )
+    return runs.group_by("symbol", "state_column", "state_value").agg(
+        pl.col("run_length").median().cast(pl.Float64).alias("median_dwell_bars")
+    )
+
+
+def classifier_validity_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty():
+        return pl.DataFrame(schema=CLASSIFIER_VALIDITY_SCHEMA)
+    work = add_market_state_reductions(frame)
+    health = classifier_health_frame(work)
+    frames = []
+    if not health.is_empty():
+        frames.append(
+            health.select(
+                pl.lit("classifier-validity").alias("artifact"),
+                pl.col("health_check").alias("check"),
+                pl.col("status"),
+                pl.col("value").cast(pl.Float64),
+                pl.col("threshold").cast(pl.Float64),
+                pl.col("reason"),
+                pl.lit("").alias("state_column"),
+            )
+        )
+    frames.extend(
+        frame
+        for frame in (_regime_separation_frame(work), _liquidity_event_enrichment_frame(work))
+        if not frame.is_empty()
+    )
+    if not frames:
+        return pl.DataFrame(schema=CLASSIFIER_VALIDITY_SCHEMA)
+    return pl.concat(frames, how="diagonal_relaxed").select(list(CLASSIFIER_VALIDITY_SCHEMA))
+
+
+@dataclass(frozen=True)
+class TradabilityResult:
+    frames: tuple[pl.DataFrame, ...] = ()
+
+    def export_frame(self) -> pl.DataFrame:
+        frames = [frame for frame in self.frames if not frame.is_empty()]
+        return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+    def to_text(self, *, limit: int = 8) -> str:
+        frame = self.export_frame()
+        if frame.is_empty():
+            return "State tradability diagnostics\nno tradability rows"
+        tradability = frame.filter(pl.col("artifact") == "state-tradability")
+        validity = frame.filter(pl.col("artifact") == "classifier-validity")
+        rows = []
+        if not tradability.is_empty() and "eti" in tradability.columns:
+            top = tradability.sort("eti", descending=True).head(limit)
+            rows.append(["Top ETI states", self._rows_text(top)])
+            low_entropy = tradability.sort("transition_entropy_norm").head(limit)
+            rows.append(["Lowest entropy states", self._rows_text(low_entropy)])
+        if not validity.is_empty() and "status" in validity.columns:
+            counts = validity.group_by("status").agg(pl.len().alias("count"))
+            summary = ", ".join(
+                f"{row['status']}={row['count']}" for row in counts.iter_rows(named=True)
+            )
+            rows.append(["Classifier validity", summary])
+        return "State tradability diagnostics\n" + format_table(["Diagnostic", "Summary"], rows)
+
+    def _rows_text(self, frame: pl.DataFrame) -> str:
+        if frame.is_empty():
+            return "none"
+        return "; ".join(
+            f"{row['state_column']}={row['state_value']} "
+            f"eti={float(row['eti']):.2f} rows={row['rows']}"
+            for row in frame.iter_rows(named=True)
+        )
+
+
+def _with_tradability_scores(frame: pl.DataFrame, config: TradabilityConfig) -> pl.DataFrame:
+    if frame.is_empty():
+        return frame
+    autocorr_norm = _minmax_expr("autocorr_score", invert=False)
+    cv2_norm = _minmax_expr("cv2", invert=False)
+    eligible = pl.col("rows") >= config.min_rows
+    eti = (
+        (1.0 - pl.col("transition_entropy_norm")) * config.entropy_weight
+        + autocorr_norm * config.autocorr_weight
+        + (1.0 - cv2_norm) * config.volatility_efficiency_weight
+    ).clip(0.0, 1.0)
+    return frame.with_columns(
+        autocorr_norm.alias("autocorr_score_norm"),
+        cv2_norm.alias("cv2_norm"),
+    ).with_columns(
+        pl.when(~eligible).then(0.0).otherwise(eti).alias("eti"),
+        pl.when(~eligible)
+        .then(pl.lit("insufficient"))
+        .when(eti >= 0.67)
+        .then(pl.lit("high"))
+        .when(eti >= 0.34)
+        .then(pl.lit("medium"))
+        .otherwise(pl.lit("low"))
+        .alias("tradability_bucket"),
+    )
+
+
+def _minmax_expr(column: str, *, invert: bool) -> pl.Expr:
+    col = pl.col(column).cast(pl.Float64)
+    min_value = col.min()
+    max_value = col.max()
+    normalized = (
+        pl.when((max_value - min_value).abs() <= 1e-12)
+        .then(0.0)
+        .otherwise((col - min_value) / (max_value - min_value))
+    )
+    return 1.0 - normalized if invert else normalized
+
+
+def _regime_separation_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    frames = []
+    for metric in ("atr_14", "adx_14"):
+        if metric not in frame.columns or "market_stage_reduced" not in frame.columns:
+            continue
+        eta = _eta_squared_native(frame, "market_stage_reduced", metric)
+        frames.append(
+            pl.DataFrame(
+                {
+                    "artifact": ["classifier-validity"],
+                    "check": [f"{metric}_state_separation"],
+                    "status": ["pass" if eta >= 0.05 else "warn"],
+                    "value": [eta],
+                    "threshold": [0.05],
+                    "reason": [f"eta_squared={eta:.3f}"],
+                    "state_column": ["market_stage_reduced"],
+                },
+                schema=CLASSIFIER_VALIDITY_SCHEMA,
+            )
+        )
+    return (
+        pl.concat(frames, how="diagonal_relaxed")
+        if frames
+        else pl.DataFrame(schema=CLASSIFIER_VALIDITY_SCHEMA)
+    )
+
+
+def _eta_squared_native(frame: pl.DataFrame, group_col: str, value_col: str) -> float:
+    work = frame.select(group_col, value_col).drop_nulls()
+    if work.height < 2:
+        return 0.0
+    stats = work.select(
+        pl.col(value_col).cast(pl.Float64).mean().alias("grand_mean"),
+        pl.col(value_col).cast(pl.Float64).var().alias("variance"),
+        pl.len().alias("rows"),
+    ).row(0, named=True)
+    total_ss = float(stats["variance"] or 0.0) * max(int(stats["rows"] or 0) - 1, 0)
+    if total_ss <= 1e-12:
+        return 0.0
+    grand_mean = float(stats["grand_mean"] or 0.0)
+    between = (
+        work.group_by(group_col)
+        .agg(
+            pl.len().alias("rows"),
+            pl.col(value_col).cast(pl.Float64).mean().alias("mean"),
+        )
+        .select((pl.col("rows") * (pl.col("mean") - grand_mean) ** 2).sum())
+        .item()
+    )
+    return float(max(0.0, min(1.0, float(between or 0.0) / total_ss)))
+
+
+def _liquidity_event_enrichment_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if "market_stage_reduced" not in frame.columns or "liquidity_event_type" not in frame.columns:
+        return pl.DataFrame(schema=CLASSIFIER_VALIDITY_SCHEMA)
+    work = frame.with_columns(
+        (pl.col("liquidity_event_type").cast(pl.Utf8).fill_null("none") != "none").alias(
+            "has_event"
+        )
+    )
+    unconditional = float(work.select(pl.col("has_event").mean()).item() or 0.0)
+    grouped = (
+        work.group_by("market_stage_reduced")
+        .agg(pl.len().alias("rows"), pl.col("has_event").mean().alias("event_rate"))
+        .filter(pl.col("rows") >= 10)
+        .with_columns((pl.col("event_rate") / max(unconditional, 1e-12)).alias("enrichment"))
+        .sort("enrichment", descending=True)
+        .head(1)
+    )
+    if grouped.is_empty():
+        best = 0.0
+        best_stage = "none"
+    else:
+        row = grouped.row(0, named=True)
+        best = float(row["enrichment"] or 0.0)
+        best_stage = str(row["market_stage_reduced"] or "none")
+    return pl.DataFrame(
+        {
+            "artifact": ["classifier-validity"],
+            "check": ["liquidity_event_stage_enrichment"],
+            "status": ["pass" if best >= 1.5 else "warn"],
+            "value": [best],
+            "threshold": [1.5],
+            "reason": [f"best_stage={best_stage} enrichment={best:.2f}"],
+            "state_column": ["market_stage_reduced"],
+        },
+        schema=CLASSIFIER_VALIDITY_SCHEMA,
+    )
+
+
+def _empty_market_state_forward_frame(horizons: tuple[int, ...]) -> pl.DataFrame:
+    data: dict[str, list[object]] = {
+        "symbol": [],
+        "timestamp": [],
+        "close": [],
+        "high": [],
+        "low": [],
+        "atr_14": [],
+    }
+    for horizon in horizons:
+        for suffix in (
+            "return_pct",
+            "return_atr",
+            "max_up_pct",
+            "max_down_pct",
+            "mfe_long_atr",
+            "mae_long_atr",
+            "mfe_short_atr",
+            "mae_short_atr",
+            "direction",
+            "trend_continuation_up",
+            "trend_continuation_down",
+            "reversal_up",
+            "reversal_down",
+        ):
+            data[f"fwd_{horizon}_{suffix}"] = []
+    return pl.DataFrame(data)
+
+
+def _resolve_market_state_columns(
+    frame: pl.DataFrame, columns: tuple[str, ...]
+) -> tuple[tuple[str, str], ...]:
+    resolved = []
+    for column in columns:
+        source = _first_column(frame, _MARKET_STATE_ALIASES.get(column, (column,)))
+        if source:
+            resolved.append((column, source))
+    return tuple(dict.fromkeys(resolved))
+
+
+def _market_state_value_expr(column: str, logical_name: str) -> pl.Expr:
+    del logical_name
+    return pl.col(column).cast(pl.Utf8).fill_null("unknown")
+
+
+def _horizon_from_outcome(column: str) -> int:
+    parts = column.split("_")
+    if len(parts) >= 2 and parts[0] == "fwd":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _outcome_kind_from_column(column: str) -> str:
+    parts = column.split("_")
+    if len(parts) >= 3 and parts[0] == "fwd":
+        return "_".join(parts[2:])
+    return column
+
+
+def _mean_array(values: np.ndarray) -> float:
+    if values.size == 0:
+        return 0.0
+    return float(np.nanmean(values))
+
+
+def _quantile_array(values: np.ndarray, q: float) -> float:
+    if values.size == 0:
+        return 0.0
+    return float(np.nanquantile(values, q))
+
+
+def _cvar_array(values: np.ndarray, q: float) -> float:
+    if values.size == 0:
+        return 0.0
+    threshold = np.nanquantile(values, q)
+    tail = values[values <= threshold]
+    return _mean_array(tail)
+
+
+def _cohens_d_array(base_values: np.ndarray, cell_values: np.ndarray, delta: float) -> float:
+    if base_values.size <= 1 or cell_values.size <= 1:
+        return 0.0
+    base_var = float(np.nanvar(base_values, ddof=1))
+    cell_var = float(np.nanvar(cell_values, ddof=1))
+    denom_n = base_values.size + cell_values.size - 2
+    if denom_n <= 0:
+        return 0.0
+    pooled = math.sqrt(
+        max(((base_values.size - 1) * base_var + (cell_values.size - 1) * cell_var) / denom_n, 0.0)
+    )
+    if pooled <= 1e-12:
+        return 0.0
+    return delta / pooled
+
+
+def _auto_newey_west_lag(n: int) -> int:
+    if n <= 1:
+        return 0
+    return min(n - 1, max(0, int(math.floor(4 * (n / 100) ** (2 / 9)))))
+
+
+def _newey_west_standard_error(values: np.ndarray, *, max_lag: int | None = None) -> float:
+    n = int(values.size)
+    if n <= 1:
+        return 0.0
+    lag_limit = min(n - 1, _auto_newey_west_lag(n) if max_lag is None else max(0, int(max_lag)))
+    centered = values - _mean_array(values)
+    gamma0 = float(np.dot(centered, centered) / n)
+    variance = gamma0
+    for lag in range(1, lag_limit + 1):
+        weight = 1.0 - lag / (lag_limit + 1.0)
+        gamma = float(np.dot(centered[lag:], centered[:-lag]) / n)
+        variance += 2.0 * weight * gamma
+    return math.sqrt(max(variance, 0.0) / n)
+
+
+def _standard_error_array(values: np.ndarray) -> float:
+    if values.size <= 1:
+        return 0.0
+    return float(np.nanstd(values, ddof=1) / math.sqrt(values.size))
+
+
+def _standard_error_for_method(
+    values: np.ndarray,
+    *,
+    method: str,
+    max_lag: int | None,
+) -> float:
+    if method == "newey_west":
+        return _newey_west_standard_error(values, max_lag=max_lag)
+    if method == "effective_n":
+        return adjusted_standard_error(values.tolist(), max_lag=max_lag)
+    return _standard_error_array(values)
+
+
+def _delta_robust_standard_error_band(
+    base_values: np.ndarray,
+    cell_values: np.ndarray,
+    delta: float,
+    *,
+    method: str,
+    max_lag: int | None,
+) -> tuple[float, float, float]:
+    base_se = _standard_error_for_method(base_values, method=method, max_lag=max_lag)
+    cell_se = _standard_error_for_method(cell_values, method=method, max_lag=max_lag)
+    delta_se = math.sqrt(base_se**2 + cell_se**2)
+    band = 1.96 * delta_se
+    return delta - band, delta + band, delta_se
+
+
+def _normal_approx_p_value(delta: float, se: float) -> float:
+    if se <= 1e-12:
+        return 0.0 if abs(delta) > 1e-12 else 1.0
+    z = abs(delta / se)
+    return math.erfc(z / math.sqrt(2.0))
+
+
+def _companion_return_atr_column(outcome_column: str) -> str:
+    horizon = _horizon_from_outcome(outcome_column)
+    return f"fwd_{horizon}_return_atr" if horizon else ""
+
+
+def _market_state_modulation_rows_for_frame(
+    frame: pl.DataFrame,
+    *,
+    symbol: str,
+    horizon: int,
+    outcome_column: str,
+    outcome_kind: str,
+    resolved_bases: tuple[tuple[str, str], ...],
+    resolved_modulators: tuple[tuple[str, str], ...],
+    min_base_rows: int,
+    min_cell_rows: int,
+    practical_delta_threshold: float,
+    time_splits: int,
+    min_segment_base_rows: int,
+    min_segment_cell_rows: int,
+    robustness: ModulationRobustnessConfig,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for base_name, base_col in resolved_bases:
+        base_prepared = frame.with_columns(
+            _market_state_value_expr(base_col, base_name).alias("_base_value")
+        )
+        for base_key, base_group in base_prepared.group_by("_base_value", maintain_order=True):
+            base_value = str(base_key[0] if isinstance(base_key, tuple) else base_key)
+            base_returns = [float(value or 0.0) for value in base_group["_mod_return"].to_list()]
+            base_array = np.asarray(base_returns, dtype=np.float64)
+            base_atr_array = np.asarray(
+                [float(value or 0.0) for value in base_group["_mod_return_atr"].to_list()],
+                dtype=np.float64,
+            )
+            base_mean = _mean_array(base_array)
+            for modulator_name, modulator_col in resolved_modulators:
+                if modulator_col == base_col:
+                    continue
+                mod_prepared = base_group.with_columns(
+                    _market_state_value_expr(modulator_col, modulator_name).alias(
+                        "_modulator_value"
+                    )
+                )
+                for mod_key, cell in mod_prepared.group_by("_modulator_value", maintain_order=True):
+                    modulator_value = str(mod_key[0] if isinstance(mod_key, tuple) else mod_key)
+                    cell_returns = [float(value or 0.0) for value in cell["_mod_return"].to_list()]
+                    cell_array = np.asarray(cell_returns, dtype=np.float64)
+                    cell_atr_array = np.asarray(
+                        [float(value or 0.0) for value in cell["_mod_return_atr"].to_list()],
+                        dtype=np.float64,
+                    )
+                    cell_mean = _mean_array(cell_array)
+                    delta = cell_mean - base_mean
+                    ci_low, ci_high = _delta_standard_error_band(base_group, cell, delta)
+                    overlap_lag = max(0, horizon - 1)
+                    adj_ci_low, adj_ci_high = _delta_adjusted_standard_error_band(
+                        base_returns,
+                        cell_returns,
+                        delta,
+                        max_lag=overlap_lag,
+                    )
+                    robust_ci_low, robust_ci_high, robust_se = _delta_robust_standard_error_band(
+                        base_array,
+                        cell_array,
+                        delta,
+                        method=robustness.se_method,
+                        max_lag=overlap_lag,
+                    )
+                    p_value = _normal_approx_p_value(delta, robust_se)
+                    delta_cohens_d = _cohens_d_array(base_array, cell_array, delta)
+                    effect_size_material = abs(delta_cohens_d) >= robustness.cohens_d_threshold
+                    base_mean_atr = _mean_array(base_atr_array)
+                    cell_mean_atr = _mean_array(cell_atr_array)
+                    delta_atr = cell_mean_atr - base_mean_atr
+                    base_q10 = _quantile_array(base_array, 0.10)
+                    cell_q10 = _quantile_array(cell_array, 0.10)
+                    base_q25 = _quantile_array(base_array, 0.25)
+                    cell_q25 = _quantile_array(cell_array, 0.25)
+                    base_median = _quantile_array(base_array, 0.50)
+                    cell_median = _quantile_array(cell_array, 0.50)
+                    base_q75 = _quantile_array(base_array, 0.75)
+                    cell_q75 = _quantile_array(cell_array, 0.75)
+                    base_cvar10 = _cvar_array(base_array, 0.10)
+                    cell_cvar10 = _cvar_array(cell_array, 0.10)
+                    split_stats = _market_state_time_split_stability(
+                        base_group,
+                        modulator_col=modulator_col,
+                        modulator_value=modulator_value,
+                        time_splits=time_splits,
+                        min_segment_base_rows=min_segment_base_rows,
+                        min_segment_cell_rows=min_segment_cell_rows,
+                    )
+                    sufficient_base = len(base_returns) >= min_base_rows
+                    sufficient_cell = len(cell_returns) >= min_cell_rows
+                    significant = (
+                        sufficient_base
+                        and sufficient_cell
+                        and abs(delta) >= practical_delta_threshold
+                        and (ci_low > 0.0 or ci_high < 0.0)
+                    )
+                    robust_significant = (
+                        sufficient_base
+                        and sufficient_cell
+                        and effective_sample_size(base_returns, max_lag=overlap_lag)
+                        >= robustness.n_eff_min
+                        and effective_sample_size(cell_returns, max_lag=overlap_lag)
+                        >= robustness.n_eff_min
+                        and abs(delta) >= practical_delta_threshold
+                        and (robust_ci_low > 0.0 or robust_ci_high < 0.0)
+                    )
+                    rows.append(
+                        {
+                            "artifact": "market-state-modulation",
+                            "symbol": symbol,
+                            "horizon": horizon,
+                            "outcome_column": outcome_column,
+                            "outcome_kind": outcome_kind,
+                            "base_feature": base_name,
+                            "base_value": base_value,
+                            "modulator": modulator_name,
+                            "modulator_value": modulator_value,
+                            "min_base_rows": min_base_rows,
+                            "min_cell_rows": min_cell_rows,
+                            "base_rows": len(base_returns),
+                            "conditional_rows": len(cell_returns),
+                            "base_mean_return_pct": base_mean,
+                            "conditional_mean_return_pct": cell_mean,
+                            "delta_return_pct": delta,
+                            "delta_ci_low": ci_low,
+                            "delta_ci_high": ci_high,
+                            "effective_base_rows": effective_sample_size(
+                                base_returns, max_lag=overlap_lag
+                            ),
+                            "effective_conditional_rows": effective_sample_size(
+                                cell_returns, max_lag=overlap_lag
+                            ),
+                            "overlap_lag": overlap_lag,
+                            "overlap_adjusted_delta_ci_low": adj_ci_low,
+                            "overlap_adjusted_delta_ci_high": adj_ci_high,
+                            "overlap_warning": (
+                                "overlapping_forward_windows" if overlap_lag else "none"
+                            ),
+                            "se_method": robustness.se_method,
+                            "robust_delta_ci_low": robust_ci_low,
+                            "robust_delta_ci_high": robust_ci_high,
+                            "robust_significant": robust_significant,
+                            "n_eff_min": robustness.n_eff_min,
+                            "base_mean_return_atr": base_mean_atr,
+                            "conditional_mean_return_atr": cell_mean_atr,
+                            "delta_return_atr": delta_atr,
+                            "delta_cohens_d": delta_cohens_d,
+                            "cohens_d_threshold": robustness.cohens_d_threshold,
+                            "effect_size_material": effect_size_material,
+                            "base_q10": base_q10,
+                            "conditional_q10": cell_q10,
+                            "delta_q10": cell_q10 - base_q10,
+                            "base_q25": base_q25,
+                            "conditional_q25": cell_q25,
+                            "delta_q25": cell_q25 - base_q25,
+                            "base_median": base_median,
+                            "conditional_median": cell_median,
+                            "delta_median": cell_median - base_median,
+                            "base_q75": base_q75,
+                            "conditional_q75": cell_q75,
+                            "delta_q75": cell_q75 - base_q75,
+                            "base_cvar10": base_cvar10,
+                            "conditional_cvar10": cell_cvar10,
+                            "delta_cvar10": cell_cvar10 - base_cvar10,
+                            "p_value": p_value,
+                            "fdr_alpha": robustness.fdr_alpha,
+                            "fdr_significant": False,
+                            "practical_delta_threshold": practical_delta_threshold,
+                            "significant": significant,
+                            "stable_across_symbols": False,
+                            "time_splits": time_splits,
+                            "sufficient_time_splits": split_stats["sufficient_time_splits"],
+                            "time_split_sign_agreement_pct": split_stats[
+                                "time_split_sign_agreement_pct"
+                            ],
+                            "time_stable": split_stats["time_stable"],
+                            "time_split_significant_segments": split_stats[
+                                "time_split_significant_segments"
+                            ],
+                            "time_split_material_segments": split_stats[
+                                "time_split_material_segments"
+                            ],
+                            "symbol_effect_count": 0,
+                            "cross_asset_effect_mean": 0.0,
+                            "cross_asset_effect_std": 0.0,
+                            "cross_asset_homogeneous": False,
+                            "partially_replicable": False,
+                            "interaction_order": 1,
+                            "meta_stable": split_stats["meta_stable"],
+                            "classification": "insufficient"
+                            if not (sufficient_base and sufficient_cell)
+                            else "unstable",
+                        }
+                    )
+    return rows
+
+
+def _classify_market_state_modulation_rows(frame: pl.DataFrame) -> pl.DataFrame:
+    records = [dict(row) for row in frame.iter_rows(named=True)]
+    symbol_lookup: dict[tuple[str, str, str, str, int, str], list[dict[str, object]]] = {}
+    for row in records:
+        if row["symbol"] == "ALL":
+            continue
+        key = (
+            str(row["base_feature"]),
+            str(row["base_value"]),
+            str(row["modulator"]),
+            str(row["modulator_value"]),
+            _int_value(row.get("horizon")),
+            str(row.get("outcome_kind") or "return_pct"),
+        )
+        symbol_lookup.setdefault(key, []).append(row)
+    for row in records:
+        if int(row["base_rows"] or 0) < int(row["min_base_rows"] or 0) or int(
+            row["conditional_rows"] or 0
+        ) < int(row["min_cell_rows"] or 0):
+            row["classification"] = "insufficient"
+            row["stable_across_symbols"] = False
+            continue
+        key = (
+            str(row["base_feature"]),
+            str(row["base_value"]),
+            str(row["modulator"]),
+            str(row["modulator_value"]),
+            _int_value(row.get("horizon")),
+            str(row.get("outcome_kind") or "return_pct"),
+        )
+        symbol_rows = [
+            item
+            for item in symbol_lookup.get(key, [])
+            if _int_value(item["base_rows"]) >= _int_value(item["min_base_rows"])
+            and _int_value(item["conditional_rows"]) >= _int_value(item["min_cell_rows"])
+        ]
+        signs = [_sign(_float_value(item["delta_return_pct"])) for item in symbol_rows]
+        signs = [sign for sign in signs if sign]
+        stable = bool(signs) and max(signs.count(1), signs.count(-1)) / len(signs) >= 2 / 3
+        effects = [_float_value(item.get("delta_cohens_d")) for item in symbol_rows]
+        row["symbol_effect_count"] = len(effects)
+        row["cross_asset_effect_mean"] = float(np.mean(effects)) if effects else 0.0
+        row["cross_asset_effect_std"] = float(np.std(effects, ddof=0)) if effects else 0.0
+        same_sign = bool(signs) and len(set(signs)) == 1
+        homogeneous = (
+            same_sign
+            and len(effects) >= 2
+            and row["cross_asset_effect_std"]
+            <= max(
+                abs(row["cross_asset_effect_mean"]) * 0.75,
+                0.05,
+            )
+        )
+        row["cross_asset_homogeneous"] = homogeneous
+        row["partially_replicable"] = stable and not homogeneous and len(effects) >= 2
+        row["stable_across_symbols"] = stable
+        if not bool(row["significant"]):
+            row["classification"] = "unstable"
+        elif row["symbol"] == "ALL" and stable:
+            row["classification"] = "global"
+        elif row["symbol"] == "ALL":
+            row["classification"] = "asset_specific" if signs else "unstable"
+        else:
+            row["classification"] = "asset_specific"
+    return pl.DataFrame(records, schema=MARKET_STATE_MODULATION_SCHEMA)
+
+
+def _append_market_state_fdr(frame: pl.DataFrame, *, alpha: float) -> pl.DataFrame:
+    if frame.is_empty() or "p_value" not in frame.columns:
+        return frame
+    records = [dict(row) for row in frame.iter_rows(named=True)]
+    grouped: dict[tuple[str, int, str], list[int]] = {}
+    for idx, row in enumerate(records):
+        grouped.setdefault(
+            (
+                str(row.get("symbol") or "ALL"),
+                _int_value(row.get("horizon")),
+                str(row.get("outcome_kind") or "return_pct"),
+            ),
+            [],
+        ).append(idx)
+    for indices in grouped.values():
+        ordered = sorted(indices, key=lambda idx: _float_value(records[idx].get("p_value")))
+        threshold_rank = 0
+        m = max(len(ordered), 1)
+        for rank, idx in enumerate(ordered, start=1):
+            if _float_value(records[idx].get("p_value")) <= alpha * rank / m:
+                threshold_rank = rank
+        passing = set(ordered[:threshold_rank])
+        for idx in indices:
+            records[idx]["fdr_alpha"] = alpha
+            records[idx]["fdr_significant"] = idx in passing and bool(
+                records[idx].get("robust_significant")
+            )
+    return pl.DataFrame(records, schema=MARKET_STATE_MODULATION_SCHEMA)
+
+
+def _format_market_state_groups(frame: pl.DataFrame, *, limit: int, descending: bool) -> str:
+    if frame.is_empty() or "mean_return_pct" not in frame.columns:
+        return "none"
+    rows = (
+        frame.filter(pl.col("sufficient_rows"))
+        .sort(["mean_return_pct", "rows"], descending=[descending, True])
+        .head(limit)
+    )
+    if rows.is_empty():
+        return "none"
+    return "; ".join(
+        f"h{int(row['horizon'] or 0)} {row['symbol']} {row['group_columns']}="
+        f"{row['group_key']}:n={int(row['rows'] or 0)} "
+        f"ret={float(row['mean_return_pct'] or 0.0):+.2f}% "
+        f"ci=[{float(row['return_ci_low'] or 0.0):+.2f},"
+        f"{float(row['return_ci_high'] or 0.0):+.2f}]"
+        for row in rows.iter_rows(named=True)
+    )
+
+
+def _format_market_state_modulation(frame: pl.DataFrame, *, limit: int) -> str:
+    if frame.is_empty() or "delta_return_pct" not in frame.columns:
+        return "none"
+    rows = frame.sort(["classification", "conditional_rows"], descending=[False, True]).head(limit)
+    return "; ".join(
+        f"h{int(row['horizon'] or 0)} {row['symbol']} {row['base_feature']}={row['base_value']} x "
+        f"{row['modulator']}={row['modulator_value']}:n={int(row['conditional_rows'] or 0)}/"
+        f"base={int(row['base_rows'] or 0)} delta={float(row['delta_return_pct'] or 0.0):+.2f}%"
+        for row in rows.iter_rows(named=True)
+    )
+
+
+def modulation_effect_matrix(
+    trades: pl.DataFrame,
+    *,
+    base_columns: tuple[str, ...] = MODULATION_BASE_COLUMNS,
+    modulator_columns: tuple[str, ...] = MODULATION_MODULATOR_COLUMNS,
+    return_column: str = "net_pnl_usd",
+    min_base_trades: int = 20,
+    min_cell_trades: int = 10,
+    practical_delta_threshold: float = 0.15,
+) -> pl.DataFrame:
+    if trades.is_empty():
+        return pl.DataFrame(schema=MODULATION_EFFECT_SCHEMA)
+    net_col = return_column if return_column in trades.columns else _net_col(trades)
+    if net_col not in trades.columns:
+        return pl.DataFrame(schema=MODULATION_EFFECT_SCHEMA)
+
+    symbol_col = _first_column(trades, ("symbol", "asset", "label"))
+    prepared = trades.with_columns(
+        pl.col(net_col).cast(pl.Float64).fill_null(0.0).alias("_mod_return"),
+        (
+            pl.col(symbol_col).cast(pl.Utf8).fill_null("UNKNOWN") if symbol_col else pl.lit("ALL")
+        ).alias("_mod_symbol"),
+    )
+    resolved_bases = _resolve_modulation_columns(prepared, base_columns)
+    resolved_modulators = _resolve_modulation_columns(prepared, modulator_columns)
+    if not resolved_bases or not resolved_modulators:
+        return pl.DataFrame(schema=MODULATION_EFFECT_SCHEMA)
+
+    rows: list[dict[str, object]] = []
+    for symbol, symbol_frame in [("ALL", prepared), *_modulation_symbol_frames(prepared)]:
+        rows.extend(
+            _modulation_rows_for_frame(
+                symbol_frame,
+                symbol=str(symbol),
+                resolved_bases=resolved_bases,
+                resolved_modulators=resolved_modulators,
+                min_base_trades=min_base_trades,
+                min_cell_trades=min_cell_trades,
+                practical_delta_threshold=practical_delta_threshold,
+            )
+        )
+    if not rows:
+        return pl.DataFrame(schema=MODULATION_EFFECT_SCHEMA)
+    frame = pl.DataFrame(rows, schema=MODULATION_EFFECT_SCHEMA)
+    return _classify_modulation_rows(frame).sort(
+        ["classification", "symbol", "base_feature", "base_value", "modulator", "modulator_value"],
+        descending=[False, False, False, False, False, False],
+    )
+
+
+def format_modulation_effect_summary(frame: pl.DataFrame, *, limit: int = 10) -> str:
+    if frame.is_empty():
+        return "Modulation effect diagnostics\nno modulation rows"
+    total = frame.height
+    insufficient = frame.filter(pl.col("classification") == "insufficient").height
+    global_rows = frame.filter(pl.col("classification") == "global")
+    asset_specific = frame.filter(pl.col("classification") == "asset_specific")
+    unstable = frame.filter(pl.col("classification") == "unstable")
+    below_cell = frame.filter(~pl.col("sufficient_cell")).height
+    below_base = frame.filter(~pl.col("sufficient_base")).height
+    rows = [
+        [
+            "Trade-count sufficiency",
+            f"rows={total} insufficient={insufficient} below_base={below_base} "
+            f"below_cell={below_cell}",
+        ],
+        ["Global modulation effects", _format_modulation_rows(global_rows, limit=limit)],
+        [
+            "Asset-specific modulation effects",
+            _format_modulation_rows(asset_specific, limit=limit),
+        ],
+        ["Unstable modulation effects", _format_modulation_rows(unstable, limit=limit)],
+    ]
+    return "Modulation effect diagnostics\n" + format_table(["Diagnostic", "Summary"], rows)
+
+
+def _resolve_modulation_columns(
+    frame: pl.DataFrame, columns: tuple[str, ...]
+) -> tuple[tuple[str, str], ...]:
+    resolved = []
+    for column in columns:
+        source = _first_column(frame, _MODULATION_ALIASES.get(column, (column,)))
+        if source:
+            resolved.append((column, source))
+    return tuple(dict.fromkeys(resolved))
+
+
+def _modulation_symbol_frames(frame: pl.DataFrame) -> list[tuple[str, pl.DataFrame]]:
+    if "_mod_symbol" not in frame.columns:
+        return []
+    return [
+        (str(key[0] if isinstance(key, tuple) else key), group)
+        for key, group in frame.group_by("_mod_symbol", maintain_order=True)
+    ]
+
+
+def _modulation_rows_for_frame(
+    frame: pl.DataFrame,
+    *,
+    symbol: str,
+    resolved_bases: tuple[tuple[str, str], ...],
+    resolved_modulators: tuple[tuple[str, str], ...],
+    min_base_trades: int,
+    min_cell_trades: int,
+    practical_delta_threshold: float,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for base_name, base_col in resolved_bases:
+        base_prepared = frame.with_columns(
+            _modulation_value_expr(base_col, base_name, "_base_value")
+        )
+        for base_key, base_group in base_prepared.group_by("_base_value", maintain_order=True):
+            base_value = str(base_key[0] if isinstance(base_key, tuple) else base_key)
+            base_stats = _modulation_stats(base_group)
+            for modulator_name, modulator_col in resolved_modulators:
+                if modulator_col == base_col:
+                    continue
+                mod_prepared = base_group.with_columns(
+                    _modulation_value_expr(modulator_col, modulator_name, "_modulator_value")
+                )
+                for mod_key, cell in mod_prepared.group_by("_modulator_value", maintain_order=True):
+                    modulator_value = str(mod_key[0] if isinstance(mod_key, tuple) else mod_key)
+                    cell_stats = _modulation_stats(cell)
+                    delta = cell_stats["expectancy"] - base_stats["expectancy"]
+                    ci_low, ci_high = _delta_standard_error_band(base_group, cell, delta)
+                    sufficient_base = base_stats["trades"] >= min_base_trades
+                    sufficient_cell = cell_stats["trades"] >= min_cell_trades
+                    significant = (
+                        sufficient_base
+                        and sufficient_cell
+                        and abs(delta) >= practical_delta_threshold
+                        and (ci_low > 0.0 or ci_high < 0.0)
+                    )
+                    rows.append(
+                        {
+                            "symbol": symbol,
+                            "base_feature": base_name,
+                            "base_value": base_value,
+                            "modulator": modulator_name,
+                            "modulator_value": modulator_value,
+                            "min_base_trades": min_base_trades,
+                            "min_cell_trades": min_cell_trades,
+                            "base_trades": base_stats["trades"],
+                            "conditional_trades": cell_stats["trades"],
+                            "base_expectancy": base_stats["expectancy"],
+                            "conditional_expectancy": cell_stats["expectancy"],
+                            "delta_expectancy": delta,
+                            "base_profit_factor": base_stats["profit_factor"],
+                            "conditional_profit_factor": cell_stats["profit_factor"],
+                            "delta_ci_low": ci_low,
+                            "delta_ci_high": ci_high,
+                            "practical_delta_threshold": practical_delta_threshold,
+                            "sufficient_base": sufficient_base,
+                            "sufficient_cell": sufficient_cell,
+                            "significant": significant,
+                            "stable_across_symbols": False,
+                            "classification": "insufficient"
+                            if not (sufficient_base and sufficient_cell)
+                            else "unstable",
+                        }
+                    )
+    return rows
+
+
+def _modulation_value_expr(column: str, logical_name: str, alias: str) -> pl.Expr:
+    expr = pl.col(column).cast(pl.Utf8).fill_null("unknown")
+    if logical_name == "side":
+        return expr.map_elements(_normalize_side, return_dtype=pl.Utf8).alias(alias)
+    return expr.alias(alias)
+
+
+def _modulation_stats(frame: pl.DataFrame) -> dict[str, float | int]:
+    values = [float(value or 0.0) for value in frame["_mod_return"].to_list()]
+    trades = len(values)
+    gross_profit = sum(value for value in values if value > 0.0)
+    gross_loss = abs(sum(value for value in values if value < 0.0))
+    net = sum(values)
+    return {
+        "trades": trades,
+        "expectancy": net / max(trades, 1),
+        "profit_factor": gross_profit / gross_loss if gross_loss > 1e-9 else float("inf"),
+    }
+
+
+def _delta_standard_error_band(
+    base_group: pl.DataFrame,
+    cell: pl.DataFrame,
+    delta: float,
+) -> tuple[float, float]:
+    base_values = [float(value or 0.0) for value in base_group["_mod_return"].to_list()]
+    cell_values = [float(value or 0.0) for value in cell["_mod_return"].to_list()]
+    base_se = _standard_error(base_values)
+    cell_se = _standard_error(cell_values)
+    delta_se = math.sqrt(base_se**2 + cell_se**2)
+    band = 1.96 * delta_se
+    return delta - band, delta + band
+
+
+def _delta_adjusted_standard_error_band(
+    base_values: list[float],
+    cell_values: list[float],
+    delta: float,
+    *,
+    max_lag: int | None = None,
+) -> tuple[float, float]:
+    base_se = adjusted_standard_error(base_values, max_lag=max_lag)
+    cell_se = adjusted_standard_error(cell_values, max_lag=max_lag)
+    delta_se = math.sqrt(base_se**2 + cell_se**2)
+    band = 1.96 * delta_se
+    return delta - band, delta + band
+
+
+def _standard_error(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(variance / len(values))
+
+
+def effective_sample_size(values: list[float], *, max_lag: int | None = None) -> float:
+    n = len(values)
+    if n <= 1:
+        return float(n)
+    lag_limit = min(n - 1, max(0, int(max_lag or 0)))
+    if lag_limit <= 0:
+        return float(n)
+    mean = sum(values) / n
+    denom = sum((value - mean) ** 2 for value in values)
+    if denom <= 1e-12:
+        return float(n)
+    autocorr_sum = 0.0
+    for lag in range(1, lag_limit + 1):
+        cov = sum((values[idx] - mean) * (values[idx - lag] - mean) for idx in range(lag, n))
+        autocorr_sum += max(cov / denom, 0.0)
+    shrink = max(1.0, 1.0 + 2.0 * autocorr_sum)
+    return max(1.0, n / shrink)
+
+
+def adjusted_standard_error(values: list[float], *, max_lag: int | None = None) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(variance / effective_sample_size(values, max_lag=max_lag))
+
+
+def _classify_modulation_rows(frame: pl.DataFrame) -> pl.DataFrame:
+    records = [dict(row) for row in frame.iter_rows(named=True)]
+    symbol_lookup: dict[tuple[str, str, str, str], list[dict[str, object]]] = {}
+    for row in records:
+        if row["symbol"] == "ALL":
+            continue
+        key = (
+            str(row["base_feature"]),
+            str(row["base_value"]),
+            str(row["modulator"]),
+            str(row["modulator_value"]),
+        )
+        symbol_lookup.setdefault(key, []).append(row)
+    for row in records:
+        if not (bool(row["sufficient_base"]) and bool(row["sufficient_cell"])):
+            row["classification"] = "insufficient"
+            row["stable_across_symbols"] = False
+            continue
+        key = (
+            str(row["base_feature"]),
+            str(row["base_value"]),
+            str(row["modulator"]),
+            str(row["modulator_value"]),
+        )
+        symbol_rows = [
+            item
+            for item in symbol_lookup.get(key, [])
+            if bool(item["sufficient_base"]) and bool(item["sufficient_cell"])
+        ]
+        signs = [_sign(_float_value(item["delta_expectancy"])) for item in symbol_rows]
+        signs = [sign for sign in signs if sign]
+        stable = bool(signs) and max(signs.count(1), signs.count(-1)) / len(signs) >= 2 / 3
+        row["stable_across_symbols"] = stable
+        if not bool(row["significant"]):
+            row["classification"] = "unstable"
+        elif row["symbol"] == "ALL" and stable:
+            row["classification"] = "global"
+        elif row["symbol"] == "ALL":
+            row["classification"] = "asset_specific" if signs else "unstable"
+        else:
+            row["classification"] = "asset_specific"
+    return pl.DataFrame(records, schema=MODULATION_EFFECT_SCHEMA)
+
+
+def _sign(value: float) -> int:
+    if value > 0.0:
+        return 1
+    if value < 0.0:
+        return -1
+    return 0
+
+
+def _float_value(value: object) -> float:
+    if isinstance(value, int | float | str):
+        return float(value)
+    return 0.0
+
+
+def _int_value(value: object) -> int:
+    if isinstance(value, int | float | str):
+        return int(value)
+    return 0
+
+
+def _format_modulation_rows(frame: pl.DataFrame, *, limit: int) -> str:
+    if frame.is_empty():
+        return "none"
+    rows = frame.sort(
+        ["significant", "conditional_trades", "delta_expectancy"],
+        descending=[True, True, True],
+    ).head(limit)
+    parts = []
+    for row in rows.iter_rows(named=True):
+        parts.append(
+            f"{row['symbol']} {row['base_feature']}={row['base_value']} x "
+            f"{row['modulator']}={row['modulator_value']}:"
+            f"n={int(row['conditional_trades'] or 0)}/"
+            f"base={int(row['base_trades'] or 0)} "
+            f"delta={float(row['delta_expectancy'] or 0.0):+.2f} "
+            f"ci=[{float(row['delta_ci_low'] or 0.0):+.2f},"
+            f"{float(row['delta_ci_high'] or 0.0):+.2f}]"
+        )
+    return "; ".join(parts)
+
+
+def format_state_filter_delta(
+    baseline: pl.DataFrame,
+    variant: pl.DataFrame,
+    *,
+    baseline_label: str = "baseline",
+    variant_label: str = "variant",
+    limit: int = 8,
+) -> str:
+    baseline_buckets = _state_filter_delta_buckets(baseline)
+    variant_buckets = _state_filter_delta_buckets(variant)
+    if baseline_buckets.is_empty() and variant_buckets.is_empty():
+        return "State filter delta\nno state-profitability rows"
+
+    rows = []
+    rows.extend(_state_filter_symbol_totals(baseline_buckets, baseline_label))
+    rows.extend(_state_filter_symbol_totals(variant_buckets, variant_label))
+    rows.extend(_state_filter_delta_rows(baseline_buckets, variant_buckets, "removed", limit))
+    rows.extend(_state_filter_delta_rows(variant_buckets, baseline_buckets, "retained", limit))
+    rows.extend(_state_filter_remaining_losses(variant_buckets, limit))
+    return "State filter delta\n" + format_table(["Diagnostic", "Summary"], rows)
+
+
+def _state_filter_delta_buckets(frame: pl.DataFrame) -> pl.DataFrame:
+    schema = {
+        "symbol": pl.Utf8,
+        "market_stage": pl.Utf8,
+        "market_stage_reason": pl.Utf8,
+        "event_type": pl.Utf8,
+        "side": pl.Utf8,
+        "trades": pl.Int64,
+        "net_pnl_usd": pl.Float64,
+        "gross_profit_usd": pl.Float64,
+        "gross_loss_usd": pl.Float64,
+        "expectancy_usd": pl.Float64,
+        "profit_factor": pl.Float64,
+    }
+    if frame.is_empty():
+        return pl.DataFrame(schema=schema)
+    prepared = frame.with_columns(
+        _symbol_expr(),
+        _optional_utf8_expr(frame, "market_stage", _h1_component_expr("stage_key")),
+        _optional_utf8_expr(frame, "market_stage_reason", pl.lit("unknown")),
+        pl.col("event_type").cast(pl.Utf8).fill_null("none"),
+        pl.col("side").cast(pl.Utf8).fill_null("unknown"),
+        pl.col("trades").cast(pl.Int64).fill_null(0),
+        pl.col("net_pnl_usd").cast(pl.Float64).fill_null(0.0),
+        pl.col("gross_profit_usd").cast(pl.Float64).fill_null(0.0),
+        pl.col("gross_loss_usd").cast(pl.Float64).fill_null(0.0),
+    )
+    return (
+        prepared.group_by(
+            ["symbol", "market_stage", "market_stage_reason", "event_type", "side"],
+            maintain_order=True,
+        )
+        .agg(
+            pl.col("trades").sum(),
+            pl.col("net_pnl_usd").sum(),
+            pl.col("gross_profit_usd").sum(),
+            pl.col("gross_loss_usd").sum(),
+        )
+        .with_columns(
+            (pl.col("net_pnl_usd") / pl.max_horizontal(pl.col("trades"), pl.lit(1))).alias(
+                "expectancy_usd"
+            ),
+            pl.when(pl.col("gross_loss_usd") > 1e-9)
+            .then(pl.col("gross_profit_usd") / pl.col("gross_loss_usd"))
+            .otherwise(float("inf"))
+            .alias("profit_factor"),
+        )
+        .select(list(schema))
+    )
+
+
+def _state_filter_symbol_totals(frame: pl.DataFrame, label: str) -> list[list[str]]:
+    if frame.is_empty():
+        return [[f"{label} totals", "none"]]
+    rows = []
+    totals = (
+        frame.group_by("symbol", maintain_order=True)
+        .agg(
+            pl.col("trades").sum(),
+            pl.col("net_pnl_usd").sum(),
+            pl.col("gross_profit_usd").sum(),
+            pl.col("gross_loss_usd").sum(),
+        )
+        .sort("symbol")
+    )
+    for row in totals.iter_rows(named=True):
+        gross_loss = float(row["gross_loss_usd"] or 0.0)
+        profit_factor = (
+            float("inf") if gross_loss <= 1e-9 else float(row["gross_profit_usd"]) / gross_loss
+        )
+        expectancy = float(row["net_pnl_usd"] or 0.0) / max(int(row["trades"] or 0), 1)
+        rows.append(
+            [
+                f"{label} total {row['symbol']}",
+                _format_state_filter_bucket_summary(
+                    row,
+                    market_stage="all",
+                    market_stage_reason="all",
+                    event_type="all",
+                    side="all",
+                    profit_factor=profit_factor,
+                    expectancy=expectancy,
+                ),
+            ]
+        )
+    return rows
+
+
+def _state_filter_delta_rows(
+    left: pl.DataFrame,
+    right: pl.DataFrame,
+    label: str,
+    limit: int,
+) -> list[list[str]]:
+    if left.is_empty():
+        return [[f"{label} buckets", "none"]]
+    keys = ["symbol", "market_stage", "market_stage_reason", "event_type", "side"]
+    join_type: Literal["anti", "semi"] = "semi" if label == "retained" else "anti"
+    delta = left.join(right.select(keys), on=keys, how=join_type)
+    if delta.is_empty():
+        return [[f"{label} buckets", "none"]]
+    return [
+        [f"{label} bucket", _format_state_filter_bucket_summary(row)]
+        for row in delta.sort("net_pnl_usd").head(limit).iter_rows(named=True)
+    ]
+
+
+def _state_filter_remaining_losses(frame: pl.DataFrame, limit: int) -> list[list[str]]:
+    if frame.is_empty():
+        return [["remaining loss buckets", "none"]]
+    losses = frame.filter(pl.col("net_pnl_usd") < 0.0).sort("net_pnl_usd").head(limit)
+    if losses.is_empty():
+        return [["remaining loss buckets", "none"]]
+    return [
+        ["remaining loss bucket", _format_state_filter_bucket_summary(row)]
+        for row in losses.iter_rows(named=True)
+    ]
+
+
+def _symbol_expr() -> pl.Expr:
+    return (
+        pl.col("label")
+        .cast(pl.Utf8)
+        .fill_null("unknown")
+        .str.split(" ")
+        .list.first()
+        .alias("symbol")
+    )
+
+
+def _optional_utf8_expr(frame: pl.DataFrame, column: str, fallback: pl.Expr) -> pl.Expr:
+    if column in frame.columns:
+        return pl.col(column).cast(pl.Utf8).fill_null("unknown").alias(column)
+    return fallback.cast(pl.Utf8).fill_null("unknown").alias(column)
+
+
+def _h1_component_expr(column: str) -> pl.Expr:
+    return pl.col(column).cast(pl.Utf8).fill_null("unknown").str.split("|").list.last()
+
+
+def _format_state_filter_bucket_summary(
+    row: dict[str, object],
+    *,
+    market_stage: str | None = None,
+    market_stage_reason: str | None = None,
+    event_type: str | None = None,
+    side: str | None = None,
+    profit_factor: float | None = None,
+    expectancy: float | None = None,
+) -> str:
+    pf = _as_float(row["profit_factor"] if profit_factor is None else profit_factor)
+    exp = _as_float(row["expectancy_usd"] if expectancy is None else expectancy)
+    pf_text = "inf" if math.isinf(pf) else f"{pf:.2f}"
+    return (
+        f"{row['symbol']} {market_stage or row.get('market_stage', 'unknown')}/"
+        f"{market_stage_reason or row.get('market_stage_reason', 'unknown')} "
+        f"{event_type or row.get('event_type', 'all')} {side or row.get('side', 'all')} "
+        f"trades={_as_int(row['trades'])} net=${_as_float(row['net_pnl_usd']):+.2f} "
+        f"exp=${exp:+.2f} pf={pf_text}"
+    )
+
+
+def _as_float(value: object) -> float:
+    return float(cast(float | int | str, 0.0 if value is None else value))
+
+
+def _as_int(value: object) -> int:
+    return int(cast(float | int | str, 0 if value is None else value))
+
+
 def _signal_development_row(
     report: Report,
     signal_frame: pl.DataFrame,
@@ -1530,8 +3964,7 @@ def _liquidity_development_row(
         signal_frame,
         raw_expr
         & (
-            pl.col("swept_high").fill_null(False)
-            | pl.col("swept_low").fill_null(False)
+            pl.col("swept_high").fill_null(False) | pl.col("swept_low").fill_null(False)
             if {"swept_high", "swept_low"} <= set(signal_frame.columns)
             else pl.lit(False)
         ),
@@ -1562,8 +3995,7 @@ def _liquidity_development_row(
         & (
             pl.col("breakout_acceptance_high").fill_null(False)
             | pl.col("breakout_acceptance_low").fill_null(False)
-            if {"breakout_acceptance_high", "breakout_acceptance_low"}
-            <= set(signal_frame.columns)
+            if {"breakout_acceptance_high", "breakout_acceptance_low"} <= set(signal_frame.columns)
             else pl.lit(False)
         ),
     )
@@ -1810,9 +4242,7 @@ def _format_mtf_context_coverage_row(signal_frame: pl.DataFrame) -> list[str]:
         return ["MTF context coverage", "n/a"]
     parts = []
     for prefix in ("m15", "h4", "d1"):
-        column = (
-            f"{prefix}_confirm_available" if prefix == "m15" else f"{prefix}_context_available"
-        )
+        column = f"{prefix}_confirm_available" if prefix == "m15" else f"{prefix}_context_available"
         if column not in signal_frame.columns:
             parts.append(f"{prefix}_available=n/a")
             continue
@@ -1977,7 +4407,7 @@ def _format_mtf_right_edge_drift_row(signal_frame: pl.DataFrame, edge_bars: int 
         return ["MTF right-edge drift", "n/a"]
     transitions = [1 if prev != curr else 0 for prev, curr in zip(values, values[1:], strict=False)]
     edge = transitions[-edge_bars:]
-    history = transitions[: -edge_bars] if len(transitions) > edge_bars else transitions
+    history = transitions[:-edge_bars] if len(transitions) > edge_bars else transitions
     edge_rate = sum(edge) / max(len(edge), 1) * 100.0
     history_rate = sum(history) / max(len(history), 1) * 100.0
     drift_threshold = max(history_rate * 2.0, history_rate + 25.0)
@@ -2017,8 +4447,11 @@ def _format_mtf_state_separation_row(report: Report, min_trades: int = 10) -> li
     trades = _structural_event_trades(report.trades)
     state_col = _first_column(trades, ("entry_mtf_state_bucket", "entry_mtf_state_key"))
     event_col = _event_column(trades)
-    if trades.is_empty() or not state_col or not event_col or not {state_col, event_col} <= set(
-        trades.columns
+    if (
+        trades.is_empty()
+        or not state_col
+        or not event_col
+        or not {state_col, event_col} <= set(trades.columns)
     ):
         return ["MTF state separation", "n/a"]
     net_col = _net_col(trades)
@@ -2147,8 +4580,7 @@ def _format_mtf_state_time_consistency_row(report: Report) -> list[str]:
         pl.len().alias("time_buckets"),
     )
     concentrated = state_totals.filter(
-        (pl.col("total_net") > 0.0)
-        & (pl.col("best_bucket_net") / pl.col("total_net") > 0.6)
+        (pl.col("total_net") > 0.0) & (pl.col("best_bucket_net") / pl.col("total_net") > 0.6)
     )
     labels = []
     for row in concentrated.head(3).iter_rows(named=True):
@@ -2356,8 +4788,7 @@ def _format_structural_event_time_clustering_row(report: Report) -> list[str]:
     if summary.segments <= 0:
         return ["Structural event time clustering", "no trades"]
     segment_text = ",".join(
-        f"{row.key[0]}:{row.trades}/${row.net:+.2f}/${row.expectancy:+.2f}"
-        for row in summary.rows
+        f"{row.key[0]}:{row.trades}/${row.net:+.2f}/${row.expectancy:+.2f}" for row in summary.rows
     )
     return [
         "Structural event time clustering",
@@ -2580,6 +5011,66 @@ def _net_col(frame: pl.DataFrame) -> str:
     return "net_pnl_usd" if "net_pnl_usd" in frame.columns else "pnl_usd"
 
 
+def _normalize_side(value: object) -> str:
+    side = str(value or "unknown").lower()
+    if side in {"buy", "long", "1", "1.0"}:
+        return "long"
+    if side in {"sell", "short", "-1", "-1.0"}:
+        return "short"
+    return side or "unknown"
+
+
+def _first_group_value(group: pl.DataFrame, columns: tuple[str, ...]) -> str:
+    column = _first_column(group, columns)
+    if not column:
+        return "unknown"
+    values = group[column].drop_nulls().to_list()
+    return str(values[0] if values else "unknown")
+
+
+def _time_bucket_positive_share(group: pl.DataFrame, bucket_count: int = 4) -> tuple[int, float]:
+    if group.is_empty() or "_net_pnl" not in group.columns:
+        return 0, 0.0
+    time_col = _first_column(group, ("entry_ts", "entry_bar_index", "timestamp"))
+    ordered = group.sort(time_col) if time_col else group
+    segments = min(bucket_count, max(1, ordered.height))
+    bucket_nets = []
+    for idx in range(segments):
+        start = idx * ordered.height // segments
+        end = (idx + 1) * ordered.height // segments
+        segment = ordered.slice(start, end - start)
+        net = float(segment.select(pl.col("_net_pnl").sum()).item() or 0.0)
+        bucket_nets.append(net)
+    positive_total = sum(value for value in bucket_nets if value > 0.0)
+    best_positive = max((value for value in bucket_nets if value > 0.0), default=0.0)
+    share = best_positive / positive_total * 100.0 if positive_total > 1e-9 else 0.0
+    return segments, share
+
+
+def _format_state_profitability_groups(frame: pl.DataFrame, *, limit: int = 6) -> str:
+    if frame.is_empty():
+        return "none"
+    rows = frame.sort("expectancy_usd", descending=True).head(limit).iter_rows(named=True)
+    parts = []
+    for row in rows:
+        pf = float(row["profit_factor"] or 0.0)
+        pf_text = "inf" if math.isinf(pf) else f"{pf:.2f}"
+        flags = []
+        if bool(row["clustered"]):
+            flags.append("clustered")
+        if bool(row["fragile"]):
+            flags.append("fragile")
+        if bool(row["actionable"]):
+            flags.append("actionable")
+        flag_text = "+".join(flags) or "stable"
+        parts.append(
+            f"{row['state_key']}/{row['event_type']}/{row['side']}:"
+            f"{int(row['trades'])}/${float(row['expectancy_usd']):+.2f}/"
+            f"wr={float(row['win_rate_pct']):.0f}%/pf={pf_text}/{flag_text}"
+        )
+    return ",".join(parts)
+
+
 def _trade_bucket_summaries(
     frame: pl.DataFrame,
     columns: tuple[str, ...],
@@ -2682,8 +5173,7 @@ def _none_time_clustering_stats(none_trades: pl.DataFrame) -> dict[str, object]:
         total_abs = sum(abs(net) for _, _, net, _ in rows)
         best_share = abs(best_net) / total_abs * 100.0 if total_abs > 0.0 else 0.0
     text = ",".join(
-        f"q{idx}:{count}/${net:+.2f}/${expectancy:+.2f}"
-        for idx, count, net, expectancy in rows
+        f"q{idx}:{count}/${net:+.2f}/${expectancy:+.2f}" for idx, count, net, expectancy in rows
     )
     return {
         "segments": segment_count,
@@ -2876,7 +5366,8 @@ def _structure_veto_opportunity_cost(
 
 
 def _filter_attrition_rows(
-    signal_frame: pl.DataFrame, strategy: StrategyBehavior) -> list[list[str]]:
+    signal_frame: pl.DataFrame, strategy: StrategyBehavior
+) -> list[list[str]]:
     if not isinstance(strategy, StrategySpec):
         return [["Filter attrition", "n/a for non-spec strategy"]]
     if not strategy.filters:
@@ -3251,9 +5742,7 @@ def _volatility_expansion_loss(row: dict[str, object]) -> str:
 def _countertrend_loss(row: dict[str, object]) -> str:
     side = str(row.get("side") or "")
     structure = str(row.get("entry_structure_bucket") or row.get("entry_trend_bucket") or "")
-    if (side == "buy" and structure == "downtrend") or (
-        side == "sell" and structure == "uptrend"
-    ):
+    if (side == "buy" and structure == "downtrend") or (side == "sell" and structure == "uptrend"):
         return LossCause.TREND_CONTINUATION_AGAINST_REVERSION
     return ""
 
@@ -3363,9 +5852,11 @@ def _cross_bucket_expectancy(
 def _filtered_mean(signal_frame: pl.DataFrame, expr: pl.Expr, column: str) -> float:
     if column not in signal_frame.columns:
         return 0.0
-    value = signal_frame.filter(expr.fill_null(False)).select(
-        pl.col(column).cast(pl.Float64).mean()
-    ).item()
+    value = (
+        signal_frame.filter(expr.fill_null(False))
+        .select(pl.col(column).cast(pl.Float64).mean())
+        .item()
+    )
     return float(value or 0.0)
 
 
@@ -3403,10 +5894,7 @@ def _stage_trade_expectancy(report: Report) -> str:
         .sort(bucket)
     )
     parts = [
-        (
-            f"{row[bucket]}:{int(row['trades'])}/"
-            f"${float(row['expectancy'] or 0.0):+.2f}"
-        )
+        (f"{row[bucket]}:{int(row['trades'])}/${float(row['expectancy'] or 0.0):+.2f}")
         for row in grouped.iter_rows(named=True)
     ]
     return "trade_expectancy_by_stage=" + ",".join(parts)
@@ -3429,34 +5917,3 @@ def format_layer_summary(
     rows.append(list(lifecycle_layer(report)))
     rows.append(list(sizing_layer(report)))
     return f"{label}\n" + format_table(["Layer", "Summary"], rows)
-
-
-def format_status_table(reports: list[Report], gates: RiskGateConfig) -> str:
-    rows = []
-    for report in reports:
-        status = report_status(report, gates)
-        d = report.diagnostics
-        rows.append(
-            [
-                status.status,
-                report.label,
-                str(report.metrics.num_trades),
-                f"{report.metrics.profit_factor:.2f}",
-                f"{report.trade_expectancy_pct:+.2f}",
-                f"{report.metrics.max_drawdown_pct:.1f}",
-                f"{d.max_notional_exposure_pct:.1f}" if d is not None else "n/a",
-                ",".join(status.reasons) or "-",
-            ]
-        )
-    return format_table(
-        ["Status", "Label", "Trades", "PF", "Exp%", "DD%", "MaxNot%", "Reasons"],
-        rows,
-    )
-
-
-def assert_reports_pass(reports: list[Report], gates: RiskGateConfig) -> None:
-    failures = [report_status(report, gates) for report in reports]
-    failed = [status for status in failures if status.status == "FAIL"]
-    if gates.fail_on_risk and failed:
-        reasons = "; ".join(",".join(status.reasons) for status in failed)
-        raise SystemExit(f"risk gates failed: {reasons}")

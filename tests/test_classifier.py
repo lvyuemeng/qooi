@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import polars as pl
 
+import qooi.strategies.features as features
 from qooi.strategies.features import (
     RangeWidthThresholdConfig,
-    StructureClassifier,
     StructureClassifierConfig,
     add_price_structure_stage_features,
-    classify_price_structure_frame,
 )
 
 
@@ -36,12 +35,16 @@ def test_structure_classifier_config_public_constructors():
     assert rolling.range_width_threshold.min_samples == 30
 
 
-def test_structure_classifier_method_api_matches_compatibility_wrapper():
+def test_structure_classifier_facades_are_removed():
+    assert not hasattr(features, "StructureClassifier")
+    assert not hasattr(features, "classify_price_structure_frame")
+
+
+def test_add_price_structure_stage_features_is_classifier_api():
     config = StructureClassifierConfig.fixed(range_width_atr_max=8.0)
     frame = _frame()
 
-    method = StructureClassifier(config).classify(frame)
-    wrapper = classify_price_structure_frame(frame, config)
+    out = add_price_structure_stage_features(config=config)(frame)
 
     columns = [
         "structure_trend_state",
@@ -52,7 +55,7 @@ def test_structure_classifier_method_api_matches_compatibility_wrapper():
         "range_width_atr_threshold",
         "range_width_threshold_source",
     ]
-    assert method.select(columns).equals(wrapper.select(columns))
+    assert set(columns) <= set(out.columns)
 
 
 def test_add_price_structure_stage_features_accepts_config_and_legacy_kwargs():
@@ -82,8 +85,8 @@ def test_structure_classifier_uses_dynamic_threshold_without_lookahead():
     )
     config = StructureClassifierConfig.rolling_quantile(window=60, min_samples=20)
 
-    before = StructureClassifier(config).classify(base)
-    after = StructureClassifier(config).classify(pl.concat([base, future]))
+    before = add_price_structure_stage_features(config=config)(base)
+    after = add_price_structure_stage_features(config=config)(pl.concat([base, future]))
 
     audit_columns = [
         "range_width_atr_threshold",
@@ -96,7 +99,7 @@ def test_structure_classifier_uses_dynamic_threshold_without_lookahead():
 
 def test_structure_classifier_exposes_threshold_audit_columns():
     config = StructureClassifierConfig.rolling_quantile(window=30, min_samples=10)
-    out = StructureClassifier(config).classify(_frame(90))
+    out = add_price_structure_stage_features(config=config)(_frame(90))
 
     assert {
         "range_width_atr_threshold",

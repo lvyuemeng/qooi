@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from math import log, sqrt
 from typing import Literal
 
 import polars as pl
@@ -276,21 +275,6 @@ class StructureClassifierConfig:
         )
 
 
-class StructureClassifier:
-    def __init__(self, config: StructureClassifierConfig | None = None) -> None:
-        self.config = config or StructureClassifierConfig.default()
-
-    def classify(self, frame: pl.DataFrame) -> pl.DataFrame:
-        return add_price_structure_stage_features(config=self.config)(frame)
-
-
-def classify_price_structure_frame(
-    frame: pl.DataFrame,
-    config: StructureClassifierConfig | None = None,
-) -> pl.DataFrame:
-    return StructureClassifier(config).classify(frame)
-
-
 def add_price_structure_stage_features(
     *,
     config: StructureClassifierConfig | None = None,
@@ -302,16 +286,26 @@ def add_price_structure_stage_features(
 ) -> FeatureFn:
     """Add no-lookahead structure, range, and coarse lifecycle diagnostics."""
 
-    normalized = config or StructureClassifierConfig(
-        swing_lookback=swing_lookback,
-        range_lookback=range_lookback,
-        trend_window=trend_window,
-        level_proximity_atr=level_proximity_atr,
-        range_width_threshold=RangeWidthThresholdConfig(
-            mode="fixed",
-            fixed_atr_max=8.0 if range_width_atr_max is None else range_width_atr_max,
-        ),
-    )
+    if config is not None:
+        normalized = config
+    elif range_width_atr_max is None:
+        normalized = StructureClassifierConfig(
+            swing_lookback=swing_lookback,
+            range_lookback=range_lookback,
+            trend_window=trend_window,
+            level_proximity_atr=level_proximity_atr,
+        )
+    else:
+        normalized = StructureClassifierConfig(
+            swing_lookback=swing_lookback,
+            range_lookback=range_lookback,
+            trend_window=trend_window,
+            level_proximity_atr=level_proximity_atr,
+            range_width_threshold=RangeWidthThresholdConfig(
+                mode="fixed",
+                fixed_atr_max=range_width_atr_max,
+            ),
+        )
 
     def _add(df: pl.DataFrame) -> pl.DataFrame:
         threshold_config = normalized.range_width_threshold
@@ -440,6 +434,8 @@ def add_price_structure_stage_features(
             .then(pl.lit(MarketStage.MARKUP))
             .when(markdown)
             .then(pl.lit(MarketStage.MARKDOWN))
+            .when(transition)
+            .then(pl.lit(MarketStage.TRANSITION))
             .when(range_compression & near_range_low)
             .then(pl.lit(MarketStage.ACCUMULATION))
             .when(range_compression & near_range_high)
@@ -450,8 +446,6 @@ def add_price_structure_stage_features(
             .then(pl.lit(MarketStage.TREND_CONTINUATION))
             .when(wide_range)
             .then(pl.lit(MarketStage.WIDE_RANGE))
-            .when(transition)
-            .then(pl.lit(MarketStage.TRANSITION))
             .otherwise(pl.lit(MarketStage.UNKNOWN))
         )
         market_stage_reason = (
@@ -463,6 +457,8 @@ def add_price_structure_stage_features(
             .then(pl.lit(MarketStageReason.MARKUP_BREAKOUT))
             .when(markdown)
             .then(pl.lit(MarketStageReason.MARKDOWN_BREAKOUT))
+            .when(transition)
+            .then(pl.lit(MarketStageReason.AMBIGUOUS_TRANSITION))
             .when(range_compression & near_range_low)
             .then(pl.lit(MarketStageReason.COMPRESSED_NEAR_LOW))
             .when(range_compression & near_range_high)
@@ -473,8 +469,6 @@ def add_price_structure_stage_features(
             .then(pl.lit(MarketStageReason.TREND_WITHOUT_RANGE_BREAK))
             .when(wide_range)
             .then(pl.lit(MarketStageReason.WIDE_RANGE_NO_STAGE))
-            .when(transition)
-            .then(pl.lit(MarketStageReason.AMBIGUOUS_TRANSITION))
             .otherwise(pl.lit(MarketStageReason.UNKNOWN_UNHANDLED))
         )
         stage_unknown_reason = (
@@ -615,78 +609,5 @@ def add_none_context_diagnostics(
             near_low.alias("near_prior_low_no_breach"),
             proximity_bucket.alias("key_level_proximity_bucket"),
         )
-
-    return _add
-
-
-def add_volatility_regime(
-    short_span: int = 24,
-    long_span: int = 168,
-    *,
-    output: str = "volatility_regime",
-) -> FeatureFn:
-    def _add(df: pl.DataFrame) -> pl.DataFrame:
-        ret = (pl.col("close") / pl.col("close").shift(1)).log()
-        short = (ret**2).ewm_mean(span=short_span, min_samples=short_span).sqrt()
-        long = (ret**2).ewm_mean(span=long_span, min_samples=long_span).sqrt()
-        safe_long = pl.when(long.abs() > 1e-10).then(long).otherwise(1e-10)
-        ratio = short / safe_long
-        regime = pl.when(ratio < 0.75).then(-1).when(ratio > 1.5).then(1).otherwise(0)
-        return df.with_columns(
-            short.alias("realized_vol_short"),
-            long.alias("realized_vol_long"),
-            ratio.alias("volatility_ratio"),
-            regime.alias(output),
-        )
-
-    return _add
-
-
-def add_garch_like_volatility(
-    omega: float = 0.0,
-    alpha: float = 0.08,
-    beta: float = 0.90,
-    *,
-    output: str = "conditional_volatility",
-) -> FeatureFn:
-    def _add(df: pl.DataFrame) -> pl.DataFrame:
-        closes = [float(v) if v is not None else None for v in df["close"].to_list()]
-        returns = [
-            None
-            if prev is None or curr is None or prev <= 0 or curr <= 0
-            else log(curr / prev)
-            for prev, curr in zip([None, *closes[:-1]], closes, strict=False)
-        ]
-        variance = 0.0
-        vols: list[float | None] = []
-        z_returns: list[float | None] = []
-        for ret in returns:
-            if ret is None:
-                vols.append(None)
-                z_returns.append(None)
-                continue
-            variance = omega + alpha * (ret**2) + beta * variance
-            vol = sqrt(max(variance, 1e-20))
-            vols.append(vol)
-            z_returns.append(ret / vol if vol > 1e-10 else None)
-        return df.with_columns(
-            pl.Series(output, vols, dtype=pl.Float64),
-            pl.Series("garch_z_return", z_returns, dtype=pl.Float64),
-        )
-
-    return _add
-
-
-def add_macd_histogram(
-    *,
-    fast_ema: int = 12,
-    slow_ema: int = 26,
-    signal_period: int = 9,
-    output: str = "macd_hist",
-) -> FeatureFn:
-    def _add(df: pl.DataFrame) -> pl.DataFrame:
-        macd = pl.col(f"ema_{fast_ema}") - pl.col(f"ema_{slow_ema}")
-        signal = macd.ewm_mean(span=signal_period, min_samples=signal_period)
-        return df.with_columns((macd - signal).alias(output))
 
     return _add

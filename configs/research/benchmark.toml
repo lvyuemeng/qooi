@@ -1,0 +1,12 @@
+[run]
+profile = "research"
+universe = "core"
+data_source = "swap"
+
+[strategy]
+benchmark = true
+benchmark_group = "baselines"
+diagnostics = true
+
+[diagnostics]
+mode = "backtest"

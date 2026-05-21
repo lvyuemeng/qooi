@@ -2,9 +2,132 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from math import log, sqrt
 
 import polars as pl
+
+IndicatorFn = Callable[[pl.DataFrame], pl.DataFrame]
+
+
+# Predicate expressions
+
+
+def uptrend(ema_mid: int = 50, ema_slow: int = 200) -> pl.Expr:
+    return (pl.col(f"ema_{ema_mid}") > 0) & (pl.col(f"ema_{ema_slow}") > 0) & (
+        pl.col(f"ema_{ema_mid}") > pl.col(f"ema_{ema_slow}")
+    )
+
+
+def downtrend(ema_mid: int = 50, ema_slow: int = 200) -> pl.Expr:
+    return (pl.col(f"ema_{ema_mid}") > 0) & (pl.col(f"ema_{ema_slow}") > 0) & (
+        pl.col(f"ema_{ema_mid}") < pl.col(f"ema_{ema_slow}")
+    )
+
+
+def trend_mature(min_bars: int) -> pl.Expr:
+    return pl.col("trend_bars").abs() >= min_bars
+
+
+def adx_above(threshold: float = 20.0) -> pl.Expr:
+    return pl.col("adx_14") > threshold
+
+
+def session_between(start_hour: int = 8, end_hour: int = 22) -> pl.Expr:
+    return pl.col("hour_utc").is_between(start_hour, end_hour)
+
+
+def volume_spike(multiplier: float = 1.5) -> pl.Expr:
+    return pl.col("vol") > multiplier * pl.col("vol_avg")
+
+
+def above_ema(period: int = 20) -> pl.Expr:
+    return pl.col("close") > pl.col(f"ema_{period}")
+
+
+def below_ema(period: int = 20) -> pl.Expr:
+    return pl.col("close") < pl.col(f"ema_{period}")
+
+
+def higher_low_structure() -> pl.Expr:
+    return pl.col("low_short") > pl.col("low_long")
+
+
+def lower_high_structure() -> pl.Expr:
+    return pl.col("high_short") < pl.col("high_long")
+
+
+def momentum_gt(threshold: float) -> pl.Expr:
+    return pl.col("momentum_return") > threshold
+
+
+def momentum_lt(threshold: float) -> pl.Expr:
+    return pl.col("momentum_return") < threshold
+
+
+def rsi_cross_from_oversold(
+    *, rsi_period: int = 14, oversold: float = 30.0, bounce: float = 25.0
+) -> pl.Expr:
+    rsi_col = pl.col(f"rsi_{rsi_period}")
+    return (rsi_col > bounce) & (rsi_col.shift(1) <= oversold)
+
+
+def rsi_bounce_held(*, rsi_period: int = 14, confirmation: float = 20.0) -> pl.Expr:
+    rsi_col = pl.col(f"rsi_{rsi_period}")
+    return (rsi_col > confirmation) & (rsi_col.shift(1) > confirmation)
+
+
+def rsi_above(*, rsi_period: int = 14, threshold: float = 50.0) -> pl.Expr:
+    return pl.col(f"rsi_{rsi_period}") > threshold
+
+
+def rsi_below(*, rsi_period: int = 14, threshold: float = 50.0) -> pl.Expr:
+    return pl.col(f"rsi_{rsi_period}") < threshold
+
+
+def zscore_below(threshold: float, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) <= threshold
+
+
+def zscore_above(threshold: float, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) >= threshold
+
+
+def zscore_reverted_long(exit_level: float = 0.0, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) >= exit_level
+
+
+def zscore_reverted_short(exit_level: float = 0.0, *, col: str = "close_z_score") -> pl.Expr:
+    return pl.col(col) <= -exit_level
+
+
+def dynamic_z_below(threshold: float, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) <= threshold
+
+
+def dynamic_z_above(threshold: float, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) >= threshold
+
+
+def dynamic_z_reverted_long(exit_level: float = 0.0, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) >= -abs(exit_level)
+
+
+def dynamic_z_reverted_short(exit_level: float = 0.0, *, col: str = "dynamic_z_score") -> pl.Expr:
+    return pl.col(col) <= abs(exit_level)
+
+
+def volatility_ratio_below(threshold: float, *, col: str = "volatility_ratio") -> pl.Expr:
+    return pl.col(col) <= threshold
+
+
+def macd_hist_above(threshold: float = 0.0, *, col: str = "macd_hist") -> pl.Expr:
+    return pl.col(col) > threshold
+
+
+def macd_hist_below(threshold: float = 0.0, *, col: str = "macd_hist") -> pl.Expr:
+    return pl.col(col) < threshold
 
 
 @dataclass(frozen=True)
@@ -286,6 +409,79 @@ def apply_regime_gate(
         .otherwise(pl.col(signal_col))
         .alias(signal_col)
     )
+
+
+def add_volatility_regime(
+    short_span: int = 24,
+    long_span: int = 168,
+    *,
+    output: str = "volatility_regime",
+) -> IndicatorFn:
+    def _add(df: pl.DataFrame) -> pl.DataFrame:
+        ret = (pl.col("close") / pl.col("close").shift(1)).log()
+        short = (ret**2).ewm_mean(span=short_span, min_samples=short_span).sqrt()
+        long = (ret**2).ewm_mean(span=long_span, min_samples=long_span).sqrt()
+        safe_long = pl.when(long.abs() > 1e-10).then(long).otherwise(1e-10)
+        ratio = short / safe_long
+        regime = pl.when(ratio < 0.75).then(-1).when(ratio > 1.5).then(1).otherwise(0)
+        return df.with_columns(
+            short.alias("realized_vol_short"),
+            long.alias("realized_vol_long"),
+            ratio.alias("volatility_ratio"),
+            regime.alias(output),
+        )
+
+    return _add
+
+
+def add_garch_like_volatility(
+    omega: float = 0.0,
+    alpha: float = 0.08,
+    beta: float = 0.90,
+    *,
+    output: str = "conditional_volatility",
+) -> IndicatorFn:
+    def _add(df: pl.DataFrame) -> pl.DataFrame:
+        closes = [float(v) if v is not None else None for v in df["close"].to_list()]
+        returns = [
+            None
+            if prev is None or curr is None or prev <= 0 or curr <= 0
+            else log(curr / prev)
+            for prev, curr in zip([None, *closes[:-1]], closes, strict=False)
+        ]
+        variance = 0.0
+        vols: list[float | None] = []
+        z_returns: list[float | None] = []
+        for ret in returns:
+            if ret is None:
+                vols.append(None)
+                z_returns.append(None)
+                continue
+            variance = omega + alpha * (ret**2) + beta * variance
+            vol = sqrt(max(variance, 1e-20))
+            vols.append(vol)
+            z_returns.append(ret / vol if vol > 1e-10 else None)
+        return df.with_columns(
+            pl.Series(output, vols, dtype=pl.Float64),
+            pl.Series("garch_z_return", z_returns, dtype=pl.Float64),
+        )
+
+    return _add
+
+
+def add_macd_histogram(
+    *,
+    fast_ema: int = 12,
+    slow_ema: int = 26,
+    signal_period: int = 9,
+    output: str = "macd_hist",
+) -> IndicatorFn:
+    def _add(df: pl.DataFrame) -> pl.DataFrame:
+        macd = pl.col(f"ema_{fast_ema}") - pl.col(f"ema_{slow_ema}")
+        signal = macd.ewm_mean(span=signal_period, min_samples=signal_period)
+        return df.with_columns((macd - signal).alias(output))
+
+    return _add
 
 
 def normalize_order_book_snapshots(df: pl.DataFrame) -> pl.DataFrame:
