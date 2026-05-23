@@ -1,8 +1,7 @@
-"""Research-owned frame preparation workflows."""
+"""Cache-backed context, classifier, and signal frame preparation."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -12,11 +11,10 @@ import polars as pl
 from qooi.core.instruments import PairConfig
 from qooi.exchange.market import CandleSource
 from qooi.exchange.store import (
-    AsyncCacheStore,
     CacheStore,
     HistoryCoverage,
-    HistoryRefreshRequest,
     HistoryRequest,
+    _bar_interval_ms,
     validate_history,
 )
 from qooi.research.config import SignalDebugFilterConfig
@@ -53,20 +51,6 @@ class FrameRequest:
 
 
 @dataclass(frozen=True)
-class CacheAuditRequest:
-    pairs: tuple[PairConfig, ...]
-    data_source: str
-    days: int
-    min_bars: int
-    min_coverage_pct: float
-    bars: tuple[str, ...] = ()
-    refresh: bool = False
-    async_refresh: bool = False
-    refresh_concurrency: int = 3
-    incremental: bool = True
-
-
-@dataclass(frozen=True)
 class BacktestFrameOptions:
     signal_filters: SignalDebugFilterConfig
     metadata: tuple[str, ...]
@@ -93,24 +77,6 @@ PreparedClassifierFrame = FrameResult
 
 
 @dataclass(frozen=True)
-class CacheAuditResult:
-    frame: pl.DataFrame
-
-
-CACHE_AUDIT_SCHEMA = {
-    "status": pl.Utf8,
-    "instrument": pl.Utf8,
-    "bar": pl.Utf8,
-    "actual_bars": pl.Int64,
-    "target_bars": pl.Int64,
-    "coverage_pct": pl.Float64,
-    "start_ms": pl.Int64,
-    "end_ms": pl.Int64,
-    "notes": pl.Utf8,
-}
-
-
-@dataclass(frozen=True)
 class ContextSpec:
     bar: str
     prefix: str
@@ -124,106 +90,6 @@ DEFAULT_CONTEXTS: tuple[ContextSpec, ...] = (
     ContextSpec("4H", "h4", role="higher_context"),
     ContextSpec("1D", "d1", role="higher_context"),
 )
-
-
-def build_history_refresh_requests(
-    request: CacheAuditRequest,
-) -> tuple[HistoryRefreshRequest, ...]:
-    requests: list[HistoryRefreshRequest] = []
-    contexts = tuple(context for context in DEFAULT_CONTEXTS if context.role == "higher_context")
-    for pair in request.pairs:
-        signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
-        for bar in request.bars or (pair.asset.timeframe,):
-            for inst_id in dict.fromkeys((signal_inst_id, execution_inst_id)):
-                requests.append(
-                    HistoryRefreshRequest(
-                        inst_id=inst_id,
-                        bar=bar,
-                        days=request.days,
-                        min_bars=request.min_bars,
-                        refresh=request.refresh,
-                        source="trade",
-                        incremental=request.incremental,
-                    )
-                )
-        for context in contexts:
-            requests.append(
-                HistoryRefreshRequest(
-                    inst_id=signal_inst_id,
-                    bar=context.bar,
-                    days=request.days,
-                    min_bars=_context_min_bars(
-                        context.bar,
-                        request.days,
-                        role="higher_context",
-                    ),
-                    refresh=request.refresh,
-                    source=context.source,
-                    incremental=request.incremental,
-                )
-            )
-    return tuple(dict.fromkeys(requests))
-
-
-def run_cache_audit_workflow(request: CacheAuditRequest) -> CacheAuditResult:
-    store = CacheStore()
-    if request.refresh and request.async_refresh:
-        requests = build_history_refresh_requests(request)
-        asyncio.run(_stream_cache_refresh(requests, request.refresh_concurrency))
-    refresh_local = request.refresh and not request.async_refresh
-    local_request = replace(request, refresh=refresh_local)
-    rows: list[dict[str, object]] = []
-    for history_request in build_history_refresh_requests(local_request):
-        try:
-            _df, coverage = store.bars(
-                HistoryRequest(
-                    inst_id=history_request.inst_id,
-                    bar=history_request.bar,
-                    days=history_request.days,
-                    min_bars=history_request.min_bars,
-                    refresh=refresh_local,
-                    source=history_request.source,
-                )
-            )
-            rows.append(
-                {
-                    "status": "PASS"
-                    if coverage.coverage_pct >= request.min_coverage_pct
-                    else "LOW",
-                    "instrument": history_request.inst_id,
-                    "bar": history_request.bar,
-                    "actual_bars": coverage.actual_bars,
-                    "target_bars": coverage.target.target_bars,
-                    "coverage_pct": coverage.coverage_pct,
-                    "start_ms": coverage.actual_start_ms,
-                    "end_ms": coverage.actual_end_ms,
-                    "notes": ",".join(coverage.notes),
-                }
-            )
-        except Exception as exc:
-            rows.append(
-                {
-                    "status": "ERROR",
-                    "instrument": history_request.inst_id,
-                    "bar": history_request.bar,
-                    "actual_bars": 0,
-                    "target_bars": 0,
-                    "coverage_pct": 0.0,
-                    "start_ms": None,
-                    "end_ms": None,
-                    "notes": str(exc),
-                }
-            )
-    return CacheAuditResult(pl.DataFrame(rows, schema=CACHE_AUDIT_SCHEMA))
-
-
-async def _stream_cache_refresh(
-    requests: tuple[HistoryRefreshRequest, ...], concurrency: int
-) -> None:
-    async with AsyncCacheStore() as store:
-        async for event in store.stream_many(requests, concurrency=concurrency):
-            if event.kind in {"completed", "failed", "summary"}:
-                logger.info("%s", event.message)
 
 
 SIGNAL_CONTEXT_COLUMNS: tuple[str, ...] = (
@@ -390,19 +256,7 @@ def load_context_for_request(
 
 
 def _timeframe_interval_ms(timeframe: str) -> int:
-    normalized = timeframe.replace(" ", "")
-    unit = normalized[-1:].upper()
-    try:
-        value = int(normalized[:-1])
-    except ValueError:
-        return 0
-    if unit == "M":
-        return value * 60_000
-    if unit == "H":
-        return value * 3_600_000
-    if unit == "D":
-        return value * 86_400_000
-    return 0
+    return _bar_interval_ms(timeframe)
 
 
 def _expected_bars_for_days(timeframe: str, days: int) -> int:

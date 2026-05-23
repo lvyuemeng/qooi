@@ -401,16 +401,61 @@ The exposed diagnostics API has two modes: `backtest` and `research-evaluation`.
 `research-evaluation` exposes only:
 
 - `timeframe-classifier`: classifier health evidence.
-- `joint-forward-quality`: the core side-normalized joint bucket candidate table.
+- `dynamic-transition-discovery`: deterministic transition-pattern discovery artifacts.
+- `pattern-quality`: shared scored-pattern surface for static, transition, learned-state, and policy-context diagnostics.
 - `trade-record-modulation`: optional post-trade control evidence.
 
-Former direct diagnostic modes such as `modulation-effect`, `market-state-forward`, `tradability`, `state`, `state-profitability`, and `state-filter-delta` were removed. Their useful concepts were either embedded in `joint-forward-quality` support artifacts or left to normal backtest reports.
+Dynamic transition discovery is an output under `research-evaluation`, not a new diagnostics mode.
 
-Forward labels may use future OHLCV only as outcome columns. Grouping and state columns must remain known at bar close. `joint-forward-quality` is diagnostic-only: no entry filter or strategy variant is authorized until an explicit strategy hypothesis passes execution-aware backtests.
+Behavior-driven state research uses the shared `ResearchFrame -> PatternTable -> OutcomeTable -> MetricTable -> ScoredPatternTable -> ArtifactBundle` data pipe.
+
+Former direct diagnostic modes and outputs such as `modulation-effect`, `market-state-forward`, `tradability`, `joint-forward-quality`, `timeframe-forward-quality`, `resonance-candidates`, `state`, `state-profitability`, and `state-filter-delta` were removed. Their useful concepts are represented by shared pattern metrics, promotion gates, transition artifacts, or normal backtest reports.
+
+Forward labels may use future OHLCV only as outcome columns. Grouping and state columns must remain known at bar close. Pattern-quality artifacts are diagnostic-only: no entry filter or strategy variant is authorized until an explicit strategy hypothesis passes execution-aware backtests.
 
 Detailed formulas and the reduced graph contract are documented in `docs/research-evaluation-api-reference.md`.
 
-## 13. Backtest Orchestration
+## 13. Behavior-Driven State Research
+
+Behavior-driven state research is an exploratory research layer above data preparation and below strategy promotion. It discovers market-state structure from known-at-close labels, then subjects any candidate pattern to the normal promotion and backtest contract.
+
+Research stages:
+
+- Stage 1 dynamic transition diagnostics consume known-at-close classifier labels and deterministic context columns.
+- Stage 2 learned state encoders may produce `behavior_state_id` research labels only after Stage 1 evidence justifies model complexity.
+- Stage 3 policy learners and world models remain simulation/research artifacts until adapted into normal qooi signal columns.
+
+Boundary rules:
+
+- Dynamic transition discovery must not import executor, basket, recovery, or exchange trading clients.
+- Learned state IDs are research labels, not strategy identities.
+- Policy learners must not own basket lifecycle, fills, fees, cash, exchange calls, or recovery mutation.
+- Forward returns may score transition patterns but must not feed state construction.
+- No diagnostic artifact authorizes live trading or allocation.
+
+Deployable outputs must eventually adapt into normal signal columns:
+
+- `raw_entry_signal`
+- `entry_signal`
+- `position_signal`
+- `exit_signal`
+- `signal_strength`
+- `signal_id`
+
+Stage 1 artifacts are:
+
+- `state-transition-graph.csv`
+- `transition-information.csv`
+- `transition-ngram-quality.csv`
+- `none-event-context-quality.csv`
+
+Dependency policy:
+
+- Stage 1 uses Polars and the standard library only.
+- Stage 2 ML dependencies are optional research dependencies, not core runtime dependencies.
+- Stage 3 RL dependencies are optional research dependencies and require a concrete simulation environment contract first.
+
+## 14. Backtest Orchestration
 
 File:
 
@@ -431,7 +476,7 @@ Responsibilities:
 - Call the engine or styles layer.
 - Call evaluation formatting.
 
-## 14. Dynamic Statistics Research
+## 15. Dynamic Statistics Research
 
 The first adaptive-indicator slice is dependency-free and intentionally precedes HMM, PCA, Kalman, GARCH package fitting, or ML classifiers.
 
@@ -450,7 +495,7 @@ Research strategy variants:
 
 Signal strength remains `1.0` for entries in this slice. Strength-based sizing should not be enabled until base signal quality is measured under comparable data settings.
 
-## 15. Data Depth Research
+## 16. Data Depth Research
 
 Backtest research defaults target `730` days and `12,000` bars. These are requested targets, not guaranteed exchange availability.
 
@@ -462,7 +507,7 @@ Asset universes are explicit:
 - `RESEARCH_UNIVERSE` expands liquid swap research assets without changing live trading defaults.
 - `scripts/research.py --config ...` selects the orchestration universe through config `run.universe = "core"|"research"`.
 
-## 16. Current Strategy Recommendation
+## 17. Current Strategy Recommendation
 
 Latest mechanics-normalized evaluation changed the interpretation of prior cached strategy results.
 
@@ -484,7 +529,7 @@ Candidate evaluation baseline:
 - Treat `EXECUTION_INFEASIBLE`, `RECOVERY_EXPERIMENTAL`, `INTRABAR_AMBIGUITY`, and high stop-loss concentration as evidence gates before any strategy promotion.
 - Validate any candidate with rolling or walk-forward tests before increasing basket caps, notional budgets, or enabling recovery.
 
-## 17. Dead-Code Policy
+## 18. Dead-Code Policy
 
 Removed or obsolete APIs should not be reintroduced unless a current caller requires them.
 
@@ -538,3 +583,10 @@ uv run python scripts/research.py --config configs/research/zscore-reverse.toml
 | mark-to-market | Equity valuation including unrealized PnL each bar |
 | fill policy | Rules for stop/target/trailing fills and ambiguity handling |
 | comparability | Whether two reports share enough metadata to compare metrics |
+| behavior state encoder | Research model mapping known-at-close OHLCV windows to discrete market-state labels |
+| endogenous state | Data-discovered discrete market state used for diagnostics before strategy promotion |
+| state-transition graph | Directed graph of known-at-close state changes with empirical transition probabilities |
+| transition information | Mutual information between previous and current known-at-close states |
+| transition n-gram | Consecutive known-at-close state path used as a diagnostic grouping unit |
+| policy learner | Research model that proposes actions in simulation but must be adapted to qooi signal columns before execution |
+| world model | Research model of market dynamics used for simulation or stress testing, not an executor |

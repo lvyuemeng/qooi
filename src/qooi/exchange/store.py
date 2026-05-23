@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -272,6 +272,21 @@ class CacheStore:
         notes = (f"source={request.source}", *(self._exchange.last_bars_audit if refreshed else ()))
         return frame, validate_history(frame, target, refreshed=refreshed, extra_notes=notes)
 
+    def audit_bars(
+        self,
+        requests: Iterable[HistoryRequest],
+        *,
+        min_coverage_pct: float = 0.0,
+    ) -> pl.DataFrame:
+        rows: list[dict[str, object]] = []
+        for request in requests:
+            try:
+                _df, coverage = self.bars(request)
+                rows.append(history_coverage_row(coverage, min_coverage_pct=min_coverage_pct))
+            except Exception as exc:
+                rows.append(history_coverage_error_row(request, exc))
+        return pl.DataFrame(rows, schema=HISTORY_COVERAGE_SCHEMA)
+
     def funding(self, request: FundingRequest) -> pl.DataFrame:
         path = _resource_path(request.inst_id, resource="funding")
         if path.exists() and not request.refresh:
@@ -426,6 +441,18 @@ class AsyncCacheStore:
             if event.result is not None:
                 results.append(event.result)
         return tuple(results)
+
+    async def audit_bars_many(
+        self,
+        requests: Iterable[HistoryRefreshRequest],
+        *,
+        concurrency: int = 3,
+        min_coverage_pct: float = 0.0,
+    ) -> pl.DataFrame:
+        results = await self.many(tuple(requests), concurrency=concurrency, fail_fast=False)
+        return history_coverage_frame(
+            (result.coverage for result in results), min_coverage_pct=min_coverage_pct
+        )
 
     async def stream_many(
         self,
@@ -700,6 +727,63 @@ def validate_history(
         refreshed=refreshed,
         notes=(*notes, *extra_notes),
     )
+
+
+HISTORY_COVERAGE_SCHEMA = {
+    "status": pl.Utf8,
+    "instrument": pl.Utf8,
+    "bar": pl.Utf8,
+    "actual_bars": pl.Int64,
+    "target_bars": pl.Int64,
+    "coverage_pct": pl.Float64,
+    "start_ms": pl.Int64,
+    "end_ms": pl.Int64,
+    "notes": pl.Utf8,
+}
+
+
+def history_coverage_frame(
+    coverages: Iterable[HistoryCoverage],
+    *,
+    min_coverage_pct: float = 0.0,
+) -> pl.DataFrame:
+    rows = [history_coverage_row(item, min_coverage_pct=min_coverage_pct) for item in coverages]
+    return pl.DataFrame(rows, schema=HISTORY_COVERAGE_SCHEMA)
+
+
+def history_coverage_row(
+    coverage: HistoryCoverage,
+    *,
+    min_coverage_pct: float = 0.0,
+) -> dict[str, object]:
+    return {
+        "status": "PASS" if coverage.coverage_pct >= min_coverage_pct else "LOW",
+        "instrument": coverage.inst_id,
+        "bar": coverage.bar,
+        "actual_bars": coverage.actual_bars,
+        "target_bars": coverage.target.target_bars,
+        "coverage_pct": coverage.coverage_pct,
+        "start_ms": coverage.actual_start_ms,
+        "end_ms": coverage.actual_end_ms,
+        "notes": ",".join(coverage.notes),
+    }
+
+
+def history_coverage_error_row(
+    request: HistoryRequest,
+    error: Exception,
+) -> dict[str, object]:
+    return {
+        "status": "ERROR",
+        "instrument": request.inst_id,
+        "bar": request.bar,
+        "actual_bars": 0,
+        "target_bars": 0,
+        "coverage_pct": 0.0,
+        "start_ms": None,
+        "end_ms": None,
+        "notes": str(error),
+    }
 
 
 def _refresh_event_message(

@@ -4,10 +4,9 @@ import polars as pl
 import pytest
 
 from qooi.exchange.store import HistoryCoverage, HistoryTarget
-from qooi.research.config import ResearchCommandConfig
+from qooi.research.config import ResearchCommandConfig, resolve_research_outputs
+from qooi.research.context_frames import DEFAULT_CONTEXTS, FrameRequest, prepare_classifier_frame
 from qooi.research.instruments import RESEARCH_UNIVERSE
-from qooi.research.run import _resolve_research_outputs
-from qooi.research.workflows import DEFAULT_CONTEXTS, FrameRequest, prepare_classifier_frame
 from qooi.strategies.features import StructureClassifierConfig
 
 
@@ -174,36 +173,44 @@ def test_diagnostic_mode_accepts_only_backtest_and_research_evaluation():
             ResearchCommandConfig.model_validate({"diagnostics": {"mode": mode}})
 
 
-def test_joint_forward_quality_config_defaults_disabled_and_validates():
+def test_pattern_quality_config_defaults_and_dynamic_transition_validates():
     default = ResearchCommandConfig()
     assert default.research_evaluation.outputs == (
         "timeframe-classifier",
-        "joint-forward-quality",
+        "dynamic-transition-discovery",
+        "pattern-quality",
     )
     assert default.research_evaluation.include_backtest_report is False
-    assert default.research_evaluation.joint_forward_quality.enabled is False
+    assert default.research_evaluation.pattern_quality.enabled is False
+    assert default.research_evaluation.dynamic_transition_discovery.enabled is False
 
     config = ResearchCommandConfig.model_validate(
         {
             "research_evaluation": {
-                "outputs": ["joint-forward-quality"],
-                "joint_forward_quality": {
+                "outputs": ["dynamic-transition-discovery", "pattern-quality"],
+                "dynamic_transition_discovery": {
                     "enabled": True,
                     "min_rows": 12,
-                    "transition_min_rows": 8,
+                    "ngram_lengths": [2, 3, 3],
                 },
+                "pattern_quality": {"enabled": True, "min_rows": 12},
             }
         }
     )
 
-    assert config.research_evaluation.outputs == ("joint-forward-quality",)
-    assert config.research_evaluation.joint_forward_quality.enabled is True
-    assert config.research_evaluation.joint_forward_quality.transition_min_rows == 8
+    assert config.research_evaluation.outputs == (
+        "dynamic-transition-discovery",
+        "pattern-quality",
+    )
+    assert config.research_evaluation.dynamic_transition_discovery.enabled is True
+    assert config.research_evaluation.dynamic_transition_discovery.ngram_lengths == (2, 3, 3)
+    assert config.research_evaluation.pattern_quality.enabled is True
 
 
 def test_research_evaluation_rejects_removed_outputs():
     removed = [
         "classifier",
+        "joint-forward-quality",
         "tradability",
         "market-state-forward",
         "market-state-modulation",
@@ -218,6 +225,16 @@ def test_research_evaluation_rejects_removed_outputs():
 
 
 def test_research_evaluation_resolves_reduced_outputs_only():
-    assert _resolve_research_outputs(
-        ("joint-forward-quality", "timeframe-classifier", "trade-record-modulation")
-    ) == ("timeframe-classifier", "joint-forward-quality", "trade-record-modulation")
+    assert resolve_research_outputs(
+        (
+            "pattern-quality",
+            "timeframe-classifier",
+            "dynamic-transition-discovery",
+            "trade-record-modulation",
+        )
+    ) == (
+        "timeframe-classifier",
+        "dynamic-transition-discovery",
+        "pattern-quality",
+        "trade-record-modulation",
+    )

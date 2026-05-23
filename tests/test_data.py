@@ -16,8 +16,7 @@ from qooi.exchange.store import (
     plan_history,
     validate_history,
 )
-from qooi.research.instruments import CORE_UNIVERSE, RESEARCH_UNIVERSE
-from qooi.research.workflows import (
+from qooi.research.context_frames import (
     _add_missing_context_columns,
     _compact_higher_timeframe_context,
     _context_min_bars,
@@ -25,6 +24,7 @@ from qooi.research.workflows import (
     add_mtf_state_keys,
     attach_higher_timeframe_context,
 )
+from qooi.research.instruments import CORE_UNIVERSE, RESEARCH_UNIVERSE
 from qooi.strategies.features import add_price_structure_stage_features
 from qooi.strategies.indicators import add_indicators, attach_order_book_features
 

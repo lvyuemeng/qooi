@@ -1,10 +1,9 @@
 """Reduced research orchestration tests."""
 
 from qooi.research.config import ResearchCommandConfig, apply_sizing_overrides
+from qooi.research.history_requests import CacheAuditRequest, build_history_refresh_requests
 from qooi.research.instruments import CORE_UNIVERSE
-from qooi.research.pipeline import WORKFLOW_BUILDERS, compile_research_plan
-from qooi.research.run import strategy_selection_from_config
-from qooi.research.workflows import CacheAuditRequest, build_history_refresh_requests
+from qooi.research.signal_reports import strategy_selection_from_config
 from qooi.strategies.catalog import BENCHMARK_GROUPS
 from qooi.strategies.specs import (
     structure_event_reversal_v1_spec,
@@ -47,13 +46,6 @@ def _command(**overrides):
             update={"sizing": config.sizing.model_copy(update=sizing_updates)}
         )
     return ResearchCommandConfig.model_validate(config.model_dump())
-
-
-def test_workflow_builders_are_reduced_to_backtest_and_research_evaluation():
-    assert set(WORKFLOW_BUILDERS) == {"backtest", "research-evaluation"}
-    assert compile_research_plan(ResearchCommandConfig()).name == "backtest"
-    command = ResearchCommandConfig.model_validate({"diagnostics": {"mode": "research-evaluation"}})
-    assert compile_research_plan(command).name == "research-evaluation"
 
 
 def test_strategy_registry_builds_baselines():

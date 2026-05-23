@@ -29,9 +29,16 @@ DiagnosticMode = Literal[
 ]
 ResearchOutputName = Literal[
     "trade-record-modulation",
-    "joint-forward-quality",
+    "dynamic-transition-discovery",
+    "pattern-quality",
     "timeframe-classifier",
 ]
+RESEARCH_OUTPUT_ORDER: tuple[ResearchOutputName, ...] = (
+    "timeframe-classifier",
+    "dynamic-transition-discovery",
+    "pattern-quality",
+    "trade-record-modulation",
+)
 BarName = Literal["15m", "1H", "4H", "1D"]
 ClassifierProfile = Literal["default", "fixed", "rolling"]
 RangeThresholdMode = Literal["rolling_quantile", "fixed"]
@@ -40,6 +47,13 @@ RangeThresholdFallback = Literal["fixed", "data_error"]
 
 class StrictConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def resolve_research_outputs(
+    requested: tuple[ResearchOutputName, ...],
+) -> tuple[ResearchOutputName, ...]:
+    outputs = set(requested)
+    return tuple(output for output in RESEARCH_OUTPUT_ORDER if output in outputs)
 
 
 class RunConfig(StrictConfigModel):
@@ -157,34 +171,54 @@ class ModulationEffectConfig(StrictConfigModel):
     practical_delta_threshold: float = 0.15
 
 
-class JointForwardQualityConfig(StrictConfigModel):
+class PatternQualityConfig(StrictConfigModel):
     enabled: bool = False
     min_rows: int = 30
     min_symbol_rows: int = 20
     min_time_split_rows: int = 15
     time_splits: int = 2
+    promotion_min_rows: int = 50
+    promotion_min_symbols: int = 3
+    promotion_min_time_splits: int = 2
+    promotion_symbol_agreement_pct: float = 67.0
+    promotion_time_agreement_pct: float = 100.0
     omega_threshold: float = 1.5
     pwpr_threshold: float = 2.0
-    transition_min_rows: int = 50
-    transition_omega_threshold: float = 3.0
-    include_raw_mtf: bool = True
-    include_reduced: bool = True
-    include_transitions: bool = True
-    prior_strength: int = 50
     invalid_values: tuple[str, ...] = ("warmup", "unknown", "data_error")
+
+
+class DynamicTransitionDiscoveryConfig(PatternQualityConfig):
+    enabled: bool = False
+    state_columns: tuple[str, ...] = (
+        "market_stage_reduced",
+        "d1_market_stage_reduced",
+        "h4_market_stage_reduced",
+        "structure_trend_state",
+    )
+    event_column: str = "liquidity_event_type"
+    ngram_lengths: tuple[int, ...] = (2, 3)
+    information_min_rows: int = 100
+    include_none_context: bool = True
+    none_context_columns: tuple[str, ...] = (
+        "atr_percentile_bucket",
+        "key_level_proximity_bucket",
+        "market_stage_reduced",
+    )
 
 
 class ResearchEvaluationConfig(StrictConfigModel):
     outputs: tuple[ResearchOutputName, ...] = (
         "timeframe-classifier",
-        "joint-forward-quality",
+        "dynamic-transition-discovery",
+        "pattern-quality",
     )
     include_backtest_report: bool = False
     write_exports: bool = True
     fail_fast: bool = False
     modulation_effect: ModulationEffectConfig = Field(default_factory=ModulationEffectConfig)
-    joint_forward_quality: JointForwardQualityConfig = Field(
-        default_factory=JointForwardQualityConfig
+    pattern_quality: PatternQualityConfig = Field(default_factory=PatternQualityConfig)
+    dynamic_transition_discovery: DynamicTransitionDiscoveryConfig = Field(
+        default_factory=DynamicTransitionDiscoveryConfig
     )
 
     @field_validator("outputs")

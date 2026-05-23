@@ -11,10 +11,10 @@ from qooi.research.config import (
     ResearchCommandConfig,
     load_research_command_config,
 )
-from qooi.research.pipeline import (
-    compile_research_plan,
-    execute_research_plan,
-    render_research_result,
+from qooi.research.signal_reports import (
+    run_backtest_workflow,
+    run_cache_audit,
+    run_research_evaluation,
 )
 
 
@@ -72,9 +72,12 @@ def _command_config(cli_args: argparse.Namespace) -> ResearchCommandConfig:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     command = _command_config(_parse_args())
-    plan = compile_research_plan(command)
-    result = execute_research_plan(plan, command)
-    print(render_research_result(result))
+    if command.cache.audit:
+        print(run_cache_audit(command))
+    elif command.diagnostics.mode == "research-evaluation":
+        print(run_research_evaluation(command))
+    else:
+        print(run_backtest_workflow(command))
 
 
 if __name__ == "__main__":

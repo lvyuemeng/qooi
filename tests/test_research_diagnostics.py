@@ -2,160 +2,150 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.research.diagnostics import (
-    add_forward_outcomes,
-    add_market_state_reductions,
-    classifier_health,
-    joint_forward_quality,
-    trade_record_control,
-)
+from qooi.research import artifacts, frames, metrics, outcomes, patterns, promotion
 
 
-def test_classifier_health_returns_exportable_rows():
-    result = classifier_health(
-        pl.DataFrame(
-            {
-                "market_stage": ["range"],
-                "structure_trend_state": ["range"],
-                "structure_reason": ["compressed"],
-                "stage_unknown_reason": ["none"],
-            }
-        ),
-        label="BTC 1H",
+def _market_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "symbol": ["BTC"] * 5,
+            "timeframe": ["1H"] * 5,
+            "timestamp": [1, 2, 3, 4, 5],
+            "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "high": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "close": [100.0, 101.0, 102.0, 101.0, 103.0],
+            "market_stage_reduced": ["range", "range", "markup", "markup", "range"],
+            "structure_trend_state": ["range", "uptrend", "uptrend", "range", "range"],
+            "liquidity_event_type": [
+                "none",
+                "failed_breakout_low",
+                "failed_breakout_low",
+                "failed_breakout_high",
+                "none",
+            ],
+            "atr_percentile_bucket": ["normal", "high", "high", "normal", "low"],
+        }
     )
 
-    assert set(result.frame["artifact"].to_list()) == {"classifier-health"}
-    assert "required_classifier_columns" in result.text
 
-
-def test_add_forward_outcomes_uses_future_as_label_only():
-    frame = add_forward_outcomes(
-        pl.DataFrame({"timestamp": [1, 2, 3], "close": [100.0, 101.0, 99.0]}),
+def test_normalize_research_frame_emits_long_known_at_close_rows():
+    research_frame = frames.normalize_research_frame(
+        _market_frame(),
         symbol="BTC",
-        horizons=(1,),
+        timeframe="1H",
+        state_columns=("market_stage_reduced", "structure_trend_state"),
+        event_column="liquidity_event_type",
+        context_columns=("atr_percentile_bucket",),
     )
 
-    assert frame["fwd_1_return_pct"].to_list()[0] == 1.0
-    assert frame["fwd_1_direction"].to_list()[:2] == ["up", "down"]
+    assert research_frame.height == 10
+    assert set(research_frame["state_column"].to_list()) == {
+        "market_stage_reduced",
+        "structure_trend_state",
+    }
+    assert "atr_percentile_bucket" in research_frame.columns
+    assert "forward_return_pct" not in research_frame.columns
 
 
-def test_market_state_reduction_preserves_raw_labels_and_projects_semantics():
-    frame = add_market_state_reductions(
-        pl.DataFrame({"market_stage": ["wide_range", "trend_continuation", "range"]})
+def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
+    research_frame = frames.normalize_research_frame(
+        _market_frame(),
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=("market_stage_reduced",),
+        event_column="liquidity_event_type",
     )
 
-    assert frame["market_stage"].to_list() == ["wide_range", "trend_continuation", "range"]
-    assert frame["market_stage_reduced"].to_list() == [
-        "wide_range",
-        "trend_continuation",
-        "range",
-    ]
+    transition_patterns = patterns.materialize_transition_patterns(
+        research_frame, {"ngram_lengths": (2, 3)}
+    )
+
+    assert set(transition_patterns["pattern_family"].to_list()) == {
+        "transition",
+        "transition_ngram",
+    }
+    assert transition_patterns.filter(pl.col("ngram_length") == 2).height == 4
+    assert transition_patterns.filter(pl.col("ngram_length") == 3).height == 3
+    assert "range->markup" in transition_patterns["pattern_value"].to_list()
 
 
-def test_joint_quality_side_normalizes_short_returns():
+def test_outcomes_attach_forward_labels_after_pattern_materialization():
+    market = _market_frame()
+    research_frame = frames.normalize_research_frame(
+        market,
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=("market_stage_reduced",),
+        event_column="liquidity_event_type",
+    )
+    static_patterns = patterns.materialize_static_patterns(research_frame)
+
+    outcome_table = outcomes.attach_forward_outcomes(static_patterns, market, (1,))
+    long_row = outcome_table.filter(pl.col("event_value") == "failed_breakout_low").row(
+        0, named=True
+    )
+    short_row = outcome_table.filter(pl.col("event_value") == "failed_breakout_high").row(
+        0, named=True
+    )
+
+    assert long_row["side"] == "long"
+    assert short_row["side"] == "short"
+    assert "side_return_pct" in outcome_table.columns
+
+
+def test_metrics_and_promotion_are_separate_pipe_steps():
+    market = _market_frame()
+    research_frame = frames.normalize_research_frame(
+        market,
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=("market_stage_reduced",),
+        event_column="liquidity_event_type",
+    )
+    static_patterns = patterns.materialize_static_patterns(research_frame)
+    outcome_table = outcomes.attach_forward_outcomes(static_patterns, market, (1,))
+
+    metric_table = metrics.summarize_returns(
+        outcome_table,
+        ["pattern_id", "pattern_family", "pattern_source", "symbol", "horizon", "side"],
+    )
+    assert "passes_candidate_gate" not in metric_table.columns
+
+    scored = promotion.apply_candidate_gate(
+        metric_table,
+        {"min_rows": 1, "omega_threshold": 0.1, "pwpr_threshold": 0.1},
+    )
+    assert "passes_candidate_gate" in scored.columns
+
+
+def test_information_metrics_are_count_table_based():
     frame = pl.DataFrame(
         {
-            "symbol": ["BTC"] * 4,
-            "timestamp": [1, 2, 3, 4],
-            "d1_market_stage_reduced": ["range"] * 4,
-            "liquidity_event_type": ["failed_breakout_high"] * 4,
-            "fwd_1_return_pct": [-1.0, -2.0, 1.0, -3.0],
+            "prev": ["a", "a", "b", "b"],
+            "current": ["a", "a", "b", "b"],
+            "event": ["x", "x", "y", "y"],
         }
     )
 
-    result = joint_forward_quality(
-        frame,
-        horizons=(1,),
-        min_rows=1,
-        transition_min_rows=1,
-        omega_threshold=1.5,
-        pwpr_threshold=2.0,
-        prior_strength=10,
-        invalid_values=("warmup", "unknown", "data_error"),
-    ).frame
-
-    row = result.filter(pl.col("artifact") == "joint-forward-quality").row(0, named=True)
-    assert row["side"] == "short"
-    assert row["mean_side_return_pct"] > 0.0
+    assert metrics.entropy(frame, "current") == 1.0
+    assert metrics.mutual_information(frame, "prev", "current") == 1.0
+    assert metrics.conditional_mutual_information(frame, "prev", "current", "event") == 0.0
 
 
-def test_joint_quality_emits_required_artifacts():
-    frame = pl.DataFrame(
-        {
-            "symbol": ["BTC"] * 6,
-            "timestamp": list(range(6)),
-            "market_stage_reduced": ["range", "markup", "markup", "range", "markup", "range"],
-            "h4_market_stage_reduced": ["range"] * 6,
-            "d1_market_stage_reduced": ["range"] * 6,
-            "d1_structure_trend_state": ["uptrend"] * 6,
-            "liquidity_event_type": ["failed_breakout_low"] * 6,
-            "fwd_1_return_pct": [1.0, 2.0, 1.0, -0.5, 2.0, 1.0],
-        }
+def test_artifact_projections_are_views_over_shared_contracts():
+    research_frame = frames.normalize_research_frame(
+        _market_frame(),
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=("market_stage_reduced",),
+        event_column="liquidity_event_type",
+    )
+    transition_patterns = patterns.materialize_transition_patterns(
+        research_frame, {"ngram_lengths": (2,)}
     )
 
-    artifacts = set(
-        joint_forward_quality(
-            frame,
-            horizons=(1,),
-            min_rows=1,
-            transition_min_rows=1,
-            omega_threshold=1.5,
-            pwpr_threshold=2.0,
-            prior_strength=10,
-            invalid_values=("warmup", "unknown", "data_error"),
-        )
-        .frame["artifact"]
-        .to_list()
-    )
+    graph = artifacts.project_transition_graph(transition_patterns)
 
-    assert "configuration-intrinsic-quality" in artifacts
-    assert "joint-forward-quality" in artifacts
-    assert "transition-event-quality" in artifacts
-    assert "joint-reduction-comparison" in artifacts
-    assert "inner-connection-reduction-quality" in artifacts
-
-
-def test_joint_quality_shrinkage_changes_rank_fields():
-    frame = pl.DataFrame(
-        {
-            "symbol": ["BTC"] * 12,
-            "timestamp": list(range(12)),
-            "d1_market_stage_reduced": ["rare"] * 2 + ["common"] * 10,
-            "liquidity_event_type": ["failed_breakout_low"] * 12,
-            "fwd_1_return_pct": [10.0, 10.0] + [1.0] * 10,
-        }
-    )
-
-    rows = joint_forward_quality(
-        frame,
-        horizons=(1,),
-        min_rows=1,
-        transition_min_rows=1,
-        omega_threshold=1.5,
-        pwpr_threshold=2.0,
-        prior_strength=10,
-        invalid_values=("warmup", "unknown", "data_error"),
-    ).frame.filter(pl.col("artifact") == "joint-forward-quality")
-    rare = rows.filter(pl.col("joint_group") == "rare").row(0, named=True)
-
-    assert rare["shrunk_mean_side_return_pct"] < rare["bucket_mean_side_return_pct"]
-    assert "rank_delta" in rows.columns
-
-
-def test_trade_record_control_is_optional_and_strategy_conditioned():
-    result = trade_record_control(
-        pl.DataFrame(
-            {
-                "side": ["buy", "buy", "sell", "sell"],
-                "entry_market_stage": ["range"] * 4,
-                "entry_d1_structure_trend_state": ["uptrend", "uptrend", "downtrend", "downtrend"],
-                "net_pnl_usd": [1.0, 1.0, -1.0, -1.0],
-            }
-        ),
-        min_base_trades=1,
-        min_cell_trades=1,
-        practical_delta_threshold=0.1,
-    )
-
-    assert not result.frame.is_empty()
-    assert set(result.frame["artifact"].to_list()) == {"trade-record-modulation"}
+    assert set(graph["artifact"].to_list()) == {"state-transition-graph"}
+    assert {"source_state", "target_state", "transition_probability"} <= set(graph.columns)
