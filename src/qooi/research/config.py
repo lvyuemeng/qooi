@@ -7,10 +7,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
+from qooi.core.config import StrictConfigModel
 from qooi.core.instruments import PairConfig
+from qooi.research.data import FrameRequest
 from qooi.research.instruments import universe_pairs
+from qooi.research.states import LearnedStateConfig
 from qooi.strategies.catalog import BENCHMARK_GROUP_CHOICES, DEFAULT_STRATEGY, STRATEGY_CHOICES
 from qooi.strategies.features import StructureClassifierConfig
 
@@ -43,10 +46,6 @@ BarName = Literal["15m", "1H", "4H", "1D"]
 ClassifierProfile = Literal["default", "fixed", "rolling"]
 RangeThresholdMode = Literal["rolling_quantile", "fixed"]
 RangeThresholdFallback = Literal["fixed", "data_error"]
-
-
-class StrictConfigModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 def resolve_research_outputs(
@@ -220,6 +219,7 @@ class ResearchEvaluationConfig(StrictConfigModel):
     dynamic_transition_discovery: DynamicTransitionDiscoveryConfig = Field(
         default_factory=DynamicTransitionDiscoveryConfig
     )
+    learned_states: LearnedStateConfig = Field(default_factory=LearnedStateConfig)
 
     @field_validator("outputs")
     @classmethod
@@ -526,6 +526,25 @@ class ResearchCommandConfig(StrictConfigModel):
                 if pair.asset.symbol == self.run.symbol or pair.asset.sig_symbol == self.run.symbol
             ]
         return tuple(apply_sizing_overrides(pair, self.sizing_overrides) for pair in pairs)
+
+    def frame_request(
+        self,
+        pair: PairConfig,
+        *,
+        bar: str | None = None,
+        days: int | None = None,
+        min_bars: int | None = None,
+    ) -> FrameRequest:
+        return FrameRequest(
+            pair=pair,
+            data_source=self.run.data_source,
+            bar=bar or pair.asset.timeframe,
+            days=days or self.days,
+            min_bars=min_bars or self.min_bars,
+            refresh=self.cache.refresh,
+            min_coverage_pct=self.min_coverage_pct,
+            allow_swap_signal_fallback=self.run.allow_swap_signal_fallback,
+        )
 
     def metadata(self) -> tuple[str, ...]:
         return (

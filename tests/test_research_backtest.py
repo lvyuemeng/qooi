@@ -1,9 +1,9 @@
 """Reduced research orchestration tests."""
 
 from qooi.research.config import ResearchCommandConfig, apply_sizing_overrides
-from qooi.research.history_requests import CacheAuditRequest, build_history_refresh_requests
+from qooi.research.data import CacheAuditRequest, build_history_refresh_requests
 from qooi.research.instruments import CORE_UNIVERSE
-from qooi.research.signal_reports import strategy_selection_from_config
+from qooi.research.reports import strategy_selection_from_config
 from qooi.strategies.catalog import BENCHMARK_GROUPS
 from qooi.strategies.specs import (
     structure_event_reversal_v1_spec,
@@ -80,7 +80,7 @@ def test_strategy_selection_supports_benchmark_group():
     )
 
 
-def test_cache_audit_history_requests_include_base_and_higher_context_targets():
+def test_cache_audit_requests_include_base_and_higher_context_targets():
     command = _command(strategy="structure_event_trend_aligned_v1", days=730, min_bars=12000)
     pair = CORE_UNIVERSE[0]
 

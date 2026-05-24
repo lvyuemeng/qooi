@@ -5,7 +5,7 @@ import pytest
 
 from qooi.exchange.store import HistoryCoverage, HistoryTarget
 from qooi.research.config import ResearchCommandConfig, resolve_research_outputs
-from qooi.research.context_frames import DEFAULT_CONTEXTS, FrameRequest, prepare_classifier_frame
+from qooi.research.data import DEFAULT_CONTEXTS, FrameRequest, prepare_classifier_frame
 from qooi.research.instruments import RESEARCH_UNIVERSE
 from qooi.strategies.features import StructureClassifierConfig
 

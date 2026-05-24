@@ -61,20 +61,11 @@ fast when data is too shallow.
 # Auto-creates signal bot on first run, then trades every 1H
 uv run python scripts/trade.py test
 
-# Backtest a strategy on cached data
-uv run python scripts/research.py --config configs/research/base-backtest.toml --symbol ETH-USDT-SWAP
+# Manual-classifier research evaluation
+uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
 
-# Refresh cache and require at least 90% target coverage
-uv run python scripts/research.py --config configs/research/base-backtest.toml --symbol ETH-USDT-SWAP --refresh-cache
-
-# Compare current benchmark set
-uv run python scripts/research.py --config configs/research/benchmark.toml
-
-# Sweep recovery profiles
-uv run python scripts/research.py --config configs/research/base-backtest.toml
-uv run python scripts/research.py --config configs/research/grid-backtest.toml
-uv run python scripts/research.py --config configs/research/martingale-backtest.toml
-uv run python scripts/research.py --config configs/research/hedge-backtest.toml
+# Dynamic behavior-state research evaluation
+uv run python scripts/learned_states.py --config configs/research/behavior-state-vq-rssm.toml
 
 # Custom backtest:
 uv run python -c "

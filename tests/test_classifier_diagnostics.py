@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.research.diagnostics import classifier_health
+from qooi.research.states import classifier_health
 
 
 def test_classifier_health_replaces_legacy_builder_surface():
@@ -23,7 +23,7 @@ def test_classifier_health_replaces_legacy_builder_surface():
 
 
 def test_no_legacy_classifier_builder_symbols_are_exported():
-    import qooi.research.diagnostics as diagnostics
+    import qooi.research.states as states
 
-    assert not hasattr(diagnostics, "ClassifierDiagnosticsBuilder")
-    assert not hasattr(diagnostics, "evaluate_classifier_frame")
+    assert not hasattr(states, "ClassifierDiagnosticsBuilder")
+    assert not hasattr(states, "evaluate_classifier_frame")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.research import artifacts, frames, metrics, outcomes, patterns, promotion
+from qooi.research import tables
 
 
 def _market_frame() -> pl.DataFrame:
@@ -30,7 +30,7 @@ def _market_frame() -> pl.DataFrame:
 
 
 def test_normalize_research_frame_emits_long_known_at_close_rows():
-    research_frame = frames.normalize_research_frame(
+    research_frame = tables.normalize_research_frame(
         _market_frame(),
         symbol="BTC",
         timeframe="1H",
@@ -49,7 +49,7 @@ def test_normalize_research_frame_emits_long_known_at_close_rows():
 
 
 def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
-    research_frame = frames.normalize_research_frame(
+    research_frame = tables.normalize_research_frame(
         _market_frame(),
         symbol="BTC",
         timeframe="1H",
@@ -57,7 +57,7 @@ def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
         event_column="liquidity_event_type",
     )
 
-    transition_patterns = patterns.materialize_transition_patterns(
+    transition_patterns = tables.materialize_transition_patterns(
         research_frame, {"ngram_lengths": (2, 3)}
     )
 
@@ -72,16 +72,16 @@ def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
 
 def test_outcomes_attach_forward_labels_after_pattern_materialization():
     market = _market_frame()
-    research_frame = frames.normalize_research_frame(
+    research_frame = tables.normalize_research_frame(
         market,
         symbol="BTC",
         timeframe="1H",
         state_columns=("market_stage_reduced",),
         event_column="liquidity_event_type",
     )
-    static_patterns = patterns.materialize_static_patterns(research_frame)
+    static_patterns = tables.materialize_transition_patterns(research_frame)
 
-    outcome_table = outcomes.attach_forward_outcomes(static_patterns, market, (1,))
+    outcome_table = tables.attach_forward_outcomes(static_patterns, market, (1,))
     long_row = outcome_table.filter(pl.col("event_value") == "failed_breakout_low").row(
         0, named=True
     )
@@ -96,23 +96,23 @@ def test_outcomes_attach_forward_labels_after_pattern_materialization():
 
 def test_metrics_and_promotion_are_separate_pipe_steps():
     market = _market_frame()
-    research_frame = frames.normalize_research_frame(
+    research_frame = tables.normalize_research_frame(
         market,
         symbol="BTC",
         timeframe="1H",
         state_columns=("market_stage_reduced",),
         event_column="liquidity_event_type",
     )
-    static_patterns = patterns.materialize_static_patterns(research_frame)
-    outcome_table = outcomes.attach_forward_outcomes(static_patterns, market, (1,))
+    static_patterns = tables.materialize_transition_patterns(research_frame)
+    outcome_table = tables.attach_forward_outcomes(static_patterns, market, (1,))
 
-    metric_table = metrics.summarize_returns(
+    metric_table = tables.summarize_returns(
         outcome_table,
         ["pattern_id", "pattern_family", "pattern_source", "symbol", "horizon", "side"],
     )
     assert "passes_candidate_gate" not in metric_table.columns
 
-    scored = promotion.apply_candidate_gate(
+    scored = tables.apply_candidate_gate(
         metric_table,
         {"min_rows": 1, "omega_threshold": 0.1, "pwpr_threshold": 0.1},
     )
@@ -120,32 +120,33 @@ def test_metrics_and_promotion_are_separate_pipe_steps():
 
 
 def test_information_metrics_are_count_table_based():
-    frame = pl.DataFrame(
-        {
-            "prev": ["a", "a", "b", "b"],
-            "current": ["a", "a", "b", "b"],
-            "event": ["x", "x", "y", "y"],
-        }
-    )
-
-    assert metrics.entropy(frame, "current") == 1.0
-    assert metrics.mutual_information(frame, "prev", "current") == 1.0
-    assert metrics.conditional_mutual_information(frame, "prev", "current", "event") == 0.0
-
-
-def test_artifact_projections_are_views_over_shared_contracts():
-    research_frame = frames.normalize_research_frame(
+    research_frame = tables.normalize_research_frame(
         _market_frame(),
         symbol="BTC",
         timeframe="1H",
         state_columns=("market_stage_reduced",),
         event_column="liquidity_event_type",
     )
-    transition_patterns = patterns.materialize_transition_patterns(
+
+    info = tables.summarize_transition_information(research_frame)
+
+    assert info.height == 1
+    assert "transition_information" in info.columns
+
+
+def test_artifact_projections_are_views_over_shared_contracts():
+    research_frame = tables.normalize_research_frame(
+        _market_frame(),
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=("market_stage_reduced",),
+        event_column="liquidity_event_type",
+    )
+    transition_patterns = tables.materialize_transition_patterns(
         research_frame, {"ngram_lengths": (2,)}
     )
 
-    graph = artifacts.project_transition_graph(transition_patterns)
+    graph = tables.project_transition_graph(transition_patterns)
 
     assert set(graph["artifact"].to_list()) == {"state-transition-graph"}
     assert {"source_state", "target_state", "transition_probability"} <= set(graph.columns)

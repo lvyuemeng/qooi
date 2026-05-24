@@ -101,7 +101,7 @@ Rules:
 
 ## Module Dependency Graph
 
-The target architecture is terse composition plus table-owned transformations. Command dispatch belongs in `scripts/research.py`; package modules should either own one table transition or expose one small helper surface.
+The target architecture is terse composition plus table-owned transformations. Scripts are single-role config entry points, not generic command dispatchers.
 
 ## Current Implementation Snapshot
 
@@ -117,57 +117,32 @@ Current research modules:
 ```text
 src/qooi/research/config.py                # command config, output names, stage config
 src/qooi/research/instruments.py           # research/core universes
-src/qooi/research/context_frames.py        # cache-backed classifier/context/signal frame preparation
-src/qooi/research/history_requests.py      # research command -> HistoryRefreshRequest planning
-src/qooi/research/signal_reports.py        # command-facing report/research text and export composition; still bloated
-src/qooi/research/diagnostics.py           # classifier health and post-trade controls
-src/qooi/research/contracts.py             # canonical table schemas and schema utilities
-src/qooi/research/frames.py                # wide prepared frames -> ResearchFrame
-src/qooi/research/patterns.py              # ResearchFrame -> PatternTable
-src/qooi/research/outcomes.py              # PatternTable + market OHLCV -> OutcomeTable
-src/qooi/research/metrics.py               # OutcomeTable/ResearchFrame -> MetricTable
-src/qooi/research/promotion.py             # MetricTable -> ScoredPatternTable / gates
-src/qooi/research/artifacts.py             # artifact projections and CSV writing
-src/qooi/research/transition_discovery.py  # Stage 1 dynamic transition bundle construction
+src/qooi/research/data.py                  # cache-backed request planning and prepared frames
+src/qooi/research/tables.py                # ResearchFrame -> patterns/outcomes/metrics/artifacts
+src/qooi/research/states.py                # classifier-health and learned-state contracts
+src/qooi/research/reports.py               # backtest/cache-audit/research report helpers
 ```
 
-Current command graph:
+Current classifier-state graph:
 
 ```text
-scripts/research.py
+scripts/classifier_states.py
   -> config.load_research_command_config(...)
-  -> if cache audit:
-       history_requests.build_history_refresh_requests(...)
-       exchange.store.CacheStore.audit_bars(...)
-  -> if diagnostics.mode == "research-evaluation":
-       signal_reports.run_research_evaluation(...)
-         -> context_frames.prepare_classifier_frame(...)
-         -> diagnostics.classifier_health(...)
-         -> transition_discovery.build_dynamic_transition_bundle(...)
-            -> frames.normalize_research_frame(...)
-            -> patterns.materialize_transition_patterns(...)
-            -> patterns.materialize_none_event_context_patterns(...)
-            -> outcomes.attach_forward_outcomes(...)
-            -> metrics.summarize_returns(...)
-            -> metrics.summarize_transition_information(...)
-            -> promotion.apply_candidate_gate(...)
-            -> artifacts.project_*()
-         -> artifacts.write_bundle(...)
-  -> else backtest branch:
-       signal_reports.run_backtest_workflow(...)
+  -> reports.run_research_evaluation(...)
+       -> data.prepare_classifier_frame(...)
+       -> states.classifier_health(...)
+       -> tables.build_transition_bundle(...)
+       -> tables.write_bundle(...)
 ```
 
 Current assessment:
 
-- `scripts/research.py` is the composition root for command mode selection.
-- `context_frames.py` is the cache-backed wide-frame preparation layer.
-- `history_requests.py` owns research-specific cache history request planning; generic coverage/audit framing lives in `exchange.store`.
-- `frames.py` is the first canonical research-contract layer.
-- `transition_discovery.py` is a small Stage 1 bundle builder and must not become an orchestration layer.
-- `artifacts.project_transition_graph()` owns transition graph projection; `patterns.py` owns pattern materialization only.
-- `signal_reports.py` is the current command-facing helper, but it is not the desired final boundary because it still mixes backtest, cache-audit formatting, research-evaluation composition, and text rendering.
-- `context_frames.py` has a clearer owner than old `workflows.py`, but still combines classifier/context frame prep with signal frame prep and should be watched for future split pressure.
-- `diagnostics.py` remains outside the Stage 1 pipe.
+- `scripts/classifier_states.py` is the single-role entry point for classifier-state research evaluation.
+- `scripts/learned_states.py` is the single-role entry point for learned behavior-state discovery.
+- `data.py` owns research-specific cache requests plus classifier/context/signal frame preparation.
+- `tables.py` owns the canonical research table pipe and artifact projections.
+- `states.py` owns classifier-health state diagnostics and learned-state contracts.
+- `reports.py` is the remaining command-facing report helper for backtest, cache-audit, and research-evaluation text.
 - `joint_quality.py` is not preserved as an architecture module.
 - Schemas describe pipe contracts or artifact projections, never unrelated artifact unions.
 
@@ -175,37 +150,28 @@ Compatibility stance:
 
 - Do not keep `joint_quality.py` as a permanent module.
 - Do not design new modules around old artifact families.
-- Migrate useful return metrics into `metrics.py`.
-- Migrate useful gate logic into `promotion.py`.
-- Migrate useful grouping logic into `patterns.py`.
+- Keep return metrics, gate logic, and grouping logic in `tables.py` unless a second cohesive owner emerges.
 - Do not reintroduce `pipeline.py`, `run.py`, `workflows.py`, or `runner.py`.
-- Do not let `signal_reports.py`, `context_frames.py`, or `transition_discovery.py` become renamed monoliths.
-- Keep command dispatch in `scripts/research.py`.
+- Do not let `reports.py`, `data.py`, or `tables.py` grow unrelated responsibilities.
+- Keep scripts single-role; do not reintroduce a generic research command dispatcher.
 
 Dependency direction:
 
 | Module | Imports | Responsibility |
 |---|---|---|
-| `scripts/research.py` | argparse, config, narrow workflow functions | CLI composition root and direct mode selection |
+| `scripts/classifier_states.py` | argparse, config, reports | Classifier-state research entry point |
+| `scripts/learned_states.py` | argparse, config, states, tables | Learned behavior-state research entry point |
 | `config.py` | Pydantic, typing | Command config models and output names |
-| `context_frames.py` | cache store, strategy feature prep | Cache-backed classifier/context/signal frame preparation |
-| `history_requests.py` | config/request types, exchange history request type | Research command to history request planning |
-| `signal_reports.py` | executor/evaluate/context frames | Current command-facing helper for backtest, cache-audit text, and research-evaluation text |
-| `diagnostics.py` | Polars, table formatter | Classifier health and post-trade controls outside the pipe |
-| `frames.py` | Polars | Normalize prepared frames into `ResearchFrame` |
-| `patterns.py` | Polars | Materialize `PatternTable` rows from state/event data |
-| `outcomes.py` | Polars | Attach forward labels and side-normalized returns |
-| `metrics.py` | `math`, Polars | Compute information and return-quality metrics |
-| `promotion.py` | Polars | Apply candidate and strict promotion gates |
-| `artifacts.py` | dataclasses, pathlib, Polars | Project/write artifact tables and summaries |
-| `transition_discovery.py` | frames, patterns, outcomes, metrics, promotion, artifacts | Build one Stage 1 transition discovery bundle |
-| `behavior_state.py` | Optional ML imports inside guarded functions | Produce learned-state labels through common contracts |
+| `data.py` | cache store, strategy feature prep | Cache-backed request planning and classifier/context/signal frame preparation |
+| `reports.py` | executor/evaluate/data/tables | Backtest, cache-audit text, and research-evaluation text |
+| `states.py` | Polars, AI contracts | Classifier health and learned `behavior_state_id` labels through common contracts |
+| `tables.py` | dataclasses, pathlib, `math`, Polars | Normalize frames, materialize/scored patterns, and project/write artifacts |
 | `policy_lab.py` | Optional RL imports inside guarded functions | Evaluate simulated policy contexts through common contracts |
 
 Forbidden dependencies:
 
-- `frames.py`, `patterns.py`, `outcomes.py`, `metrics.py`, `promotion.py`, and `artifacts.py` must not import `BacktestExecutor`, `BasketBook`, `TradingClient`, `StrategyBehavior`, or `compute_signal_frame`.
-- `behavior_state.py` must not call exchange clients or mutate caches.
+- `tables.py` must not import `BacktestExecutor`, `BasketBook`, `TradingClient`, `StrategyBehavior`, or `compute_signal_frame`.
+- `states.py` must not call exchange clients, mutate caches, or import Torch.
 - `policy_lab.py` must not submit orders or mutate real baskets.
 - Optional ML/RL packages must not be imported at package import time by core/runtime modules.
 
@@ -215,10 +181,7 @@ Layout guidance:
 - Avoid manager/helper classes unless they own durable state or a protocol boundary.
 - Keep composition code short, linear, and boring; if it needs a graph class, the API graph is too bloated.
 - Do not add package modules whose only job is command dispatch by mode.
-- Keep metric kernels in `metrics.py`.
-- Keep pattern construction in `patterns.py`.
-- Keep export concerns in `artifacts.py`.
-- Keep `transition_discovery.py` as one small Stage 1 bundle builder only.
+- Keep metric kernels, pattern construction, export concerns, and transition bundle construction in `tables.py` while they remain one cohesive table pipe.
 
 Monolith reduction rules:
 
@@ -235,41 +198,38 @@ Monolith reduction rules:
 
 Line targets:
 
-- `scripts/research.py`: under `150` lines.
-- `src/qooi/research/signal_reports.py`: current bloat risk; split by actual ownership after Stage 1 empirical runs if it remains large.
-- `src/qooi/research/context_frames.py`: split only if classifier/context frame prep and signal frame prep keep growing independently.
-- `src/qooi/research/transition_discovery.py`: under `80` lines as one pure Stage 1 bundle builder.
-- `src/qooi/research/diagnostics.py`: under `250` lines.
-- Pipe modules should stay under `200` lines each unless one cohesive algorithm justifies more.
+- `scripts/classifier_states.py` and `scripts/learned_states.py`: each under `150` lines.
+- `src/qooi/research/reports.py`: split by actual ownership if report/backtest/cache-audit responsibilities keep growing.
+- `src/qooi/research/data.py`: split only if classifier/context frame prep and signal frame prep grow independently.
+- `src/qooi/research/tables.py`: keep cohesive table-pipe ownership; split only by durable table owner.
 
 ## Current Redundancy Audit
 
 The remaining redundancy is acceptable only as a short migration state:
 
-- `signal_reports.py` still contains more than one command-facing concern: backtest execution helpers, cache-audit rendering, research-evaluation composition, export text, and post-trade modulation formatting.
-- `context_frames.py` still combines classifier/context frame preparation and signal-frame preparation; keep it only while that coupling remains practical.
-- `transition_discovery.py` is acceptable because it is a single small Stage 1 bundle builder. If it grows, split by table transition instead of creating a second orchestration layer.
-- `artifacts.project_transition_graph()` now owns transition graph projection. `patterns.py` should remain pattern materialization only.
-- `artifacts.write_bundle()` is the target writer boundary; duplicated per-table export writers should not return.
+- `reports.py` still contains more than one command-facing concern: backtest execution helpers, cache-audit rendering, research-evaluation composition, export text, and post-trade modulation formatting.
+- `data.py` combines classifier/context frame preparation and signal-frame preparation; keep it only while that coupling remains practical.
+- `tables.build_transition_bundle()` is acceptable because it is a small table-pipe assembly over local table operations.
+- `tables.write_bundle()` is the target writer boundary; duplicated per-table export writers should not return.
 - `MetricTable` and `ScoredPatternTable` intentionally repeat identity columns for traceability, but derived columns must have one owner.
-- Strict promotion support is incomplete in the current Stage 1 bundle: `promotion.symbol_support()`, `promotion.time_split_support()`, and `promotion.apply_promotion_gate()` exist but are not yet wired into `transition_discovery.py`.
-- `DynamicTransitionDiscoveryConfig.information_min_rows` exists, but transition-information sufficiency currently uses the hard-coded `100` row threshold inside `metrics.summarize_transition_information()`.
+- Strict promotion support is incomplete in the current Stage 1 bundle: `tables.apply_promotion_gate()` exists but is not yet wired into `build_transition_bundle()`.
+- `DynamicTransitionDiscoveryConfig.information_min_rows` exists, but transition-information sufficiency currently uses the hard-coded `100` row threshold inside `tables.summarize_transition_information()`.
 
 Derived-column ownership:
 
 | Derived Column Family | Owner |
 |---|---|
-| `pattern_value`, `ngram_length`, `invalid_state_present` | `patterns.py` |
-| `forward_return_pct`, `side`, `side_return_pct`, `forward_direction` | `outcomes.py` |
-| `omega_ratio`, `pwpr`, information metrics, sufficiency flags | `metrics.py` |
-| `passes_candidate_gate`, `passes_promotion_gate`, support/agreement fields, failure reasons | `promotion.py` |
-| `artifact`, CSV-specific column ordering/projections | `artifacts.py` |
+| `pattern_value`, `ngram_length`, `invalid_state_present` | `tables.py` |
+| `forward_return_pct`, `side`, `side_return_pct`, `forward_direction` | `tables.py` |
+| `omega_ratio`, `pwpr`, information metrics, sufficiency flags | `tables.py` |
+| `passes_candidate_gate`, `passes_promotion_gate`, support/agreement fields, failure reasons | `tables.py` |
+| `artifact`, CSV-specific column ordering/projections | `tables.py` |
 
 Consolidation backlog:
 
-1. Split `signal_reports.py` by actual ownership if it remains large after Stage 1 empirical runs.
-2. Split `context_frames.py` only if classifier/context frame prep and signal frame prep keep growing independently.
-3. Wire `promotion.symbol_support()`, `promotion.time_split_support()`, and `promotion.apply_promotion_gate()` into `transition_discovery.py`.
+1. Split `reports.py` by actual ownership if it remains large after Stage 1 empirical runs.
+2. Split `data.py` only if classifier/context frame prep and signal frame prep keep growing independently.
+3. Wire strict promotion support into `tables.build_transition_bundle()`.
 4. Pass `information_min_rows` into transition information sufficiency instead of relying on the hard-coded `100` row threshold.
 5. Expand classifier quality feedback with state persistence, unknown/warmup rates, state balance, and timeframe agreement metrics if Stage 1 artifacts show classifier instability.
 6. Keep `promotion-candidates.csv` interpretation conservative until strict promotion support is wired.
@@ -665,7 +625,7 @@ Metric implementation rules:
 Stage 1 can be applied now to the handcrafted classifier. The current implementation supports one command that produces both classifier-quality feedback and transition-property feedback:
 
 ```bash
-uv run python scripts/research.py --config configs/research/research-evaluation-dynamic-transitions.toml
+uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
 ```
 
 The configured export directory is:
@@ -765,29 +725,33 @@ No NetworkX dependency is needed for Stage 1.
 
 ## Stage 2: Endogenous State Discovery
 
-Stage 2 can start only if Stage 1 finds robust transition patterns.
+Stage 2 discovers endogenous market-behavior states from known-at-close OHLCV shape windows, then evaluates those labels through the same research pipe as deterministic Stage 1 states. The learned-state path supports multi-asset training through a shared codebook and optional per-symbol causal volatility scaling.
 
-Target implementation:
+Implemented flow:
 
-- Add `behavior_state.py` with importable protocols and dataclasses first.
-- Produce learned labels such as `behavior_state_id` into the `ResearchFrame` contract.
-- Reuse `patterns.py`, `outcomes.py`, `metrics.py`, and `promotion.py` unchanged where possible.
-- Add simple baselines before deep models when possible.
-- Add VQ-VAE or related discrete latent encoders only when deterministic transition states are insufficient.
+- `qooi.research.states.LearnedStateConfig.prepare()` builds causal relative OHLCV features, chronological splits, `PreparedWindows`, and separate `WindowProvenance`.
+- `qooi.research.states.LearnedStateConfig.prepare_many()` applies the same preparation per symbol, assigns splits per symbol, and merges windows for one shared VQ-RSSM dataset.
+- `qooi.ai.contracts.WindowDataset` is the only numeric model input and carries no symbol or timestamp provenance.
+- `qooi.ai.vq_rssm` owns the fixed VQ-RSSM model, `train()`, `save_checkpoint()`, `load_checkpoint()`, and `predict_codes()`.
+- `CodeSequence` is mapped back to research-owned `StateSequence` through `WindowProvenance` before `behavior_state_id` is attached.
+- Learned labels enter the shared pipe through `tables.normalize_research_frame(..., state_source="vq_rssm")`, then reuse `tables.py` pattern, outcome, metric, gate, and artifact operations.
 
 Constraints:
 
 - Encoder inputs must end at or before the decision bar close.
 - Future returns can train supervised heads but must not enter encoder input.
 - Chronological train/validation/test splits are mandatory.
+- Multi-asset splits are chronological per asset before windows are merged.
+- VQ-RSSM training updates parameters only on `split == "train"`; validation rows are metrics-only and test rows are count/evaluation-only.
 - `behavior_state_id` is a research label until promoted.
+- `states.py` and `qooi.ai.contracts` import without Torch; `qooi.ai.vq_rssm` requires `uv sync --group ml`.
+- Symbol IDs and asset embeddings must not enter encoder input unless a later ADR explicitly approves asset-conditioned learned states.
 
 Dependency group if approved:
 
 ```toml
 [dependency-groups]
 ml = [
-    "scikit-learn>=1.4",
     "torch>=2.3",
 ]
 ```
@@ -903,7 +867,7 @@ Phase 2 API graph modification:
 Phase 3 empirical run:
 
 1. Create `configs/research/research-evaluation-dynamic-transitions.toml`.
-2. Run `uv run python scripts/research.py --config configs/research/research-evaluation-dynamic-transitions.toml`.
+2. Run `uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml`.
 3. Review all Stage 1 artifacts.
 4. Apply strict promotion gates before strategy work.
 
@@ -918,7 +882,7 @@ uv run ruff check docs
 Stage 1 implementation validation:
 
 ```bash
-uv run ruff check src/qooi/research scripts/research.py tests
+uv run ruff check src/qooi/research scripts tests
 uv run pytest tests/test_research_data.py tests/test_research_diagnostics.py tests/test_research_backtest.py tests/test_classifier_diagnostics.py
 uv run python -c "from pathlib import Path; from qooi.research.config import load_research_command_config; [load_research_command_config(p) for p in sorted(Path('configs/research').glob('*.toml'))]"
 ```

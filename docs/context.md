@@ -459,9 +459,10 @@ Dependency policy:
 
 File:
 
-- `scripts/research.py`
-- `src/qooi/research/workflows.py`
-- `src/qooi/research/classifier_config.py`
+- `scripts/classifier_states.py`
+- `scripts/learned_states.py`
+- `src/qooi/research/data.py`
+- `src/qooi/research/reports.py`
 
 Responsibilities:
 
@@ -505,7 +506,7 @@ Asset universes are explicit:
 
 - `CORE_UNIVERSE` remains the live/core universe in `qooi.research.instruments`.
 - `RESEARCH_UNIVERSE` expands liquid swap research assets without changing live trading defaults.
-- `scripts/research.py --config ...` selects the orchestration universe through config `run.universe = "core"|"research"`.
+- research scripts select the orchestration universe through config `run.universe = "core"|"research"`.
 
 ## 17. Current Strategy Recommendation
 
@@ -546,7 +547,8 @@ Active code should use:
 - `HistoryRequest`, `HistoryTarget`, `HistoryCoverage`
 - `strategies/specs.py`, `features.py`, `indicators.py`
 - `core/styles.py` for temporal validation styles
-- `scripts/research.py` for orchestration
+- `scripts/classifier_states.py` for classifier-state research
+- `scripts/learned_states.py` for learned behavior-state research
 
 ## Validation Commands
 
@@ -554,11 +556,9 @@ Active code should use:
 uv run ruff check src/qooi/core src/qooi/strategies src/qooi/exchange scripts tests
 uv run ty check src/qooi/core
 uv run ty check src/qooi/strategies
-uv run ty check src/qooi/exchange/market.py src/qooi/exchange/store.py src/qooi/exchange/trading.py scripts/research.py scripts/trade.py
+uv run ty check src/qooi/exchange/market.py src/qooi/exchange/store.py src/qooi/exchange/trading.py scripts/classifier_states.py scripts/learned_states.py scripts/trade.py
 uv run pytest
-uv run python scripts/research.py --config configs/research/rsi-bounce.toml
-uv run python scripts/research.py --config configs/research/zscore-mean-reversion.toml
-uv run python scripts/research.py --config configs/research/zscore-reverse.toml
+uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
 ```
 
 ## Glossary

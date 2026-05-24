@@ -16,7 +16,7 @@ from qooi.exchange.store import (
     plan_history,
     validate_history,
 )
-from qooi.research.context_frames import (
+from qooi.research.data import (
     _add_missing_context_columns,
     _compact_higher_timeframe_context,
     _context_min_bars,

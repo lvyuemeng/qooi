@@ -24,6 +24,9 @@ dev = [
     "ruff>=0.15.12",
     "ty>=0.0.1",
 ]
+ml = [
+    "torch>=2.3",
+]
 
 [tool.ruff]
 target-version = "py311"
@@ -44,4 +47,3 @@ packages = ["src/qooi"]
 
 [tool.uv]
 prerelease = "allow"
-

@@ -11,7 +11,7 @@ A Stage 1 dynamic-transition evaluation has now been applied to the handcrafted 
 Run command:
 
 ```bash
-uv run python scripts/research.py --config configs/research/research-evaluation-joint-quality.toml
+uv run python scripts/classifier_states.py --config configs/research/research-evaluation-joint-quality.toml
 ```
 
 Export directory:
@@ -106,7 +106,7 @@ Stage 1 was run against the handcrafted classifier with the dynamic-transition c
 Run command:
 
 ```bash
-uv run python scripts/research.py --config configs/research/research-evaluation-dynamic-transitions.toml
+uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
 ```
 
 Export directory:

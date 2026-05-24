@@ -1,10 +1,10 @@
-"""Cache-backed context, classifier, and signal frame preparation."""
+"""Cache-backed research request planning and frame preparation."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
 import polars as pl
 
@@ -13,11 +13,11 @@ from qooi.exchange.market import CandleSource
 from qooi.exchange.store import (
     CacheStore,
     HistoryCoverage,
+    HistoryRefreshRequest,
     HistoryRequest,
     _bar_interval_ms,
     validate_history,
 )
-from qooi.research.config import SignalDebugFilterConfig
 from qooi.strategies.features import (
     StructureClassifierConfig,
     add_price_structure_stage_features,
@@ -51,8 +51,57 @@ class FrameRequest:
 
 
 @dataclass(frozen=True)
+class CacheAuditRequest:
+    pairs: tuple[PairConfig, ...]
+    data_source: str
+    days: int
+    min_bars: int
+    min_coverage_pct: float
+    bars: tuple[str, ...] = ()
+    refresh: bool = False
+    async_refresh: bool = False
+    refresh_concurrency: int = 3
+    incremental: bool = True
+
+
+def source_inst_ids(pair: PairConfig, data_source: str) -> tuple[str, str]:
+    if data_source == "spot_signal_swap_exec":
+        return pair.asset.sig_symbol, pair.asset.symbol
+    if data_source == "spot":
+        return pair.asset.sig_symbol, pair.asset.sig_symbol
+    return pair.asset.symbol, pair.asset.symbol
+
+
+def load_cache_for_request(
+    store: CacheStore,
+    inst_id: str,
+    timeframe: str,
+    request: FrameRequest,
+    *,
+    trim_to_target: bool = True,
+    source: CandleSource = "trade",
+) -> tuple[pl.DataFrame, HistoryCoverage]:
+    df, coverage = store.bars(
+        HistoryRequest(
+            inst_id=inst_id,
+            bar=timeframe,
+            days=request.days,
+            min_bars=request.min_bars,
+            refresh=request.refresh,
+            source=source,
+        )
+    )
+    if trim_to_target and df.height > coverage.target.target_bars:
+        df = df.tail(coverage.target.target_bars)
+        coverage = validate_history(df, coverage.target, refreshed=coverage.refreshed)
+    if request.min_coverage_pct > 0 and coverage.coverage_pct < request.min_coverage_pct:
+        raise DataCoverageError(coverage, request.min_coverage_pct)
+    return df, coverage
+
+
+@dataclass(frozen=True)
 class BacktestFrameOptions:
-    signal_filters: SignalDebugFilterConfig
+    signal_filters: Any
     metadata: tuple[str, ...]
 
 
@@ -144,17 +193,9 @@ SIGNAL_CONTEXT_COLUMNS: tuple[str, ...] = (
 )
 
 
-def source_inst_ids(pair: PairConfig, data_source: str) -> tuple[str, str]:
-    if data_source == "spot_signal_swap_exec":
-        return pair.asset.sig_symbol, pair.asset.symbol
-    if data_source == "spot":
-        return pair.asset.sig_symbol, pair.asset.sig_symbol
-    return pair.asset.symbol, pair.asset.symbol
-
-
 def apply_signal_debug_filters(
     frame: pl.DataFrame,
-    filters: SignalDebugFilterConfig,
+    filters: Any,
 ) -> pl.DataFrame:
     """Suppress diagnostic entry buckets without mutating cached strategy output."""
     if not filters.active:
@@ -206,33 +247,6 @@ def apply_signal_debug_filters(
             pl.when(blocked_signal).then(0.0).otherwise(pl.col("signal")).alias("signal")
         )
     return frame.with_columns(expressions)
-
-
-def load_cache_for_request(
-    store: CacheStore,
-    inst_id: str,
-    timeframe: str,
-    request: FrameRequest,
-    *,
-    trim_to_target: bool = True,
-    source: CandleSource = "trade",
-) -> tuple[pl.DataFrame, HistoryCoverage]:
-    df, coverage = store.bars(
-        HistoryRequest(
-            inst_id=inst_id,
-            bar=timeframe,
-            days=request.days,
-            min_bars=request.min_bars,
-            refresh=request.refresh,
-            source=source,
-        )
-    )
-    if trim_to_target and df.height > coverage.target.target_bars:
-        df = df.tail(coverage.target.target_bars)
-        coverage = validate_history(df, coverage.target, refreshed=coverage.refreshed)
-    if request.min_coverage_pct > 0 and coverage.coverage_pct < request.min_coverage_pct:
-        raise DataCoverageError(coverage, request.min_coverage_pct)
-    return df, coverage
 
 
 def load_context_for_request(
@@ -749,3 +763,42 @@ def log_cache_warnings(
             else f"{summary.inst_id} {summary.bar}"
         )
         logger.warning("cache warning %s: %s", label, ", ".join(summary.notes))
+
+
+def build_history_refresh_requests(
+    request: CacheAuditRequest,
+) -> tuple[HistoryRefreshRequest, ...]:
+    requests: list[HistoryRefreshRequest] = []
+    contexts = tuple(context for context in DEFAULT_CONTEXTS if context.role == "higher_context")
+    for pair in request.pairs:
+        signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
+        for bar in request.bars or (pair.asset.timeframe,):
+            for inst_id in dict.fromkeys((signal_inst_id, execution_inst_id)):
+                requests.append(
+                    HistoryRefreshRequest(
+                        inst_id=inst_id,
+                        bar=bar,
+                        days=request.days,
+                        min_bars=request.min_bars,
+                        refresh=request.refresh,
+                        source="trade",
+                        incremental=request.incremental,
+                    )
+                )
+        for context in contexts:
+            requests.append(
+                HistoryRefreshRequest(
+                    inst_id=signal_inst_id,
+                    bar=context.bar,
+                    days=request.days,
+                    min_bars=_context_min_bars(
+                        context.bar,
+                        request.days,
+                        role="higher_context",
+                    ),
+                    refresh=request.refresh,
+                    source=context.source,
+                    incremental=request.incremental,
+                )
+            )
+    return tuple(dict.fromkeys(requests))

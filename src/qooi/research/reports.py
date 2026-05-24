@@ -1,9 +1,10 @@
-"""Signal report and research artifact command helpers."""
+"""Research evaluation and backtest report helpers."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 import polars as pl
 
@@ -29,31 +30,25 @@ from qooi.core.recovery import (
 )
 from qooi.core.styles import cross_validate, rolling_window, walk_forward
 from qooi.exchange.store import AsyncCacheStore, CacheStore, HistoryRequest
-from qooi.research.artifacts import ArtifactBundle, write_bundle
 from qooi.research.config import (
     ResearchCommandConfig,
     ResearchOutputName,
     resolve_research_outputs,
     risk_gate_metadata,
 )
-from qooi.research.context_frames import (
+from qooi.research.data import (
     DEFAULT_CONTEXTS,
     BacktestFrameOptions,
+    CacheAuditRequest,
     DataCoverageError,
-    FrameRequest,
     add_mtf_state_keys,
+    build_history_refresh_requests,
     coverage_metadata,
     prepare_backtest_frame,
     prepare_classifier_frame,
 )
-from qooi.research.diagnostics import (
-    CONTROL_SCHEMA,
-    add_market_state_reductions,
-    classifier_health,
-    trade_record_control,
-)
-from qooi.research.history_requests import CacheAuditRequest, build_history_refresh_requests
-from qooi.research.transition_discovery import build_dynamic_transition_bundle
+from qooi.research.states import classifier_health
+from qooi.research.tables import ArtifactBundle, build_transition_bundle, write_bundle
 from qooi.strategies import StrategyBehavior, compute_signal_frame, strategy_signal_diagnostics
 from qooi.strategies.catalog import (
     strategy_metadata,
@@ -69,6 +64,64 @@ EVIDENCE_ROWS = (
     ["pattern-quality", "pattern table -> scored pattern candidates"],
     ["trade-record-modulation", "strategy signal/backtest branch -> trades"],
 )
+
+CONTROL_SCHEMA = {
+    "artifact": pl.Utf8,
+    "base_feature": pl.Utf8,
+    "base_value": pl.Utf8,
+    "modulator_feature": pl.Utf8,
+    "modulator_value": pl.Utf8,
+    "base_trades": pl.Int64,
+    "conditional_trades": pl.Int64,
+    "base_expectancy": pl.Float64,
+    "conditional_expectancy": pl.Float64,
+    "delta_expectancy": pl.Float64,
+    "classification": pl.Utf8,
+    "sufficient_base": pl.Boolean,
+    "sufficient_cell": pl.Boolean,
+    "significant": pl.Boolean,
+}
+
+
+def add_market_state_reductions(frame: pl.DataFrame) -> pl.DataFrame:
+    work = frame
+    if "market_stage" in work.columns and "market_stage_reduced" not in work.columns:
+        work = work.with_columns(pl.col("market_stage").cast(pl.Utf8).alias("market_stage_reduced"))
+    if "h4_market_stage" in work.columns and "h4_market_stage_reduced" not in work.columns:
+        work = work.with_columns(
+            pl.col("h4_market_stage").cast(pl.Utf8).alias("h4_market_stage_reduced")
+        )
+    if "d1_market_stage" in work.columns and "d1_market_stage_reduced" not in work.columns:
+        work = work.with_columns(
+            pl.col("d1_market_stage").cast(pl.Utf8).alias("d1_market_stage_reduced")
+        )
+    return work
+
+
+@dataclass(frozen=True)
+class TradeRecordControlResult:
+    frame: pl.DataFrame
+    text: str
+
+
+def trade_record_control(
+    trades: pl.DataFrame,
+    *,
+    min_base_trades: int,
+    min_cell_trades: int,
+    practical_delta_threshold: float,
+) -> TradeRecordControlResult:
+    out = _trade_record_control_frame(
+        trades,
+        min_base_trades=min_base_trades,
+        min_cell_trades=min_cell_trades,
+        practical_delta_threshold=practical_delta_threshold,
+    )
+    text = "Trade-record control\n" + format_table(
+        ["Metric", "Value"],
+        [["rows", str(out.height)], ["significant", str(_bool_sum(out, "significant"))]],
+    )
+    return TradeRecordControlResult(out, text)
 
 
 def mode_config(mode: str) -> RecoveryPolicy:
@@ -92,26 +145,6 @@ def exit_config_from_command(command: ResearchCommandConfig) -> ExitConfig:
         trail_mult=command.exit.trail_mult,
         max_bars=command.exit.max_bars,
         breakeven_after_target=command.exit.breakeven_after_target,
-    )
-
-
-def frame_request_from_command(
-    pair,
-    command: ResearchCommandConfig,
-    *,
-    bar: str | None = None,
-    days: int | None = None,
-    min_bars: int | None = None,
-) -> FrameRequest:
-    return FrameRequest(
-        pair=pair,
-        data_source=command.run.data_source,
-        bar=bar or pair.asset.timeframe,
-        days=days or command.days,
-        min_bars=min_bars or command.min_bars,
-        refresh=command.cache.refresh,
-        min_coverage_pct=command.min_coverage_pct,
-        allow_swap_signal_fallback=command.run.allow_swap_signal_fallback,
     )
 
 
@@ -166,7 +199,7 @@ def run_backtest_workflow(command: ResearchCommandConfig) -> str:
             try:
                 prepared = prepare_backtest_frame(
                     CacheStore(),
-                    frame_request_from_command(pair, command),
+                    command.frame_request(pair),
                     strategy,
                     backtest_frame_options_from_command(command),
                 )
@@ -205,7 +238,7 @@ def run_reports(
     for pair in pairs:
         try:
             prepared = prepare_backtest_frame(
-                store, frame_request_from_command(pair, command), strategy, options
+                store, command.frame_request(pair), strategy, options
             )
         except FileNotFoundError as exc:
             logger.warning("skip %s: %s", pair.asset.symbol, exc)
@@ -326,7 +359,7 @@ def _prepare_market_frames(command: ResearchCommandConfig):
         try:
             prepared = prepare_classifier_frame(
                 store,
-                frame_request_from_command(pair, command),
+                command.frame_request(pair),
                 classifier_config,
                 contexts=DEFAULT_CONTEXTS,
             )
@@ -353,9 +386,8 @@ def _prepare_timeframe_frames(
             try:
                 prepared = prepare_classifier_frame(
                     store,
-                    frame_request_from_command(
+                    command.frame_request(
                         pair,
-                        command,
                         bar=spec.bar,
                         days=spec.days,
                         min_bars=spec.min_bars,
@@ -410,7 +442,7 @@ def _dynamic_transition_bundle(command: ResearchCommandConfig, prepared_market) 
         "promotion_symbol_agreement_pct": config.promotion_symbol_agreement_pct,
         "promotion_time_agreement_pct": config.promotion_time_agreement_pct,
     }
-    return build_dynamic_transition_bundle(
+    return build_transition_bundle(
         [market_frame for _symbol, _classifier_frame, market_frame in prepared_market],
         frame_specs=[
             {
@@ -565,6 +597,103 @@ def _frame_table_rows(frame: pl.DataFrame) -> list[list[str]]:
     return [list(row) for row in frame.rows()]
 
 
+def _trade_record_control_frame(
+    trades: pl.DataFrame,
+    *,
+    min_base_trades: int,
+    min_cell_trades: int,
+    practical_delta_threshold: float,
+) -> pl.DataFrame:
+    if trades.is_empty():
+        return pl.DataFrame(schema=CONTROL_SCHEMA)
+    value_col = "net_pnl_usd" if "net_pnl_usd" in trades.columns else "pnl_usd"
+    work = _normalize_trade_aliases(trades)
+    bases = [column for column in ("entry_market_stage_bucket", "side") if column in work.columns]
+    mods = [
+        column
+        for column in ("entry_d1_structure_trend_state", "entry_d1_market_stage")
+        if column in work.columns
+    ]
+    frames = []
+    for base in bases:
+        base_stats = work.group_by(base).agg(
+            pl.len().alias("base_trades"),
+            pl.col(value_col).cast(pl.Float64).mean().alias("base_expectancy"),
+        )
+        for mod in mods:
+            frame = (
+                work.group_by(base, mod)
+                .agg(
+                    pl.len().alias("conditional_trades"),
+                    pl.col(value_col).cast(pl.Float64).mean().alias("conditional_expectancy"),
+                )
+                .join(base_stats, on=base)
+                .with_columns(
+                    pl.lit("trade-record-modulation").alias("artifact"),
+                    pl.lit(base).alias("base_feature"),
+                    pl.col(base).cast(pl.Utf8).alias("base_value"),
+                    pl.lit(mod).alias("modulator_feature"),
+                    pl.col(mod).cast(pl.Utf8).alias("modulator_value"),
+                    (pl.col("conditional_expectancy") - pl.col("base_expectancy")).alias(
+                        "delta_expectancy"
+                    ),
+                )
+                .with_columns(
+                    (pl.col("base_trades") >= min_base_trades).alias("sufficient_base"),
+                    (pl.col("conditional_trades") >= min_cell_trades).alias("sufficient_cell"),
+                )
+                .with_columns(
+                    (
+                        pl.col("sufficient_base")
+                        & pl.col("sufficient_cell")
+                        & (pl.col("delta_expectancy").abs() >= practical_delta_threshold)
+                    ).alias("significant"),
+                    pl.when(pl.col("sufficient_base") & pl.col("sufficient_cell"))
+                    .then(pl.lit("control"))
+                    .otherwise(pl.lit("insufficient"))
+                    .alias("classification"),
+                )
+            )
+            frames.append(_select_schema(frame, CONTROL_SCHEMA))
+    return (
+        pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame(schema=CONTROL_SCHEMA)
+    )
+
+
+def _normalize_trade_aliases(trades: pl.DataFrame) -> pl.DataFrame:
+    work = trades
+    if "entry_market_stage_bucket" not in work.columns and "entry_market_stage" in work.columns:
+        work = work.with_columns(pl.col("entry_market_stage").alias("entry_market_stage_bucket"))
+    if "side" in work.columns:
+        work = work.with_columns(
+            pl.when(pl.col("side").is_in(["buy", "long"]))
+            .then(pl.lit("long"))
+            .when(pl.col("side").is_in(["sell", "short"]))
+            .then(pl.lit("short"))
+            .otherwise(pl.col("side").cast(pl.Utf8))
+            .alias("side")
+        )
+    return work
+
+
+def _select_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+    if frame.is_empty() and not frame.columns:
+        return pl.DataFrame(schema=schema)
+    additions = [
+        pl.lit(None).cast(dtype).alias(column)
+        for column, dtype in schema.items()
+        if column not in frame.columns
+    ]
+    work = frame.with_columns(additions) if additions else frame
+    return work.select([pl.col(column).cast(dtype) for column, dtype in schema])
+
+
+def _bool_sum(frame: pl.DataFrame, column: str) -> int:
+    if frame.is_empty() or column not in frame.columns:
+        return 0
+    return int(frame.select(pl.col(column).fill_null(False).cast(pl.Int64).sum()).item() or 0)
+
+
 def _data_incomplete_report(
     pair,
     strategy: StrategyBehavior,
@@ -652,7 +781,7 @@ def run_style(
     options = backtest_frame_options_from_command(command)
     for pair in pairs:
         prepared = prepare_backtest_frame(
-            store, frame_request_from_command(pair, command), strategy, options
+            store, command.frame_request(pair), strategy, options
         )
 
         def _run_window(seg: pl.DataFrame):

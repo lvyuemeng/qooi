@@ -6,7 +6,7 @@ Date: 2026-05-22
 
 This document defines the reduced `research-evaluation` API and the next extension point for behavior-driven dynamic state research.
 
-It is a methodology reference, not a run report. Current empirical results are in `docs/research-evaluation-report.md`. The full architecture is in `docs/behavior-driven-state-research-architecture.md`.
+It is a methodology reference, not a run report. Current empirical results are in `docs/research-evaluation-report.md` and `docs/dynamic-transition-report.md`. The full architecture is in `docs/architecture.md`.
 
 ## Public Diagnostics Surface
 
