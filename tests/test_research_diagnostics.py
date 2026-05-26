@@ -70,6 +70,23 @@ def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
     assert "range->markup" in transition_patterns["pattern_value"].to_list()
 
 
+def test_materialize_transition_patterns_ignores_sparse_null_states():
+    research_frame = tables.normalize_research_frame(
+        _market_frame().with_columns(
+            pl.Series("learned_state", [None, "20", None, "13", None])
+        ),
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=("learned_state",),
+        event_column="liquidity_event_type",
+    )
+
+    transition_patterns = tables.materialize_transition_patterns(research_frame)
+
+    assert transition_patterns.height == 1
+    assert transition_patterns.row(0, named=True)["pattern_value"] == "20->13"
+
+
 def test_outcomes_attach_forward_labels_after_pattern_materialization():
     market = _market_frame()
     research_frame = tables.normalize_research_frame(
@@ -92,6 +109,26 @@ def test_outcomes_attach_forward_labels_after_pattern_materialization():
     assert long_row["side"] == "long"
     assert short_row["side"] == "short"
     assert "side_return_pct" in outcome_table.columns
+
+
+def test_learned_state_evaluation_outcomes_are_test_only_and_cost_adjusted():
+    outcomes = pl.DataFrame(
+        {
+            "split": ["train", "test", "test"],
+            "forward_return_pct": [1.0, 1.0, None],
+            "side_return_pct": [1.0, 1.0, None],
+        }
+    )
+
+    filtered = tables.filter_evaluation_outcomes(
+        outcomes,
+        returns_split="test",
+        transaction_cost_bps=5.0,
+    )
+
+    assert filtered.height == 1
+    assert filtered.row(0, named=True)["side_return_pct"] == 0.95
+    assert filtered.row(0, named=True)["returns_split"] == "test"
 
 
 def test_metrics_and_promotion_are_separate_pipe_steps():
@@ -134,6 +171,24 @@ def test_information_metrics_are_count_table_based():
     assert "transition_information" in info.columns
 
 
+def test_information_metrics_ignore_null_state_rows() -> None:
+    research_frame = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC", "BTC", "ETH", "ETH", "ETH"],
+            "timeframe": ["1H"] * 6,
+            "timestamp": [1, 2, 3, 1, 2, 3],
+            "state_column": ["behavior_state_id"] * 6,
+            "state_value": ["1", None, "2", "9", None, "8"],
+            "event_value": ["none"] * 6,
+        }
+    )
+
+    info = tables.summarize_transition_information(research_frame)
+
+    assert info.height == 2
+    assert sorted(info.get_column("rows").to_list()) == [2, 2]
+
+
 def test_artifact_projections_are_views_over_shared_contracts():
     research_frame = tables.normalize_research_frame(
         _market_frame(),
@@ -150,3 +205,52 @@ def test_artifact_projections_are_views_over_shared_contracts():
 
     assert set(graph["artifact"].to_list()) == {"state-transition-graph"}
     assert {"source_state", "target_state", "transition_probability"} <= set(graph.columns)
+
+
+def test_state_patterns_and_info_are_direct_null_safe_helpers() -> None:
+    research_frame = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC", "ETH"],
+            "timeframe": ["1H"] * 3,
+            "timestamp": [1, 2, 1],
+            "state_source": ["vq_rssm"] * 3,
+            "state_column": ["behavior_state_id"] * 3,
+            "state_value": ["1", None, "2"],
+            "event_value": ["none"] * 3,
+        }
+    )
+
+    patterns = tables.materialize_state_patterns(research_frame, "vq_rssm")
+    info = tables.summarize_state_info(
+        research_frame,
+        "state_value",
+        ("symbol", "timeframe", "state_column"),
+    )
+
+    assert patterns.height == 2
+    assert set(patterns.get_column("pattern_source")) == {"vq_rssm"}
+    assert sorted(info.get_column("rows")) == [1, 1]
+
+
+def test_transition_paths_compose_scoring_and_projection_helpers() -> None:
+    graph = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC"],
+            "timeframe": ["1H", "1H"],
+            "state_column": ["behavior_state_id", "behavior_state_id"],
+            "source_state": ["1", "1"],
+            "target_state": ["2", "3"],
+            "rows": [9, 1],
+            "source_rows": [10, 10],
+            "transition_probability": [0.9, 0.1],
+        }
+    )
+
+    scored = tables.with_transition_path_scores(graph)
+    paths = tables.project_transition_paths(graph)
+
+    assert "surprisal_bits" in scored.columns
+    assert set(paths.get_column("path_kind")) == {
+        "high_probability",
+        "low_probability_high_information",
+    }

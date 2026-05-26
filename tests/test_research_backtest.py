@@ -1,10 +1,12 @@
 """Reduced research orchestration tests."""
 
+from pathlib import Path
+
+from qooi.core.basket import ExitConfig
 from qooi.research.config import ResearchCommandConfig, apply_sizing_overrides
 from qooi.research.data import CacheAuditRequest, build_history_refresh_requests
 from qooi.research.instruments import CORE_UNIVERSE
-from qooi.research.reports import strategy_selection_from_config
-from qooi.strategies.catalog import BENCHMARK_GROUPS
+from qooi.strategies.catalog import BENCHMARK_GROUPS, strategy_selection
 from qooi.strategies.specs import (
     structure_event_reversal_v1_spec,
     structure_event_trend_aligned_v1_spec,
@@ -15,12 +17,10 @@ def _command(**overrides):
     config = ResearchCommandConfig()
     run_updates = {
         key: overrides[key]
-        for key in ("profile", "universe", "data_source", "symbol")
+        for key in ("profile", "universe", "ds", "symbol")
         if key in overrides
     }
-    cache_updates = {
-        key: overrides[key] for key in ("days", "min_bars", "min_coverage_pct") if key in overrides
-    }
+    req_updates = {key: overrides[key] for key in ("days", "min", "cov") if key in overrides}
     strategy_updates = {
         key: overrides[key]
         for key in ("strategy", "benchmark", "benchmark_group")
@@ -35,8 +35,8 @@ def _command(**overrides):
         sizing_updates["normalize"] = overrides["normalize_sizing"]
     if run_updates:
         config = config.model_copy(update={"run": config.run.model_copy(update=run_updates)})
-    if cache_updates:
-        config = config.model_copy(update={"cache": config.cache.model_copy(update=cache_updates)})
+    if req_updates:
+        config = config.model_copy(update={"req": config.req.model_copy(update=req_updates)})
     if strategy_updates:
         config = config.model_copy(
             update={"strategy": config.strategy.model_copy(update=strategy_updates)}
@@ -49,7 +49,13 @@ def _command(**overrides):
 
 
 def test_strategy_registry_builds_baselines():
-    selection = strategy_selection_from_config(_command(benchmark=True))
+    command = _command(benchmark=True)
+    selection = strategy_selection(
+        command.strategy.strategies,
+        benchmark=command.strategy.benchmark,
+        benchmark_group=command.strategy.benchmark_group,
+        default=command.strategy.strategy,
+    )
 
     assert [strategy.name for strategy in selection.strategies] == [
         "ema_trend_baseline",
@@ -66,7 +72,7 @@ def test_strategy_registry_builds_structural_variants():
 
 def test_strategy_registry_rejects_unknown_name():
     try:
-        strategy_selection_from_config(_command(strategy="missing"))
+        _command(strategy="missing")
     except ValueError as exc:
         assert "strategy.strategy='missing'" in str(exc)
     else:
@@ -74,20 +80,26 @@ def test_strategy_registry_rejects_unknown_name():
 
 
 def test_strategy_selection_supports_benchmark_group():
+    command = _command(benchmark=True)
     assert (
-        strategy_selection_from_config(_command(benchmark=True)).names
+        strategy_selection(
+            command.strategy.strategies,
+            benchmark=command.strategy.benchmark,
+            benchmark_group=command.strategy.benchmark_group,
+            default=command.strategy.strategy,
+        ).names
         == BENCHMARK_GROUPS["baselines"]
     )
 
 
 def test_cache_audit_requests_include_base_and_higher_context_targets():
-    command = _command(strategy="structure_event_trend_aligned_v1", days=730, min_bars=12000)
+    command = _command(strategy="structure_event_trend_aligned_v1", days=730, min=12000)
     pair = CORE_UNIVERSE[0]
 
     requests = build_history_refresh_requests(
         CacheAuditRequest(
             pairs=(pair,),
-            data_source=command.run.data_source,
+            data_source=command.run.ds,
             days=command.days,
             min_bars=command.min_bars,
             min_coverage_pct=command.min_coverage_pct,
@@ -123,3 +135,30 @@ def test_sizing_override_does_not_mutate_global_pair():
     assert updated is not pair
     assert updated.asset.max_risk_pct == 0.03
     assert pair.asset.max_risk_pct == CORE_UNIVERSE[0].asset.max_risk_pct
+
+
+def test_exit_config_is_canonical_runtime_shape():
+    assert isinstance(_command().exit, ExitConfig)
+
+
+def test_removed_research_api_wrappers_are_absent():
+    root = Path(__file__).resolve().parents[1]
+    learned = (root / "scripts" / "learned_states.py").read_text(encoding="utf-8")
+    reports = (root / "src" / "qooi" / "research" / "reports.py").read_text(
+        encoding="utf-8"
+    )
+    data = (root / "src" / "qooi" / "research" / "data.py").read_text(encoding="utf-8")
+    config = (root / "src" / "qooi" / "research" / "config.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "RunCtx" not in learned
+    assert "def pipe" not in learned
+    assert "resolve_flow" not in learned
+    assert "prepare_backtest_frame" not in data
+    assert "_attach_strategy_context" not in data
+    assert "_context_bundle_for_strategy" not in data
+    assert "exit_config_from_command" not in reports
+    assert "backtest_frame_options_from_command" not in reports
+    assert "strategy_selection_from_config" not in reports
+    assert "ExitConfigRequest" not in config

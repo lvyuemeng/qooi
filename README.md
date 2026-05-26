@@ -62,10 +62,10 @@ fast when data is too shallow.
 uv run python scripts/trade.py test
 
 # Manual-classifier research evaluation
-uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
+uv run python scripts/classifier_states.py --config configs/research/dyn-trans.toml
 
 # Dynamic behavior-state research evaluation
-uv run python scripts/learned_states.py --config configs/research/behavior-state-vq-rssm.toml
+uv run python scripts/learned_states.py --config configs/research/learn-vq.toml
 
 # Custom backtest:
 uv run python -c "

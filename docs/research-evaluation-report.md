@@ -106,13 +106,13 @@ Stage 1 was run against the handcrafted classifier with the dynamic-transition c
 Run command:
 
 ```bash
-uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
+uv run python scripts/classifier_states.py --config configs/research/dyn-trans.toml
 ```
 
 Export directory:
 
 ```text
-F:\Stratum\TEMP\kilo\qooi-research-evaluation-dynamic-transitions
+F:\Stratum\TEMP\kilo\qooi-dyn-trans
 ```
 
 Outputs requested:
@@ -298,5 +298,5 @@ The Stage 1 dynamic-transition run is also complete as an initial diagnostic pas
 1. Wire `promotion.symbol_support()`, `promotion.time_split_support()`, and `promotion.apply_promotion_gate()` into `transition_discovery.py`.
 2. Pass `information_min_rows` into transition-information sufficiency instead of relying on the hard-coded 100-row threshold.
 3. Add classifier-quality diagnostics for state persistence, unknown/warmup rates, state balance, and timeframe agreement.
-4. Re-run `configs/research/research-evaluation-dynamic-transitions.toml` after strict promotion wiring.
+4. Re-run `configs/research/dyn-trans.toml` after strict promotion wiring.
 5. Promote nothing until transition artifacts pass strict evidence discipline and execution-aware backtests.

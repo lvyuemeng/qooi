@@ -558,7 +558,7 @@ uv run ty check src/qooi/core
 uv run ty check src/qooi/strategies
 uv run ty check src/qooi/exchange/market.py src/qooi/exchange/store.py src/qooi/exchange/trading.py scripts/classifier_states.py scripts/learned_states.py scripts/trade.py
 uv run pytest
-uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
+uv run python scripts/classifier_states.py --config configs/research/dyn-trans.toml
 ```
 
 ## Glossary

@@ -72,6 +72,98 @@ def source_inst_ids(pair: PairConfig, data_source: str) -> tuple[str, str]:
     return pair.asset.symbol, pair.asset.symbol
 
 
+def history_req(
+    inst_id: str,
+    bar: str,
+    req: Any,
+    *,
+    source: CandleSource = "trade",
+) -> HistoryRequest:
+    return HistoryRequest(
+        inst_id=inst_id,
+        bar=bar,
+        days=int(req.days),
+        min_bars=int(req.min if req.min is not None else 1),
+        refresh=bool(req.refresh),
+        source=source,
+    )
+
+
+def trim_frame(frame: pl.DataFrame, cap: int, trim: bool) -> pl.DataFrame:
+    if trim and cap > 0 and frame.height > cap:
+        return frame.tail(cap)
+    return frame
+
+
+def load_frame(
+    store: CacheStore,
+    inst_id: str,
+    bar: str,
+    req: Any,
+    *,
+    source: CandleSource = "trade",
+) -> tuple[pl.DataFrame, HistoryCoverage]:
+    df, coverage = store.bars(history_req(inst_id, bar, req, source=source))
+    df = trim_frame(df, int(req.cap), bool(req.trim))
+    if df.height != coverage.actual_bars:
+        coverage = validate_history(df, coverage.target, refreshed=coverage.refreshed)
+    cov = float(req.cov or 0.0)
+    if cov > 0 and coverage.coverage_pct < cov:
+        raise DataCoverageError(coverage, cov)
+    return df, coverage
+
+
+def load_frame_with_raw_rows(
+    store: CacheStore,
+    inst_id: str,
+    bar: str,
+    req: Any,
+    *,
+    source: CandleSource = "trade",
+) -> tuple[pl.DataFrame, HistoryCoverage, int, str]:
+    raw, raw_coverage = store.bars(history_req(inst_id, bar, req, source=source))
+    frame = trim_frame(raw, int(req.cap), bool(req.trim))
+    note = "trimmed" if frame.height != raw.height else ""
+    if frame.height != raw.height:
+        coverage = validate_history(frame, raw_coverage.target, refreshed=raw_coverage.refreshed)
+    else:
+        coverage = raw_coverage
+    cov = float(req.cov or 0.0)
+    if cov > 0 and coverage.coverage_pct < cov:
+        raise DataCoverageError(coverage, cov)
+    return frame, coverage, raw.height, note
+
+
+def provenance_row(
+    *,
+    symbol: str,
+    inst_id: str,
+    bar: str,
+    req: Any,
+    raw_rows: int,
+    out: pl.DataFrame,
+    coverage: HistoryCoverage,
+    note: str = "",
+) -> dict[str, object]:
+    timestamps = out.get_column("timestamp").to_list() if "timestamp" in out.columns else []
+    return {
+        "symbol": symbol,
+        "inst_id": inst_id,
+        "bar": bar,
+        "raw_rows": raw_rows,
+        "out_rows": out.height,
+        "start_timestamp": min(timestamps) if timestamps else None,
+        "end_timestamp": max(timestamps) if timestamps else None,
+        "min": req.min,
+        "cap": req.cap,
+        "trim": req.trim,
+        "cov": req.cov,
+        "coverage_pct": coverage.coverage_pct,
+        "refreshed": coverage.refreshed,
+        "note": note,
+    }
+
+
 def load_cache_for_request(
     store: CacheStore,
     inst_id: str,
@@ -269,12 +361,8 @@ def load_context_for_request(
     )
 
 
-def _timeframe_interval_ms(timeframe: str) -> int:
-    return _bar_interval_ms(timeframe)
-
-
 def _expected_bars_for_days(timeframe: str, days: int) -> int:
-    interval_ms = _timeframe_interval_ms(timeframe)
+    interval_ms = _bar_interval_ms(timeframe)
     if interval_ms <= 0:
         return 0
     return max(1, int((days * 86_400_000 + interval_ms - 1) / interval_ms))
@@ -557,16 +645,6 @@ def add_mtf_state_keys(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns(expressions)
 
 
-def _context_bundle_for_strategy(strategy: StrategyBehavior) -> tuple[ContextSpec, ...]:
-    required_columns = getattr(strategy, "required_columns", ())
-    strategy_name = str(getattr(strategy, "name", ""))
-    if strategy_name.startswith("structure_event_") or any(
-        column.startswith(("h1_", "h4_", "d1_")) for column in required_columns
-    ):
-        return DEFAULT_CONTEXTS
-    return ()
-
-
 def _attach_contexts(
     store: CacheStore,
     frame: pl.DataFrame,
@@ -585,21 +663,6 @@ def _attach_contexts(
         context_summaries.append(summary)
         work = _attach_higher_context(work, context_df, spec.prefix, classifier_config)
     return work, tuple(context_summaries)
-
-
-def _attach_strategy_context(
-    store: CacheStore,
-    signal_df: pl.DataFrame,
-    signal_inst_id: str,
-    strategy: StrategyBehavior,
-    request: FrameRequest,
-    *,
-    contexts: tuple[ContextSpec, ...] | None = None,
-) -> tuple[pl.DataFrame, tuple[HistoryCoverage, ...]]:
-    bundle = _context_bundle_for_strategy(strategy) if contexts is None else contexts
-    if not bundle:
-        return signal_df, ()
-    return _attach_contexts(store, signal_df, signal_inst_id, request, bundle)
 
 
 def coverage_metadata(
@@ -662,22 +725,13 @@ def prepare_classifier_frame(
     )
 
 
-def prepare_backtest_frame(
-    store: CacheStore,
-    request: FrameRequest,
-    strategy: StrategyBehavior,
-    options: BacktestFrameOptions,
-) -> PreparedBacktestFrame:
-    return prepare_signal_frame(store, request, strategy, options=options)
-
-
 def prepare_signal_frame(
     store: CacheStore,
     request: FrameRequest,
     strategy: StrategyBehavior,
     *,
     options: BacktestFrameOptions,
-    contexts: tuple[ContextSpec, ...] | None = None,
+    contexts: tuple[ContextSpec, ...] = (),
 ) -> PreparedBacktestFrame:
     pair = request.pair
     signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
@@ -694,13 +748,8 @@ def prepare_signal_frame(
             store, signal_inst_id, timeframe, request
         )
 
-    signal_df, context_summaries = _attach_strategy_context(
-        store,
-        signal_df,
-        signal_inst_id,
-        strategy,
-        request,
-        contexts=contexts,
+    signal_df, context_summaries = _attach_contexts(
+        store, signal_df, signal_inst_id, request, contexts
     )
     has_context = bool(context_summaries)
     if execution_inst_id == signal_inst_id:

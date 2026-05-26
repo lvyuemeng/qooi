@@ -128,11 +128,11 @@ Current classifier-state graph:
 ```text
 scripts/classifier_states.py
   -> config.load_research_command_config(...)
-  -> reports.run_research_evaluation(...)
+  -> reports.classifier_state_research(...)
        -> data.prepare_classifier_frame(...)
        -> states.classifier_health(...)
        -> tables.build_transition_bundle(...)
-       -> tables.write_bundle(...)
+       -> tables.ArtifactBundle.write(...)
 ```
 
 Current assessment:
@@ -210,7 +210,7 @@ The remaining redundancy is acceptable only as a short migration state:
 - `reports.py` still contains more than one command-facing concern: backtest execution helpers, cache-audit rendering, research-evaluation composition, export text, and post-trade modulation formatting.
 - `data.py` combines classifier/context frame preparation and signal-frame preparation; keep it only while that coupling remains practical.
 - `tables.build_transition_bundle()` is acceptable because it is a small table-pipe assembly over local table operations.
-- `tables.write_bundle()` is the target writer boundary; duplicated per-table export writers should not return.
+- `ArtifactBundle.write()` is the target writer boundary; duplicated per-table export writers should not return.
 - `MetricTable` and `ScoredPatternTable` intentionally repeat identity columns for traceability, but derived columns must have one owner.
 - Strict promotion support is incomplete in the current Stage 1 bundle: `tables.apply_promotion_gate()` exists but is not yet wired into `build_transition_bundle()`.
 - `DynamicTransitionDiscoveryConfig.information_min_rows` exists, but transition-information sufficiency currently uses the hard-coded `100` row threshold inside `tables.summarize_transition_information()`.
@@ -487,11 +487,11 @@ Rules:
 
 ```python
 ArtifactBundle(name, tables, summary, warnings, metadata)
+ArtifactBundle.write(export_dir) -> list[str]
 project_transition_graph(patterns) -> pl.DataFrame
 project_transition_information(scored) -> pl.DataFrame
 project_pattern_quality(scored, families) -> pl.DataFrame
 project_promotion_candidates(scored) -> pl.DataFrame
-write_bundle(bundle, export_dir) -> list[str]
 ```
 
 Rules:
@@ -625,13 +625,13 @@ Metric implementation rules:
 Stage 1 can be applied now to the handcrafted classifier. The current implementation supports one command that produces both classifier-quality feedback and transition-property feedback:
 
 ```bash
-uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
+uv run python scripts/classifier_states.py --config configs/research/dyn-trans.toml
 ```
 
 The configured export directory is:
 
 ```text
-F:\Stratum\TEMP\kilo\qooi-research-evaluation-dynamic-transitions
+F:\Stratum\TEMP\kilo\qooi-dyn-trans
 ```
 
 Feedback families:
@@ -866,8 +866,8 @@ Phase 2 API graph modification:
 
 Phase 3 empirical run:
 
-1. Create `configs/research/research-evaluation-dynamic-transitions.toml`.
-2. Run `uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml`.
+1. Create `configs/research/dyn-trans.toml`.
+2. Run `uv run python scripts/classifier_states.py --config configs/research/dyn-trans.toml`.
 3. Review all Stage 1 artifacts.
 4. Apply strict promotion gates before strategy work.
 

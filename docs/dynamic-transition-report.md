@@ -16,13 +16,13 @@ The answer is yes for diagnostics and no for promotion. All classifier health ch
 Run command:
 
 ```bash
-uv run python scripts/classifier_states.py --config configs/research/research-evaluation-dynamic-transitions.toml
+uv run python scripts/classifier_states.py --config configs/research/dyn-trans.toml
 ```
 
 Export directory:
 
 ```text
-F:\Stratum\TEMP\kilo\qooi-research-evaluation-dynamic-transitions
+F:\Stratum\TEMP\kilo\qooi-dyn-trans
 ```
 
 Requested outputs:

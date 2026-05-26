@@ -152,11 +152,14 @@ class BasketAction:
 
 @dataclass
 class ExitConfig:
+    drawdown_stop_pct: float | None = None
+    no_drawdown_stop: bool = False
     stop_mult: float = 1.5
     target_mult: float = 1.3
     trail_mult: float = 2.0
     max_bars: int = 10
     breakeven_after_target: bool = False
+    loss_cooldown_bars: int = 0
     session_end_utc: int = 22
 
 

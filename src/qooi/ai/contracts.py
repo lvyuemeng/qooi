@@ -13,6 +13,7 @@ SplitName = Literal["train", "valid", "test"]
 SPLIT_NAMES = ("train", "valid", "test")
 
 WindowTensor = tuple[tuple[tuple[float, ...], ...], ...]
+FeatureSequence = tuple[tuple[float, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,51 @@ class WindowDataset:
             seq_len=self.seq_len,
             stride=self.stride,
         )
+
+
+@dataclass(frozen=True)
+class AssetFeatureSequence:
+    symbol: str
+    split: SplitName
+    features: FeatureSequence
+    row_index: tuple[int, ...]
+    timestamps: tuple[int, ...]
+    volatility_scale: tuple[float | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.split not in SPLIT_NAMES:
+            raise ValueError("split must be one of: train, valid, test")
+        if not self.features:
+            raise ValueError("features must contain at least one row")
+        lengths = {len(self.features), len(self.row_index), len(self.timestamps)}
+        if self.volatility_scale:
+            lengths.add(len(self.volatility_scale))
+        if len(lengths) != 1:
+            raise ValueError(
+                "features, row_index, timestamps, and volatility_scale must have equal lengths"
+            )
+        for row in self.features:
+            if not row:
+                raise ValueError("feature rows must be non-empty")
+            if any(not math.isfinite(value) for value in row):
+                raise ValueError("feature values must be finite floats")
+
+
+@dataclass(frozen=True)
+class SequenceDataset:
+    sequences: tuple[AssetFeatureSequence, ...]
+    feature_columns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.sequences:
+            raise ValueError("sequences must contain at least one asset/split sequence")
+        if not self.feature_columns:
+            raise ValueError("feature_columns must be non-empty")
+        width = len(self.feature_columns)
+        for sequence in self.sequences:
+            for row in sequence.features:
+                if len(row) != width:
+                    raise ValueError("each feature row must match feature_columns width")
 
 
 @dataclass(frozen=True)

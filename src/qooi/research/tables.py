@@ -101,16 +101,43 @@ class ArtifactBundle:
     warnings: tuple[str, ...] = ()
     metadata: dict[str, str] = field(default_factory=dict)
 
+    def write(self, export_dir: str | Path) -> list[str]:
+        root = Path(export_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        written = []
+        for name, table in self.tables.items():
+            path = root / name
+            table.write_csv(path)
+            written.append(str(path))
+        return written
 
-def write_bundle(bundle: ArtifactBundle, export_dir: str | Path) -> list[str]:
-    root = Path(export_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    written = []
-    for name, table in bundle.tables.items():
-        path = root / name
-        table.write_csv(path)
-        written.append(str(path))
-    return written
+    def non_empty(self, allow_empty: Iterable[str] = ()) -> ArtifactBundle:
+        allowed = set(allow_empty)
+        return ArtifactBundle(
+            self.name,
+            {
+                name: frame
+                for name, frame in self.tables.items()
+                if not frame.is_empty() or name in allowed
+            },
+            summary=self.summary,
+            warnings=self.warnings,
+            metadata=self.metadata,
+        )
+
+    def pick(self, names: Iterable[str]) -> ArtifactBundle:
+        wanted = set(names)
+        return ArtifactBundle(
+            self.name,
+            {name: frame for name, frame in self.tables.items() if name in wanted},
+            summary=self.summary,
+            warnings=self.warnings,
+            metadata=self.metadata,
+        )
+
+
+def ensure_columns(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+    return _ensure_columns(frame, schema)
 
 
 def normalize_research_frame(
@@ -127,7 +154,9 @@ def normalize_research_frame(
     if frame.is_empty():
         return _empty_frame(RESEARCH_FRAME_SCHEMA)
     base_cols = [
-        column for column in ("timestamp", "open", "high", "low", "close") if column in frame
+        column
+        for column in ("timestamp", "open", "high", "low", "close", "split")
+        if column in frame
     ]
     context_cols = [column for column in context_columns if column in frame]
     states = [column for column in state_columns if column in frame]
@@ -166,7 +195,9 @@ def materialize_transition_patterns(
     ngram_lengths = tuple(int(v) for v in (spec or {}).get("ngram_lengths", (2,)))
     source = str((spec or {}).get("pattern_source", "transition"))
     sort_cols = ["symbol", "timeframe", "state_source", "state_column", "timestamp"]
-    work = research_frame.sort([column for column in sort_cols if column in research_frame.columns])
+    work = research_frame.filter(pl.col("state_value").is_not_null()).sort(
+        [column for column in sort_cols if column in research_frame.columns]
+    )
     frames = []
     group = ["symbol", "timeframe", "state_source", "state_column"]
     for length in ngram_lengths:
@@ -182,12 +213,14 @@ def materialize_transition_patterns(
             ngram.alias("pattern_value"),
             ready.alias("_ready"),
         ).filter(pl.col("_ready"))
+        optional_cols = [column for column in ("split",) if column in frame.columns]
         frame = frame.select(
             pl.lit(family).alias("pattern_family"),
             pl.lit(source).alias("pattern_source"),
             "symbol",
             "timeframe",
             "timestamp",
+            *optional_cols,
             "state_source",
             "state_column",
             "pattern_value",
@@ -198,6 +231,31 @@ def materialize_transition_patterns(
         )
         frames.append(_with_pattern_id(frame))
     return _concat_patterns(frames)
+
+
+def materialize_state_patterns(research_frame: pl.DataFrame, source: str) -> pl.DataFrame:
+    if research_frame.is_empty():
+        return _empty_frame(PATTERN_TABLE_SCHEMA)
+    work = research_frame.filter(pl.col("state_value").is_not_null())
+    if work.is_empty():
+        return _empty_frame(PATTERN_TABLE_SCHEMA)
+    optional_cols = [column for column in ("split",) if column in work.columns]
+    frame = work.select(
+        pl.lit("state").alias("pattern_family"),
+        pl.lit(source).alias("pattern_source"),
+        "symbol",
+        "timeframe",
+        "timestamp",
+        *optional_cols,
+        "state_source",
+        "state_column",
+        pl.col("state_value").alias("pattern_value"),
+        "event_value",
+        pl.lit(None, dtype=pl.Utf8).alias("side"),
+        pl.lit(1).alias("ngram_length"),
+        pl.lit(False).alias("invalid_state_present"),
+    )
+    return _with_pattern_id(frame)
 
 
 def materialize_none_event_context_patterns(
@@ -282,6 +340,25 @@ def attach_forward_outcomes(
         )
         frames.append(joined)
     return _attach_side_returns(pl.concat(frames, how="diagonal_relaxed"))
+
+
+def filter_evaluation_outcomes(
+    outcomes: pl.DataFrame,
+    *,
+    returns_split: str = "test",
+    transaction_cost_bps: float = 0.0,
+) -> pl.DataFrame:
+    if outcomes.is_empty():
+        return outcomes
+    work = outcomes.filter(pl.col("forward_return_pct").is_not_null())
+    if returns_split != "all" and "split" in work.columns:
+        work = work.filter(pl.col("split") == returns_split)
+    cost_pct = transaction_cost_bps / 100.0
+    return work.with_columns(
+        (pl.col("side_return_pct") - cost_pct).alias("side_return_pct"),
+        pl.lit(transaction_cost_bps).alias("transaction_cost_bps"),
+        pl.lit(returns_split).alias("returns_split"),
+    )
 
 
 def summarize_returns(outcomes: pl.DataFrame, group_cols: Iterable[str]) -> pl.DataFrame:
@@ -369,6 +446,9 @@ def summarize_transition_information(
     groups = frame.partition_by(group_cols, as_dict=True) if group_cols else {(): frame}
     for key, group in groups.items():
         key_values = key if isinstance(key, tuple) else (key,)
+        group = group.filter(pl.col(state_column).is_not_null())
+        if group.is_empty():
+            continue
         ti = _transition_information(group, state_column)
         cti = (
             _conditional_mutual_information(group, state_column, "_prev_state", condition_column)
@@ -396,6 +476,83 @@ def summarize_transition_information(
             }
         )
     return _ensure_columns(pl.DataFrame(rows), METRIC_TABLE_SCHEMA)
+
+
+def summarize_state_info(
+    frame: pl.DataFrame,
+    state_col: str,
+    group_cols: tuple[str, ...],
+) -> pl.DataFrame:
+    if frame.is_empty() or state_col not in frame.columns:
+        return pl.DataFrame()
+    groups = [column for column in group_cols if column in frame.columns]
+    work = frame.filter(pl.col(state_col).is_not_null())
+    if work.is_empty():
+        return pl.DataFrame()
+    partitions = work.partition_by(groups, as_dict=True) if groups else {(): work}
+    rows = []
+    for key, group in partitions.items():
+        key_values = key if isinstance(key, tuple) else (key,)
+        states = [str(value) for value in group.get_column(state_col).to_list()]
+        pairs = list(zip(states[:-1], states[1:], strict=False))
+        entropy = _entropy_values(states)
+        conditional_entropy = _conditional_entropy_values(pairs)
+        mutual_information = max(entropy - conditional_entropy, 0.0)
+        rows.append(
+            {
+                **{column: value for column, value in zip(groups, key_values, strict=False)},
+                "rows": len(states),
+                "active_states": len(set(states)),
+                "state_entropy_bits": entropy,
+                "conditional_entropy_bits": conditional_entropy,
+                "mutual_information_bits": mutual_information,
+                "normalized_mutual_information": mutual_information / max(entropy, 1e-12),
+                "effective_states": 2.0**entropy,
+                "statistical_complexity_proxy": entropy,
+                "predictive_information_proxy": mutual_information,
+            }
+        )
+    return pl.DataFrame(rows)
+
+
+def with_transition_path_scores(graph: pl.DataFrame) -> pl.DataFrame:
+    if graph.is_empty() or "transition_probability" not in graph.columns:
+        return pl.DataFrame()
+    surprisal = -(pl.col("transition_probability").log() / math.log(2))
+    return graph.with_columns(
+        surprisal.alias("surprisal_bits"),
+        (pl.col("transition_probability") * surprisal).alias("information_contribution_bits"),
+    )
+
+
+def project_top_transitions(
+    scored_graph: pl.DataFrame, *, order_by: str, label: str, n: int
+) -> pl.DataFrame:
+    if scored_graph.is_empty() or order_by not in scored_graph.columns:
+        return pl.DataFrame()
+    return scored_graph.sort(order_by, descending=True).head(n).with_columns(
+        pl.lit(label).alias("path_kind")
+    )
+
+
+def project_transition_paths(graph: pl.DataFrame) -> pl.DataFrame:
+    scored = with_transition_path_scores(graph)
+    paths = [
+        project_top_transitions(
+            scored,
+            order_by="transition_probability",
+            label="high_probability",
+            n=25,
+        ),
+        project_top_transitions(
+            scored,
+            order_by="surprisal_bits",
+            label="low_probability_high_information",
+            n=25,
+        ),
+    ]
+    non_empty = [path for path in paths if not path.is_empty()]
+    return pl.concat(non_empty, how="diagonal_relaxed") if non_empty else pl.DataFrame()
 
 
 def apply_candidate_gate(metrics: pl.DataFrame, thresholds: Mapping[str, object]) -> pl.DataFrame:
@@ -663,6 +820,26 @@ def _entropy(frame: pl.DataFrame, column: str) -> float:
     if total == 0:
         return 0.0
     return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def _entropy_values(values: list[str]) -> float:
+    total = len(values)
+    if total == 0:
+        return 0.0
+    counts = Counter(values)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def _conditional_entropy_values(pairs: list[tuple[str, str]]) -> float:
+    if not pairs:
+        return 0.0
+    total = len(pairs)
+    sources = {source for source, _target in pairs}
+    out = 0.0
+    for source in sources:
+        targets = [target for prev, target in pairs if prev == source]
+        out += len(targets) / total * _entropy_values(targets)
+    return out
 
 
 def _mutual_information(frame: pl.DataFrame, x: str, y: str) -> float:

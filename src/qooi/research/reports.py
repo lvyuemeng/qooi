@@ -44,11 +44,11 @@ from qooi.research.data import (
     add_mtf_state_keys,
     build_history_refresh_requests,
     coverage_metadata,
-    prepare_backtest_frame,
     prepare_classifier_frame,
+    prepare_signal_frame,
 )
 from qooi.research.states import classifier_health
-from qooi.research.tables import ArtifactBundle, build_transition_bundle, write_bundle
+from qooi.research.tables import ArtifactBundle, build_transition_bundle, ensure_columns
 from qooi.strategies import StrategyBehavior, compute_signal_frame, strategy_signal_diagnostics
 from qooi.strategies.catalog import (
     strategy_metadata,
@@ -138,38 +138,16 @@ def mode_config(mode: str) -> RecoveryPolicy:
     return NoRecovery()
 
 
-def exit_config_from_command(command: ResearchCommandConfig) -> ExitConfig:
-    return ExitConfig(
-        stop_mult=command.exit.stop_mult,
-        target_mult=command.exit.target_mult,
-        trail_mult=command.exit.trail_mult,
-        max_bars=command.exit.max_bars,
-        breakeven_after_target=command.exit.breakeven_after_target,
-    )
-
-
-def backtest_frame_options_from_command(command: ResearchCommandConfig) -> BacktestFrameOptions:
-    return BacktestFrameOptions(
-        signal_filters=command.signal_filters,
-        metadata=command.metadata(),
-    )
-
-
-def strategy_selection_from_config(command: ResearchCommandConfig):
-    labels = command.strategy.strategies
-    return strategy_selection(
-        labels,
+def run_backtest_workflow(command: ResearchCommandConfig) -> str:
+    pairs = command.pairs()
+    selection = strategy_selection(
+        command.strategy.strategies,
         benchmark=command.strategy.benchmark,
         benchmark_group=command.strategy.benchmark_group,
         default=command.strategy.strategy,
     )
-
-
-def run_backtest_workflow(command: ResearchCommandConfig) -> str:
-    pairs = command.pairs()
-    selection = strategy_selection_from_config(command)
     recovery_cfg = mode_config(command.strategy.mode)
-    exit_cfg = exit_config_from_command(command)
+    exit_cfg = command.exit
 
     if len(selection.strategies) > 1:
         benchmark_results = []
@@ -197,11 +175,15 @@ def run_backtest_workflow(command: ResearchCommandConfig) -> str:
     if wants_diagnostics:
         for pair, report in zip(pairs, reports, strict=False):
             try:
-                prepared = prepare_backtest_frame(
+                prepared = prepare_signal_frame(
                     CacheStore(),
                     command.frame_request(pair),
                     strategy,
-                    backtest_frame_options_from_command(command),
+                    options=BacktestFrameOptions(
+                        signal_filters=command.signal_filters,
+                        metadata=command.metadata(),
+                    ),
+                    contexts=DEFAULT_CONTEXTS,
                 )
             except DataCoverageError:
                 continue
@@ -234,11 +216,18 @@ def run_reports(
 ):
     reports = []
     store = CacheStore()
-    options = backtest_frame_options_from_command(command)
+    options = BacktestFrameOptions(
+        signal_filters=command.signal_filters,
+        metadata=command.metadata(),
+    )
     for pair in pairs:
         try:
-            prepared = prepare_backtest_frame(
-                store, command.frame_request(pair), strategy, options
+            prepared = prepare_signal_frame(
+                store,
+                command.frame_request(pair),
+                strategy,
+                options=options,
+                contexts=DEFAULT_CONTEXTS,
             )
         except FileNotFoundError as exc:
             logger.warning("skip %s: %s", pair.asset.symbol, exc)
@@ -291,55 +280,113 @@ def _prepare_market_state_frame(
     return add_market_state_reductions(work)
 
 
-def run_research_evaluation(command: ResearchCommandConfig) -> str:
+def classifier_state_research(command: ResearchCommandConfig) -> str:
     outputs = resolve_research_outputs(command.research_evaluation.outputs)
+    output_set = set(outputs)
+    wants_timeframe = "timeframe-classifier" in output_set
+    wants_transition = bool({"dynamic-transition-discovery", "pattern-quality"} & output_set)
+    wants_trade = "trade-record-modulation" in output_set
     sections = ["Layered research evaluation", _research_graph_text(outputs)]
     summary_rows: list[list[str]] = []
     export_messages: list[str] = []
     reports: list[Report] = []
+    tables: dict[str, pl.DataFrame] = {}
 
-    timeframe_frames = (
-        _prepare_timeframe_frames(command) if "timeframe-classifier" in outputs else {}
-    )
-    prepared_market = (
-        _prepare_market_frames(command)
-        if {"dynamic-transition-discovery", "pattern-quality"} & set(outputs)
-        else []
-    )
+    if wants_timeframe:
+        rows, text_sections, output_tables = _timeframe_classifier_output(command)
+        summary_rows.extend(rows)
+        sections.extend(text_sections)
+        tables.update(output_tables)
 
-    if "timeframe-classifier" in outputs:
-        frame, text = _timeframe_classifier_artifact(timeframe_frames)
-        summary_rows.append(["timeframe-classifier", f"rows={frame.height}"])
-        if text:
-            sections.append("Timeframe classifier diagnostics\n" + text)
-        export_messages.extend(_write_tables(command, {"timeframe-classifier.csv": frame}))
-
-    if {"dynamic-transition-discovery", "pattern-quality"} & set(outputs):
-        bundle = _dynamic_transition_bundle(command, prepared_market)
-        scored = bundle.tables.get("scored-patterns.csv", pl.DataFrame())
-        summary_rows.append(
-            [
-                "pattern-quality",
-                f"rows={scored.height} candidates={_bool_count(scored, 'passes_candidate_gate')}",
-            ]
+    if wants_transition:
+        rows, text_sections, output_tables = _dynamic_transition_output(
+            command,
+            include_graph="dynamic-transition-discovery" in output_set,
+            include_quality="pattern-quality" in output_set,
         )
-        sections.append("Pattern quality\n" + "\n".join(bundle.summary))
-        export_messages.extend(_write_tables(command, _filter_bundle_tables(bundle, outputs)))
+        summary_rows.extend(rows)
+        sections.extend(text_sections)
+        tables.update(output_tables)
 
-    if command.research_evaluation.include_backtest_report or "trade-record-modulation" in outputs:
+    if command.research_evaluation.include_backtest_report or wants_trade:
         reports, text = _research_backtest_branch(command)
         if text:
             sections.append(text)
-    if "trade-record-modulation" in outputs:
-        frame = _trade_record_modulation_frame(command, reports)
-        summary_rows.extend(_trade_modulation_summary_rows(frame))
-        sections.append("Trade-record control\nrows=" + str(frame.height))
-        export_messages.extend(_write_tables(command, {"trade-record-modulation.csv": frame}))
+    if wants_trade:
+        rows, text_sections, output_tables = _trade_modulation_output(command, reports)
+        summary_rows.extend(rows)
+        sections.extend(text_sections)
+        tables.update(output_tables)
+
+    export_root = command.diagnostics.export_dir or command.diagnostics.export
+    if command.research_evaluation.write_exports and export_root:
+        bundle = ArtifactBundle("classifier-state-research", tables).non_empty(
+            allow_empty=("promotion-candidates.csv",)
+        )
+        for path in bundle.write(export_root):
+            name = path.replace("\\", "/").rsplit("/", 1)[-1]
+            export_messages.append(f"{name}: {path}")
 
     if export_messages:
         sections.append("Research evaluation exports\n" + "\n".join(export_messages))
     summary = "Evidence graph summary\n" + format_table(["Layer", "Summary"], summary_rows)
     return summary + "\n\n" + "\n\n".join(section for section in sections if section.strip())
+
+
+def _timeframe_classifier_output(
+    command: ResearchCommandConfig,
+) -> tuple[list[list[str]], list[str], dict[str, pl.DataFrame]]:
+    frame, text = _timeframe_classifier_artifact(_prepare_timeframe_frames(command))
+    sections = ["Timeframe classifier diagnostics\n" + text] if text else []
+    return [["timeframe-classifier", f"rows={frame.height}"]], sections, {
+        "timeframe-classifier.csv": frame
+    }
+
+
+def _dynamic_transition_output(
+    command: ResearchCommandConfig,
+    *,
+    include_graph: bool,
+    include_quality: bool,
+) -> tuple[list[list[str]], list[str], dict[str, pl.DataFrame]]:
+    bundle = _dynamic_transition_bundle(command, _prepare_market_frames(command))
+    names = []
+    if include_graph:
+        names.extend(("state-transition-graph.csv", "transition-information.csv"))
+    if include_quality:
+        names.extend(
+            (
+                "transition-ngram-quality.csv",
+                "none-event-context-quality.csv",
+                "scored-patterns.csv",
+                "promotion-candidates.csv",
+            )
+        )
+    tables = bundle.pick(names).tables
+    rows = []
+    if include_quality:
+        scored = bundle.tables.get("scored-patterns.csv", pl.DataFrame())
+        rows.append(
+            [
+                "pattern-quality",
+                f"rows={scored.height} candidates={_bool_count(scored, 'passes_candidate_gate')}",
+            ]
+        )
+    if include_graph:
+        graph = bundle.tables.get("state-transition-graph.csv", pl.DataFrame())
+        rows.append(["dynamic-transition-discovery", f"edges={graph.height}"])
+    return rows, ["Pattern quality\n" + "\n".join(bundle.summary)], tables
+
+
+def _trade_modulation_output(
+    command: ResearchCommandConfig, reports: list[Report]
+) -> tuple[list[list[str]], list[str], dict[str, pl.DataFrame]]:
+    frame = _trade_record_modulation_frame(command, reports)
+    return (
+        _trade_modulation_summary_rows(frame),
+        ["Trade-record control\nrows=" + str(frame.height)],
+        {"trade-record-modulation.csv": frame},
+    )
 
 
 def _research_graph_text(outputs: tuple[ResearchOutputName, ...]) -> str:
@@ -459,24 +506,13 @@ def _dynamic_transition_bundle(command: ResearchCommandConfig, prepared_market) 
     )
 
 
-def _filter_bundle_tables(
-    bundle: ArtifactBundle, outputs: tuple[ResearchOutputName, ...]
-) -> dict[str, pl.DataFrame]:
-    tables = {}
-    for name, frame in bundle.tables.items():
-        if name.startswith("state-") and "dynamic-transition-discovery" not in outputs:
-            continue
-        if (
-            name in {"scored-patterns.csv", "promotion-candidates.csv"}
-            and "pattern-quality" not in outputs
-        ):
-            continue
-        tables[name] = frame
-    return tables
-
-
 def _research_backtest_branch(command: ResearchCommandConfig) -> tuple[list[Report], str]:
-    selection = strategy_selection_from_config(command)
+    selection = strategy_selection(
+        command.strategy.strategies,
+        benchmark=command.strategy.benchmark,
+        benchmark_group=command.strategy.benchmark_group,
+        default=command.strategy.strategy,
+    )
     if len(selection.strategies) != 1 or command.strategy.style != "single":
         return [], (
             "Backtest branch\n"
@@ -489,7 +525,7 @@ def _research_backtest_branch(command: ResearchCommandConfig) -> tuple[list[Repo
         command.pairs(),
         strategy,
         mode_config(command.strategy.mode),
-        exit_config_from_command(command),
+        command.exit,
         command,
     )
     if command.research_evaluation.fail_fast:
@@ -523,23 +559,6 @@ def _trade_record_modulation_frame(
         min_cell_trades=config.min_cell_trades,
         practical_delta_threshold=config.practical_delta_threshold,
     ).frame
-
-
-def _write_tables(command: ResearchCommandConfig, tables: dict[str, pl.DataFrame]) -> list[str]:
-    export_root = command.diagnostics.export_dir or command.diagnostics.export
-    if not command.research_evaluation.write_exports or not export_root:
-        return []
-    non_empty = {
-        name: frame
-        for name, frame in tables.items()
-        if not frame.is_empty() or name == "promotion-candidates.csv"
-    }
-    written = write_bundle(ArtifactBundle("research-evaluation", non_empty), export_root)
-    messages = []
-    for path in written:
-        name = path.replace("\\", "/").rsplit("/", 1)[-1]
-        messages.append(f"{name}: {path}")
-    return messages
 
 
 def _trade_modulation_summary_rows(frame: pl.DataFrame) -> list[list[str]]:
@@ -654,7 +673,7 @@ def _trade_record_control_frame(
                     .alias("classification"),
                 )
             )
-            frames.append(_select_schema(frame, CONTROL_SCHEMA))
+            frames.append(ensure_columns(frame, CONTROL_SCHEMA).select(list(CONTROL_SCHEMA)))
     return (
         pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame(schema=CONTROL_SCHEMA)
     )
@@ -674,18 +693,6 @@ def _normalize_trade_aliases(trades: pl.DataFrame) -> pl.DataFrame:
             .alias("side")
         )
     return work
-
-
-def _select_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
-    if frame.is_empty() and not frame.columns:
-        return pl.DataFrame(schema=schema)
-    additions = [
-        pl.lit(None).cast(dtype).alias(column)
-        for column, dtype in schema.items()
-        if column not in frame.columns
-    ]
-    work = frame.with_columns(additions) if additions else frame
-    return work.select([pl.col(column).cast(dtype) for column, dtype in schema])
 
 
 def _bool_sum(frame: pl.DataFrame, column: str) -> int:
@@ -778,10 +785,17 @@ def run_style(
 ) -> str:
     lines = []
     store = CacheStore()
-    options = backtest_frame_options_from_command(command)
+    options = BacktestFrameOptions(
+        signal_filters=command.signal_filters,
+        metadata=command.metadata(),
+    )
     for pair in pairs:
-        prepared = prepare_backtest_frame(
-            store, command.frame_request(pair), strategy, options
+        prepared = prepare_signal_frame(
+            store,
+            command.frame_request(pair),
+            strategy,
+            options=options,
+            contexts=DEFAULT_CONTEXTS,
         )
 
         def _run_window(seg: pl.DataFrame):
@@ -831,15 +845,15 @@ def run_style(
 def run_cache_audit(command: ResearchCommandConfig) -> str:
     request = CacheAuditRequest(
         pairs=command.pairs(),
-        data_source=command.run.data_source,
+        data_source=command.run.ds,
         days=command.days,
         min_bars=command.min_bars,
         min_coverage_pct=command.min_coverage_pct,
         bars=command.timeframes.bars if command.diagnostics.mode == "research-evaluation" else (),
-        refresh=command.cache.refresh,
-        async_refresh=command.cache.async_refresh,
-        refresh_concurrency=command.cache.refresh_concurrency,
-        incremental=not command.cache.refresh_full,
+        refresh=command.req.refresh,
+        async_refresh=command.req.async_refresh,
+        refresh_concurrency=command.req.refresh_concurrency,
+        incremental=not command.req.refresh_full,
     )
     refresh_requests = build_history_refresh_requests(request)
     if request.refresh and request.async_refresh:

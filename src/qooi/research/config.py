@@ -9,6 +9,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from qooi.core.basket import ExitConfig
 from qooi.core.config import StrictConfigModel
 from qooi.core.instruments import PairConfig
 from qooi.research.data import FrameRequest
@@ -58,22 +59,24 @@ def resolve_research_outputs(
 class RunConfig(StrictConfigModel):
     profile: Profile = "research"
     universe: UniverseName = "core"
-    data_source: DataSource = "swap"
+    ds: DataSource = "swap"
     symbol: str = ""
     exclude_symbol: tuple[str, ...] = ()
     allow_swap_signal_fallback: bool = False
     show_status: bool = False
 
 
-class CacheConfig(StrictConfigModel):
+class ReqConfig(StrictConfigModel):
     audit: bool = False
     refresh: bool = False
     async_refresh: bool = False
     refresh_concurrency: int = 3
     refresh_full: bool = False
     days: int | None = None
-    min_bars: int | None = None
-    min_coverage_pct: float | None = None
+    min: int | None = None
+    cap: int = 0
+    trim: bool = False
+    cov: float | None = None
 
 
 class StrategyConfig(StrictConfigModel):
@@ -145,17 +148,6 @@ class RiskConfig(StrictConfigModel):
     fail_on_risk: bool = False
 
 
-class ExitConfigRequest(StrictConfigModel):
-    drawdown_stop_pct: float | None = None
-    no_drawdown_stop: bool = False
-    max_bars: int = 10
-    stop_mult: float = 1.5
-    target_mult: float = 1.3
-    trail_mult: float = 2.0
-    breakeven_after_target: bool = False
-    loss_cooldown_bars: int = 0
-
-
 class DiagnosticsConfig(StrictConfigModel):
     mode: DiagnosticMode = "backtest"
     export: str = ""
@@ -219,8 +211,6 @@ class ResearchEvaluationConfig(StrictConfigModel):
     dynamic_transition_discovery: DynamicTransitionDiscoveryConfig = Field(
         default_factory=DynamicTransitionDiscoveryConfig
     )
-    learned_states: LearnedStateConfig = Field(default_factory=LearnedStateConfig)
-
     @field_validator("outputs")
     @classmethod
     def _outputs_non_empty(
@@ -425,33 +415,34 @@ class MarketStateConfig(StrictConfigModel):
 
 class ResearchCommandConfig(StrictConfigModel):
     run: RunConfig = Field(default_factory=RunConfig)
-    cache: CacheConfig = Field(default_factory=CacheConfig)
+    req: ReqConfig = Field(default_factory=ReqConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     sizing: SizingConfig = Field(default_factory=SizingConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
-    exit: ExitConfigRequest = Field(default_factory=ExitConfigRequest)
+    exit: ExitConfig = Field(default_factory=ExitConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     classifier: ClassifierConfigRequest = Field(default_factory=ClassifierConfigRequest)
     market_state: MarketStateConfig = Field(default_factory=MarketStateConfig)
     timeframes: TimeframeResearchConfig = Field(default_factory=TimeframeResearchConfig)
     research_evaluation: ResearchEvaluationConfig = Field(default_factory=ResearchEvaluationConfig)
+    learn: LearnedStateConfig = Field(default_factory=LearnedStateConfig)
 
     @property
     def days(self) -> int:
         if self.run.profile == "smoke":
-            return int(self.cache.days) if self.cache.days is not None else 90
-        return int(self.cache.days) if self.cache.days is not None else 730
+            return int(self.req.days) if self.req.days is not None else 90
+        return int(self.req.days) if self.req.days is not None else 730
 
     @property
     def min_bars(self) -> int:
         if self.run.profile == "smoke":
-            return int(self.cache.min_bars) if self.cache.min_bars is not None else 1000
-        return int(self.cache.min_bars) if self.cache.min_bars is not None else 12000
+            return int(self.req.min) if self.req.min is not None else 1000
+        return int(self.req.min) if self.req.min is not None else 12000
 
     @property
     def min_coverage_pct(self) -> float:
-        if self.cache.min_coverage_pct is not None:
-            return float(self.cache.min_coverage_pct)
+        if self.req.cov is not None:
+            return float(self.req.cov)
         if self.run.profile in ("research", "safe"):
             return 90.0
         return 0.0
@@ -537,11 +528,11 @@ class ResearchCommandConfig(StrictConfigModel):
     ) -> FrameRequest:
         return FrameRequest(
             pair=pair,
-            data_source=self.run.data_source,
+            data_source=self.run.ds,
             bar=bar or pair.asset.timeframe,
             days=days or self.days,
             min_bars=min_bars or self.min_bars,
-            refresh=self.cache.refresh,
+            refresh=self.req.refresh,
             min_coverage_pct=self.min_coverage_pct,
             allow_swap_signal_fallback=self.run.allow_swap_signal_fallback,
         )
@@ -552,7 +543,7 @@ class ResearchCommandConfig(StrictConfigModel):
             f"days={self.days}",
             f"min_bars={self.min_bars}",
             f"universe={self.run.universe}",
-            f"data_source={self.run.data_source}",
+            f"data_source={self.run.ds}",
             f"style={self.strategy.style}",
             f"max_per_strategy_symbol={self.max_per_strategy_symbol}",
             *self.sizing_overrides.metadata(),

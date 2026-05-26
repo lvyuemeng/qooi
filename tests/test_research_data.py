@@ -5,7 +5,7 @@ import pytest
 
 from qooi.exchange.store import HistoryCoverage, HistoryTarget
 from qooi.research.config import ResearchCommandConfig, resolve_research_outputs
-from qooi.research.data import DEFAULT_CONTEXTS, FrameRequest, prepare_classifier_frame
+from qooi.research.data import DEFAULT_CONTEXTS, FrameRequest, load_frame, prepare_classifier_frame
 from qooi.research.instruments import RESEARCH_UNIVERSE
 from qooi.strategies.features import StructureClassifierConfig
 
@@ -48,8 +48,8 @@ def _command():
     return config.model_copy(
         update={
             "run": config.run.model_copy(update={"profile": "smoke"}),
-            "cache": config.cache.model_copy(
-                update={"days": 10, "min_bars": 10, "min_coverage_pct": 0.0}
+            "req": config.req.model_copy(
+                update={"days": 10, "min": 10, "cov": 0.0}
             ),
         }
     )
@@ -58,11 +58,11 @@ def _command():
 def _request(pair, command: ResearchCommandConfig) -> FrameRequest:
     return FrameRequest(
         pair=pair,
-        data_source=command.run.data_source,
+        data_source=command.run.ds,
         bar=pair.asset.timeframe,
         days=command.days,
         min_bars=command.min_bars,
-        refresh=command.cache.refresh,
+        refresh=command.req.refresh,
         min_coverage_pct=command.min_coverage_pct,
         allow_swap_signal_fallback=command.run.allow_swap_signal_fallback,
     )
@@ -133,6 +133,34 @@ def test_prepare_classifier_frame_uses_requested_bar_without_default_context():
     assert "h4_market_stage" not in prepared.frame.columns
     assert "d1_market_stage" not in prepared.frame.columns
     assert "mtf_state_key" not in prepared.frame.columns
+
+
+def test_req_replaces_cache_and_rejects_old_cache_shape() -> None:
+    command = ResearchCommandConfig.model_validate(
+        {"req": {"days": 20, "min": 12, "cap": 0, "trim": False, "cov": 0}}
+    )
+
+    assert command.days == 20
+    assert command.min_bars == 12
+    with pytest.raises(ValueError):
+        ResearchCommandConfig.model_validate({"cache": {"days": 20}})
+
+
+def test_load_frame_treats_min_as_floor_and_cap_only_when_trimmed() -> None:
+    command = ResearchCommandConfig.model_validate(
+        {"req": {"days": 10, "min": 10, "cap": 100, "trim": False, "cov": 0}}
+    )
+
+    full, _coverage = load_frame(FakeStore(), "BTC-USDT-SWAP", "1H", command.req)
+    trimmed, _coverage = load_frame(
+        FakeStore(),
+        "BTC-USDT-SWAP",
+        "1H",
+        command.req.model_copy(update={"trim": True}),
+    )
+
+    assert full.height == 240
+    assert trimmed.height == 100
 
 
 def test_timeframe_config_resolves_defaults_and_overrides():

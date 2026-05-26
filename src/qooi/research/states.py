@@ -11,7 +11,16 @@ from typing import Literal, Self
 import polars as pl
 from pydantic import Field, field_validator, model_validator
 
-from qooi.ai.contracts import SPLIT_NAMES, CodeSequence, SplitName, WindowDataset
+from qooi.ai import vq_rssm
+from qooi.ai.contracts import (
+    SPLIT_NAMES,
+    AssetFeatureSequence,
+    CodeSequence,
+    SequenceDataset,
+    SplitName,
+    WindowDataset,
+)
+from qooi.ai.training import TrainingConfig
 from qooi.core.config import StrictConfigModel
 from qooi.core.evaluate import format_table
 from qooi.research import tables
@@ -23,8 +32,10 @@ LEARNED_STATE_FEATURE_COLUMNS = (
     "close_rel",
     "volume_log_rel",
 )
-LearnedStateAction = Literal["train", "predict", "evaluate"]
 VolatilityScalingMethod = Literal["ewm_std"]
+LearnedStateReturnSplit = Literal["train", "valid", "test", "all"]
+LearnedStatePhase = Literal["train", "predict", "evaluate"]
+LearnedObjectiveTerm = Literal["reconstruct", "vq", "kl", "future_infonce"]
 _ROW_INDEX = "__behavior_row_index"
 
 HEALTH_SCHEMA = {
@@ -98,15 +109,31 @@ class FeatureColumns(StrictConfigModel):
 
 
 class VolatilityScalingConfig(StrictConfigModel):
-    enabled: bool = False
+    on: bool = False
     method: VolatilityScalingMethod = "ewm_std"
-    return_column: str = "close_rel"
-    columns: tuple[str, ...] = ("open_rel", "high_rel", "low_rel", "close_rel")
-    half_life: float = 10.0
+    ret: str = "close_rel"
+    cols: tuple[str, ...] = ("open_rel", "high_rel", "low_rel", "close_rel")
+    half: float = 10.0
     min_periods: int = 2
     floor: float = 1e-4
     cap: float = 0.10
     output_column: str = "volatility_scale"
+
+    @property
+    def enabled(self) -> bool:
+        return self.on
+
+    @property
+    def return_column(self) -> str:
+        return self.ret
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return self.cols
+
+    @property
+    def half_life(self) -> float:
+        return self.half
 
     @model_validator(mode="after")
     def _valid_scaling(self) -> Self:
@@ -127,13 +154,130 @@ class VolatilityScalingConfig(StrictConfigModel):
         return self
 
 
+class LearnedStateEvaluationConfig(StrictConfigModel):
+    h: tuple[int, ...] = ()
+    split: LearnedStateReturnSplit = "test"
+    cost: float = 5.0
+    min: int = 1
+
+    @property
+    def horizons(self) -> tuple[int, ...]:
+        return self.h
+
+    @property
+    def returns_split(self) -> LearnedStateReturnSplit:
+        return self.split
+
+    @property
+    def transaction_cost_bps(self) -> float:
+        return self.cost
+
+    @property
+    def min_rows(self) -> int:
+        return self.min
+
+    @field_validator("h")
+    @classmethod
+    def _horizons_positive(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(horizon <= 0 for horizon in value):
+            raise ValueError("learned state evaluation horizons must be positive")
+        return tuple(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _valid_evaluation(self) -> Self:
+        if self.cost < 0.0 or not math.isfinite(self.cost):
+            raise ValueError("transaction_cost_bps must be a finite non-negative float")
+        if self.min <= 0:
+            raise ValueError("min_rows must be positive")
+        return self
+
+
+class LearnedStateRunConfig(StrictConfigModel):
+    phases: tuple[LearnedStatePhase, ...] = ("train", "predict", "evaluate")
+    checkpoint: Path = Path("")
+    states: Path = Path("")
+
+    @field_validator("phases")
+    @classmethod
+    def _phases_non_empty(
+        cls, value: tuple[LearnedStatePhase, ...]
+    ) -> tuple[LearnedStatePhase, ...]:
+        phases = tuple(dict.fromkeys(value))
+        if not phases:
+            raise ValueError("learn.run.phases must contain at least one phase")
+        return phases
+
+
+class FutureObjectiveConfig(StrictConfigModel):
+    kind: Literal["infonce"] = "infonce"
+    min_len: int = 4
+    max_len: int = 32
+    samples: int = 1
+    dim: int = 32
+    temperature: float = 0.1
+    source: Literal["features"] = "features"
+    length_policy: Literal["cycle"] = "cycle"
+
+    @model_validator(mode="after")
+    def _valid_future(self) -> Self:
+        if self.min_len <= 0:
+            raise ValueError("future min_len must be positive")
+        if self.max_len < self.min_len:
+            raise ValueError("future max_len must be >= min_len")
+        if self.samples <= 0:
+            raise ValueError("future samples must be positive")
+        if self.dim <= 0:
+            raise ValueError("future dim must be positive")
+        if self.temperature <= 0.0 or not math.isfinite(self.temperature):
+            raise ValueError("future temperature must be a finite positive float")
+        return self
+
+
+class LearnedObjectiveConfig(StrictConfigModel):
+    terms: tuple[LearnedObjectiveTerm, ...] = ("reconstruct", "vq", "kl")
+    reconstruct: float = 1.0
+    vq: float = 1.0
+    kl: float = 1.0
+    future: float = 0.0
+
+    @field_validator("terms")
+    @classmethod
+    def _terms_non_empty(
+        cls, value: tuple[LearnedObjectiveTerm, ...]
+    ) -> tuple[LearnedObjectiveTerm, ...]:
+        terms = tuple(dict.fromkeys(value))
+        if not terms:
+            raise ValueError("learn.objective.terms must contain at least one term")
+        return terms
+
+    @model_validator(mode="after")
+    def _valid_weights(self) -> Self:
+        for name in ("reconstruct", "vq", "kl", "future"):
+            value = getattr(self, name)
+            if value < 0.0 or not math.isfinite(value):
+                raise ValueError(f"objective {name} weight must be finite and non-negative")
+        return self
+
+
 class WindowConfig(StrictConfigModel):
-    seq_len: int = 100
+    len: int = 100
     stride: int = 1
     eps: float = 1e-8
     use_global_zscore: bool = False
-    train_pct: float = 0.7
-    valid_pct: float = 0.2
+    train: float = 0.7
+    valid: float = 0.2
+
+    @property
+    def seq_len(self) -> int:
+        return self.len
+
+    @property
+    def train_pct(self) -> float:
+        return self.train
+
+    @property
+    def valid_pct(self) -> float:
+        return self.valid
 
     @model_validator(mode="after")
     def _valid_window(self) -> WindowConfig:
@@ -278,56 +422,207 @@ class WindowConfig(StrictConfigModel):
             raise ValueError("prepared window and provenance counts must match")
         return prepared, provenance
 
+    def sequences(
+        self,
+        frame: pl.DataFrame,
+        columns: FeatureColumns,
+        seq_config: SequenceConfig,
+        feature_columns: tuple[str, ...] = LEARNED_STATE_FEATURE_COLUMNS,
+        volatility_scale_column: str = "volatility_scale",
+    ) -> tuple[PreparedSequences, WindowProvenance]:
+        _require_columns(frame, feature_columns)
+        if columns.split not in frame.columns:
+            raise ValueError("frame must contain a split column")
+        work = frame.with_row_index(_ROW_INDEX) if _ROW_INDEX not in frame.columns else frame
+        scale_values = (
+            work.get_column(volatility_scale_column).to_list()
+            if volatility_scale_column in work.columns
+            else None
+        )
+        sequences = []
+        emit_row_index = []
+        emit_timestamps = []
+        emit_symbols = []
+        emit_splits = []
+        emit_scales = []
+        for split in SPLIT_NAMES:
+            part = work.filter(pl.col(columns.split) == split)
+            if part.is_empty():
+                continue
+            feature_rows = tuple(
+                tuple(float(value) for value in row)
+                for row in part.select(feature_columns).rows()
+            )
+            source_row_index = tuple(int(value) for value in part.get_column(_ROW_INDEX).to_list())
+            timestamps = tuple(_timestamp_values(part, columns.timestamp))
+            symbols = (
+                tuple(part.get_column(columns.symbol).cast(pl.Utf8).to_list())
+                if columns.symbol in part.columns
+                else ("",) * part.height
+            )
+            symbol = str(symbols[0]) if symbols else ""
+            scales = (
+                tuple(
+                    float(value) if value is not None else None
+                    for value in part.get_column(volatility_scale_column).to_list()
+                )
+                if scale_values is not None
+                else ()
+            )
+            sequences.append(
+                AssetFeatureSequence(
+                    symbol=symbol,
+                    split=split,
+                    features=feature_rows,
+                    row_index=source_row_index,
+                    timestamps=timestamps,
+                    volatility_scale=scales,
+                )
+            )
+            for offset in range(seq_config.warmup - 1, part.height, seq_config.stride):
+                emit_row_index.append(source_row_index[offset])
+                emit_timestamps.append(timestamps[offset])
+                emit_symbols.append(symbols[offset])
+                emit_splits.append(split)
+                if scales:
+                    emit_scales.append(scales[offset])
+        prepared = PreparedSequences(
+            sequences=tuple(sequences),
+            feature_columns=feature_columns,
+            chunk=seq_config.chunk,
+            warmup=seq_config.warmup,
+            stride=seq_config.stride,
+            carry=seq_config.carry,
+        )
+        provenance = WindowProvenance(
+            row_index=tuple(emit_row_index),
+            timestamps=tuple(emit_timestamps),
+            symbols=tuple(str(symbol) for symbol in emit_symbols),
+            splits=tuple(_split_name(split) for split in emit_splits),
+            volatility_scale=tuple(emit_scales),
+        )
+        return prepared, provenance
+
+
+class SequenceConfig(StrictConfigModel):
+    chunk: int = 256
+    warmup: int = 64
+    stride: int = 1
+    carry: bool = True
+    reset: Literal["asset_split"] = "asset_split"
+
+    @model_validator(mode="after")
+    def _valid_sequence(self) -> SequenceConfig:
+        if self.chunk <= 0:
+            raise ValueError("chunk must be positive")
+        if self.warmup <= 0:
+            raise ValueError("warmup must be positive")
+        if self.stride <= 0:
+            raise ValueError("stride must be positive")
+        return self
+
 
 class VqRssmConfig(StrictConfigModel):
     input_dim: int | None = None
-    hidden_dim: int = 128
-    latent_dim: int = 16
-    num_codes: int = 128
-    commitment_cost: float = 0.25
-    kl_anneal_steps: int = 5000
+    hidden: int = 128
+    latent: int = 16
+    codes: int = 128
+    commit: float = 0.25
+    kl_steps: int = 5000
     eps: float = 1e-8
 
+    @property
+    def hidden_dim(self) -> int:
+        return self.hidden
 
-class TrainConfig(StrictConfigModel):
-    epochs: int = 20
-    batch_size: int = 64
-    learning_rate: float = 1e-3
-    max_grad_norm: float = 1.0
-    seed: int | None = None
+    @property
+    def latent_dim(self) -> int:
+        return self.latent
+
+    @property
+    def num_codes(self) -> int:
+        return self.codes
+
+    @property
+    def commitment_cost(self) -> float:
+        return self.commit
+
+    @property
+    def kl_anneal_steps(self) -> int:
+        return self.kl_steps
 
 
 class LearnedStateConfig(StrictConfigModel):
-    enabled: bool = False
+    input: Literal["window", "sequence"] = "window"
     model: Literal["vq-rssm"] = "vq-rssm"
-    actions: tuple[LearnedStateAction, ...] = ("train", "predict", "evaluate")
-    state_column: str = "behavior_state_id"
+    state: str = "behavior_state_id"
     timeframe: str = "1H"
+    out: Path = Path("data/output/learned-states/vq-rssm")
+    predict: bool = True
+    run: LearnedStateRunConfig = Field(default_factory=LearnedStateRunConfig)
+    objective: LearnedObjectiveConfig = Field(default_factory=LearnedObjectiveConfig)
     feature_columns: tuple[str, ...] = LEARNED_STATE_FEATURE_COLUMNS
     columns: FeatureColumns = Field(default_factory=FeatureColumns)
-    volatility_scaling: VolatilityScalingConfig = Field(default_factory=VolatilityScalingConfig)
-    window: WindowConfig = Field(default_factory=WindowConfig)
-    vq_rssm: VqRssmConfig = Field(default_factory=VqRssmConfig)
-    train: TrainConfig = Field(default_factory=TrainConfig)
-    checkpoint_dir: Path = Path("data/output/learned-states/vq-rssm")
+    scale: VolatilityScalingConfig = Field(default_factory=VolatilityScalingConfig)
+    win: WindowConfig = Field(default_factory=WindowConfig)
+    seq: SequenceConfig = Field(default_factory=SequenceConfig)
+    vq: VqRssmConfig = Field(default_factory=VqRssmConfig)
+    train: TrainingConfig = Field(default_factory=TrainingConfig)
+    eval: LearnedStateEvaluationConfig = Field(default_factory=LearnedStateEvaluationConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_predict_flag(cls, data):
+        if isinstance(data, dict) and data.get("predict") is False and "run" not in data:
+            data = {**data, "run": {"phases": ("train",)}}
+        return data
 
     @field_validator("feature_columns")
     @classmethod
     def _feature_columns_non_empty(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(dict.fromkeys(value)) or LEARNED_STATE_FEATURE_COLUMNS
 
-    @field_validator("actions")
-    @classmethod
-    def _actions_non_empty(
-        cls, value: tuple[LearnedStateAction, ...]
-    ) -> tuple[LearnedStateAction, ...]:
-        return tuple(dict.fromkeys(value)) or ("train", "predict", "evaluate")
+    @property
+    def state_column(self) -> str:
+        return self.state
+
+    @property
+    def checkpoint_dir(self) -> Path:
+        return self.out
+
+    @property
+    def volatility_scaling(self) -> VolatilityScalingConfig:
+        return self.scale
+
+    @property
+    def window(self) -> WindowConfig:
+        return self.win
+
+    @property
+    def sequence(self) -> SequenceConfig:
+        return self.seq
+
+    @property
+    def vq_rssm(self) -> VqRssmConfig:
+        return self.vq
+
+    @property
+    def evaluation(self) -> LearnedStateEvaluationConfig:
+        return self.eval
 
     def required_columns(self) -> tuple[str, ...]:
         return self.window.required_columns(self.columns)
 
     def checkpoint_path(self) -> Path:
-        return self.checkpoint_dir / "behavior-state-model.pt"
+        return self.out / "behavior-state-model.pt"
+
+    def run_checkpoint_path(self) -> Path:
+        return self.run.checkpoint if self.run.checkpoint != Path(".") else self.checkpoint_path()
+
+    def run_states_path(self) -> Path:
+        if self.run.states != Path("."):
+            return self.run.states
+        return self.out / "behavior-state-sequence.csv"
 
     def prepare(self, frame: pl.DataFrame):
         from qooi.ai.state import PreparedStateDiscovery
@@ -338,6 +633,116 @@ class LearnedStateConfig(StrictConfigModel):
         from qooi.ai.state import PreparedStateDiscovery
 
         return PreparedStateDiscovery.from_frames(tuple(frames), self)
+
+def summarize_hidden(
+    states: StateSequence,
+    diagnostics: vq_rssm.InferenceDiagnostics,
+) -> pl.DataFrame:
+    if not diagnostics.hidden_states:
+        return pl.DataFrame()
+    rows = []
+    for index, state in enumerate(states.frame.get_column(states.state_column).to_list()):
+        row = {states.state_column: int(state), "rows": 1}
+        for dim, value in enumerate(diagnostics.hidden_states[index]):
+            row[f"h_{dim}_mean"] = value
+        rows.append(row)
+    frame = pl.DataFrame(rows)
+    return frame.group_by(states.state_column).agg(
+        pl.len().alias("rows"),
+        *[
+            pl.col(column).mean().alias(column)
+            for column in frame.columns
+            if column.endswith("_mean")
+        ],
+    )
+
+
+def mean_hidden(diagnostics: vq_rssm.InferenceDiagnostics) -> tuple[float, ...]:
+    if not diagnostics.hidden_states:
+        return ()
+    width = len(diagnostics.hidden_states[0])
+    return tuple(
+        sum(row[index] for row in diagnostics.hidden_states) / len(diagnostics.hidden_states)
+        for index in range(width)
+    )
+
+
+def project_codebook(
+    checkpoint: vq_rssm.VqRssmCheckpoint,
+    feature_cols: tuple[str, ...],
+    hidden_refs: tuple[tuple[str, tuple[float, ...] | None], ...],
+) -> pl.DataFrame:
+    rows = []
+    for label, hidden in hidden_refs:
+        for state_id, values in enumerate(vq_rssm.decode_codebook(checkpoint, hidden_state=hidden)):
+            row: dict[str, object] = {
+                "behavior_state_id": state_id,
+                "hidden_reference": label,
+                "shape_note": "normalized feature reconstruction, not absolute OHLC",
+            }
+            row.update({column: value for column, value in zip(feature_cols, values, strict=False)})
+            rows.append(row)
+    return pl.DataFrame(rows)
+
+
+def summarize_morph(prepared, states: StateSequence) -> pl.DataFrame:
+    if getattr(prepared.config, "input", "window") == "sequence":
+        return _summarize_sequence_morph(prepared, states)
+    rows = []
+    state_values = states.frame.get_column(states.state_column).to_list()
+    for window_index, window in enumerate(prepared.windows.features):
+        state = int(state_values[window_index])
+        for step, values in enumerate(window):
+            row = {states.state_column: state, "step": step, "rows": 1}
+            row.update(
+                {
+                    column: value
+                    for column, value in zip(prepared.windows.feature_columns, values, strict=False)
+                }
+            )
+            rows.append(row)
+    if not rows:
+        return pl.DataFrame()
+    frame = pl.DataFrame(rows)
+    value_columns = list(prepared.windows.feature_columns)
+    return frame.group_by(states.state_column, "step").agg(
+        pl.len().alias("rows"),
+        *[pl.col(column).mean().alias(column) for column in value_columns],
+    )
+
+
+def _summarize_sequence_morph(prepared, states: StateSequence) -> pl.DataFrame:
+    rows = []
+    state_values = states.frame.get_column(states.state_column).to_list()
+    state_index = 0
+    warmup = prepared.sequences.warmup
+    stride = prepared.sequences.stride
+    for sequence in prepared.sequences.sequences:
+        for end in range(warmup - 1, len(sequence.features), stride):
+            if state_index >= len(state_values):
+                break
+            state = int(state_values[state_index])
+            state_index += 1
+            start = end - warmup + 1
+            for step, values in enumerate(sequence.features[start : end + 1]):
+                row = {states.state_column: state, "step": step, "rows": 1}
+                row.update(
+                    {
+                        column: value
+                        for column, value in zip(
+                            prepared.sequences.feature_columns, values, strict=False
+                        )
+                    }
+                )
+                rows.append(row)
+    if not rows:
+        return pl.DataFrame()
+    frame = pl.DataFrame(rows)
+    value_columns = list(prepared.sequences.feature_columns)
+    return frame.group_by(states.state_column, "step").agg(
+        pl.len().alias("rows"),
+        *[pl.col(column).mean().alias(column) for column in value_columns],
+    )
 
 
 @dataclass(frozen=True)
@@ -414,6 +819,60 @@ class PreparedWindows:
 
 
 @dataclass(frozen=True)
+class PreparedSequences:
+    sequences: tuple[AssetFeatureSequence, ...]
+    feature_columns: tuple[str, ...]
+    chunk: int
+    warmup: int
+    stride: int
+    carry: bool
+
+    def __post_init__(self) -> None:
+        if not self.sequences:
+            raise ValueError("sequences must contain at least one asset/split sequence")
+        if not self.feature_columns:
+            raise ValueError("feature_columns must be non-empty")
+        if self.chunk <= 0:
+            raise ValueError("chunk must be positive")
+        if self.warmup <= 0:
+            raise ValueError("warmup must be positive")
+        if self.stride <= 0:
+            raise ValueError("stride must be positive")
+
+    def to_dataset(self) -> SequenceDataset:
+        return SequenceDataset(
+            sequences=self.sequences,
+            feature_columns=self.feature_columns,
+        )
+
+    @classmethod
+    def concat(cls, sequences: Iterable[PreparedSequences]) -> PreparedSequences:
+        items = tuple(sequences)
+        non_empty = [item for item in items if item.sequences]
+        if not non_empty:
+            raise ValueError("sequences must contain at least one prepared sequence set")
+        first = non_empty[0]
+        if any(item.feature_columns != first.feature_columns for item in non_empty):
+            raise ValueError("all prepared sequence sets must use identical feature columns")
+        if any(item.chunk != first.chunk for item in non_empty):
+            raise ValueError("all prepared sequence sets must use identical chunk")
+        if any(item.warmup != first.warmup for item in non_empty):
+            raise ValueError("all prepared sequence sets must use identical warmup")
+        if any(item.stride != first.stride for item in non_empty):
+            raise ValueError("all prepared sequence sets must use identical stride")
+        if any(item.carry != first.carry for item in non_empty):
+            raise ValueError("all prepared sequence sets must use identical carry policy")
+        return cls(
+            sequences=tuple(sequence for item in non_empty for sequence in item.sequences),
+            feature_columns=first.feature_columns,
+            chunk=first.chunk,
+            warmup=first.warmup,
+            stride=first.stride,
+            carry=first.carry,
+        )
+
+
+@dataclass(frozen=True)
 class WindowProvenance:
     row_index: tuple[int, ...]
     timestamps: tuple[int, ...]
@@ -434,7 +893,7 @@ class WindowProvenance:
         items = tuple(provenances)
         non_empty = [item for item in items if item.row_index]
         if not non_empty:
-            raise ValueError("provenance must contain at least one window")
+            return cls(row_index=(), timestamps=(), symbols=(), splits=())
         include_scale = any(item.volatility_scale for item in non_empty)
         return cls(
             row_index=tuple(value for item in non_empty for value in item.row_index),
@@ -514,6 +973,24 @@ class StateSequence:
             self.frame.select("row_index", self.state_column),
             on="row_index",
             how="left",
+        )
+
+    def event_frame(self, market_frame: pl.DataFrame) -> pl.DataFrame:
+        work = _with_state_row_index(market_frame)
+        keys = ["row_index"]
+        if "symbol" in work.columns and "symbol" in self.frame.columns:
+            keys.insert(0, "symbol")
+        market_columns = [
+            column
+            for column in work.columns
+            if column in set(keys)
+            or column not in set(self.frame.columns)
+            or column in {"open", "high", "low", "close", "vol", "volume", "liquidity_event_type"}
+        ]
+        return self.frame.join(
+            work.select(list(dict.fromkeys(market_columns))),
+            on=keys,
+            how="inner",
         )
 
     def research_frame(

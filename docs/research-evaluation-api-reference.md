@@ -54,7 +54,7 @@ Focused config shape:
 ```toml
 [diagnostics]
 mode = "research-evaluation"
-export_dir = "F:\\Stratum\\TEMP\\kilo\\qooi-research-evaluation-dynamic-transitions"
+export_dir = "F:\\Stratum\\TEMP\\kilo\\qooi-dyn-trans"
 
 [research_evaluation]
 outputs = ["timeframe-classifier", "dynamic-transition-discovery", "pattern-quality"]
