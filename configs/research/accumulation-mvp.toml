@@ -1,0 +1,42 @@
+[run]
+universe = "research"
+out = "data/output/accumulation/mvp"
+
+[market]
+ds = "swap"
+bar = "1H"
+days = 60
+refresh = false
+book_samples = 720
+book_every_seconds = 5.0
+book_depth = 25
+
+[onchain]
+enabled = false
+provider = "etherscan"
+lookback_days = 60
+poll_minutes = 10
+exchange_address_book = "configs/research/exchange-addresses.example.toml"
+
+[features]
+flow_zscore_window_hours = 168
+flow_negative_streak_hours = 2
+depth_window_minutes = 60
+large_trade_usd = 50000.0
+large_trade_multiple = 5.0
+resilience_minutes = 5
+ma_hours = 200
+
+[scoring]
+yellow_threshold = 20
+orange_threshold = 35
+red_threshold = 40
+flow_outflow_z = -3.0
+flow_inflow_z = 3.0
+whale_accumulation_threshold = 0.70
+depth_imbalance_threshold = 0.30
+down_day_return_threshold = -0.02
+resilience_threshold = 0.60
+mention_growth_hot = 3.0
+max_position_pct = 0.05
+stop_loss_pct = 0.05

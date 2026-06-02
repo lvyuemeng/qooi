@@ -1,0 +1,11 @@
+# Partial example labels only. Replace with verified exchange wallet labels before on-chain use.
+
+[[addresses]]
+chain = "ethereum"
+label = "example_exchange_wallet"
+address = "0x0000000000000000000000000000000000000001"
+
+[[addresses]]
+chain = "bsc"
+label = "example_exchange_wallet"
+address = "0x0000000000000000000000000000000000000002"
