@@ -116,3 +116,4 @@ def test_backtest_script_does_not_import_scan_script() -> None:
     text = _SCRIPT_PATH.read_text(encoding="utf-8")
 
     assert "accumulation_scan" not in text
+

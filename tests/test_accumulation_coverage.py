@@ -24,3 +24,4 @@ def test_missing_data_is_warning_not_neutral_evidence() -> None:
 
     assert "books_missing" in missing
     assert "trades_missing" in missing
+

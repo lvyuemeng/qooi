@@ -9,6 +9,10 @@ import polars as pl
 
 from qooi.accumulation.schema import (
     BACKTEST_EVENT_SCHEMA,
+    BROAD_CANDIDATE_SCHEMA,
+    BROAD_MARKET_SCHEMA,
+    BROAD_NEWS_SCHEMA,
+    BROAD_PROTOCOL_SCHEMA,
     CANDIDATE_DETAIL_SCHEMA,
     CANDIDATE_SUMMARY_SCHEMA,
     DISCOVERY_SCHEMA,
@@ -19,13 +23,19 @@ from qooi.accumulation.schema import (
     SOURCE_BARS_SCHEMA,
     SOURCE_BOOKS_SCHEMA,
     SOURCE_FUNDING_SCHEMA,
+    SOURCE_LONG_SHORT_RATIO_SCHEMA,
     SOURCE_MANIFEST_SCHEMA,
     SOURCE_MESSAGES_SCHEMA,
     SOURCE_ONCHAIN_FLOWS_SCHEMA,
     SOURCE_OPEN_INTEREST_SCHEMA,
     SOURCE_POLYMARKET_EVENTS_SCHEMA,
     SOURCE_POLYMARKET_MARKETS_SCHEMA,
+    SOURCE_TAKER_VOLUME_SCHEMA,
     SOURCE_TRADES_SCHEMA,
+)
+from qooi.strategies.potential import (
+    POTENTIAL_BOARD_SCHEMA,
+    POTENTIAL_SOURCE_SCHEMA,
 )
 
 ArtifactName = Literal[
@@ -37,6 +47,8 @@ ArtifactName = Literal[
     "source_trades",
     "source_funding",
     "source_open_interest",
+    "source_taker_volume",
+    "source_long_short_ratios",
     "source_onchain_flows",
     "source_messages",
     "source_polymarket_events",
@@ -50,6 +62,12 @@ ArtifactName = Literal[
     "next_fetch_actions",
     "backtest_events",
     "backtest_summary",
+    "broad_market_snapshot",
+    "broad_protocol_snapshot",
+    "broad_news_snapshot",
+    "broad_candidates",
+    "potential_board",
+    "potential_sources",
 ]
 
 
@@ -77,6 +95,12 @@ ARTIFACT_SPECS: dict[ArtifactName, ArtifactSpec] = {
     "source_funding": ArtifactSpec("source_funding", "sources/funding.csv", SOURCE_FUNDING_SCHEMA),
     "source_open_interest": ArtifactSpec(
         "source_open_interest", "sources/open-interest.csv", SOURCE_OPEN_INTEREST_SCHEMA
+    ),
+    "source_taker_volume": ArtifactSpec(
+        "source_taker_volume", "sources/taker-volume-contract.csv", SOURCE_TAKER_VOLUME_SCHEMA
+    ),
+    "source_long_short_ratios": ArtifactSpec(
+        "source_long_short_ratios", "sources/long-short-ratios.csv", SOURCE_LONG_SHORT_RATIO_SCHEMA
     ),
     "source_onchain_flows": ArtifactSpec(
         "source_onchain_flows", "sources/onchain-flows.csv", SOURCE_ONCHAIN_FLOWS_SCHEMA
@@ -114,8 +138,22 @@ ARTIFACT_SPECS: dict[ArtifactName, ArtifactSpec] = {
     "backtest_events": ArtifactSpec(
         "backtest_events", "accumulation-backtest-events.csv", BACKTEST_EVENT_SCHEMA
     ),
-    "backtest_summary": ArtifactSpec(
-        "backtest_summary", "accumulation-backtest-summary.csv", {}
+    "backtest_summary": ArtifactSpec("backtest_summary", "accumulation-backtest-summary.csv", {}),
+    "broad_market_snapshot": ArtifactSpec(
+        "broad_market_snapshot", "broad/market-snapshot.csv", BROAD_MARKET_SCHEMA
+    ),
+    "broad_protocol_snapshot": ArtifactSpec(
+        "broad_protocol_snapshot", "broad/protocols.csv", BROAD_PROTOCOL_SCHEMA
+    ),
+    "broad_news_snapshot": ArtifactSpec("broad_news_snapshot", "broad/news.csv", BROAD_NEWS_SCHEMA),
+    "broad_candidates": ArtifactSpec(
+        "broad_candidates", "broad/candidates.csv", BROAD_CANDIDATE_SCHEMA
+    ),
+    "potential_board": ArtifactSpec(
+        "potential_board", "potential/board.csv", POTENTIAL_BOARD_SCHEMA
+    ),
+    "potential_sources": ArtifactSpec(
+        "potential_sources", "potential/sources.csv", POTENTIAL_SOURCE_SCHEMA
     ),
 }
 

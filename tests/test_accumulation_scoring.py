@@ -57,6 +57,7 @@ def test_negative_filters_suppress_positive_alert() -> None:
     assert out["negative_score"][0] == -55
     assert out["score_total"][0] < 20
     assert out["alert_level"][0] == "none"
+    assert out["suggestion_type"][0] == "reject_or_deprioritize"
 
 
 def test_missing_message_fields_are_neutral() -> None:
@@ -84,8 +85,43 @@ def test_trade_metadata_missing_blocks_high_confidence() -> None:
     assert "trade_notional_metadata_missing" in out["missing_evidence"][0]
 
 
+def test_zero_score_structure_only_row_is_rejected() -> None:
+    out = score_accumulation_features(
+        pl.DataFrame(
+            [
+                _feature(
+                    flow_zscore=0.0,
+                    flow_zscore_negative_streak_hours=0,
+                    whale_accumulation_ratio=0.0,
+                    depth_imbalance_10_mean=0.0,
+                    resilience_score=0.0,
+                    return_24h=0.0,
+                    source_coverage_score=1.0,
+                    range_position_pct=0.5,
+                    data_quality_warning="",
+                )
+            ]
+        ),
+        ScoringConfig(),
+    )
+
+    assert out["score_total"][0] == 0
+    assert out["explanation"][0] == "no_rules_fired"
+    assert out["suggestion_type"][0] == "reject_or_deprioritize"
+
+
+def test_disabled_source_tokens_are_not_missing_evidence() -> None:
+    out = score_accumulation_features(
+        pl.DataFrame([_feature(data_quality_warning="messages_disabled;onchain_disabled")]),
+        ScoringConfig(),
+    )
+
+    assert out["missing_evidence"][0] == ""
+
+
 def test_default_config_parses_and_invalid_thresholds_raise() -> None:
     cfg = AccumulationConfig.model_validate({})
     assert cfg.run.out
     with pytest.raises(ValueError):
         ScoringConfig(flow_outflow_z=float("inf"))
+

@@ -18,6 +18,7 @@ ChainName = Literal["ethereum", "bsc"]
 OnchainProvider = Literal["etherscan"]
 BookMode = Literal["snapshot", "sample", "off"]
 PolymarketProvider = Literal["gamma"]
+BroadProvider = Literal["coingecko", "coinpaprika", "defillama", "cryptopanic"]
 
 
 class RunConfig(StrictConfigModel):
@@ -47,12 +48,45 @@ class MarketConfig(StrictConfigModel):
 
 
 class DiscoveryConfig(StrictConfigModel):
+    top_n: int = Field(default=25, gt=0)
     min_volume_usd: float = Field(default=1_000_000.0, ge=0.0)
     max_spread_bps: float = Field(default=50.0, gt=0.0)
     min_history_coverage_pct: float = Field(default=0.0, ge=0.0, le=100.0)
     missing_contract_penalty: float = Field(default=2.0, ge=0.0)
     spread_bps_penalty_scale: float = Field(default=100.0, gt=0.0)
     coverage_bonus_scale: float = Field(default=100.0, gt=0.0)
+
+
+class BroadCoinGeckoConfig(StrictConfigModel):
+    api_key_env: str = "COINGECKO_DEMO_API_KEY"
+    vs_currency: str = "usd"
+    order: str = "volume_desc"
+    per_page: int = Field(default=250, gt=0, le=250)
+    price_change_percentage: tuple[str, ...] = ("1h", "24h")
+    include_trending: bool = True
+    trending_weight: float = Field(default=4.0, ge=0.0)
+
+
+class BroadCryptoPanicConfig(StrictConfigModel):
+    api_key_env: str = "CRYPTOPANIC_API_KEY"
+    enabled_without_key: bool = False
+    limit: int = Field(default=100, gt=0, le=100)
+
+
+class BroadScanConfig(StrictConfigModel):
+    providers: tuple[BroadProvider, ...] = ("coingecko", "coinpaprika", "defillama")
+    optional_providers: tuple[BroadProvider, ...] = ("cryptopanic",)
+    max_assets: int = Field(default=500, gt=0)
+    coingecko_pages: int = Field(default=2, gt=0, le=10)
+    coinpaprika_max_assets: int = Field(default=1000, gt=0)
+    min_market_cap_usd: float = Field(default=1_000_000.0, ge=0.0)
+    max_market_cap_usd: float = Field(default=500_000_000.0, ge=0.0)
+    min_volume_24h_usd: float = Field(default=500_000.0, ge=0.0)
+    tvl_change_1d_min_pct: float = 20.0
+    output_top_n: int = Field(default=25, gt=0)
+    excluded_base_ccy: tuple[str, ...] = ("USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE")
+    coingecko: BroadCoinGeckoConfig = Field(default_factory=BroadCoinGeckoConfig)
+    cryptopanic: BroadCryptoPanicConfig = Field(default_factory=BroadCryptoPanicConfig)
 
 
 class PolymarketAliasConfig(StrictConfigModel):
@@ -76,7 +110,6 @@ class PolymarketAliasConfig(StrictConfigModel):
 
 
 class PolymarketSourceConfig(StrictConfigModel):
-    enabled: bool = False
     provider: PolymarketProvider = "gamma"
     search_limit_per_symbol: int = Field(default=10, gt=0, le=100)
     max_markets_per_symbol: int = Field(default=25, gt=0, le=250)
@@ -88,9 +121,14 @@ class PolymarketSourceConfig(StrictConfigModel):
 
 
 class LocalMessageSourceConfig(StrictConfigModel):
-    enabled: bool = False
     path: str = ""
     default_source: str = "local_csv"
+
+
+class DisabledSourceConfig(StrictConfigModel):
+    families: tuple[str, ...] = ()
+    symbols: tuple[str, ...] = ()
+    polymarket_queries: tuple[str, ...] = ()
 
 
 class SourceConfig(StrictConfigModel):
@@ -98,6 +136,10 @@ class SourceConfig(StrictConfigModel):
     trade_limit: int = Field(default=100, gt=0, le=500)
     funding_limit: int = Field(default=100, gt=0, le=400)
     open_interest_refresh: bool = False
+    rubik_period: str = "1H"
+    rubik_limit: int = Field(default=100, gt=0, le=100)
+    rubik_taker_unit: Literal["0", "1", "2"] = "2"
+    disabled: DisabledSourceConfig = Field(default_factory=DisabledSourceConfig)
     polymarket: PolymarketSourceConfig = Field(default_factory=PolymarketSourceConfig)
     messages: LocalMessageSourceConfig = Field(default_factory=LocalMessageSourceConfig)
 
@@ -105,6 +147,32 @@ class SourceConfig(StrictConfigModel):
 class SummaryConfig(StrictConfigModel):
     top_n: int = Field(default=10, gt=0)
     latest_only: bool = True
+
+
+class PotentialScanConfig(StrictConfigModel):
+    enabled: bool = True
+    output_top_n: int = Field(default=40, gt=0)
+    min_market_cap_usd: float = Field(default=1_000_000.0, ge=0.0)
+    max_market_cap_usd: float = Field(default=500_000_000.0, ge=0.0)
+    min_volume_24h_usd: float = Field(default=500_000.0, ge=0.0)
+    near_low_ratio: float = Field(default=1.30, gt=0.0)
+    strong_near_low_ratio: float = Field(default=1.10, gt=0.0)
+    compression_pctile_max: float = Field(default=0.30, ge=0.0, le=1.0)
+    volume_contraction_max: float = Field(default=0.60, ge=0.0)
+    volume_spike_ratio: float = Field(default=3.0, gt=0.0)
+    first_spike_lookback_hours: int = Field(default=120, gt=0)
+    range_low_max_pct: float = Field(default=0.35, ge=0.0, le=1.0)
+    late_range_min_pct: float = Field(default=0.80, ge=0.0, le=1.0)
+    taker_buy_confirm_min: float = Field(default=0.65, ge=0.0, le=1.0)
+    min_history_hours: int = Field(default=720, gt=0)
+    full_history_hours: int = Field(default=2160, gt=0)
+    min_base_duration_hours: int = Field(default=168, gt=0)
+    max_new_low_count_30d: int = Field(default=2, ge=0)
+    max_ma30_down_slope: float = -0.03
+    ma7_reclaim_min_pct: float = 0.0
+    ma30_reclaim_min_pct: float = 0.0
+    strong_downtrend_60d_return: float = -0.35
+    strong_downtrend_90d_return: float = -0.50
 
 
 class DatabaseConfig(StrictConfigModel):
@@ -133,11 +201,10 @@ class TokenConfig(StrictConfigModel):
 
 
 class OnchainConfig(StrictConfigModel):
-    enabled: bool = False
     provider: OnchainProvider = "etherscan"
     lookback_days: int = Field(default=60, gt=0)
     poll_minutes: int = Field(default=10, gt=0)
-    exchange_address_book: str = "configs/research/exchange-addresses.example.toml"
+    exchange_address_book: str = ""
     tokens: tuple[TokenConfig, ...] = ()
 
 
@@ -195,10 +262,12 @@ class AccumulationConfig(StrictConfigModel):
     market: MarketConfig = Field(default_factory=MarketConfig)
     onchain: OnchainConfig = Field(default_factory=OnchainConfig)
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
+    broad_scan: BroadScanConfig = Field(default_factory=BroadScanConfig)
     sources: SourceConfig = Field(default_factory=SourceConfig)
     features: FeatureConfig = Field(default_factory=FeatureConfig)
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     summary: SummaryConfig = Field(default_factory=SummaryConfig)
+    potential_scan: PotentialScanConfig = Field(default_factory=PotentialScanConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
 
     @property

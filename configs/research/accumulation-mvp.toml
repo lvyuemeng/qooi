@@ -10,13 +10,49 @@ refresh = false
 book_samples = 720
 book_every_seconds = 5.0
 book_depth = 25
+book_mode = "snapshot"
 
 [onchain]
-enabled = false
 provider = "etherscan"
 lookback_days = 60
 poll_minutes = 10
-exchange_address_book = "configs/research/exchange-addresses.example.toml"
+exchange_address_book = ""
+
+[sources.disabled]
+families = []
+symbols = []
+polymarket_queries = []
+
+[sources.polymarket]
+provider = "gamma"
+
+[sources.messages]
+path = ""
+
+[broad_scan]
+providers = ["coingecko", "coinpaprika", "defillama"]
+optional_providers = ["cryptopanic"]
+max_assets = 500
+coingecko_pages = 2
+coinpaprika_max_assets = 1000
+min_market_cap_usd = 1000000.0
+max_market_cap_usd = 500000000.0
+min_volume_24h_usd = 500000.0
+tvl_change_1d_min_pct = 20.0
+output_top_n = 25
+
+[broad_scan.coingecko]
+api_key_env = "COINGECKO_DEMO_API_KEY"
+vs_currency = "usd"
+order = "volume_desc"
+per_page = 250
+price_change_percentage = ["1h", "24h"]
+include_trending = true
+trending_weight = 4.0
+
+[broad_scan.cryptopanic]
+api_key_env = "CRYPTOPANIC_API_KEY"
+enabled_without_key = false
 
 [features]
 flow_zscore_window_hours = 168

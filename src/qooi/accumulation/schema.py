@@ -35,9 +35,27 @@ FEATURE_SCHEMA: dict[str, pl.DataType] = {
     "depth_rebuild_score": pl.Float64,
     "funding_rate": pl.Float64,
     "funding_zscore": pl.Float64,
+    "open_interest_usd": pl.Float64,
     "open_interest_change_24h": pl.Float64,
+    "open_interest_usd_change_24h": pl.Float64,
+    "taker_buy_volume": pl.Float64,
+    "taker_sell_volume": pl.Float64,
+    "taker_buy_ratio": pl.Float64,
+    "taker_volume_total": pl.Float64,
+    "taker_volume_imbalance": pl.Float64,
+    "long_short_account_ratio": pl.Float64,
+    "top_trader_long_short_account_ratio": pl.Float64,
+    "top_trader_long_short_position_ratio": pl.Float64,
     "volatility_compression_pctile": pl.Float64,
     "range_position_pct": pl.Float64,
+    "range_low_px": pl.Float64,
+    "range_high_px": pl.Float64,
+    "range_width_pct": pl.Float64,
+    "upside_to_range_high_pct": pl.Float64,
+    "downside_to_range_low_pct": pl.Float64,
+    "range_reward_risk": pl.Float64,
+    "structure_invalidation_px": pl.Float64,
+    "structure_target_px": pl.Float64,
     "structure_stage": pl.String,
     "source_coverage_score": pl.Float64,
     "polymarket_related_market_count": pl.Int64,
@@ -102,6 +120,71 @@ DISCOVERY_SCHEMA: dict[str, pl.DataType] = {
     "rank_score": pl.Float64,
 }
 
+BROAD_MARKET_SCHEMA: dict[str, pl.DataType] = {
+    "timestamp": pl.Int64,
+    "provider": pl.String,
+    "coin_id": pl.String,
+    "base_ccy": pl.String,
+    "name": pl.String,
+    "rank": pl.Int64,
+    "price_usd": pl.Float64,
+    "market_cap_usd": pl.Float64,
+    "volume_24h_usd": pl.Float64,
+    "volume_24h_change_pct": pl.Float64,
+    "price_change_pct_1h": pl.Float64,
+    "price_change_pct_24h": pl.Float64,
+    "last_updated": pl.Int64,
+    "trending_rank": pl.Int64,
+    "trending_score": pl.Float64,
+    "heat_source": pl.String,
+}
+
+BROAD_PROTOCOL_SCHEMA: dict[str, pl.DataType] = {
+    "timestamp": pl.Int64,
+    "provider": pl.String,
+    "protocol": pl.String,
+    "base_ccy": pl.String,
+    "name": pl.String,
+    "category": pl.String,
+    "chains": pl.String,
+    "tvl_usd": pl.Float64,
+    "tvl_change_1d_pct": pl.Float64,
+    "tvl_change_7d_pct": pl.Float64,
+}
+
+BROAD_NEWS_SCHEMA: dict[str, pl.DataType] = {
+    "timestamp": pl.Int64,
+    "provider": pl.String,
+    "source_id": pl.String,
+    "title": pl.String,
+    "url": pl.String,
+    "base_ccy": pl.String,
+    "sentiment": pl.String,
+}
+
+BROAD_CANDIDATE_SCHEMA: dict[str, pl.DataType] = {
+    "rank": pl.Int64,
+    "timestamp": pl.Int64,
+    "base_ccy": pl.String,
+    "coin_id": pl.String,
+    "name": pl.String,
+    "okx_symbol": pl.String,
+    "okx_mapped": pl.Boolean,
+    "market_cap_usd": pl.Float64,
+    "volume_24h_usd": pl.Float64,
+    "price_change_pct_1h": pl.Float64,
+    "price_change_pct_24h": pl.Float64,
+    "trending_rank": pl.Int64,
+    "trending_score": pl.Float64,
+    "heat_source": pl.String,
+    "tvl_usd": pl.Float64,
+    "tvl_change_1d_pct": pl.Float64,
+    "news_mentions": pl.Int64,
+    "broad_score": pl.Float64,
+    "broad_reasons": pl.String,
+    "exclude_reason": pl.String,
+}
+
 SOURCE_BARS_SCHEMA: dict[str, pl.DataType] = {
     "symbol": pl.String,
     "timestamp": pl.Int64,
@@ -153,6 +236,23 @@ SOURCE_OPEN_INTEREST_SCHEMA: dict[str, pl.DataType] = {
     "timestamp": pl.Int64,
     "open_interest": pl.Float64,
     "open_interest_ccy": pl.Float64,
+    "open_interest_usd": pl.Float64,
+}
+
+SOURCE_TAKER_VOLUME_SCHEMA: dict[str, pl.DataType] = {
+    "symbol": pl.String,
+    "timestamp": pl.Int64,
+    "taker_sell_volume": pl.Float64,
+    "taker_buy_volume": pl.Float64,
+    "taker_volume_unit": pl.String,
+}
+
+SOURCE_LONG_SHORT_RATIO_SCHEMA: dict[str, pl.DataType] = {
+    "symbol": pl.String,
+    "timestamp": pl.Int64,
+    "long_short_account_ratio": pl.Float64,
+    "top_trader_long_short_account_ratio": pl.Float64,
+    "top_trader_long_short_position_ratio": pl.Float64,
 }
 
 SOURCE_ONCHAIN_FLOWS_SCHEMA: dict[str, pl.DataType] = {
@@ -291,13 +391,27 @@ CANDIDATE_DETAIL_SCHEMA: dict[str, pl.DataType] = {
     "activation_state": pl.String,
     "risk_state": pl.String,
     "return_24h": pl.Float64,
+    "close": pl.Float64,
     "range_position_pct": pl.Float64,
+    "range_low_px": pl.Float64,
+    "range_high_px": pl.Float64,
+    "upside_to_range_high_pct": pl.Float64,
+    "downside_to_range_low_pct": pl.Float64,
+    "range_reward_risk": pl.Float64,
+    "structure_invalidation_px": pl.Float64,
+    "structure_target_px": pl.Float64,
     "volatility_compression_pctile": pl.Float64,
     "depth_imbalance_25_mean": pl.Float64,
     "large_trade_buy_ratio": pl.Float64,
     "resilience_score": pl.Float64,
     "funding_rate": pl.Float64,
     "open_interest_change_24h": pl.Float64,
+    "open_interest_usd_change_24h": pl.Float64,
+    "taker_buy_ratio": pl.Float64,
+    "taker_volume_imbalance": pl.Float64,
+    "long_short_account_ratio": pl.Float64,
+    "top_trader_long_short_account_ratio": pl.Float64,
+    "top_trader_long_short_position_ratio": pl.Float64,
     "positive_components": pl.String,
     "negative_filters": pl.String,
     "missing_evidence": pl.String,
@@ -347,6 +461,22 @@ def empty_backtest_event_frame() -> pl.DataFrame:
 
 def empty_discovery_frame() -> pl.DataFrame:
     return pl.DataFrame(schema=DISCOVERY_SCHEMA)
+
+
+def empty_broad_market_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=BROAD_MARKET_SCHEMA)
+
+
+def empty_broad_protocol_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=BROAD_PROTOCOL_SCHEMA)
+
+
+def empty_broad_news_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=BROAD_NEWS_SCHEMA)
+
+
+def empty_broad_candidate_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=BROAD_CANDIDATE_SCHEMA)
 
 
 def empty_source_manifest_frame() -> pl.DataFrame:

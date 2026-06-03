@@ -114,3 +114,4 @@ def test_explorer_error_classifier_maps_documented_messages(
 def test_config_rejects_bscscan_provider() -> None:
     with pytest.raises(ValidationError):
         AccumulationConfig.model_validate({"onchain": {"provider": "bscscan"}})
+

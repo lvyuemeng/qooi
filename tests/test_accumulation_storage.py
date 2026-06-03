@@ -72,3 +72,4 @@ def test_polymarket_artifacts_use_context_source_paths(tmp_path) -> None:
     )
 
     assert (tmp_path / "sources" / "polymarket-markets.csv").exists()
+
