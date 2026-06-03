@@ -35,6 +35,8 @@ class SourceHttpError(RuntimeError):
 
 
 def sanitize_error(exc: BaseException) -> str:
+    if isinstance(exc, SourceHttpError):
+        return exc.message
     if isinstance(exc, httpx.HTTPStatusError):
         return f"{exc.response.status_code} {exc.response.reason_phrase}"
     return type(exc).__name__
@@ -117,6 +119,32 @@ async def request_json_async(
         error_classifier=error_classifier,
         allow_empty_message=allow_empty_message,
     )
+
+
+async def request_json_value_async(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    *,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    try:
+        response = await client.get(endpoint, params=params, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        raise SourceHttpError(
+            _http_status_category(exc.response.status_code),
+            sanitize_error(exc),
+            http_status=exc.response.status_code,
+            endpoint=endpoint,
+        ) from None
+    except httpx.TimeoutException as exc:
+        raise SourceHttpError(
+            "timeout_or_too_broad", sanitize_error(exc), endpoint=endpoint
+        ) from None
+    except httpx.TransportError as exc:
+        raise SourceHttpError("transport_error", sanitize_error(exc), endpoint=endpoint) from None
 
 
 async def gather_source_results(

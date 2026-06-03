@@ -3,7 +3,7 @@ from __future__ import annotations
 import polars as pl
 
 from qooi.accumulation.config import DiscoveryConfig
-from qooi.accumulation.discovery import rank_discovery_frame, select_candidate_symbols
+from qooi.exchange.discovery import rank_discovery_frame, select_candidate_symbols
 
 
 def _instruments() -> pl.DataFrame:
@@ -104,3 +104,4 @@ def test_select_preserves_manual_symbols() -> None:
         "MAN-USDT-SWAP",
         "BTC-USDT-SWAP",
     )
+

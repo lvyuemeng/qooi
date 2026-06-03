@@ -25,7 +25,7 @@ def manifest_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
     for col, dtype in SOURCE_MANIFEST_SCHEMA.items():
         if col not in frame.columns:
             frame = frame.with_columns(pl.lit(None).cast(dtype).alias(col))
-    return frame.select(SOURCE_MANIFEST_SCHEMA.keys())
+    return frame.select(pl.col(col).cast(dtype) for col, dtype in SOURCE_MANIFEST_SCHEMA.items())
 
 
 def source_manifest_row(

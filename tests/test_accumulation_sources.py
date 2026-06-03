@@ -6,11 +6,21 @@ import httpx
 import polars as pl
 import pytest
 
+from qooi.sources.coingecko import fetch_coingecko_trending_async
 from qooi.sources.http import SourceHttpError, request_json, request_json_async, sanitize_error
 from qooi.sources.okx import (
     _fetch_okx_frame,
     _normalize_instruments,
+    _normalize_open_interest_history,
+    _normalize_ratio_rows,
+    _normalize_taker_volume_contract,
     normalize_okx_trades,
+)
+from qooi.sources.okx_ws import (
+    collect_okx_ws_public_async,
+    normalize_okx_ws_books,
+    normalize_okx_ws_trades,
+    okx_ws_subscribe_message,
 )
 
 
@@ -191,3 +201,176 @@ async def test_async_okx_fetch_uses_async_retry_iteration() -> None:
 
     assert result.frame["timestamp"][0] == 1
     assert result.manifest["status"][0] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_coingecko_trending_empty_response_writes_missing_manifest() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/search/trending")
+        return httpx.Response(200, json={"coins": []})
+
+    async with httpx.AsyncClient(
+        base_url="https://api.coingecko.com/api/v3", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await fetch_coingecko_trending_async(client)
+
+    assert result.frame.is_empty()
+    assert result.manifest["source"][0] == "coingecko_trending"
+    assert result.manifest["status"][0] == "missing"
+    assert result.manifest["warning"][0] == "coingecko_trending_empty"
+
+
+@pytest.mark.asyncio
+async def test_coingecko_trending_failed_request_writes_failed_manifest() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        base_url="https://api.coingecko.com/api/v3", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await fetch_coingecko_trending_async(client)
+
+    assert result.frame.is_empty()
+    assert result.manifest["source"][0] == "coingecko_trending"
+    assert result.manifest["status"][0] == "failed"
+    assert result.manifest["warning"][0] == "500 Internal Server Error"
+
+
+def test_okx_rubik_open_interest_history_normalizer() -> None:
+    out = _normalize_open_interest_history([["3600000", "100", "10", "2500000"]])
+
+    assert out["timestamp"][0] == 3_600_000
+    assert out["open_interest"][0] == 100.0
+    assert out["open_interest_ccy"][0] == 10.0
+    assert out["open_interest_usd"][0] == 2_500_000.0
+
+
+def test_okx_rubik_taker_volume_contract_normalizer() -> None:
+    out = _normalize_taker_volume_contract([["3600000", "40", "60"]], "2")
+
+    assert out["timestamp"][0] == 3_600_000
+    assert out["taker_sell_volume"][0] == 40.0
+    assert out["taker_buy_volume"][0] == 60.0
+    assert out["taker_volume_unit"][0] == "2"
+
+
+def test_okx_rubik_ratio_normalizer() -> None:
+    out = _normalize_ratio_rows([["3600000", "1.25"]], "long_short_account_ratio")
+
+    assert out["timestamp"][0] == 3_600_000
+    assert out["long_short_account_ratio"][0] == 1.25
+
+
+def test_okx_ws_subscribe_message_builds_public_channel_args() -> None:
+    message = okx_ws_subscribe_message(("BTC-USDT-SWAP",), channels=("trades", "books5"))
+
+    assert message == {
+        "op": "subscribe",
+        "args": [
+            {"channel": "trades", "instId": "BTC-USDT-SWAP"},
+            {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+        ],
+    }
+
+
+def test_okx_ws_trade_normalizer_maps_public_trade_rows() -> None:
+    frame = normalize_okx_ws_trades(
+        {
+            "arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"},
+            "data": [{"ts": "1000", "tradeId": "1", "px": "100", "sz": "2", "side": "buy"}],
+        },
+        contract_values={"BTC-USDT-SWAP": 0.01},
+    )
+
+    assert frame.to_dicts() == [
+        {
+            "symbol": "BTC-USDT-SWAP",
+            "timestamp": 1000,
+            "trade_id": "1",
+            "price": 100.0,
+            "size": 2.0,
+            "side": "buy",
+            "notional_usd": 2.0,
+        }
+    ]
+
+
+def test_okx_ws_book_normalizer_maps_depth_distribution_rows() -> None:
+    frame = normalize_okx_ws_books(
+        {
+            "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+            "data": [
+                {
+                    "ts": "1000",
+                    "bids": [["99", "2"], ["98.9", "1"]],
+                    "asks": [["100", "1"], ["100.1", "1"]],
+                }
+            ],
+        },
+        contract_values={"BTC-USDT-SWAP": 0.01},
+    )
+
+    row = frame.to_dicts()[0]
+    assert row["symbol"] == "BTC-USDT-SWAP"
+    assert row["timestamp"] == 1000
+    assert row["ob_bid_price"] == 99.0
+    assert row["ob_ask_price"] == 100.0
+    assert row["ob_bid_vol_5"] > row["ob_ask_vol_5"]
+    assert row["ob_imbalance_5"] > 0.0
+    assert row["spread_bps"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_okx_ws_collector_uses_supplied_message_stream_and_manifest() -> None:
+    async def messages():
+        yield {
+            "arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"},
+            "data": [{"ts": str(10**13), "tradeId": "1", "px": "100", "sz": "2", "side": "buy"}],
+        }
+        yield {
+            "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+            "data": [
+                {
+                    "ts": str(10**13),
+                    "bids": [["99", "2"]],
+                    "asks": [["100", "1"]],
+                }
+            ],
+        }
+
+    result = await collect_okx_ws_public_async(
+        ("BTC-USDT-SWAP",),
+        message_source=messages(),
+        contract_values={"BTC-USDT-SWAP": 0.01},
+        stale_after_ms=10**15,
+    )
+
+    assert result.trades.height == 1
+    assert result.books.height == 1
+    statuses = result.manifest.select("source", "status").to_dicts()
+    assert statuses == [
+        {"source": "okx_ws_trades", "status": "ok"},
+        {"source": "okx_ws_books", "status": "ok"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_okx_ws_collector_reports_stale_and_errors() -> None:
+    async def messages():
+        yield {"event": "error", "msg": "channel rejected"}
+        yield {
+            "arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"},
+            "data": [{"ts": "1", "tradeId": "1", "px": "100", "sz": "2", "side": "buy"}],
+        }
+
+    result = await collect_okx_ws_public_async(
+        ("BTC-USDT-SWAP",), message_source=messages(), stale_after_ms=1
+    )
+
+    trades = result.manifest.filter(pl.col("source") == "okx_ws_trades")
+    books = result.manifest.filter(pl.col("source") == "okx_ws_books")
+    assert trades["status"][0] == "partial"
+    assert "channel rejected" in trades["warning"][0]
+    assert "okx_ws_stale" in trades["warning"][0]
+    assert books["status"][0] == "failed"
+

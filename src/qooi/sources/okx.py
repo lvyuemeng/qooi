@@ -106,6 +106,109 @@ async def fetch_okx_open_interest_async(client: httpx.AsyncClient, inst_id: str)
     )
 
 
+async def fetch_okx_open_interest_history_async(
+    client: httpx.AsyncClient,
+    inst_id: str,
+    *,
+    period: str = "1H",
+    limit: int = 100,
+    begin: str | None = None,
+    end: str | None = None,
+) -> SourceResult:
+    params = _rubik_params(inst_id, period=period, limit=limit, begin=begin, end=end)
+    return await _fetch_okx_frame(
+        client,
+        endpoint="/api/v5/rubik/stat/contracts/open-interest-history",
+        params=params,
+        source="open_interest_history",
+        symbol=inst_id,
+        normalizer=_normalize_open_interest_history,
+    )
+
+
+async def fetch_okx_taker_volume_contract_async(
+    client: httpx.AsyncClient,
+    inst_id: str,
+    *,
+    period: str = "1H",
+    unit: str = "2",
+    limit: int = 100,
+    begin: str | None = None,
+    end: str | None = None,
+) -> SourceResult:
+    params = _rubik_params(inst_id, period=period, limit=limit, begin=begin, end=end)
+    params["unit"] = unit
+    return await _fetch_okx_frame(
+        client,
+        endpoint="/api/v5/rubik/stat/taker-volume-contract",
+        params=params,
+        source="taker_volume_contract",
+        symbol=inst_id,
+        normalizer=lambda rows: _normalize_taker_volume_contract(rows, unit),
+    )
+
+
+async def fetch_okx_long_short_account_ratio_contract_async(
+    client: httpx.AsyncClient,
+    inst_id: str,
+    *,
+    period: str = "1H",
+    limit: int = 100,
+    begin: str | None = None,
+    end: str | None = None,
+) -> SourceResult:
+    return await _fetch_okx_frame(
+        client,
+        endpoint="/api/v5/rubik/stat/contracts/long-short-account-ratio-contract",
+        params=_rubik_params(inst_id, period=period, limit=limit, begin=begin, end=end),
+        source="long_short_ratio_contract",
+        symbol=inst_id,
+        normalizer=lambda rows: _normalize_ratio_rows(rows, "long_short_account_ratio"),
+    )
+
+
+async def fetch_okx_top_trader_long_short_account_ratio_contract_async(
+    client: httpx.AsyncClient,
+    inst_id: str,
+    *,
+    period: str = "1H",
+    limit: int = 100,
+    begin: str | None = None,
+    end: str | None = None,
+) -> SourceResult:
+    return await _fetch_okx_frame(
+        client,
+        endpoint="/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader",
+        params=_rubik_params(inst_id, period=period, limit=limit, begin=begin, end=end),
+        source="top_trader_long_short_account_ratio_contract",
+        symbol=inst_id,
+        normalizer=lambda rows: _normalize_ratio_rows(
+            rows, "top_trader_long_short_account_ratio"
+        ),
+    )
+
+
+async def fetch_okx_top_trader_long_short_position_ratio_contract_async(
+    client: httpx.AsyncClient,
+    inst_id: str,
+    *,
+    period: str = "1H",
+    limit: int = 100,
+    begin: str | None = None,
+    end: str | None = None,
+) -> SourceResult:
+    return await _fetch_okx_frame(
+        client,
+        endpoint="/api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader",
+        params=_rubik_params(inst_id, period=period, limit=limit, begin=begin, end=end),
+        source="top_trader_long_short_position_ratio_contract",
+        symbol=inst_id,
+        normalizer=lambda rows: _normalize_ratio_rows(
+            rows, "top_trader_long_short_position_ratio"
+        ),
+    )
+
+
 async def fetch_okx_book_snapshot_async(
     client: httpx.AsyncClient, inst_id: str, *, limit: int = 25
 ) -> SourceResult:
@@ -147,7 +250,7 @@ async def _fetch_okx_frame(
     params: dict[str, str],
     source: str,
     symbol: str,
-    normalizer: Callable[[list[dict[str, Any]]], pl.DataFrame],
+    normalizer: Callable[[list[Any]], pl.DataFrame],
 ) -> SourceResult:
     try:
         async for attempt in AsyncRetrying(**OKX_RETRY_KWARGS):
@@ -277,6 +380,47 @@ def _normalize_open_interest(rows: list[dict[str, Any]]) -> pl.DataFrame:
     return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
 
 
+def _normalize_open_interest_history(rows: list[Any]) -> pl.DataFrame:
+    out = []
+    for row in rows:
+        if not isinstance(row, list | tuple):
+            continue
+        out.append(
+            {
+                "timestamp": _array_int(row, 0),
+                "open_interest": _array_float(row, 1),
+                "open_interest_ccy": _array_float_or_none(row, 2),
+                "open_interest_usd": _array_float_or_none(row, 3),
+            }
+        )
+    return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
+
+
+def _normalize_taker_volume_contract(rows: list[Any], unit: str) -> pl.DataFrame:
+    out = []
+    for row in rows:
+        if not isinstance(row, list | tuple):
+            continue
+        out.append(
+            {
+                "timestamp": _array_int(row, 0),
+                "taker_sell_volume": _array_float_or_none(row, 1),
+                "taker_buy_volume": _array_float_or_none(row, 2),
+                "taker_volume_unit": unit,
+            }
+        )
+    return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
+
+
+def _normalize_ratio_rows(rows: list[Any], ratio_column: str) -> pl.DataFrame:
+    out = []
+    for row in rows:
+        if not isinstance(row, list | tuple):
+            continue
+        out.append({"timestamp": _array_int(row, 0), ratio_column: _array_float_or_none(row, 1)})
+    return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
+
+
 def _normalize_books(rows: list[dict[str, Any]], inst_id: str) -> pl.DataFrame:
     out = []
     for row in rows:
@@ -351,6 +495,40 @@ def _int(value: Any) -> int:
 
 def _int_or_none(value: Any) -> int | None:
     return None if value in {None, ""} else int(value)
+
+
+def _rubik_params(
+    inst_id: str,
+    *,
+    period: str,
+    limit: int,
+    begin: str | None,
+    end: str | None,
+) -> dict[str, str]:
+    if limit > 100:
+        raise ValueError("OKX Rubik limit must be <= 100")
+    params = {"instId": inst_id, "period": period, "limit": str(limit)}
+    if begin is not None:
+        params["begin"] = begin
+    if end is not None:
+        params["end"] = end
+    return params
+
+
+def _array_value(row: list[Any] | tuple[Any, ...], index: int) -> Any:
+    return row[index] if len(row) > index else None
+
+
+def _array_float(row: list[Any] | tuple[Any, ...], index: int) -> float:
+    return _float(_array_value(row, index))
+
+
+def _array_float_or_none(row: list[Any] | tuple[Any, ...], index: int) -> float | None:
+    return _float_or_none(_array_value(row, index))
+
+
+def _array_int(row: list[Any] | tuple[Any, ...], index: int) -> int:
+    return _int(_array_value(row, index))
 
 
 def _contract_value_supported(

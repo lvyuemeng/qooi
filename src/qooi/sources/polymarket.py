@@ -138,7 +138,7 @@ def normalize_polymarket_search_results(
             row["event_id"] = str(event.get("id") or row["event_id"])
             row["category"] = str(event.get("category") or row["category"] or "")
             markets.append(row)
-    return pl.DataFrame(markets) if markets else pl.DataFrame()
+    return pl.DataFrame(markets, infer_schema_length=None) if markets else pl.DataFrame()
 
 
 def normalize_polymarket_events(
@@ -177,14 +177,14 @@ def normalize_polymarket_events(
                 "data_quality_warning": "" if query else "polymarket_alias_missing",
             }
         )
-    return pl.DataFrame(out) if out else pl.DataFrame()
+    return pl.DataFrame(out, infer_schema_length=None) if out else pl.DataFrame()
 
 
 def normalize_polymarket_markets(
     rows: list[dict[str, Any]], *, symbol: str, query: str
 ) -> pl.DataFrame:
     out = [_market_row(row, symbol=symbol, query=query) for row in rows]
-    return pl.DataFrame(out) if out else pl.DataFrame()
+    return pl.DataFrame(out, infer_schema_length=None) if out else pl.DataFrame()
 
 
 def _market_row(row: dict[str, Any], *, symbol: str, query: str) -> dict[str, Any]:
