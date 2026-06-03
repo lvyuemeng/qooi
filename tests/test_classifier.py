@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import polars as pl
 
-import qooi.strategies.features as features
-from qooi.strategies.features import (
+import qooi.strategies.structure as features
+from qooi.strategies.structure import (
     RangeWidthThresholdConfig,
     StructureClassifierConfig,
     add_price_structure_stage_features,
@@ -109,3 +109,4 @@ def test_structure_classifier_exposes_threshold_audit_columns():
     } <= set(out.columns)
     assert set(out["range_width_threshold_mode"].unique().to_list()) == {"rolling_quantile"}
     assert "rolling_quantile" in set(out["range_width_threshold_source"].unique().to_list())
+

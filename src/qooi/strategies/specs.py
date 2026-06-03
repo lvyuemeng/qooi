@@ -9,7 +9,13 @@ from typing import Literal, cast
 import polars as pl
 
 import qooi.strategies.indicators as c
-from qooi.strategies.features import (
+from qooi.strategies.indicators import (
+    add_indicators,
+    add_macd_histogram,
+    compute_flow_pipeline_frame,
+)
+from qooi.strategies.semantics import LiquidityEvent, StructureState
+from qooi.strategies.structure import (
     FeatureFn,
     add_liquidity_sweep_features,
     add_momentum_return,
@@ -20,12 +26,6 @@ from qooi.strategies.features import (
     add_utc_hour,
     add_volume_average,
 )
-from qooi.strategies.indicators import (
-    add_indicators,
-    add_macd_histogram,
-    compute_flow_pipeline_frame,
-)
-from qooi.strategies.semantics import LiquidityEvent, StructureState
 
 Direction = Literal[-1, 1]
 

@@ -25,8 +25,8 @@ from qooi.research.data import (
     attach_higher_timeframe_context,
 )
 from qooi.research.instruments import CORE_UNIVERSE, RESEARCH_UNIVERSE
-from qooi.strategies.features import add_price_structure_stage_features
 from qooi.strategies.indicators import add_indicators, attach_order_book_features
+from qooi.strategies.structure import add_price_structure_stage_features
 
 
 class TestIndicators:
@@ -533,3 +533,4 @@ def test_missing_higher_timeframe_context_marks_unavailable():
     out = _add_missing_context_columns(base, "d1")
 
     assert out["d1_context_available"].to_list() == [False]
+

@@ -16,13 +16,13 @@ from qooi.strategies import (
     structure_event_trend_aligned_v1_spec,
 )
 from qooi.strategies.catalog import BENCHMARK_GROUPS, strategy_selection
-from qooi.strategies.features import (
+from qooi.strategies.indicators import add_garch_like_volatility, add_volatility_regime
+from qooi.strategies.specs import HoldPolicy, SignalRule, StrategySpec, apply_strategy_spec
+from qooi.strategies.structure import (
     add_liquidity_sweep_features,
     add_none_context_diagnostics,
     add_price_structure_stage_features,
 )
-from qooi.strategies.indicators import add_garch_like_volatility, add_volatility_regime
-from qooi.strategies.specs import HoldPolicy, SignalRule, StrategySpec, apply_strategy_spec
 
 
 def _ohlcv_frame(
@@ -785,3 +785,4 @@ def test_directional_hold_policy_exits_only_matching_side():
 
     assert out["position_signal"].to_list() == [1.0, 1.0, 0.0, 0.0]
     assert out["exit_signal"].to_list() == [False, False, True, False]
+

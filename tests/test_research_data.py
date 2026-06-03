@@ -7,7 +7,7 @@ from qooi.exchange.store import HistoryCoverage, HistoryTarget
 from qooi.research.config import ResearchCommandConfig, resolve_research_outputs
 from qooi.research.data import DEFAULT_CONTEXTS, FrameRequest, load_frame, prepare_classifier_frame
 from qooi.research.instruments import RESEARCH_UNIVERSE
-from qooi.strategies.features import StructureClassifierConfig
+from qooi.strategies.structure import StructureClassifierConfig
 
 
 def _frame(rows: int = 240, step_ms: int = 3_600_000) -> pl.DataFrame:
@@ -266,3 +266,4 @@ def test_research_evaluation_resolves_reduced_outputs_only():
         "pattern-quality",
         "trade-record-modulation",
     )
+

@@ -1,13 +1,13 @@
-"""Composable strategy feature builders."""
+"""Composable structural strategy feature builders."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
 import polars as pl
 
+from qooi.strategies.indicators import IndicatorFn
 from qooi.strategies.semantics import (
     ClassifierColumn,
     LiquidityEvent,
@@ -18,7 +18,7 @@ from qooi.strategies.semantics import (
     StructureState,
 )
 
-FeatureFn = Callable[[pl.DataFrame], pl.DataFrame]
+FeatureFn = IndicatorFn
 
 
 def add_momentum_return(period: int, *, output: str = "momentum_return") -> FeatureFn:
