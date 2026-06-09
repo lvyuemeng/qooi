@@ -244,6 +244,24 @@ def test_candidate_evidence_matches_latest_observation_to_selected_evidence() ->
     assert row["candidate_status"] == "matched_evidence"
 
 
+def test_candidate_evidence_combines_matched_and_unmatched_latest_observations() -> None:
+    observations = pl.DataFrame(
+        [
+            _observation("BTC-USDT-SWAP", 1, changed=True),
+            _observation("ETH-USDT-SWAP", 1, changed=False),
+        ],
+        schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA,
+    )
+
+    candidates = potential_candidates.candidate_evidence_frame(
+        observations, _selected_evidence_for_test()
+    )
+
+    assert candidates.height == 2
+    rows = {row["symbol"]: row for row in candidates.iter_rows(named=True)}
+    assert rows["BTC-USDT-SWAP"]["candidate_status"] == "matched_evidence"
+    assert rows["ETH-USDT-SWAP"]["candidate_status"] == "no_matching_evidence"
+
 
 def test_candidate_evidence_emits_unmatched_latest_observation_caveat() -> None:
     observations = pl.DataFrame(
@@ -380,6 +398,14 @@ transition_context_limit = 0
     assert (diagnostics / "candidate-rank.csv").exists()
     assert (diagnostics / "evidence-backtest.csv").exists()
     assert (diagnostics / "evidence-baselines.csv").exists()
+    assert (states / "kline-state.csv").exists()
+    (diagnostics / "candidate-rank.parquet").write_text("stale", encoding="utf-8")
+    (states / "kline-state.parquet").write_text("stale", encoding="utf-8")
+
+    second_written = run(config)
+
+    assert second_written == report_path
+    assert (diagnostics / "candidate-rank.csv").exists()
     assert (states / "kline-state.csv").exists()
     assert not (diagnostics / "candidate-rank.parquet").exists()
     assert not (states / "kline-state.parquet").exists()

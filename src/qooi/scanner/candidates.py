@@ -167,7 +167,7 @@ def candidate_evidence_frame(
         if non_empty_frames
         else pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
     )
-    matched = _best_candidate_per_observation(matched)
+    matched = _select_schema(_best_candidate_per_observation(matched), CANDIDATE_EVIDENCE_SCHEMA)
     unmatched = _unmatched_observations(base, matched)
     if not unmatched.is_empty():
         matched = pl.concat([matched, unmatched], how="vertical_relaxed")

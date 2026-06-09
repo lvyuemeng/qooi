@@ -70,6 +70,9 @@ def write_diagnostics(inputs: ReportInputs) -> None:
     states = inputs.artifacts.states_dir
     diagnostics.mkdir(parents=True, exist_ok=True)
     states.mkdir(parents=True, exist_ok=True)
+    for directory in (diagnostics, states):
+        for stale in directory.glob("*.parquet"):
+            stale.unlink()
 
     _write_diagnostic_frames(diagnostic_frames, diagnostics)
     _write_state_frames(state_frames, states)
