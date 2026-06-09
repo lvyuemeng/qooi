@@ -623,3 +623,4 @@ def evaluate_hard_exits(
         px=stop_px,
         fraction=1.0,
     )
+

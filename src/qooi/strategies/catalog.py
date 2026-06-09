@@ -120,3 +120,4 @@ def _specs_for_labels(
 
 def strategy_metadata(strategy: StrategyBehavior) -> str:
     return f"strategy={strategy.name}"
+

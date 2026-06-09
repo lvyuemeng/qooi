@@ -1464,3 +1464,4 @@ def format_backtest_report(
 def format_signal_diagnostics(label: str, diagnostics: dict[str, float]) -> str:
     parts = [f"{key}={value:.1f}" for key, value in sorted(diagnostics.items())]
     return f"  {label}: " + "  ".join(parts)
+

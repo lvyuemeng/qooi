@@ -11,11 +11,15 @@ from qooi.sources.manifest import manifest_frame, now_ms, source_manifest_row
 
 __all__ = [
     "compute_source_coverage_score",
+    "eligible_fetch_symbols",
+    "latest_manifest_rows",
+    "latest_manifest_status",
     "manifest_frame",
     "manifest_row_from_history_coverage",
     "missing_evidence_for_symbol",
     "now_ms",
     "source_manifest_row",
+    "stale_symbols",
 ]
 
 
@@ -85,9 +89,73 @@ def missing_evidence_for_symbol(coverage: pl.DataFrame, symbol: str) -> str:
     return ";".join(missing)
 
 
+def latest_manifest_rows(manifest: pl.DataFrame) -> pl.DataFrame:
+    if manifest.is_empty() or not {"symbol", "source", "timestamp"}.issubset(manifest.columns):
+        return manifest
+    return manifest.sort("timestamp").unique(subset=["symbol", "source"], keep="last")
+
+
+def latest_manifest_status(manifest: pl.DataFrame, *, source: str, symbol: str) -> str | None:
+    rows = latest_manifest_rows(manifest)
+    if rows.is_empty() or not {"symbol", "source", "status"}.issubset(rows.columns):
+        return None
+    match = rows.filter((pl.col("symbol") == symbol) & (pl.col("source") == source)).head(1)
+    if match.is_empty():
+        return None
+    value = match.get_column("status")[0]
+    return str(value) if value is not None else None
+
+
+def stale_symbols(
+    frame: pl.DataFrame,
+    symbols: tuple[str, ...],
+    *,
+    now_ms: int,
+    max_age_ms: int,
+    timestamp_col: str = "timestamp",
+) -> tuple[str, ...]:
+    latest_by_symbol = _latest_timestamps(frame, timestamp_col=timestamp_col)
+    return tuple(
+        symbol
+        for symbol in symbols
+        if (latest := latest_by_symbol.get(symbol)) is None or now_ms - latest > max_age_ms
+    )
+
+
+def eligible_fetch_symbols(
+    frame: pl.DataFrame,
+    symbols: tuple[str, ...],
+    *,
+    now_ms: int,
+    max_age_ms: int,
+    refresh: bool,
+    timestamp_col: str = "timestamp",
+) -> tuple[str, ...]:
+    if refresh:
+        return symbols
+    latest_by_symbol = _latest_timestamps(frame, timestamp_col=timestamp_col)
+    return tuple(
+        symbol
+        for symbol in symbols
+        if (latest := latest_by_symbol.get(symbol)) is None or now_ms - latest > max_age_ms
+    )
+
+
+def _latest_timestamps(frame: pl.DataFrame, *, timestamp_col: str) -> dict[str, int]:
+    if frame.is_empty() or "symbol" not in frame.columns or timestamp_col not in frame.columns:
+        return {}
+    rows = frame.group_by("symbol").agg(pl.col(timestamp_col).max().alias("latest"))
+    return {
+        str(row["symbol"]): int(row["latest"])
+        for row in rows.iter_rows(named=True)
+        if row["latest"] is not None
+    }
+
+
 def _note_value(notes: tuple[str, ...], key: str) -> str:
     prefix = f"{key}="
     for note in notes:
         if note.startswith(prefix):
             return note.removeprefix(prefix)
     return ""
+

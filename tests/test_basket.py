@@ -9,7 +9,7 @@ from qooi.core.basket import (
     BasketState,
     Position,
 )
-from qooi.core.instruments import AssetConfig
+from qooi.core.config import AssetConfig
 
 
 def test_create_basket_initializes_full_state():
@@ -168,3 +168,5 @@ def test_stop_target_rounds_to_configured_tick_size():
 
     assert stop_px == 98.0
     assert target_px == 103.2
+
+

@@ -4,17 +4,58 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Protocol
 
 import httpx
 import polars as pl
 
-from qooi.accumulation.config import AccumulationConfig, DiscoveryConfig
-from qooi.accumulation.schema import DISCOVERY_SCHEMA, empty_discovery_frame
 from qooi.sources.okx import (
     OKX_BASE_URL,
-    fetch_okx_instruments_async,
-    fetch_okx_tickers_async,
+    fetch_okx_instruments,
+    fetch_okx_tickers,
 )
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    top_n: int = 25
+    min_volume_usd: float = 1_000_000.0
+    max_spread_bps: float = 50.0
+    min_history_coverage_pct: float = 0.0
+    missing_contract_penalty: float = 2.0
+    spread_bps_penalty_scale: float = 100.0
+    coverage_bonus_scale: float = 100.0
+
+
+class DiscoveryWorkflowConfig(Protocol):
+    discovery: DiscoveryConfig
+
+
+DISCOVERY_SCHEMA: dict[str, pl.DataType] = {
+    "symbol": pl.String,
+    "inst_id": pl.String,
+    "inst_type": pl.String,
+    "state": pl.String,
+    "base_ccy": pl.String,
+    "quote_ccy": pl.String,
+    "settle_ccy": pl.String,
+    "ct_val": pl.Float64,
+    "ct_val_ccy": pl.String,
+    "list_time": pl.Int64,
+    "quote_volume_24h": pl.Float64,
+    "last": pl.Float64,
+    "bid_px": pl.Float64,
+    "ask_px": pl.Float64,
+    "spread_bps": pl.Float64,
+    "history_coverage_pct": pl.Float64,
+    "eligible": pl.Boolean,
+    "exclude_reason": pl.String,
+    "rank_score": pl.Float64,
+}
+
+
+def empty_discovery_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=DISCOVERY_SCHEMA)
 
 
 @dataclass(frozen=True)
@@ -25,14 +66,14 @@ class DiscoveryResult:
 
 
 def discover_candidates(
-    config: AccumulationConfig,
+    config: DiscoveryWorkflowConfig,
     *,
-    top_n: int,
+    top_n: int | None = None,
     min_volume_usd: float | None = None,
     symbols: tuple[str, ...] = (),
 ) -> DiscoveryResult:
     return asyncio.run(
-        discover_candidates_async(
+        _discover_candidates_task(
             config,
             top_n=top_n,
             min_volume_usd=min_volume_usd,
@@ -41,16 +82,16 @@ def discover_candidates(
     )
 
 
-async def discover_candidates_async(
-    config: AccumulationConfig,
+async def _discover_candidates_task(
+    config: DiscoveryWorkflowConfig,
     *,
-    top_n: int,
+    top_n: int | None = None,
     min_volume_usd: float | None = None,
     symbols: tuple[str, ...] = (),
 ) -> DiscoveryResult:
     async with httpx.AsyncClient(base_url=OKX_BASE_URL, timeout=20.0) as client:
         instruments_result, tickers_result = await asyncio.gather(
-            fetch_okx_instruments_async(client), fetch_okx_tickers_async(client)
+            fetch_okx_instruments(client), fetch_okx_tickers(client)
         )
     discovery = rank_discovery_frame(
         instruments_result.frame,
@@ -137,7 +178,7 @@ def rank_discovery_frame(
 
 
 def select_candidate_symbols(
-    discovery: pl.DataFrame, *, top_n: int, manual_symbols: tuple[str, ...] = ()
+    discovery: pl.DataFrame, *, top_n: int | None = None, manual_symbols: tuple[str, ...] = ()
 ) -> tuple[str, ...]:
     if discovery.is_empty():
         return manual_symbols
@@ -154,7 +195,8 @@ def select_candidate_symbols(
     ):
         if symbol not in selected:
             selected.append(symbol)
-        if len(selected) >= top_n:
+        if top_n is not None and len(selected) >= top_n:
             break
-    return tuple(selected[:top_n])
+    return tuple(selected if top_n is None else selected[:top_n])
+
 

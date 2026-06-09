@@ -611,3 +611,4 @@ def add_none_context_diagnostics(
         )
 
     return _add
+

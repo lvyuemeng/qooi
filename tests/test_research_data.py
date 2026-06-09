@@ -3,10 +3,10 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
+from qooi.core.config import RESEARCH_UNIVERSE
 from qooi.exchange.store import HistoryCoverage, HistoryTarget
 from qooi.research.config import ResearchCommandConfig, resolve_research_outputs
 from qooi.research.data import DEFAULT_CONTEXTS, FrameRequest, load_frame, prepare_classifier_frame
-from qooi.research.instruments import RESEARCH_UNIVERSE
 from qooi.strategies.structure import StructureClassifierConfig
 
 
@@ -266,4 +266,5 @@ def test_research_evaluation_resolves_reduced_outputs_only():
         "pattern-quality",
         "trade-record-modulation",
     )
+
 

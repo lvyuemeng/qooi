@@ -14,3 +14,4 @@ SourceStatus = Literal["ok", "partial", "missing", "skipped", "failed"]
 class SourceResult:
     frame: pl.DataFrame
     manifest: pl.DataFrame
+

@@ -21,7 +21,7 @@ from qooi.core.basket import (
     evaluate_exits,
     evaluate_hard_exits,
 )
-from qooi.core.instruments import PairConfig
+from qooi.core.config import PairConfig
 from qooi.core.recovery import NoRecovery, RecoveryPolicy
 from qooi.core.recovery import evaluate as evaluate_recovery
 
@@ -493,3 +493,4 @@ def _exit_action(
         signal_strength=signal.strength,
         snapshot=snapshot,
     )
+

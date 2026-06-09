@@ -127,3 +127,4 @@ def _save_plot(fig, path: Path) -> Path:
     fig.savefig(path)
     plt.close(fig)
     return path
+

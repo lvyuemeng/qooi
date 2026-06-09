@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Literal, Protocol
 
 import polars as pl
 
-from qooi.core.instruments import PairConfig
+from qooi.core.config import PairConfig
 from qooi.exchange.market import CandleSource
 from qooi.exchange.store import (
     CacheStore,
@@ -18,14 +18,30 @@ from qooi.exchange.store import (
     _bar_interval_ms,
     validate_history,
 )
-from qooi.strategies.features import (
+from qooi.strategies.indicators import add_indicators, add_macd_histogram
+from qooi.strategies.specs import StrategyBehavior, compute_signal_frame
+from qooi.strategies.structure import (
     StructureClassifierConfig,
     add_price_structure_stage_features,
 )
-from qooi.strategies.indicators import add_indicators, add_macd_histogram
-from qooi.strategies.specs import StrategyBehavior, compute_signal_frame
 
 logger = logging.getLogger(__name__)
+
+
+class HistoryLoadConfig(Protocol):
+    days: int
+    min: int | None
+    refresh: bool
+    cap: int
+    trim: bool
+    cov: float | None
+
+
+class SignalFilterConfig(Protocol):
+    active: bool
+    side: str
+    include_signal_ids: tuple[str, ...]
+    exclude_signal_ids: tuple[str, ...]
 
 
 class DataCoverageError(RuntimeError):
@@ -72,10 +88,10 @@ def source_inst_ids(pair: PairConfig, data_source: str) -> tuple[str, str]:
     return pair.asset.symbol, pair.asset.symbol
 
 
-def history_req(
+def _history_req(
     inst_id: str,
     bar: str,
-    req: Any,
+    req: HistoryLoadConfig,
     *,
     source: CandleSource = "trade",
 ) -> HistoryRequest:
@@ -89,7 +105,7 @@ def history_req(
     )
 
 
-def trim_frame(frame: pl.DataFrame, cap: int, trim: bool) -> pl.DataFrame:
+def _trim_frame(frame: pl.DataFrame, cap: int, trim: bool) -> pl.DataFrame:
     if trim and cap > 0 and frame.height > cap:
         return frame.tail(cap)
     return frame
@@ -99,12 +115,12 @@ def load_frame(
     store: CacheStore,
     inst_id: str,
     bar: str,
-    req: Any,
+    req: HistoryLoadConfig,
     *,
     source: CandleSource = "trade",
 ) -> tuple[pl.DataFrame, HistoryCoverage]:
-    df, coverage = store.bars(history_req(inst_id, bar, req, source=source))
-    df = trim_frame(df, int(req.cap), bool(req.trim))
+    df, coverage = store.bars(_history_req(inst_id, bar, req, source=source))
+    df = _trim_frame(df, int(req.cap), bool(req.trim))
     if df.height != coverage.actual_bars:
         coverage = validate_history(df, coverage.target, refreshed=coverage.refreshed)
     cov = float(req.cov or 0.0)
@@ -117,12 +133,12 @@ def load_frame_with_raw_rows(
     store: CacheStore,
     inst_id: str,
     bar: str,
-    req: Any,
+    req: HistoryLoadConfig,
     *,
     source: CandleSource = "trade",
 ) -> tuple[pl.DataFrame, HistoryCoverage, int, str]:
-    raw, raw_coverage = store.bars(history_req(inst_id, bar, req, source=source))
-    frame = trim_frame(raw, int(req.cap), bool(req.trim))
+    raw, raw_coverage = store.bars(_history_req(inst_id, bar, req, source=source))
+    frame = _trim_frame(raw, int(req.cap), bool(req.trim))
     note = "trimmed" if frame.height != raw.height else ""
     if frame.height != raw.height:
         coverage = validate_history(frame, raw_coverage.target, refreshed=raw_coverage.refreshed)
@@ -139,7 +155,7 @@ def provenance_row(
     symbol: str,
     inst_id: str,
     bar: str,
-    req: Any,
+    req: HistoryLoadConfig,
     raw_rows: int,
     out: pl.DataFrame,
     coverage: HistoryCoverage,
@@ -164,7 +180,7 @@ def provenance_row(
     }
 
 
-def load_cache_for_request(
+def _load_cache_for_request(
     store: CacheStore,
     inst_id: str,
     timeframe: str,
@@ -193,7 +209,7 @@ def load_cache_for_request(
 
 @dataclass(frozen=True)
 class BacktestFrameOptions:
-    signal_filters: Any
+    signal_filters: SignalFilterConfig
     metadata: tuple[str, ...]
 
 
@@ -212,9 +228,6 @@ class PreparedBacktestFrame(FrameResult):
     precomputed_signal: bool
     signal_coverage: HistoryCoverage
     execution_coverage: HistoryCoverage
-
-
-PreparedClassifierFrame = FrameResult
 
 
 @dataclass(frozen=True)
@@ -285,9 +298,9 @@ SIGNAL_CONTEXT_COLUMNS: tuple[str, ...] = (
 )
 
 
-def apply_signal_debug_filters(
+def _apply_signal_debug_filters(
     frame: pl.DataFrame,
-    filters: Any,
+    filters: SignalFilterConfig,
 ) -> pl.DataFrame:
     """Suppress diagnostic entry buckets without mutating cached strategy output."""
     if not filters.active:
@@ -341,7 +354,7 @@ def apply_signal_debug_filters(
     return frame.with_columns(expressions)
 
 
-def load_context_for_request(
+def _load_context_for_request(
     store: CacheStore,
     inst_id: str,
     context: ContextSpec,
@@ -352,7 +365,7 @@ def load_context_for_request(
         bar=context.bar,
         min_bars=_context_min_bars(context.bar, request.days, role="higher_context"),
     )
-    return load_cache_for_request(
+    return _load_cache_for_request(
         store,
         inst_id,
         context.bar,
@@ -659,7 +672,7 @@ def _attach_contexts(
         if spec.role == "base":
             work = _attach_base_context_aliases(work, spec.prefix, classifier_config)
             continue
-        context_df, summary = load_context_for_request(store, signal_inst_id, spec, request)
+        context_df, summary = _load_context_for_request(store, signal_inst_id, spec, request)
         context_summaries.append(summary)
         work = _attach_higher_context(work, context_df, spec.prefix, classifier_config)
     return work, tuple(context_summaries)
@@ -689,17 +702,21 @@ def prepare_classifier_frame(
     classifier: StructureClassifierConfig | None = None,
     *,
     contexts: tuple[ContextSpec, ...] = (),
-) -> PreparedClassifierFrame:
+) -> FrameResult:
     classifier = classifier or StructureClassifierConfig.default()
     pair = request.pair
     signal_inst_id, _execution_inst_id = source_inst_ids(pair, request.data_source)
     try:
-        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, request.bar, request)
+        base_df, base_coverage = _load_cache_for_request(
+            store, signal_inst_id, request.bar, request
+        )
     except FileNotFoundError:
         if not request.allow_swap_signal_fallback or signal_inst_id == pair.asset.symbol:
             raise
         signal_inst_id = pair.asset.symbol
-        base_df, base_coverage = load_cache_for_request(store, signal_inst_id, request.bar, request)
+        base_df, base_coverage = _load_cache_for_request(
+            store, signal_inst_id, request.bar, request
+        )
 
     work = add_macd_histogram()(add_indicators(base_df))
     work = add_price_structure_stage_features(config=classifier)(work)
@@ -715,7 +732,7 @@ def prepare_classifier_frame(
         f"classifier_bar={request.bar}",
         *(summary.note() for summary in coverage),
     )
-    return PreparedClassifierFrame(
+    return FrameResult(
         pair=pair,
         frame=work,
         signal_inst_id=signal_inst_id,
@@ -737,14 +754,14 @@ def prepare_signal_frame(
     signal_inst_id, execution_inst_id = source_inst_ids(pair, request.data_source)
     timeframe = request.bar
     try:
-        signal_df, signal_summary = load_cache_for_request(
+        signal_df, signal_summary = _load_cache_for_request(
             store, signal_inst_id, timeframe, request
         )
     except FileNotFoundError:
         if not request.allow_swap_signal_fallback or signal_inst_id == pair.asset.symbol:
             raise
         signal_inst_id = pair.asset.symbol
-        signal_df, signal_summary = load_cache_for_request(
+        signal_df, signal_summary = _load_cache_for_request(
             store, signal_inst_id, timeframe, request
         )
 
@@ -757,18 +774,18 @@ def prepare_signal_frame(
         if options.signal_filters.active or has_context:
             signal_frame = compute_signal_frame(signal_df, strategy)
             frame = add_mtf_state_keys(
-                apply_signal_debug_filters(signal_frame, options.signal_filters)
+                _apply_signal_debug_filters(signal_frame, options.signal_filters)
             )
             precomputed_signal = True
         else:
             frame = signal_df
             precomputed_signal = False
     else:
-        execution_df, execution_summary = load_cache_for_request(
+        execution_df, execution_summary = _load_cache_for_request(
             store, execution_inst_id, timeframe, request
         )
         signal_frame = add_mtf_state_keys(
-            apply_signal_debug_filters(
+            _apply_signal_debug_filters(
                 compute_signal_frame(signal_df, strategy),
                 options.signal_filters,
             )
@@ -786,7 +803,7 @@ def prepare_signal_frame(
         f"execution_inst={execution_inst_id}",
         *(summary.note() for summary in coverage),
     )
-    log_cache_warnings(coverage, signal_inst_id, execution_inst_id)
+    _log_cache_warnings(coverage, signal_inst_id, execution_inst_id)
     return PreparedBacktestFrame(
         pair=pair,
         frame=frame,
@@ -800,7 +817,7 @@ def prepare_signal_frame(
     )
 
 
-def log_cache_warnings(
+def _log_cache_warnings(
     coverage: tuple[HistoryCoverage, ...], signal_inst_id: str, execution_inst_id: str
 ) -> None:
     for summary in coverage:

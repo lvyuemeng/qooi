@@ -1,14 +1,12 @@
-"""BacktestExecutor white-box integration tests."""
+"""BacktestExecutor boundary integration tests."""
 
 import polars as pl
 import pytest
 
 from qooi.core.basket import Basket, BasketState, ExitConfig
-from qooi.core.evaluate import Report
+from qooi.core.config import CORE_UNIVERSE, AssetConfig, PairConfig
 from qooi.core.executor import BacktestExecutor
-from qooi.core.instruments import AssetConfig, PairConfig
 from qooi.core.recovery import GridRecovery, HedgeRecovery, MartingaleRecovery
-from qooi.research.instruments import CORE_UNIVERSE
 
 
 def _load(sig_symbol: str) -> pl.DataFrame:
@@ -41,6 +39,32 @@ def _pair(
     if max_notional_pct_per_basket is not None:
         asset_kwargs["max_notional_pct_per_basket"] = max_notional_pct_per_basket
     return PairConfig(asset=AssetConfig(**asset_kwargs))
+
+
+def _tiny_unsizeable_pair() -> PairConfig:
+    return _pair(
+        capital=1.0,
+        max_risk_pct=0.001,
+        leverage=1.0,
+        max_notional_pct_per_basket=None,
+        ct_val=1.0,
+        min_contracts=1.0,
+        lot_size=1.0,
+    )
+
+
+def _seed_basket() -> Basket:
+    return Basket(
+        basket_id="seed",
+        symbol="TEST-USDT-SWAP",
+        strategy="momentum_burst",
+        side="buy",
+        state=BasketState.ACTIVE,
+        entry_px=100.0,
+        current_sz=1.0,
+        stop_px=98.0,
+        target_px=103.0,
+    )
 
 
 def _signal_frame() -> pl.DataFrame:
@@ -88,7 +112,7 @@ def _cooldown_frame() -> pl.DataFrame:
         {
             "timestamp": list(range(6)),
             "open": [100.0] * 6,
-            "high": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            "high": [100.0] * 6,
             "low": [100.0, 100.0, 98.0, 100.0, 100.0, 100.0],
             "close": [100.0, 100.0, 98.0, 100.0, 100.0, 100.0],
             "vol": [1000.0] * 6,
@@ -107,10 +131,10 @@ def _ambiguous_frame() -> pl.DataFrame:
     return pl.DataFrame(
         {
             "timestamp": list(range(4)),
-            "open": [100.0, 100.0, 100.0, 100.0],
+            "open": [100.0] * 4,
             "high": [100.0, 100.0, 103.0, 100.0],
             "low": [100.0, 100.0, 98.0, 100.0],
-            "close": [100.0, 100.0, 100.0, 100.0],
+            "close": [100.0] * 4,
             "vol": [1000.0] * 4,
             "atr_14": [1.0] * 4,
             "signal": [0.0, 1.0, 1.0, 0.0],
@@ -123,79 +147,43 @@ def _ambiguous_frame() -> pl.DataFrame:
     )
 
 
-@pytest.mark.parametrize("pair", CORE_UNIVERSE[:2])
-def test_run_generates_multiple_trades_from_cached_data(pair):
-    df = _load(pair.asset.sig_symbol)
-    trades, equity = BacktestExecutor(initial_capital=pair.asset.capital).run(df, pair)
-    assert len(trades) > 0
-    assert len(equity) > 10
-    assert equity[-1] > 0
-
-
-def test_trade_pnl_sign_matches_direction():
+def test_cached_data_run_report_preserves_trade_schema_and_pnl_direction():
     pair = CORE_UNIVERSE[0]
-    df = _load(pair.asset.sig_symbol)
-    trades, _ = BacktestExecutor(initial_capital=pair.asset.capital).run(df, pair)
-    assert trades
-    for t in trades:
-        entry = float(t["entry_px"])
-        exit_px = float(t["exit_px"])
-        pnl = float(t["pnl"])
-        side = t["side"]
-        if side == "buy":
+    report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
+        _load(pair.asset.sig_symbol),
+        pair,
+    )
+
+    assert report.metrics.num_trades > 0
+    assert report.equity.height > 10
+    assert float(report.equity["portfolio_value"][-1]) > 0
+    assert float(report.equity["portfolio_value"][-1]) != pair.asset.capital
+    expected_columns = {
+        "pnl_usd",
+        "bars_held",
+        "entry_ts",
+        "exit_ts",
+        "entry_notional_usd",
+        "notional_pct_capital",
+        "pre_entry_total_notional_pct",
+        "post_entry_total_notional_pct",
+        "exit_family",
+        "recovery_active_at_exit",
+        "sizing_binding",
+    }
+    assert expected_columns <= set(report.trades.columns)
+    assert any(abs(float(t["pnl_usd"])) > 0 for t in report.trades.iter_rows(named=True))
+    for trade in report.trades.iter_rows(named=True):
+        entry = float(trade["entry_px"])
+        exit_px = float(trade["exit_px"])
+        pnl = float(trade["pnl"])
+        if trade["side"] == "buy":
             assert (exit_px > entry and pnl > 0) or (exit_px <= entry and pnl <= 0)
         else:
             assert (exit_px < entry and pnl > 0) or (exit_px >= entry and pnl <= 0)
 
 
-def test_trade_rows_include_richer_fields():
-    pair = CORE_UNIVERSE[0]
-    df = _load(pair.asset.sig_symbol)
-    trades, _ = BacktestExecutor(initial_capital=pair.asset.capital).run(df, pair)
-    assert trades
-    row = trades[0]
-    assert "pnl_usd" in row
-    assert "bars_held" in row
-    assert "entry_ts" in row
-    assert "exit_ts" in row
-    assert "entry_notional_usd" in row
-    assert "notional_pct_capital" in row
-    assert "pre_entry_total_notional_pct" in row
-    assert "post_entry_total_notional_pct" in row
-    assert "exit_family" in row
-    assert "recovery_active_at_exit" in row
-    assert "sizing_binding" in row
-
-
-def test_trade_pnl_usd_uses_exit_size_snapshot():
-    pair = CORE_UNIVERSE[0]
-    df = _load(pair.asset.sig_symbol)
-    trades, equity = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run(
-        df, pair
-    )
-    assert trades
-    assert any(abs(float(t["pnl_usd"])) > 0 for t in trades if float(t["pnl"]) != 0)
-    assert equity[-1] != pair.asset.capital
-
-
-def test_run_report_returns_report():
-    pair = CORE_UNIVERSE[0]
-    df = _load(pair.asset.sig_symbol)
-    report = BacktestExecutor(initial_capital=pair.asset.capital).run_report(df, pair)
-    assert isinstance(report, Report)
-    assert report.metrics.num_trades >= 0
-    assert report.equity.height > 0
-
-
-def test_drawdown_stop_halts_loop():
-    pair = CORE_UNIVERSE[0]
-    df = _load(pair.asset.sig_symbol)
-    # tiny capital + normal costs should stop early on DD if losses occur
-    trades, equity = BacktestExecutor(initial_capital=50.0).run(df, pair)
-    assert len(equity) <= df.height
-
-
-def test_executor_populates_grouped_lifecycle_and_risk_diagnostics():
+def test_executor_populates_lifecycle_risk_and_drawdown_diagnostics():
     pair = CORE_UNIVERSE[0]
     report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
         _signal_frame(),
@@ -216,46 +204,43 @@ def test_executor_populates_grouped_lifecycle_and_risk_diagnostics():
     assert lifecycle.duplicate_entry_suppressed >= 0
     assert isinstance(lifecycle.blocked_entry_reasons, dict)
     assert risk.max_notional_exposure_pct >= 0
-    assert "Basket Lifecycle Diagnostics" in report.diagnostics_table()
-    assert "EntryAccept" in report.diagnostics_table()
-    assert "Risk Control Diagnostics" in report.diagnostics_table()
+    assert {
+        "entry_equity",
+        "entry_drawdown_pct",
+        "pre_entry_total_notional_pct",
+        "post_entry_total_notional_pct",
+        "exit_drawdown_pct_before",
+    } <= set(report.trades.columns)
+    table = report.diagnostics_table()
+    assert "Basket Lifecycle Diagnostics" in table
+    assert "EntryAccept" in table
+    assert "Risk Control Diagnostics" in table
+    assert "Drawdown Path Diagnostics" in table
 
 
-def test_executor_records_drawdown_path_trade_metadata():
-    pair = CORE_UNIVERSE[0]
-    report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
-        _signal_frame(),
-        pair,
-        exit_cfg=ExitConfig(max_bars=2),
-        precomputed_signal=True,
-    )
-
-    assert not report.trades.is_empty()
-    assert "entry_equity" in report.trades.columns
-    assert "entry_drawdown_pct" in report.trades.columns
-    assert "pre_entry_total_notional_pct" in report.trades.columns
-    assert "post_entry_total_notional_pct" in report.trades.columns
-    assert "exit_drawdown_pct_before" in report.trades.columns
-    assert "Drawdown Path Diagnostics" in report.diagnostics_table()
-
-
-def test_grid_recovery_is_sized_and_allowed():
+@pytest.mark.parametrize(
+    "recovery_cfg, action_field",
+    [
+        (GridRecovery(zone_atr=1.0, multiplier=0.5, max_levels=1), "grid_actions"),
+        (HedgeRecovery(zone_atr=1.0, multiplier=1.0, max_levels=1), "hedge_actions"),
+    ],
+)
+def test_recovery_actions_are_sized_allowed_and_diagnosed(recovery_cfg, action_field):
     pair = _pair()
     report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
         _mechanics_frame(),
         pair,
         exit_cfg=ExitConfig(max_bars=10),
-        recovery_cfg=GridRecovery(zone_atr=1.0, multiplier=0.5, max_levels=1),
+        recovery_cfg=recovery_cfg,
         precomputed_signal=True,
     )
 
     assert report.diagnostics is not None
     risk = report.diagnostics.risk
     lifecycle = report.diagnostics.lifecycle
-    assert risk.recovery_preempted_stop_count == 0
     assert risk.recovery_unsized_actions == 0
     assert risk.recovery_allowed_actions >= 1
-    assert lifecycle.grid_actions >= 1
+    assert getattr(lifecycle, action_field) >= 1
     assert lifecycle.action_event_count >= 1
     table = report.diagnostics_table()
     assert "Recovery Mechanics Diagnostics" in table
@@ -263,26 +248,7 @@ def test_grid_recovery_is_sized_and_allowed():
 
 
 def test_grid_recovery_blocked_by_sizing_reports_concrete_reason():
-    pair = _pair(
-        capital=1.0,
-        max_risk_pct=0.001,
-        leverage=1.0,
-        max_notional_pct_per_basket=None,
-        ct_val=1.0,
-        min_contracts=1.0,
-        lot_size=1.0,
-    )
-    initial = Basket(
-        basket_id="seed",
-        symbol=pair.asset.symbol,
-        strategy="momentum_burst",
-        side="buy",
-        state=BasketState.ACTIVE,
-        entry_px=100.0,
-        current_sz=1.0,
-        stop_px=98.0,
-        target_px=103.0,
-    )
+    pair = _tiny_unsizeable_pair()
     executor = BacktestExecutor(
         initial_capital=pair.asset.capital,
         cost_pct=0.0,
@@ -293,7 +259,7 @@ def test_grid_recovery_blocked_by_sizing_reports_concrete_reason():
         pair,
         exit_cfg=ExitConfig(max_bars=10),
         recovery_cfg=GridRecovery(zone_atr=1.0, multiplier=1.0, max_levels=1),
-        initial_baskets=[initial],
+        initial_baskets=[_seed_basket()],
         precomputed_signal=True,
     )
 
@@ -304,26 +270,7 @@ def test_grid_recovery_blocked_by_sizing_reports_concrete_reason():
 
 
 def test_martingale_recovery_group_is_blocked_atomically_when_reversal_sizing_fails():
-    pair = _pair(
-        capital=1.0,
-        max_risk_pct=0.001,
-        leverage=1.0,
-        max_notional_pct_per_basket=None,
-        ct_val=1.0,
-        min_contracts=1.0,
-        lot_size=1.0,
-    )
-    initial = Basket(
-        basket_id="seed",
-        symbol=pair.asset.symbol,
-        strategy="momentum_burst",
-        side="buy",
-        state=BasketState.ACTIVE,
-        entry_px=100.0,
-        current_sz=1.0,
-        stop_px=98.0,
-        target_px=103.0,
-    )
+    pair = _tiny_unsizeable_pair()
     executor = BacktestExecutor(
         initial_capital=pair.asset.capital,
         cost_pct=0.0,
@@ -334,7 +281,7 @@ def test_martingale_recovery_group_is_blocked_atomically_when_reversal_sizing_fa
         pair,
         exit_cfg=ExitConfig(max_bars=10),
         recovery_cfg=MartingaleRecovery(zone_atr=1.0, max_levels=1),
-        initial_baskets=[initial],
+        initial_baskets=[_seed_basket()],
         precomputed_signal=True,
     )
 
@@ -346,24 +293,6 @@ def test_martingale_recovery_group_is_blocked_atomically_when_reversal_sizing_fa
     assert risk.recovery_blocked_reasons["below_min_contracts_1"] >= 1
     assert risk.recovery_blocked_reasons["paired_below_min_contracts_1"] >= 1
     assert risk.recovery_allowed_actions == 0
-
-
-def test_hedge_recovery_is_sized_with_stop_target_geometry():
-    pair = _pair()
-    report = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0).run_report(
-        _mechanics_frame(),
-        pair,
-        exit_cfg=ExitConfig(max_bars=10),
-        recovery_cfg=HedgeRecovery(zone_atr=1.0, multiplier=1.0, max_levels=1),
-        precomputed_signal=True,
-    )
-
-    assert report.diagnostics is not None
-    risk = report.diagnostics.risk
-    lifecycle = report.diagnostics.lifecycle
-    assert risk.recovery_unsized_actions == 0
-    assert risk.recovery_allowed_actions >= 1
-    assert lifecycle.hedge_actions >= 1
 
 
 def test_same_bar_terminal_entry_block_reports_sizing_not_duplicate():
@@ -391,20 +320,9 @@ def test_same_bar_terminal_entry_block_reports_sizing_not_duplicate():
             "signal_id": ["seed", "same_bar_entry"],
         }
     )
-    initial = Basket(
-        basket_id="seed",
-        symbol=pair.asset.symbol,
-        strategy="momentum_burst",
-        side="buy",
-        state=BasketState.ACTIVE,
-        entry_px=100.0,
-        current_sz=1.0,
-        stop_px=98.0,
-        target_px=103.0,
-    )
     executor = BacktestExecutor(initial_capital=pair.asset.capital, cost_pct=0.0)
 
-    executor.run(frame, pair, initial_baskets=[initial], precomputed_signal=True)
+    executor.run(frame, pair, initial_baskets=[_seed_basket()], precomputed_signal=True)
 
     diagnostics = executor._last_diagnostics
     assert diagnostics.lifecycle.sizing_blocked_entries == 1

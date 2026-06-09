@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.research import tables
+from qooi.research import behavior_tables, candidates, rule_primitives
+from qooi.research import patterns as pattern_tables
+from qooi.research.artifacts import ensure_columns
 
 
 def _market_frame() -> pl.DataFrame:
@@ -30,7 +32,7 @@ def _market_frame() -> pl.DataFrame:
 
 
 def test_normalize_research_frame_emits_long_known_at_close_rows():
-    research_frame = tables.normalize_research_frame(
+    research_frame = pattern_tables.normalize_research_frame(
         _market_frame(),
         symbol="BTC",
         timeframe="1H",
@@ -49,7 +51,7 @@ def test_normalize_research_frame_emits_long_known_at_close_rows():
 
 
 def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
-    research_frame = tables.normalize_research_frame(
+    research_frame = pattern_tables.normalize_research_frame(
         _market_frame(),
         symbol="BTC",
         timeframe="1H",
@@ -57,7 +59,7 @@ def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
         event_column="liquidity_event_type",
     )
 
-    transition_patterns = tables.materialize_transition_patterns(
+    transition_patterns = pattern_tables.materialize_transition_patterns(
         research_frame, {"ngram_lengths": (2, 3)}
     )
 
@@ -71,17 +73,15 @@ def test_materialize_transition_patterns_is_deterministic_and_no_lookahead():
 
 
 def test_materialize_transition_patterns_ignores_sparse_null_states():
-    research_frame = tables.normalize_research_frame(
-        _market_frame().with_columns(
-            pl.Series("learned_state", [None, "20", None, "13", None])
-        ),
+    research_frame = pattern_tables.normalize_research_frame(
+        _market_frame().with_columns(pl.Series("learned_state", [None, "20", None, "13", None])),
         symbol="BTC",
         timeframe="1H",
         state_columns=("learned_state",),
         event_column="liquidity_event_type",
     )
 
-    transition_patterns = tables.materialize_transition_patterns(research_frame)
+    transition_patterns = pattern_tables.materialize_transition_patterns(research_frame)
 
     assert transition_patterns.height == 1
     assert transition_patterns.row(0, named=True)["pattern_value"] == "20->13"
@@ -89,16 +89,16 @@ def test_materialize_transition_patterns_ignores_sparse_null_states():
 
 def test_outcomes_attach_forward_labels_after_pattern_materialization():
     market = _market_frame()
-    research_frame = tables.normalize_research_frame(
+    research_frame = pattern_tables.normalize_research_frame(
         market,
         symbol="BTC",
         timeframe="1H",
         state_columns=("market_stage_reduced",),
         event_column="liquidity_event_type",
     )
-    static_patterns = tables.materialize_transition_patterns(research_frame)
+    static_patterns = pattern_tables.materialize_transition_patterns(research_frame)
 
-    outcome_table = tables.attach_forward_outcomes(static_patterns, market, (1,))
+    outcome_table = pattern_tables.attach_forward_outcomes(static_patterns, market, (1,))
     long_row = outcome_table.filter(pl.col("event_value") == "failed_breakout_low").row(
         0, named=True
     )
@@ -120,7 +120,7 @@ def test_learned_state_evaluation_outcomes_are_test_only_and_cost_adjusted():
         }
     )
 
-    filtered = tables.filter_evaluation_outcomes(
+    filtered = pattern_tables.filter_evaluation_outcomes(
         outcomes,
         returns_split="test",
         transaction_cost_bps=5.0,
@@ -133,31 +133,83 @@ def test_learned_state_evaluation_outcomes_are_test_only_and_cost_adjusted():
 
 def test_metrics_and_promotion_are_separate_pipe_steps():
     market = _market_frame()
-    research_frame = tables.normalize_research_frame(
+    research_frame = pattern_tables.normalize_research_frame(
         market,
         symbol="BTC",
         timeframe="1H",
         state_columns=("market_stage_reduced",),
         event_column="liquidity_event_type",
     )
-    static_patterns = tables.materialize_transition_patterns(research_frame)
-    outcome_table = tables.attach_forward_outcomes(static_patterns, market, (1,))
+    static_patterns = pattern_tables.materialize_transition_patterns(research_frame)
+    outcome_table = pattern_tables.attach_forward_outcomes(static_patterns, market, (1,))
 
-    metric_table = tables.summarize_returns(
+    metric_table = pattern_tables.summarize_returns(
         outcome_table,
         ["pattern_id", "pattern_family", "pattern_source", "symbol", "horizon", "side"],
     )
     assert "passes_candidate_gate" not in metric_table.columns
 
-    scored = tables.apply_candidate_gate(
+    scored = pattern_tables.apply_candidate_gate(
         metric_table,
         {"min_rows": 1, "omega_threshold": 0.1, "pwpr_threshold": 0.1},
     )
     assert "passes_candidate_gate" in scored.columns
 
 
+def test_candidate_trades_use_next_bar_entry_and_nonoverlap() -> None:
+    market = _market_frame().with_columns(
+        pl.lit("none").alias("liquidity_event_type"),
+        pl.lit("test").alias("split"),
+    )
+    research_frame = pattern_tables.normalize_research_frame(
+        market.with_columns(pl.Series("learned_state", ["1", "1", "1", "1", "1"])),
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=("learned_state",),
+        event_column="liquidity_event_type",
+        state_source="vq_rssm",
+    )
+    patterns = pattern_tables.materialize_state_patterns(research_frame, "vq_rssm")
+    scored = pl.DataFrame(
+        {
+            "pattern_id": [patterns.row(0, named=True)["pattern_id"]],
+            "pattern_family": ["state"],
+            "pattern_source": ["vq_rssm"],
+            "symbol": ["BTC"],
+            "horizon": [1],
+            "side": [None],
+            "rows": [5],
+            "positive_rate": [100.0],
+            "negative_rate": [0.0],
+            "positive_mean": [1.0],
+            "negative_mean_abs": [0.0],
+            "omega_ratio": [999.0],
+            "pwpr": [999.0],
+            "sortino_zero": [0.0],
+            "mean_side_return_pct": [1.0],
+            "invalid_state_present": [False],
+            "passes_candidate_gate": [True],
+        }
+    )
+
+    trades = candidates.build_candidate_nonoverlap_trades(
+        patterns,
+        market,
+        ensure_columns(scored, pattern_tables.SCORED_PATTERN_SCHEMA),
+        returns_split="test",
+        transaction_cost_bps=5.0,
+    )
+
+    first = trades.row(0, named=True)
+    assert first["signal_timestamp"] == 1
+    assert first["entry_timestamp"] == 2
+    assert first["exit_timestamp"] == 3
+    assert first["side_return_pct"] == ((102.0 - 101.0) / 101.0 * 100.0) - 0.05
+    assert trades.height == 2
+
+
 def test_information_metrics_are_count_table_based():
-    research_frame = tables.normalize_research_frame(
+    research_frame = pattern_tables.normalize_research_frame(
         _market_frame(),
         symbol="BTC",
         timeframe="1H",
@@ -165,7 +217,7 @@ def test_information_metrics_are_count_table_based():
         event_column="liquidity_event_type",
     )
 
-    info = tables.summarize_transition_information(research_frame)
+    info = pattern_tables.summarize_transition_information(research_frame)
 
     assert info.height == 1
     assert "transition_information" in info.columns
@@ -183,25 +235,25 @@ def test_information_metrics_ignore_null_state_rows() -> None:
         }
     )
 
-    info = tables.summarize_transition_information(research_frame)
+    info = pattern_tables.summarize_transition_information(research_frame)
 
     assert info.height == 2
     assert sorted(info.get_column("rows").to_list()) == [2, 2]
 
 
 def test_artifact_projections_are_views_over_shared_contracts():
-    research_frame = tables.normalize_research_frame(
+    research_frame = pattern_tables.normalize_research_frame(
         _market_frame(),
         symbol="BTC",
         timeframe="1H",
         state_columns=("market_stage_reduced",),
         event_column="liquidity_event_type",
     )
-    transition_patterns = tables.materialize_transition_patterns(
+    transition_patterns = pattern_tables.materialize_transition_patterns(
         research_frame, {"ngram_lengths": (2,)}
     )
 
-    graph = tables.project_transition_graph(transition_patterns)
+    graph = pattern_tables.project_transition_graph(transition_patterns)
 
     assert set(graph["artifact"].to_list()) == {"state-transition-graph"}
     assert {"source_state", "target_state", "transition_probability"} <= set(graph.columns)
@@ -220,8 +272,8 @@ def test_state_patterns_and_info_are_direct_null_safe_helpers() -> None:
         }
     )
 
-    patterns = tables.materialize_state_patterns(research_frame, "vq_rssm")
-    info = tables.summarize_state_info(
+    patterns = pattern_tables.materialize_state_patterns(research_frame, "vq_rssm")
+    info = pattern_tables.summarize_state_info(
         research_frame,
         "state_value",
         ("symbol", "timeframe", "state_column"),
@@ -246,11 +298,127 @@ def test_transition_paths_compose_scoring_and_projection_helpers() -> None:
         }
     )
 
-    scored = tables.with_transition_path_scores(graph)
-    paths = tables.project_transition_paths(graph)
+    scored = pattern_tables.with_transition_path_scores(graph)
+    paths = pattern_tables.project_transition_paths(graph)
 
     assert "surprisal_bits" in scored.columns
     assert set(paths.get_column("path_kind")) == {
         "high_probability",
         "low_probability_high_information",
     }
+
+
+def test_state_diagnostics_compute_future_metrics_without_signal_columns() -> None:
+    market = _market_frame().with_columns(
+        pl.Series("learned_state", ["1", "1", "2", "2", "1"]),
+        pl.lit("test").alias("split"),
+    )
+
+    diagnostics = behavior_tables.summarize_state_diagnostics(
+        market, "learned_state", (1,), split="test"
+    )
+    state_one = diagnostics.filter(pl.col("context_value") == "1").row(0, named=True)
+
+    assert state_one["rows"] == 2
+    assert state_one["forward_return_mean_pct"] == 0.995049504950495
+    assert "signal_timestamp" not in diagnostics.columns
+
+
+def test_state_transition_chains_are_timestamped_at_last_state() -> None:
+    market = _market_frame().with_columns(
+        pl.Series("learned_state", ["1", "2", "3", "4", "5"]),
+        pl.lit("test").alias("split"),
+    )
+
+    chains = behavior_tables.build_state_transition_chains(market, "learned_state", (2, 3))
+    row = chains.filter(pl.col("chain_value") == "1->2->3").row(0, named=True)
+
+    assert row["timestamp"] == 3
+    assert row["from_state"] == "1"
+    assert row["to_state"] == "3"
+    assert row["previous_state"] == "2"
+
+
+def test_chain_information_and_taxonomy_compose_with_rule_signals() -> None:
+    market = pl.DataFrame(
+        {
+            "symbol": ["BTC"] * 8,
+            "timeframe": ["1H"] * 8,
+            "timestamp": list(range(1, 9)),
+            "open": [10.0, 10.5, 11.0, 11.2, 11.5, 11.8, 12.2, 12.8],
+            "high": [10.2, 10.7, 11.3, 11.4, 11.8, 12.0, 12.5, 13.0],
+            "low": [9.8, 10.3, 10.8, 11.0, 11.2, 11.5, 12.0, 12.5],
+            "close": [10.0, 10.6, 11.1, 11.3, 11.6, 11.9, 12.4, 12.9],
+            "learned_state": ["1", "2", "1", "2", "1", "2", "1", "2"],
+            "split": ["test"] * 8,
+        }
+    )
+    chains = behavior_tables.build_state_transition_chains(market, "learned_state", (2,))
+    info = behavior_tables.summarize_state_chain_information(chains, market, (1,))
+    taxonomy = behavior_tables.classify_state_taxonomy(
+        info.with_columns(
+            pl.lit(30).alias("rows"), pl.lit(0.9).alias("normalized_information_gain")
+        )
+    ).with_columns(pl.lit("trend_smooth").alias("taxonomy_label"))
+
+    signals = rule_primitives.build_rule_primitive_signals(
+        market,
+        taxonomy,
+        "learned_state",
+        config=rule_primitives.RulePrimitiveConfig(horizons=(1,), ema_fast=2, ema_slow=3),
+    )
+
+    assert not info.is_empty()
+    assert not signals.is_empty()
+    assert set(signals.get_column("context_kind")) == {"chain"}
+
+
+def test_rule_primitive_trades_use_next_bar_nonoverlap_and_single_cost() -> None:
+    market = _market_frame().with_columns(
+        pl.Series("learned_state", ["1", "1", "1", "1", "1"]),
+        pl.lit("test").alias("split"),
+    )
+    signals = pl.DataFrame(
+        {
+            "context_kind": ["state", "state", "state"],
+            "context_value": ["1", "1", "1"],
+            "taxonomy_label": ["trend_smooth", "trend_smooth", "trend_smooth"],
+            "rule_name": ["ema_trend_follow", "ema_trend_follow", "ema_trend_follow"],
+            "symbol": ["BTC", "BTC", "BTC"],
+            "timeframe": ["1H", "1H", "1H"],
+            "timestamp": [1, 2, 4],
+            "state_column": ["learned_state", "learned_state", "learned_state"],
+            "horizon": [1, 1, 1],
+            "side": ["long", "long", "long"],
+            "signal_close": [100.0, 101.0, 101.0],
+            "split": ["test", "test", "test"],
+        }
+    )
+
+    trades = rule_primitives.build_rule_primitive_trades(
+        ensure_columns(signals, rule_primitives.RULE_PRIMITIVE_SIGNAL_SCHEMA),
+        market,
+        transaction_cost_bps=5.0,
+    )
+
+    first = trades.row(0, named=True)
+    assert first["signal_timestamp"] == 1
+    assert first["entry_timestamp"] == 2
+    assert first["exit_timestamp"] == 3
+    assert first["side_return_pct"] == ((102.0 - 101.0) / 101.0 * 100.0) - 0.05
+    assert trades.height == 1
+
+
+def test_behavior_helpers_return_typed_empty_frames() -> None:
+    empty = pl.DataFrame()
+
+    assert behavior_tables.summarize_state_diagnostics(empty, "missing", (1,)).schema == pl.Schema(
+        behavior_tables.STATE_DIAGNOSTIC_SCHEMA
+    )
+    chains = behavior_tables.build_state_transition_chains(empty, "missing", (2,))
+    assert chains.schema == pl.Schema(behavior_tables.STATE_TRANSITION_CHAIN_SCHEMA)
+    assert rule_primitives.summarize_rule_primitives(empty).schema == pl.Schema(
+        rule_primitives.RULE_PRIMITIVE_SUMMARY_SCHEMA
+    )
+
+

@@ -1201,3 +1201,4 @@ class BacktestExecutor:
             diagnostics=getattr(self, "_last_diagnostics", None),
             run_metadata=metadata,
         )
+

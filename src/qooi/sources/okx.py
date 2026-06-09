@@ -18,7 +18,7 @@ from qooi.sources.models import SourceResult
 OKX_BASE_URL = "https://www.okx.com"
 
 
-async def fetch_okx_instruments_async(
+async def fetch_okx_instruments(
     client: httpx.AsyncClient, inst_type: str = "SWAP"
 ) -> SourceResult:
     return await _fetch_okx_frame(
@@ -31,7 +31,7 @@ async def fetch_okx_instruments_async(
     )
 
 
-async def fetch_okx_tickers_async(
+async def fetch_okx_tickers(
     client: httpx.AsyncClient, inst_type: str = "SWAP"
 ) -> SourceResult:
     return await _fetch_okx_frame(
@@ -44,7 +44,7 @@ async def fetch_okx_tickers_async(
     )
 
 
-async def fetch_okx_recent_trades_async(
+async def fetch_okx_recent_trades(
     client: httpx.AsyncClient,
     inst_id: str,
     *,
@@ -82,7 +82,7 @@ async def fetch_okx_recent_trades_async(
     return result
 
 
-async def fetch_okx_funding_history_async(
+async def fetch_okx_funding_history(
     client: httpx.AsyncClient, inst_id: str, *, limit: int = 100
 ) -> SourceResult:
     return await _fetch_okx_frame(
@@ -95,7 +95,18 @@ async def fetch_okx_funding_history_async(
     )
 
 
-async def fetch_okx_open_interest_async(client: httpx.AsyncClient, inst_id: str) -> SourceResult:
+async def fetch_okx_funding_rate(client: httpx.AsyncClient, inst_id: str) -> SourceResult:
+    return await _fetch_okx_frame(
+        client,
+        endpoint="/api/v5/public/funding-rate",
+        params={"instId": inst_id},
+        source="funding_rate",
+        symbol=inst_id,
+        normalizer=lambda rows: _normalize_current_funding(rows, symbol=inst_id),
+    )
+
+
+async def fetch_okx_open_interest(client: httpx.AsyncClient, inst_id: str) -> SourceResult:
     return await _fetch_okx_frame(
         client,
         endpoint="/api/v5/public/open-interest",
@@ -106,7 +117,7 @@ async def fetch_okx_open_interest_async(client: httpx.AsyncClient, inst_id: str)
     )
 
 
-async def fetch_okx_open_interest_history_async(
+async def fetch_okx_open_interest_history(
     client: httpx.AsyncClient,
     inst_id: str,
     *,
@@ -126,7 +137,7 @@ async def fetch_okx_open_interest_history_async(
     )
 
 
-async def fetch_okx_taker_volume_contract_async(
+async def fetch_okx_taker_volume_contract(
     client: httpx.AsyncClient,
     inst_id: str,
     *,
@@ -148,7 +159,7 @@ async def fetch_okx_taker_volume_contract_async(
     )
 
 
-async def fetch_okx_long_short_account_ratio_contract_async(
+async def fetch_okx_long_short_account_ratio_contract(
     client: httpx.AsyncClient,
     inst_id: str,
     *,
@@ -167,7 +178,7 @@ async def fetch_okx_long_short_account_ratio_contract_async(
     )
 
 
-async def fetch_okx_top_trader_long_short_account_ratio_contract_async(
+async def fetch_okx_top_trader_long_short_account_ratio_contract(
     client: httpx.AsyncClient,
     inst_id: str,
     *,
@@ -188,7 +199,7 @@ async def fetch_okx_top_trader_long_short_account_ratio_contract_async(
     )
 
 
-async def fetch_okx_top_trader_long_short_position_ratio_contract_async(
+async def fetch_okx_top_trader_long_short_position_ratio_contract(
     client: httpx.AsyncClient,
     inst_id: str,
     *,
@@ -209,7 +220,7 @@ async def fetch_okx_top_trader_long_short_position_ratio_contract_async(
     )
 
 
-async def fetch_okx_book_snapshot_async(
+async def fetch_okx_book_snapshot(
     client: httpx.AsyncClient, inst_id: str, *, limit: int = 25
 ) -> SourceResult:
     return await _fetch_okx_frame(
@@ -230,12 +241,12 @@ async def gather_okx_source_results(
     return await gather_source_results(calls, base_url=OKX_BASE_URL, concurrency=concurrency)
 
 
-def fetch_okx_instruments(inst_type: str = "SWAP") -> SourceResult:
-    return asyncio.run(_fetch_sync(fetch_okx_instruments_async, inst_type))
+def fetch_okx_instruments_sync(inst_type: str = "SWAP") -> SourceResult:
+    return asyncio.run(_fetch_sync(fetch_okx_instruments, inst_type))
 
 
-def fetch_okx_tickers(inst_type: str = "SWAP") -> SourceResult:
-    return asyncio.run(_fetch_sync(fetch_okx_tickers_async, inst_type))
+def fetch_okx_tickers_sync(inst_type: str = "SWAP") -> SourceResult:
+    return asyncio.run(_fetch_sync(fetch_okx_tickers, inst_type))
 
 
 async def _fetch_sync(func: Callable[..., Awaitable[SourceResult]], *args: Any) -> SourceResult:
@@ -365,6 +376,22 @@ def _normalize_funding(rows: list[dict[str, Any]]) -> pl.DataFrame:
         }
         for row in rows
     ]
+    return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
+
+
+def _normalize_current_funding(rows: list[dict[str, Any]], *, symbol: str) -> pl.DataFrame:
+    out = []
+    for row in rows:
+        out.append(
+            {
+                "symbol": str(row.get("instId") or symbol),
+                "timestamp": _int(row.get("ts")),
+                "funding_rate": _float(row.get("fundingRate")),
+                "next_funding_rate": _float_or_none(row.get("nextFundingRate")),
+                "funding_time": _int_or_none(row.get("fundingTime")),
+                "next_funding_time": _int_or_none(row.get("nextFundingTime")),
+            }
+        )
     return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
 
 
@@ -544,3 +571,4 @@ def _infer_base_quote(inst_id: str) -> tuple[str, str]:
     if len(parts) >= 2:
         return parts[0], parts[1]
     return "", ""
+

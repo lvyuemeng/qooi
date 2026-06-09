@@ -4,9 +4,11 @@ import polars as pl
 import pytest
 
 from qooi.strategies.indicators import (
+    add_indicators,
     add_ofi_flow_columns,
     add_regime_features,
     apply_regime_gate,
+    compute_flow_pipeline_frame,
 )
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -145,3 +147,18 @@ class TestRegimeFeatures:
         df = add_regime_features(df)
         df = add_ofi_flow_columns(df)
         assert df.is_empty()
+
+
+def test_flow_pipeline_matches_manual_composition_on_synthetic_data(sample_df):
+    manual = add_indicators(sample_df.clone())
+    manual = add_regime_features(manual)
+    manual = add_ofi_flow_columns(manual)
+    manual = apply_regime_gate(manual, signal_col="ofi_flow_score")
+    ofi = pl.col("ofi_flow_score")
+    manual = manual.with_columns(
+        pl.when(ofi.abs() >= 0.25).then(ofi).otherwise(0.0).alias("signal")
+    )
+
+    computed = compute_flow_pipeline_frame(sample_df.clone(), 0.25)
+
+    assert computed["signal"].to_list() == manual["signal"].to_list()

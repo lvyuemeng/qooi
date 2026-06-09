@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import polars as pl
 
-from qooi.sources.http import request_json_value_async, sanitize_error
+from qooi.sources.http import request_json_value, sanitize_error
 from qooi.sources.manifest import manifest_frame, now_ms, source_manifest_row
 from qooi.sources.models import SourceResult
 
@@ -33,12 +33,12 @@ BROAD_MARKET_SCHEMA: dict[str, pl.DataType] = {
 }
 
 
-async def fetch_coinpaprika_tickers_async(
+async def fetch_coinpaprika_tickers(
     client: httpx.AsyncClient, *, quotes: str = "USD"
 ) -> SourceResult:
     endpoint = "/tickers"
     try:
-        payload = await request_json_value_async(client, endpoint, params={"quotes": quotes})
+        payload = await request_json_value(client, endpoint, params={"quotes": quotes})
         frame = normalize_coinpaprika_tickers(payload)
         return SourceResult(
             frame,
@@ -141,3 +141,4 @@ def _float_or_none(value: Any) -> float | None:
 
 def _int_or_none(value: Any) -> int | None:
     return None if value in {None, ""} else int(value)
+

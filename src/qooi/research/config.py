@@ -10,13 +10,11 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from qooi.core.basket import ExitConfig
-from qooi.core.config import StrictConfigModel
-from qooi.core.instruments import PairConfig
+from qooi.core.config import PairConfig, StrictConfigModel, universe_pairs
+from qooi.dynamic.states import LearnedStateConfig
 from qooi.research.data import FrameRequest
-from qooi.research.instruments import universe_pairs
-from qooi.research.states import LearnedStateConfig
 from qooi.strategies.catalog import BENCHMARK_GROUP_CHOICES, DEFAULT_STRATEGY, STRATEGY_CHOICES
-from qooi.strategies.features import StructureClassifierConfig
+from qooi.strategies.structure import StructureClassifierConfig
 
 PROFILE_CHOICES = ("research", "safe", "smoke", "live-like")
 UNIVERSE_CHOICES = ("core", "research")
@@ -211,6 +209,7 @@ class ResearchEvaluationConfig(StrictConfigModel):
     dynamic_transition_discovery: DynamicTransitionDiscoveryConfig = Field(
         default_factory=DynamicTransitionDiscoveryConfig
     )
+
     @field_validator("outputs")
     @classmethod
     def _outputs_non_empty(

@@ -110,3 +110,4 @@ def test_structure_classifier_exposes_threshold_audit_columns():
     assert set(out["range_width_threshold_mode"].unique().to_list()) == {"rolling_quantile"}
     assert "rolling_quantile" in set(out["range_width_threshold_source"].unique().to_list())
 
+

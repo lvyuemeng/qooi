@@ -16,7 +16,7 @@ from qooi.sources.models import SourceResult
 POLYMARKET_GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
 
-async def fetch_polymarket_search_async(
+async def fetch_polymarket_search(
     client: httpx.AsyncClient,
     query: str,
     *,
@@ -35,7 +35,7 @@ async def fetch_polymarket_search_async(
     )
 
 
-async def fetch_polymarket_events_async(
+async def fetch_polymarket_events(
     client: httpx.AsyncClient,
     *,
     symbol: str,
@@ -56,7 +56,7 @@ async def fetch_polymarket_events_async(
     )
 
 
-async def fetch_polymarket_markets_async(
+async def fetch_polymarket_markets(
     client: httpx.AsyncClient,
     *,
     symbol: str,
@@ -280,3 +280,4 @@ def _float_or_none(value: Any) -> float | None:
 
 def _int_or_none(value: Any) -> int | None:
     return None if value in {None, ""} else int(value)
+

@@ -128,6 +128,27 @@ def test_trailing_stop_after_target():
     assert a.reason == ExitReason.TRAILING.value
 
 
+def test_skip_trailing_blocks_trailing_and_breakeven_during_recovery():
+    b = _b("buy", 100.0)
+    b.recovery_activated = True
+    b.recovery_level = 1
+    t = TrailTracker(trail_high=110.0, trail_low=95.0, target_hit=True)
+    cfg = ExitConfig(trail_mult=1.0, breakeven_after_target=True)
+
+    a = evaluate_exits(
+        b,
+        bar_close=99.0,
+        bar_high=111.0,
+        bar_low=99.0,
+        atr=5.0,
+        trail=t,
+        config=cfg,
+        skip_trailing=True,
+    )
+
+    assert a is None
+
+
 def test_time_stop():
     b = _b("buy", 100.0, bars=11)
     t = TrailTracker()
@@ -162,3 +183,5 @@ def test_trail_updates_high_low():
     t.update(104.0, 96.0)
     assert t.trail_high == 105.0
     assert t.trail_low == 95.0
+
+

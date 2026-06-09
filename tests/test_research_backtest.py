@@ -3,9 +3,9 @@
 from pathlib import Path
 
 from qooi.core.basket import ExitConfig
+from qooi.core.config import CORE_UNIVERSE
 from qooi.research.config import ResearchCommandConfig, apply_sizing_overrides
 from qooi.research.data import CacheAuditRequest, build_history_refresh_requests
-from qooi.research.instruments import CORE_UNIVERSE
 from qooi.strategies.catalog import BENCHMARK_GROUPS, strategy_selection
 from qooi.strategies.specs import (
     structure_event_reversal_v1_spec,
@@ -162,3 +162,5 @@ def test_removed_research_api_wrappers_are_absent():
     assert "backtest_frame_options_from_command" not in reports
     assert "strategy_selection_from_config" not in reports
     assert "ExitConfigRequest" not in config
+
+

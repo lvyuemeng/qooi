@@ -10,9 +10,9 @@ Issues are tracked as local markdown files under `.scratch/<feature>/`. See `doc
 
 Labels use the five canonical defaults: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
 
-### Domain docs
+### Domain Docs
 
-Single-context repo — one `docs/context.md` for domain glossary, plus `docs/adr/` for architecture decisions. See `docs/agents/domain.md`.
+Single-context repo: `docs/context.md` is the stable domain glossary. Category docs live under `docs/graph/`, `docs/architecture/`, and `docs/report/`. See `docs/agents/domain.md`.
 
 ---
 
@@ -44,7 +44,7 @@ uv run python scripts/risk_test.py                   # risk configs on BTC 1D
 
 Any OKX instrument ID works. Common crypto: `BTC-USDT`, `ETH-USDT`, `SOL-USDT`, `XRP-USDT`, `DOGE-USDT`. Commodity perp: `XAU-USDT-SWAP` (gold, listed 2025-12-31, ~125 bars of 1D data). Use 4H/1H for more data points.
 
-See `docs/tests.md` for cross-asset strategy results, `docs/okx-api.md` for API endpoint reference, `docs/context.md` for domain glossary.
+See `docs/graph/data.md` for exchange/data graph details and `docs/context.md` for domain glossary.
 
 ### Project structure
 
@@ -72,7 +72,9 @@ qooi/
 ├── docs/
 │   ├── agents/            ← agent configuration files
 │   ├── context.md         ← domain glossary
-│   └── adr/               ← architecture decision records
+│   ├── graph/             ← module graphs
+│   ├── architecture/      ← architecture notes
+│   └── report/            ← empirical reports
 ├── README.md              ← project overview
 └── pyproject.toml         ← project metadata & dependencies (read this for canonical info)
 ```

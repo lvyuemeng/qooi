@@ -1,6 +1,7 @@
 """State provider tests."""
 
 from qooi.core.basket import Basket, BasketState
+from qooi.core.config import CORE_UNIVERSE
 from qooi.core.state import (
     BacktestStateProvider,
     BasketStateSource,
@@ -14,7 +15,6 @@ from qooi.core.state import (
     format_okx_client_id,
     parse_basket_id,
 )
-from qooi.research.instruments import CORE_UNIVERSE
 
 
 class MemorySoftStore:
@@ -182,3 +182,5 @@ def test_basket_and_okx_client_id_helpers_encode_state_identity():
     assert client_id.startswith("qooi")
     assert len(client_id) <= 32
     assert client_id.isalnum()
+
+

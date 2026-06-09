@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import polars as pl
 
-from qooi.sources.http import request_json_value_async, sanitize_error
+from qooi.sources.http import request_json_value, sanitize_error
 from qooi.sources.manifest import manifest_frame, now_ms, source_manifest_row
 from qooi.sources.models import SourceResult
 
@@ -27,10 +27,10 @@ BROAD_PROTOCOL_SCHEMA: dict[str, pl.DataType] = {
 }
 
 
-async def fetch_defillama_protocols_async(client: httpx.AsyncClient) -> SourceResult:
+async def fetch_defillama_protocols(client: httpx.AsyncClient) -> SourceResult:
     endpoint = "/protocols"
     try:
-        payload = await request_json_value_async(client, endpoint)
+        payload = await request_json_value(client, endpoint)
         frame = normalize_defillama_protocols(payload)
         return SourceResult(
             frame,
@@ -125,3 +125,4 @@ def _max_timestamp(frame: pl.DataFrame) -> int | None:
 
 def _float_or_none(value: Any) -> float | None:
     return None if value in {None, ""} else float(value)
+

@@ -726,3 +726,4 @@ def _hold_signal(
         exit_events.append(did_exit)
         signal.append(pos)
     return signal, exit_events
+

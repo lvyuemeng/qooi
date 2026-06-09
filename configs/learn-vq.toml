@@ -1,0 +1,147 @@
+[run]
+profile = "research"
+universe = "research"
+ds = "swap"
+
+[req]
+days = 730
+min = 12000
+cap = 12000
+trim = true
+cov = 0
+refresh = false
+
+[diagnostics]
+mode = "research-evaluation"
+
+[research_evaluation]
+outputs = ["timeframe-classifier"]
+include_backtest_report = false
+write_exports = false
+
+[learn]
+input = "sequence"
+model = "vq-rssm"
+state = "behavior_state_id"
+timeframe = "1H"
+out = "data/output/learned-states/vq-rssm-causal-discrete-future-sim-top5-mix050-maxlen040-lrhalf-best-epochs-015"
+feature_columns = ["open_rel", "high_rel", "low_rel", "close_rel", "volume_log_rel"]
+
+[learn.run]
+phases = ["train", "predict", "evaluate"]
+checkpoint = ""
+states = ""
+
+[learn.objective]
+terms = ["reconstruct", "future_infonce"]
+reconstruct = 1.0
+future = 0.5
+
+[learn.objective.future_config]
+kind = "infonce"
+min_len = 1
+max_len = 40
+samples = 1
+dim = 32
+temperature = 0.3
+source = "features"
+length_policy = "cycle"
+warmup_epochs = 2
+
+[learn.future_contrast]
+standard_weight = 0.5
+future_similarity_weight = 0.5
+future_similarity_top_k = 5
+future_similarity_mse_weight = 1.0
+future_similarity_cosine_weight = 0.0
+future_similarity_max_distance = 0.0
+temperature = 0.3
+
+[learn.temporal_consistency]
+weight = 0.0
+temperature = 1.0
+
+[learn.schedule]
+enabled = true
+
+[[learn.schedule.stage]]
+name = "populate"
+start_epoch = 1
+epochs = 8
+future = 0.5
+diversity_weight = 0.02
+reset_dead_codes = true
+reset_fraction = 0.25
+freeze_encoder_blocks = []
+
+[[learn.schedule.stage]]
+name = "predictive_refine"
+start_epoch = 9
+epochs = 7
+future = 0.5
+diversity_weight = 0.015
+reset_dead_codes = false
+lr = 0.0005
+freeze_encoder_blocks = []
+
+[learn.win]
+len = 64
+stride = 1
+train = 0.7
+valid = 0.2
+
+[learn.seq]
+chunk = 256
+warmup = 64
+stride = 1
+carry = true
+reset = "asset_split"
+
+[learn.scale]
+on = true
+method = "ewm_std"
+ret = "close_rel"
+cols = ["open_rel", "high_rel", "low_rel", "close_rel"]
+half = 10
+min_periods = 2
+floor = 0.0001
+cap = 0.10
+output_column = "volatility_scale"
+
+[learn.vq]
+hidden = 128
+latent = 16
+codes = 128
+ema_decay = 0.99
+ema_eps = 0.00001
+normalize = true
+reset_dead_codes = true
+reset_interval = 250
+reset_threshold = 0.2
+reset_fraction = 0.25
+reset_warmup_epochs = 3
+reset_candidate_similarity_max = 0.98
+diversity_weight = 0.02
+diversity_margin = 0.5
+eps = 0.00000001
+
+[learn.train]
+batch = 512
+lr = 0.001
+grad_clip = 1.0
+epochs = 15
+seed = 1
+device = "auto"
+threads = 0
+log_every = 100
+valid_batch = 4096
+pred_batch = 4096
+best_metric = "valid_future_loss"
+best_mode = "min"
+early_stop_patience = 3
+
+[learn.eval]
+h = [1, 3, 6]
+split = "test"
+cost = 5.0
+min = 1

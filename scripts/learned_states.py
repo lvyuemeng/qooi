@@ -9,29 +9,50 @@ from pathlib import Path
 
 import polars as pl
 
-from qooi.exchange.store import CacheStore
-from qooi.research.config import ResearchCommandConfig, load_research_command_config
-from qooi.research.data import load_frame_with_raw_rows, provenance_row, source_inst_ids
-from qooi.research.states import (
+from qooi.dynamic.states import (
     StateSequence,
     mean_hidden,
     project_codebook,
     summarize_hidden,
     summarize_morph,
+    summarize_state_stability,
 )
-from qooi.research.tables import (
-    ArtifactBundle,
+from qooi.exchange.store import CacheStore
+from qooi.research.artifacts import ArtifactBundle
+from qooi.research.behavior_tables import (
+    build_state_transition_chains,
+    classify_state_taxonomy,
+    summarize_state_chain_information,
+    summarize_state_diagnostics,
+)
+from qooi.research.candidates import (
+    bootstrap_candidate_trades,
+    build_candidate_nonoverlap_trades,
+    summarize_candidate_alpha_beta,
+    summarize_candidate_direction_asymmetry,
+    summarize_candidate_regime_segments,
+)
+from qooi.research.config import ResearchCommandConfig, load_research_command_config
+from qooi.research.data import load_frame_with_raw_rows, provenance_row, source_inst_ids
+from qooi.research.patterns import (
     apply_candidate_gate,
     attach_forward_outcomes,
     filter_evaluation_outcomes,
     materialize_state_patterns,
     materialize_transition_patterns,
+    normalize_research_frame,
     project_pattern_quality,
     project_transition_graph,
     project_transition_paths,
     summarize_returns,
     summarize_state_info,
     summarize_transition_information,
+)
+from qooi.research.rule_primitives import (
+    build_rule_primitive_baselines,
+    build_rule_primitive_signals,
+    build_rule_primitive_trades,
+    summarize_rule_primitives,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,10 +244,14 @@ def _build_evaluation_bundle(
         frames_with_states.append(frame_with_states)
         state_events = states.event_frame(market_frame)
         research_frames.append(
-            states.research_frame(
+            normalize_research_frame(
                 state_events,
                 symbol=pair.asset.symbol,
                 timeframe=config.timeframe,
+                state_columns=(config.state_column,),
+                event_column="liquidity_event_type",
+                context_columns=(),
+                state_source="vq_rssm",
             )
         )
     logger.info(
@@ -251,6 +276,7 @@ def _build_evaluation_bundle(
             (("zero_hidden", None), ("mean_hidden", hidden_mean if hidden_mean else None)),
         )
     morphology = summarize_morph(prepared, states)
+    temporal_stability = summarize_state_stability(states)
     horizons = config.evaluation.horizons or command.market_state.horizons
     state_patterns = materialize_state_patterns(research, "vq_rssm")
     transition_patterns = materialize_transition_patterns(research, {"ngram_lengths": (2, 3)})
@@ -266,12 +292,63 @@ def _build_evaluation_bundle(
     )
     thresholds = command.research_evaluation.pattern_quality.model_dump()
     scored = apply_candidate_gate(metric_table, thresholds)
+    candidate_trades = build_candidate_nonoverlap_trades(
+        all_patterns,
+        market,
+        scored,
+        returns_split=config.evaluation.returns_split,
+        transaction_cost_bps=config.evaluation.transaction_cost_bps,
+    )
     transition_graph = project_transition_graph(transition_patterns)
+    behavior_diagnostics = summarize_state_diagnostics(
+        market,
+        config.state_column,
+        horizons,
+        split=config.evaluation.returns_split,
+    )
+    behavior_chains = build_state_transition_chains(
+        market,
+        config.state_column,
+        (1, 2, 3, 4),
+    )
+    behavior_chain_information = summarize_state_chain_information(
+        behavior_chains,
+        market,
+        horizons,
+    )
+    behavior_state_taxonomy = classify_state_taxonomy(behavior_diagnostics)
+    behavior_chain_taxonomy = classify_state_taxonomy(behavior_chain_information)
+    behavior_taxonomy = pl.concat(
+        [behavior_state_taxonomy, behavior_chain_taxonomy], how="diagonal_relaxed"
+    )
+    behavior_signals = build_rule_primitive_signals(
+        market,
+        behavior_taxonomy,
+        config.state_column,
+    )
+    behavior_trades = build_rule_primitive_trades(
+        behavior_signals,
+        market,
+        transaction_cost_bps=config.evaluation.transaction_cost_bps,
+    )
     tables = {
         "behavior-state-transition-graph.csv": transition_graph,
         "behavior-state-transition-matrix.csv": transition_graph,
         "behavior-state-transition-paths.csv": project_transition_paths(transition_graph),
         "behavior-state-transition-information.csv": summarize_transition_information(research),
+        "behavior-state-diagnostics.csv": behavior_diagnostics,
+        "behavior-state-transition-chains.csv": behavior_chains,
+        "behavior-state-chain-information.csv": behavior_chain_information,
+        "behavior-state-chain-taxonomy.csv": behavior_chain_taxonomy,
+        "behavior-state-taxonomy.csv": behavior_state_taxonomy,
+        "behavior-state-rule-primitive-signals.csv": behavior_signals,
+        "behavior-state-rule-primitive-trades.csv": behavior_trades,
+        "behavior-state-rule-primitive-summary.csv": summarize_rule_primitives(behavior_trades),
+        "behavior-state-rule-primitive-baselines.csv": build_rule_primitive_baselines(
+            market,
+            horizons,
+            transaction_cost_bps=config.evaluation.transaction_cost_bps,
+        ),
         "behavior-state-information-metrics.csv": summarize_state_info(
             research,
             "state_value",
@@ -288,7 +365,17 @@ def _build_evaluation_bundle(
             scored, ("transition", "transition_ngram")
         ),
         "behavior-state-scored-patterns.csv": scored,
+        "behavior-state-candidate-nonoverlap-trades.csv": candidate_trades,
+        "behavior-state-candidate-bootstrap.csv": bootstrap_candidate_trades(candidate_trades),
+        "behavior-state-candidate-direction-asymmetry.csv": summarize_candidate_direction_asymmetry(
+            candidate_trades
+        ),
+        "behavior-state-candidate-alpha-beta.csv": summarize_candidate_alpha_beta(candidate_trades),
+        "behavior-state-candidate-regime-segments.csv": summarize_candidate_regime_segments(
+            candidate_trades, market
+        ),
         "behavior-state-distribution-by-symbol.csv": state_distribution,
+        "behavior-state-temporal-stability.csv": temporal_stability,
         "behavior-state-cross-asset-stability.csv": _cross_asset_stability(scored),
     }
     logger.info(

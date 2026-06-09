@@ -3,8 +3,9 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from qooi.ai.contracts import CodeSequence
-from qooi.research import states
+from qooi.dynamic import states
+from qooi.dynamic.contracts import CodeSequence
+from qooi.research import patterns
 
 
 def _frame() -> pl.DataFrame:
@@ -59,31 +60,184 @@ def test_learn_run_phases_are_ordered_and_validated() -> None:
         states.LearnedStateConfig(run={"phases": ["train", "unknown"]})
 
 
-def test_legacy_learn_predict_false_maps_to_train_only() -> None:
-    config = states.LearnedStateConfig(predict=False)
-
-    assert config.run.phases == ("train",)
-
-
 def test_learned_objective_terms_are_named_and_weighted() -> None:
     config = states.LearnedStateConfig(
         objective={
-            "terms": ["reconstruct", "vq", "kl", "vq"],
+            "terms": ["reconstruct", "future_infonce", "future_infonce"],
             "reconstruct": 0.5,
-            "vq": 2.0,
-            "kl": 0.25,
-            "future": 0.0,
+            "future": 0.1,
+            "future_config": {"min_len": 1, "max_len": 3, "temperature": 0.3},
         }
     )
 
-    assert config.objective.terms == ("reconstruct", "vq", "kl")
+    assert config.objective.terms == ("reconstruct", "future_infonce")
     assert config.objective.reconstruct == pytest.approx(0.5)
-    assert config.objective.vq == pytest.approx(2.0)
-    assert config.objective.kl == pytest.approx(0.25)
+    assert config.objective.future == pytest.approx(0.1)
+    assert config.objective.future_config.max_len == 3
     with pytest.raises(ValueError):
         states.LearnedStateConfig(objective={"terms": ["unknown"]})
-    with pytest.raises(ValueError, match="objective vq weight"):
-        states.LearnedStateConfig(objective={"vq": -1.0})
+    with pytest.raises(ValueError, match="objective future weight"):
+        states.LearnedStateConfig(objective={"future": -1.0})
+
+
+def test_removed_vq_rssm_config_api_is_rejected() -> None:
+    with pytest.raises(ValueError, match="objective.terms no longer supports 'kl'"):
+        states.LearnedStateConfig(objective={"terms": ["reconstruct", "kl"]})
+    with pytest.raises(ValueError, match="objective.kl is removed"):
+        states.LearnedStateConfig(objective={"kl": 0.0})
+    with pytest.raises(ValueError, match="vq.kl_steps is removed"):
+        states.LearnedStateConfig(vq={"kl_steps": 5000})
+
+
+def test_future_contrast_config_validates_composable_weights() -> None:
+    config = states.LearnedStateConfig(
+        objective={"terms": ["future_infonce"], "future": 0.5},
+        future_contrast={
+            "standard_weight": 0.75,
+            "future_similarity_weight": 0.25,
+            "future_similarity_top_k": 3,
+            "future_similarity_mse_weight": 1.0,
+            "future_similarity_cosine_weight": 0.0,
+            "future_similarity_max_distance": 0.0,
+            "temperature": 0.3,
+        },
+    )
+
+    assert config.future_contrast.standard_weight == pytest.approx(0.75)
+    assert config.future_contrast.future_similarity_weight == pytest.approx(0.25)
+    assert config.future_contrast.temperature == pytest.approx(0.3)
+    with pytest.raises(ValueError, match="positive component weight"):
+        states.LearnedStateConfig(
+            objective={"terms": ["future_infonce"], "future": 0.5},
+            future_contrast={"standard_weight": 0.0, "future_similarity_weight": 0.0},
+        )
+    with pytest.raises(ValueError, match="positive metric weight"):
+        states.LearnedStateConfig(
+            future_contrast={
+                "future_similarity_weight": 0.25,
+                "future_similarity_mse_weight": 0.0,
+                "future_similarity_cosine_weight": 0.0,
+            }
+        )
+
+
+def test_learned_schedule_uses_composable_stage_overrides() -> None:
+    config = states.LearnedStateConfig(
+        schedule={
+            "enabled": True,
+            "stage": [
+                {
+                    "name": "specialize",
+                    "start_epoch": 8,
+                    "epochs": 3,
+                    "future": 0.75,
+                    "diversity_weight": 0.005,
+                    "reset_fraction": 0.1,
+                    "reset_dead_codes": False,
+                    "lr": 0.0005,
+                    "freeze_encoder_blocks": ["encoder_input", "latent_projection", "rssm", "rssm"],
+                }
+            ],
+        }
+    )
+
+    stage = config.schedule.stages[0]
+
+    assert stage.name == "specialize"
+    assert stage.future == pytest.approx(0.75)
+    assert stage.diversity_weight == pytest.approx(0.005)
+    assert stage.reset_fraction == pytest.approx(0.1)
+    assert stage.reset_dead_codes is False
+    assert stage.lr == pytest.approx(0.0005)
+    assert stage.freeze_encoder_blocks == ("encoder_input", "latent_projection", "rssm")
+    disabled = states.LearnedStateConfig(
+        schedule={"enabled": False, "stage": [{"future": 1.0}]}
+    )
+    assert disabled.schedule.stages == ()
+    with pytest.raises(ValueError, match="unknown freeze encoder blocks"):
+        states.LearnedStateConfig(
+            schedule={"enabled": True, "stage": [{"freeze_encoder_blocks": ["unknown"]}]}
+        )
+    with pytest.raises(ValueError, match="freeze block 'posterior' is removed"):
+        states.LearnedStateConfig(
+            schedule={"enabled": True, "stage": [{"freeze_encoder_blocks": ["posterior"]}]}
+        )
+    with pytest.raises(ValueError, match="freeze block 'prior' is removed"):
+        states.LearnedStateConfig(
+            schedule={"enabled": True, "stage": [{"freeze_encoder_blocks": ["prior"]}]}
+        )
+
+
+def test_stability_config_rejects_active_latent_smoothness() -> None:
+    config = states.LearnedStateConfig(
+        stability={"latent_smoothness_weight": 0.0, "latent_smoothness_margin": 0.0}
+    )
+
+    assert config.stability.latent_smoothness_weight == pytest.approx(0.0)
+    assert config.stability.latent_smoothness_margin == pytest.approx(0.0)
+    with pytest.raises(ValueError, match="latent_smoothness_weight"):
+        states.LearnedStateConfig(stability={"latent_smoothness_weight": -0.001})
+    with pytest.raises(ValueError, match="latent_smoothness_margin"):
+        states.LearnedStateConfig(stability={"latent_smoothness_margin": -0.001})
+    with pytest.raises(ValueError, match="is removed"):
+        states.LearnedStateConfig(stability={"latent_smoothness_weight": 0.002})
+    with pytest.raises(ValueError, match="is removed"):
+        states.LearnedStateConfig(stability={"latent_smoothness_margin": 0.1})
+
+
+def test_temporal_consistency_config_maps_to_model_spec() -> None:
+    config = states.LearnedStateConfig(
+        win={"len": 2, "stride": 1},
+        temporal_consistency={"weight": 0.001, "temperature": 0.7},
+    )
+
+    spec = config.prepare(_frame()).model_spec()
+
+    assert spec.temporal_consistency_weight == pytest.approx(0.001)
+    assert spec.temporal_consistency_temperature == pytest.approx(0.7)
+    with pytest.raises(ValueError, match="temporal_consistency weight"):
+        states.LearnedStateConfig(temporal_consistency={"weight": 0.02})
+    with pytest.raises(ValueError, match="temporal_consistency temperature"):
+        states.LearnedStateConfig(temporal_consistency={"temperature": 0.0})
+
+
+def test_postprocess_config_validates_min_state_duration() -> None:
+    config = states.LearnedStateConfig(postprocess={"min_state_duration": 3})
+
+    assert config.postprocess.min_state_duration == 3
+    with pytest.raises(ValueError, match="min_state_duration"):
+        states.LearnedStateConfig(postprocess={"min_state_duration": -1})
+
+
+def test_schedule_config_accepts_lr_override() -> None:
+    config = states.LearnedStateConfig(
+        schedule={"enabled": True, "stage": [{"lr": 0.0005}]}
+    )
+
+    assert config.schedule.stages[0].lr == pytest.approx(0.0005)
+    with pytest.raises(ValueError, match="schedule stage lr"):
+        states.LearnedStateConfig(schedule={"enabled": True, "stage": [{"lr": 0.0}]})
+
+
+def test_training_config_accepts_best_metric_and_patience() -> None:
+    config = states.LearnedStateConfig(
+        train={"best_metric": "valid_future_loss", "best_mode": "min", "early_stop_patience": 3}
+    )
+
+    assert config.train.best_metric == "valid_future_loss"
+    assert config.train.best_mode == "min"
+    assert config.train.early_stop_patience == 3
+    with pytest.raises(ValueError, match="best_mode"):
+        states.LearnedStateConfig(
+            train={"best_metric": "valid_future_loss", "best_mode": "lowest"}
+        )
+
+
+def test_vq_ema_config_rejects_commitment_and_invalid_decay() -> None:
+    with pytest.raises(ValueError):
+        states.LearnedStateConfig(vq={"commit": 0.25})
+    with pytest.raises(ValueError, match="ema_decay"):
+        states.LearnedStateConfig(vq={"ema_decay": 1.0})
 
 
 def test_custom_columns_and_required_columns() -> None:
@@ -223,7 +377,32 @@ def test_sequence_features_are_finite_after_scaling() -> None:
         len(sequence.features) == len(sequence.row_index)
         for sequence in prepared.sequence_dataset.sequences
     )
-    assert len(prepared.sequence_provenance.row_index) == len(prepared.sequence_provenance.splits)
+
+
+def test_future_contrast_config_maps_to_model_spec() -> None:
+    config = states.LearnedStateConfig(
+        objective={"terms": ["future_infonce"], "future": 0.5},
+        future_contrast={
+            "standard_weight": 0.75,
+            "future_similarity_weight": 0.25,
+            "future_similarity_top_k": 5,
+            "future_similarity_mse_weight": 0.5,
+            "future_similarity_cosine_weight": 0.5,
+            "future_similarity_max_distance": 0.2,
+            "temperature": 0.3,
+        },
+        win={"len": 2, "stride": 1},
+    )
+
+    spec = config.prepare(_frame()).model_spec()
+
+    assert spec.future_standard_weight == pytest.approx(0.75)
+    assert spec.future_similarity_weight == pytest.approx(0.25)
+    assert spec.future_similarity_top_k == 5
+    assert spec.future_similarity_mse_weight == pytest.approx(0.5)
+    assert spec.future_similarity_cosine_weight == pytest.approx(0.5)
+    assert spec.future_similarity_max_distance == pytest.approx(0.2)
+    assert spec.future_temperature == pytest.approx(0.3)
 
 
 def test_volume_log_rel_not_scaled_is_explicit() -> None:
@@ -290,12 +469,140 @@ def test_codes_to_states_and_research_frame() -> None:
 
     sequence = prepared.provenance.states_from_codes(codes)
     attached = sequence.attach_to(_frame())
-    research = sequence.research_frame(attached, symbol="BTC", timeframe="1H")
+    state_events = sequence.event_frame(attached)
+    research = patterns.normalize_research_frame(
+        state_events,
+        symbol="BTC",
+        timeframe="1H",
+        state_columns=(sequence.state_column,),
+        event_column="liquidity_event_type",
+        context_columns=(),
+        state_source="vq_rssm",
+    )
 
     assert sequence.frame.select("behavior_state_id").to_series().to_list() == [7, 8, 9]
     assert attached.get_column("behavior_state_id").to_list() == [None, None, None, 7, 8, 9]
     assert set(research.get_column("state_source")) == {"vq_rssm"}
     assert set(research.get_column("state_column")) == {"behavior_state_id"}
+
+
+def test_min_state_duration_filter_merges_singleton_between_same_state() -> None:
+    codes = CodeSequence(
+        codes=(1, 1, 2, 1, 1),
+        distances=(0.1,) * 5,
+        row_index=(0, 1, 2, 3, 4),
+        splits=("train",) * 5,
+    )
+
+    filtered = states.filter_short_state_runs(
+        codes,
+        symbols=("BTC",) * 5,
+        splits=("train",) * 5,
+        min_duration=2,
+    )
+
+    assert filtered.codes == (1, 1, 1, 1, 1)
+    assert filtered.distances == codes.distances
+    assert filtered.row_index == codes.row_index
+
+
+def test_min_state_duration_filter_prefers_previous_state_between_different_states() -> None:
+    codes = CodeSequence(
+        codes=(1, 1, 2, 3, 3),
+        distances=(0.1,) * 5,
+        row_index=(0, 1, 2, 3, 4),
+        splits=("train",) * 5,
+    )
+
+    filtered = states.filter_short_state_runs(
+        codes,
+        symbols=("BTC",) * 5,
+        splits=("train",) * 5,
+        min_duration=2,
+    )
+
+    assert filtered.codes == (1, 1, 1, 3, 3)
+
+
+def test_min_state_duration_filter_respects_symbol_boundaries() -> None:
+    codes = CodeSequence(
+        codes=(1, 2, 2, 3, 3),
+        distances=(0.1,) * 5,
+        row_index=(0, 1, 2, 3, 4),
+        splits=("train",) * 5,
+    )
+
+    filtered = states.filter_short_state_runs(
+        codes,
+        symbols=("BTC", "ETH", "ETH", "ETH", "ETH"),
+        splits=("train",) * 5,
+        min_duration=2,
+    )
+
+    assert filtered.codes == (1, 2, 2, 3, 3)
+
+
+def test_min_state_duration_filter_respects_split_boundaries() -> None:
+    codes = CodeSequence(
+        codes=(1, 2, 2, 3, 3),
+        distances=(0.1,) * 5,
+        row_index=(0, 1, 2, 3, 4),
+        splits=("train", "valid", "valid", "valid", "valid"),
+    )
+
+    filtered = states.filter_short_state_runs(
+        codes,
+        symbols=("BTC",) * 5,
+        splits=("train", "valid", "valid", "valid", "valid"),
+        min_duration=2,
+    )
+
+    assert filtered.codes == (1, 2, 2, 3, 3)
+
+
+def test_min_state_duration_zero_preserves_codes() -> None:
+    codes = CodeSequence(
+        codes=(1, 2, 1),
+        distances=(0.1,) * 3,
+        row_index=(0, 1, 2),
+        splits=("train",) * 3,
+    )
+
+    assert states.filter_short_state_runs(
+        codes,
+        symbols=("BTC",) * 3,
+        splits=("train",) * 3,
+        min_duration=0,
+    ) is codes
+
+
+def test_state_stability_summary_tracks_dwell_and_overlap() -> None:
+    sequence = states.StateSequence(
+        pl.DataFrame(
+            {
+                "row_index": [1, 2, 3, 4, 5, 6],
+                "timestamp": [1, 2, 3, 4, 5, 6],
+                "symbol": ["BTC"] * 6,
+                "split": ["train", "train", "train", "valid", "valid", "valid"],
+                "behavior_state_id": [1, 1, 2, 1, 3, 3],
+                "code_distance": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            }
+        )
+    )
+
+    summary = states.summarize_state_stability(sequence)
+    train = summary.filter((pl.col("symbol") == "BTC") & (pl.col("split") == "train")).row(
+        0, named=True
+    )
+    valid = summary.filter((pl.col("symbol") == "BTC") & (pl.col("split") == "valid")).row(
+        0, named=True
+    )
+
+    assert train["active_codes"] == 2
+    assert train["state_self_transition_rate"] == pytest.approx(0.5)
+    assert train["state_mean_dwell"] == pytest.approx(1.5)
+    assert valid["state_valid_train_overlap_pct"] == pytest.approx(50.0)
+    assert valid["state_singleton_segment_pct"] == pytest.approx(50.0)
 
 
 def test_state_sequence_attach_is_symbol_safe() -> None:
@@ -363,3 +670,5 @@ def test_sequence_runtime_config_maps_research_config_once() -> None:
     assert runtime.warmup == 2
     assert runtime.stride == 2
     assert runtime.carry is False
+
+

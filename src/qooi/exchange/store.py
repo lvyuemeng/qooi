@@ -10,7 +10,7 @@ import asyncio
 import os
 import time
 from collections.abc import AsyncIterator, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -38,6 +38,8 @@ class HistoryRequest:
     min_bars: int = 400
     refresh: bool = False
     source: CandleSource = "trade"
+    max_newest_age_hours: float | None = None
+    cache_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,18 @@ class HistoryRefreshResult:
     refreshed: bool
     path: Path
     error: str | None = None
+
+
+def bar_freshness_threshold_hours(bar: str) -> float:
+    unit = bar[-1].lower()
+    value = float(bar[:-1]) if bar[:-1].isdigit() else 1.0
+    if unit == "m":
+        return max(value / 60.0 * 2.0, 0.5)
+    if unit == "h":
+        return value * 2.0
+    if unit == "d":
+        return value * 24.0 * 2.0
+    return 2.0
 
 
 @dataclass(frozen=True)
@@ -264,6 +278,13 @@ class CacheStore:
         path = _resource_path(
             request.inst_id, resource="bars", bar=request.bar, source=request.source
         )
+        if request.cache_only and not path.exists():
+            coverage = validate_history(
+                pl.DataFrame(),
+                target,
+                extra_notes=("cache_only=yes", "cache_missing", f"source={request.source}"),
+            )
+            return pl.DataFrame(), coverage
         refreshed = request.refresh or not path.exists()
         if refreshed:
             frame = self._update_bars(request, path, target)
@@ -391,6 +412,7 @@ class AsyncCacheStore:
                     request.min_bars,
                     True,
                     request.source,
+                    request.max_newest_age_hours,
                 )
             )
             result = await self._update_bars(refresh_request, path)
@@ -399,7 +421,38 @@ class AsyncCacheStore:
             frame = _read_frame(path, _normalize_bars)
             return frame, result.coverage
         frame = await asyncio.to_thread(_read_frame, path, _normalize_bars)
-        return frame, validate_history(frame, target, extra_notes=(f"source={request.source}",))
+        coverage = validate_history(frame, target, extra_notes=(f"source={request.source}",))
+        max_newest_age_hours = (
+            request.max_newest_age_hours
+            if request.max_newest_age_hours is not None
+            else bar_freshness_threshold_hours(request.bar)
+        )
+        if request.cache_only:
+            return frame, validate_history(
+                frame,
+                target,
+                extra_notes=("cache_only=yes", f"source={request.source}"),
+            )
+        if not frame.is_empty() and coverage.newest_age_hours > max_newest_age_hours:
+            refresh_request = (
+                request
+                if isinstance(request, HistoryRefreshRequest)
+                else HistoryRefreshRequest(
+                    request.inst_id,
+                    request.bar,
+                    request.days,
+                    request.min_bars,
+                    True,
+                    request.source,
+                    request.max_newest_age_hours,
+                )
+            )
+            result = await self._update_bars(replace(refresh_request, refresh=True), path)
+            if result.error:
+                return pl.DataFrame(), result.coverage
+            frame = _read_frame(path, _normalize_bars)
+            return frame, result.coverage
+        return frame, coverage
 
     async def funding(self, request: FundingRequest) -> pl.DataFrame:
         path = _resource_path(request.inst_id, resource="funding")
@@ -838,3 +891,4 @@ def _bar_interval_ms(bar: str) -> int:
     if unit == "W":
         return value * 7 * 86_400_000
     return 0
+

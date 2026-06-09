@@ -592,3 +592,4 @@ def _bar_interval_ms(df: pl.DataFrame) -> int:
     deltas = [int(timestamps[i] - timestamps[i - 1]) for i in range(1, len(timestamps))]
     positive = [delta for delta in deltas if delta > 0]
     return min(positive) if positive else 3_600_000
+

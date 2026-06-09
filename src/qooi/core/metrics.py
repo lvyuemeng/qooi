@@ -219,3 +219,4 @@ def compute_metrics(
         ic_positive_pct=round(ic_pos, 1),
         factor_return_pct=round(total_ret * 100, 2),
     )
+

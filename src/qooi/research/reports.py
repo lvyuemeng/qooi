@@ -30,6 +30,7 @@ from qooi.core.recovery import (
 )
 from qooi.core.styles import cross_validate, rolling_window, walk_forward
 from qooi.exchange.store import AsyncCacheStore, CacheStore, HistoryRequest
+from qooi.research.artifacts import ArtifactBundle, ensure_columns
 from qooi.research.config import (
     ResearchCommandConfig,
     ResearchOutputName,
@@ -47,14 +48,14 @@ from qooi.research.data import (
     prepare_classifier_frame,
     prepare_signal_frame,
 )
-from qooi.research.states import classifier_health
-from qooi.research.tables import ArtifactBundle, build_transition_bundle, ensure_columns
+from qooi.research.patterns import build_transition_bundle
+from qooi.scanner.classifiers import classifier_health
 from qooi.strategies import StrategyBehavior, compute_signal_frame, strategy_signal_diagnostics
 from qooi.strategies.catalog import (
     strategy_metadata,
     strategy_selection,
 )
-from qooi.strategies.features import add_liquidity_sweep_features, add_none_context_diagnostics
+from qooi.strategies.structure import add_liquidity_sweep_features, add_none_context_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ CONTROL_SCHEMA = {
 }
 
 
-def add_market_state_reductions(frame: pl.DataFrame) -> pl.DataFrame:
+def _add_market_state_reductions(frame: pl.DataFrame) -> pl.DataFrame:
     work = frame
     if "market_stage" in work.columns and "market_stage_reduced" not in work.columns:
         work = work.with_columns(pl.col("market_stage").cast(pl.Utf8).alias("market_stage_reduced"))
@@ -104,7 +105,7 @@ class TradeRecordControlResult:
     text: str
 
 
-def trade_record_control(
+def _trade_record_control(
     trades: pl.DataFrame,
     *,
     min_base_trades: int,
@@ -124,7 +125,7 @@ def trade_record_control(
     return TradeRecordControlResult(out, text)
 
 
-def mode_config(mode: str) -> RecoveryPolicy:
+def _mode_config(mode: str) -> RecoveryPolicy:
     if mode == "grid":
         return GridRecovery(zone_atr=1.0, multiplier=2.0, max_levels=3)
     if mode == "martingale":
@@ -138,7 +139,7 @@ def mode_config(mode: str) -> RecoveryPolicy:
     return NoRecovery()
 
 
-def run_backtest_workflow(command: ResearchCommandConfig) -> str:
+def _run_backtest_workflow(command: ResearchCommandConfig) -> str:
     pairs = command.pairs()
     selection = strategy_selection(
         command.strategy.strategies,
@@ -146,14 +147,14 @@ def run_backtest_workflow(command: ResearchCommandConfig) -> str:
         benchmark_group=command.strategy.benchmark_group,
         default=command.strategy.strategy,
     )
-    recovery_cfg = mode_config(command.strategy.mode)
+    recovery_cfg = _mode_config(command.strategy.mode)
     exit_cfg = command.exit
 
     if len(selection.strategies) > 1:
         benchmark_results = []
         all_reports = []
         for strategy in selection.strategies:
-            reports = run_reports(pairs, strategy, recovery_cfg, exit_cfg, command)
+            reports = _run_reports(pairs, strategy, recovery_cfg, exit_cfg, command)
             all_reports.extend(reports)
             benchmark_results.append((strategy.name, reports))
         _assert_reports_pass(all_reports, command)
@@ -166,9 +167,9 @@ def run_backtest_workflow(command: ResearchCommandConfig) -> str:
 
     strategy = selection.strategies[0]
     if command.strategy.style != "single":
-        return run_style(pairs, strategy, recovery_cfg, exit_cfg, command)
+        return _run_style(pairs, strategy, recovery_cfg, exit_cfg, command)
 
-    reports = run_reports(pairs, strategy, recovery_cfg, exit_cfg, command)
+    reports = _run_reports(pairs, strategy, recovery_cfg, exit_cfg, command)
     _assert_reports_pass(reports, command)
     signal_diagnostics = []
     wants_diagnostics = command.strategy.diagnostics
@@ -207,7 +208,7 @@ def run_backtest_workflow(command: ResearchCommandConfig) -> str:
     return output
 
 
-def run_reports(
+def _run_reports(
     pairs,
     strategy: StrategyBehavior,
     recovery_cfg: RecoveryPolicy,
@@ -277,7 +278,7 @@ def _prepare_market_state_frame(
         work = add_none_context_diagnostics()(work)
     if include_mtf_keys:
         work = add_mtf_state_keys(work)
-    return add_market_state_reductions(work)
+    return _add_market_state_reductions(work)
 
 
 def classifier_state_research(command: ResearchCommandConfig) -> str:
@@ -521,10 +522,10 @@ def _research_backtest_branch(command: ResearchCommandConfig) -> tuple[list[Repo
             else ""
         )
     strategy = selection.strategies[0]
-    reports = run_reports(
+    reports = _run_reports(
         command.pairs(),
         strategy,
-        mode_config(command.strategy.mode),
+        _mode_config(command.strategy.mode),
         command.exit,
         command,
     )
@@ -553,7 +554,7 @@ def _trade_record_modulation_frame(
     if not frames:
         return pl.DataFrame(schema=CONTROL_SCHEMA)
     config = command.research_evaluation.modulation_effect
-    return trade_record_control(
+    return _trade_record_control(
         pl.concat(frames, how="diagonal_relaxed"),
         min_base_trades=config.min_base_trades,
         min_cell_trades=config.min_cell_trades,
@@ -776,7 +777,7 @@ def _assert_reports_pass(reports, command: ResearchCommandConfig) -> None:
         raise SystemExit("risk gates failed: " + "; ".join(failed))
 
 
-def run_style(
+def _run_style(
     pairs,
     strategy: StrategyBehavior,
     recovery_cfg: RecoveryPolicy,
@@ -842,7 +843,7 @@ def run_style(
     return "\n".join(lines)
 
 
-def run_cache_audit(command: ResearchCommandConfig) -> str:
+def _run_cache_audit(command: ResearchCommandConfig) -> str:
     request = CacheAuditRequest(
         pairs=command.pairs(),
         data_source=command.run.ds,
@@ -910,3 +911,4 @@ async def _stream_cache_refresh(requests, concurrency: int) -> None:
         async for event in store.stream_many(requests, concurrency=concurrency):
             if event.kind in {"completed", "failed", "summary"}:
                 logger.info("%s", event.message)
+

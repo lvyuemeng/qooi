@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Protocol
 
 from qooi.core.basket import Basket, BasketState, Position
-from qooi.core.instruments import PairConfig
+from qooi.core.config import PairConfig
 
 STATE_DIR = Path("data") / "state"
 DEFAULT_SOFT_STATE_PATH = STATE_DIR / "baskets.json"
@@ -377,3 +377,4 @@ def _find_position(positions: list[dict], symbol: str) -> dict | None:
 
 def _position_qty(position: dict) -> float:
     return float(position.get("pos", 0) or 0)
+

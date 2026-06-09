@@ -133,7 +133,7 @@ def normalize_okx_ws_books(
     )
 
 
-async def collect_okx_ws_public_async(
+async def collect_okx_ws_public(
     symbols: tuple[str, ...],
     *,
     message_source: AsyncIterable[dict[str, Any]] | None = None,
@@ -367,3 +367,4 @@ _BOOK_SCHEMA = {
     "ask_depth_bps_50": pl.Float64,
     "spread_bps": pl.Float64,
 }
+

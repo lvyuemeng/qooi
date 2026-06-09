@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import polars as pl
 
-from qooi.sources.http import request_json_value_async, sanitize_error
+from qooi.sources.http import request_json_value, sanitize_error
 from qooi.sources.manifest import manifest_frame, source_manifest_row
 from qooi.sources.models import SourceResult
 
@@ -25,12 +25,12 @@ BROAD_NEWS_SCHEMA: dict[str, pl.DataType] = {
 }
 
 
-async def fetch_cryptopanic_global_posts_async(
+async def fetch_cryptopanic_global_posts(
     client: httpx.AsyncClient, *, api_key: str, limit: int = 100
 ) -> SourceResult:
     endpoint = "/posts/"
     try:
-        payload = await request_json_value_async(
+        payload = await request_json_value(
             client,
             endpoint,
             params={"auth_token": api_key, "public": "true", "limit": str(limit)},
@@ -164,3 +164,4 @@ def _min_timestamp(frame: pl.DataFrame) -> int | None:
 
 def _max_timestamp(frame: pl.DataFrame) -> int | None:
     return int(frame["timestamp"].max()) if not frame.is_empty() else None
+

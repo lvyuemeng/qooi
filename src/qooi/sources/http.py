@@ -54,7 +54,7 @@ def sanitized_provider_message(payload: dict[str, Any], *, limit: int = 160) -> 
     return out[:limit]
 
 
-def request_json(
+def request_json_sync(
     url: str,
     *,
     params: dict[str, str] | None = None,
@@ -88,7 +88,7 @@ def request_json(
     )
 
 
-async def request_json_async(
+async def request_json(
     client: httpx.AsyncClient,
     endpoint: str,
     *,
@@ -121,7 +121,7 @@ async def request_json_async(
     )
 
 
-async def request_json_value_async(
+async def request_json_value(
     client: httpx.AsyncClient,
     endpoint: str,
     *,
@@ -199,3 +199,4 @@ def _safe_endpoint(url: str) -> str:
     if parsed.scheme and parsed.netloc:
         return parsed.path or "/"
     return url.split("?", 1)[0]
+
