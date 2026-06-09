@@ -2,7 +2,7 @@
 
 ```text
 scripts/
-  accumulation_scan.py
+  potential_scan.py
     -> qooi.scanner.workflow.run(config_path)
   classifier_states.py
     -> qooi.research.reports.run_reports(...)
@@ -29,7 +29,7 @@ Default active path:
 
 ```text
 configs/potential*.toml
-  -> scripts/accumulation_scan.py
+  -> scripts/potential_scan.py
   -> qooi.scanner.workflow.run()
-  -> docs/report-style Markdown + parquet diagnostics
+  -> docs/report-style Markdown + CSV diagnostics
 ```

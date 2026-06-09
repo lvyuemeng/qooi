@@ -109,12 +109,64 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         potential_evidence,
     )
     candidate_rank = candidate_eval.rank_candidate_evidence(candidate_evidence)
-    evidence_backtest, evidence_baselines = _evidence_replay_frames(
-        potential_observations,
-        source_outcomes,
-        realized_transitions,
-        return_threshold_pct=inputs.config.transition_return_threshold_pct,
-    )
+
+    empty_backtest = pl.DataFrame(schema=candidate_eval.EVIDENCE_BACKTEST_SCHEMA)
+    empty_baseline = pl.DataFrame(schema=candidate_eval.EVIDENCE_BASELINE_SCHEMA)
+    if potential_observations.is_empty() or realized_transitions.is_empty():
+        evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
+    else:
+        times = (
+            potential_observations.get_column("decision_bar_close_ms")
+            .drop_nulls()
+            .unique()
+            .sort()
+            .to_list()
+        )
+        if len(times) < 2:
+            evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
+        else:
+            split_index = min(max(1, int(len(times) * 0.7)), len(times) - 1)
+            split_time = times[split_index - 1]
+            train_observations = potential_observations.filter(
+                pl.col("decision_bar_close_ms") <= split_time
+            )
+            holdout_observations = potential_observations.filter(
+                pl.col("decision_bar_close_ms") > split_time
+            )
+            if train_observations.is_empty() or holdout_observations.is_empty():
+                evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
+            else:
+                train_source_outcomes = (
+                    source_outcomes.filter(pl.col("aligned_bar_close_ms") <= split_time)
+                    if "aligned_bar_close_ms" in source_outcomes.columns
+                    else source_outcomes
+                )
+                train_realized_transitions = realized_transitions.filter(
+                    pl.col("bar_close_ms") <= split_time
+                )
+                train_evidence = evidence_eval.potential_evidence_frame(
+                    train_observations,
+                    train_source_outcomes,
+                    train_realized_transitions,
+                    return_threshold_pct=inputs.config.transition_return_threshold_pct,
+                )
+                if train_evidence.is_empty():
+                    evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
+                else:
+                    holdout_outcomes = evidence_eval.potential_outcome_frame(
+                        holdout_observations,
+                        source_outcomes,
+                        realized_transitions,
+                        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+                    )
+                    evidence_backtest = candidate_eval.backtest_candidate_evidence(
+                        train_evidence,
+                        holdout_observations,
+                        holdout_outcomes,
+                    )
+                    evidence_baselines = candidate_eval.compare_candidate_baselines(
+                        evidence_backtest
+                    )
     return DiagnosticFrames(
         coverage=coverage_frame(inputs.bars.coverage),
         history_feasibility=history_feasibility,
@@ -169,90 +221,48 @@ def _build_state_frames(inputs: ReportInputs) -> StateFrames:
 
 def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) -> None:
     diagnostics = Path(diagnostics)
-    frames.coverage.write_parquet(diagnostics / "coverage.parquet")
-    frames.history_feasibility.write_parquet(diagnostics / "history-feasibility.parquet")
-    frames.source_freshness.write_parquet(diagnostics / "source-freshness.parquet")
-    frames.universe.write_parquet(diagnostics / "universe.parquet")
-    frames.fetch_audit.write_parquet(diagnostics / "fetch-audit.parquet")
-    frames.transition_edges.write_parquet(diagnostics / "transition-edges.parquet")
-    frames.transition_patterns.write_parquet(diagnostics / "transition-patterns.parquet")
-    frames.unsupported_paths.write_parquet(diagnostics / "unsupported-current-paths.parquet")
-    frames.scan_funnel.write_parquet(diagnostics / "scan-funnel.parquet")
-    frames.rejection.write_parquet(diagnostics / "rejection-diagnostics.parquet")
-    frames.watchlist_feasibility.write_parquet(diagnostics / "watchlist-feasibility.parquet")
-    frames.source_state_health.write_parquet(diagnostics / "source-state-health.parquet")
-    frames.source_events.write_parquet(diagnostics / "source-events.parquet")
-    frames.kline_history.write_parquet(diagnostics / "kline-path-history.parquet")
-    frames.source_outcomes.write_parquet(diagnostics / "source-outcomes.parquet")
-    frames.realized_transitions.write_parquet(diagnostics / "realized-transition.parquet")
-    frames.potential_observations.write_parquet(diagnostics / "potential-observation.parquet")
-    frames.potential_evidence.write_parquet(diagnostics / "potential-evidence.parquet")
-    frames.candidate_evidence.write_parquet(diagnostics / "candidate-evidence.parquet")
-    frames.candidate_rank.write_parquet(diagnostics / "candidate-rank.parquet")
-    frames.evidence_backtest.write_parquet(diagnostics / "evidence-backtest.parquet")
-    frames.evidence_baselines.write_parquet(diagnostics / "evidence-baselines.parquet")
-    frames.source_timeliness.write_parquet(diagnostics / "source-timeliness.parquet")
-    frames.source_state_predictability.write_parquet(
-        diagnostics / "source-state-predictability.parquet"
-    )
+    frame_groups = {
+        "coverage": frames.coverage,
+        "history-feasibility": frames.history_feasibility,
+        "source-freshness": frames.source_freshness,
+        "universe": frames.universe,
+        "fetch-audit": frames.fetch_audit,
+        "transition-edges": frames.transition_edges,
+        "transition-patterns": frames.transition_patterns,
+        "unsupported-current-paths": frames.unsupported_paths,
+        "scan-funnel": frames.scan_funnel,
+        "rejection-diagnostics": frames.rejection,
+        "watchlist-feasibility": frames.watchlist_feasibility,
+        "source-state-health": frames.source_state_health,
+        "source-events": frames.source_events,
+        "kline-path-history": frames.kline_history,
+        "source-outcomes": frames.source_outcomes,
+        "realized-transition": frames.realized_transitions,
+        "potential-observation": frames.potential_observations,
+        "potential-evidence": frames.potential_evidence,
+        "candidate-evidence": frames.candidate_evidence,
+        "candidate-rank": frames.candidate_rank,
+        "evidence-backtest": frames.evidence_backtest,
+        "evidence-baselines": frames.evidence_baselines,
+        "source-timeliness": frames.source_timeliness,
+        "source-state-predictability": frames.source_state_predictability,
+    }
+    for name, frame in frame_groups.items():
+        frame.write_csv(diagnostics / f"{name}.csv")
 
 
 def _write_state_frames(frames: StateFrames, states: Path | str) -> None:
     states = Path(states)
-    frames.kline.write_parquet(states / "kline-state.parquet")
-    frames.books.write_parquet(states / "book-state.parquet")
-    frames.trades.write_parquet(states / "trade-flow-state.parquet")
-    frames.derivatives.write_parquet(states / "derivatives-state.parquet")
-    frames.context.write_parquet(states / "context-state.parquet")
+    frame_groups = {
+        "kline-state": frames.kline,
+        "book-state": frames.books,
+        "trade-flow-state": frames.trades,
+        "derivatives-state": frames.derivatives,
+        "context-state": frames.context,
+    }
+    for name, frame in frame_groups.items():
+        frame.write_csv(states / f"{name}.csv")
 
-
-def _evidence_replay_frames(
-    observations: pl.DataFrame,
-    source_outcomes: pl.DataFrame,
-    realized_transitions: pl.DataFrame,
-    *,
-    return_threshold_pct: float,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Build private chronological evidence replay artifacts without expanding public API."""
-    empty_backtest = pl.DataFrame(schema=candidate_eval.EVIDENCE_BACKTEST_SCHEMA)
-    empty_baseline = pl.DataFrame(schema=candidate_eval.EVIDENCE_BASELINE_SCHEMA)
-    if observations.is_empty() or realized_transitions.is_empty():
-        return empty_backtest, empty_baseline
-    times = observations.get_column("decision_bar_close_ms").drop_nulls().unique().sort().to_list()
-    if len(times) < 2:
-        return empty_backtest, empty_baseline
-    split_index = min(max(1, int(len(times) * 0.7)), len(times) - 1)
-    split_time = times[split_index - 1]
-    train_observations = observations.filter(pl.col("decision_bar_close_ms") <= split_time)
-    holdout_observations = observations.filter(pl.col("decision_bar_close_ms") > split_time)
-    if train_observations.is_empty() or holdout_observations.is_empty():
-        return empty_backtest, empty_baseline
-    train_source_outcomes = (
-        source_outcomes.filter(pl.col("aligned_bar_close_ms") <= split_time)
-        if "aligned_bar_close_ms" in source_outcomes.columns
-        else source_outcomes
-    )
-    train_realized_transitions = realized_transitions.filter(pl.col("bar_close_ms") <= split_time)
-    train_evidence = evidence_eval.potential_evidence_frame(
-        train_observations,
-        train_source_outcomes,
-        train_realized_transitions,
-        return_threshold_pct=return_threshold_pct,
-    )
-    if train_evidence.is_empty():
-        return empty_backtest, empty_baseline
-    holdout_outcomes = evidence_eval.potential_outcome_frame(
-        holdout_observations,
-        source_outcomes,
-        realized_transitions,
-        return_threshold_pct=return_threshold_pct,
-    )
-    backtest = candidate_eval.backtest_candidate_evidence(
-        train_evidence,
-        holdout_observations,
-        holdout_outcomes,
-    )
-    return backtest, candidate_eval.compare_candidate_baselines(backtest)
 
 
 def coverage_frame(coverage: tuple[HistoryCoverage, ...]) -> pl.DataFrame:

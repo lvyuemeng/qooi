@@ -73,7 +73,7 @@ dynamic
 
 ```text
 configs/potential*.toml
-  -> scripts/accumulation_scan.py       # legacy filename; active role = potential scanner CLI
+  -> scripts/potential_scan.py       # potential scanner CLI
   -> qooi.scanner.workflow.run()
   -> OHLCV/source cache and diagnostics
   -> deterministic known-at-close state classification

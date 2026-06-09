@@ -53,7 +53,6 @@ Each isolated module family owns its own graph. Cross-cutting graph appendices, 
 | Document | Purpose |
 |---|---|
 | `report/research.md` | Empirical research summaries and decisions. |
-| `report/legacy-accumulation.md` | Historical accumulation-scanner notes superseded by `architecture/scanner.md`. |
 
 ## Agent metadata
 

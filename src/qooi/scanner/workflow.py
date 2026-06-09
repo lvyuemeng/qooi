@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import polars as pl
-from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from qooi.exchange.context import BookMode
 from qooi.exchange.discovery import DiscoveryConfig, discover_candidates, empty_discovery_frame
@@ -39,286 +39,43 @@ RefreshMode = Literal["incremental", "cache_only", "force"]
 class PotentialConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    output: Path = Field(
-        default=Path("data/output/potential/report.md"),
-        validation_alias=AliasChoices(
-            AliasPath("run", "output"),
-            AliasPath("potential", "output"), AliasPath("run", "out"), "output"
-        ),
-    )
-    symbols: tuple[str, ...] = Field(
-        default=(), validation_alias=AliasChoices(AliasPath("potential", "symbols"), "symbols")
-    )
-    universe: str = Field(
-        default="research",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "universe"), AliasPath("run", "universe"), "universe"
-        ),
-    )
-    bar: str = Field(
-        default="1H",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "bar"), AliasPath("market", "bar"), "bar"
-        ),
-    )
-    timeframes: tuple[str, ...] = Field(
-        default=("1H", "4H", "1D"),
-        validation_alias=AliasChoices(AliasPath("potential", "timeframes"), "timeframes"),
-    )
-    days: int = Field(
-        default=60,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "days"), AliasPath("market", "days"), "days"
-        ),
-    )
-    refresh_mode: RefreshMode = Field(
-        default="incremental",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "refresh_mode"),
-            AliasPath("potential", "refresh", "mode"),
-            "refresh_mode",
-        ),
-    )
-    fetch_concurrency: int = Field(
-        default=3,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "fetch_concurrency"),
-            AliasPath("potential", "sources", "concurrency"),
-            "fetch_concurrency",
-        ),
-    )
-    source_refresh_mode: Literal["inherit", "incremental", "cache_only", "force"] = Field(
-        default="inherit",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "sources", "refresh"),
-            "source_refresh_mode",
-        ),
-    )
-    disabled_sources: tuple[str, ...] = Field(
-        default=(),
-        validation_alias=AliasChoices(
-            AliasPath("potential", "disabled_sources"),
-            AliasPath("potential", "sources", "disabled", "families"),
-            AliasPath("sources", "disabled", "families"),
-            "disabled_sources",
-        ),
-    )
-    disabled_symbols: tuple[str, ...] = Field(
-        default=(),
-        validation_alias=AliasChoices(
-            AliasPath("potential", "sources", "disabled", "symbols"),
-            AliasPath("sources", "disabled", "symbols"), "disabled_symbols"
-        ),
-    )
-    book_mode: BookMode = Field(
-        default="snapshot",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "book_mode"), AliasPath("market", "book_mode"), "book_mode"
-        ),
-    )
-    book_depth: int = Field(
-        default=25,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "book_depth"), AliasPath("market", "book_depth"), "book_depth"
-        ),
-    )
-    max_source_staleness_hours: int = Field(
-        default=24,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "max_source_staleness_hours"),
-            AliasPath("potential", "sources", "max_staleness_hours"),
-            "max_source_staleness_hours",
-        ),
-    )
-    trade_limit: int = Field(
-        default=100,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "trade_limit"),
-            AliasPath("potential", "sources", "trade_limit"),
-            AliasPath("sources", "trade_limit"),
-            "trade_limit",
-        ),
-    )
-    funding_limit: int = Field(
-        default=100,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "funding_limit"),
-            AliasPath("potential", "sources", "funding_limit"),
-            AliasPath("sources", "funding_limit"),
-            "funding_limit",
-        ),
-    )
-    rubik_period: str = Field(
-        default="1H",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "rubik_period"),
-            AliasPath("potential", "sources", "rubik_period"),
-            AliasPath("sources", "rubik_period"),
-            "rubik_period",
-        ),
-    )
-    rubik_limit: int = Field(
-        default=100,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "rubik_limit"),
-            AliasPath("potential", "sources", "rubik_limit"),
-            AliasPath("sources", "rubik_limit"),
-            "rubik_limit",
-        ),
-    )
-    rubik_taker_unit: Literal["0", "1", "2"] = Field(
-        default="2",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "rubik_taker_unit"),
-            AliasPath("potential", "sources", "rubik_taker_unit"),
-            AliasPath("sources", "rubik_taker_unit"),
-            "rubik_taker_unit",
-        ),
-    )
-    transition_horizon: int = Field(
-        default=12,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_horizon"),
-            AliasPath("potential", "transition", "horizon"),
-            "transition_horizon",
-        ),
-    )
-    transition_history_days: int = Field(
-        default=0,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_history_days"),
-            AliasPath("potential", "history", "transition_days"),
-            "transition_history_days",
-        ),
-    )
-    transition_ngram_length: int = Field(
-        default=3,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_ngram_length"),
-            AliasPath("potential", "transition", "ngram_length"),
-            "transition_ngram_length",
-        ),
-    )
-    transition_min_count: int = Field(
-        default=20,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_min_count"),
-            AliasPath("potential", "transition", "min_count"),
-            "transition_min_count",
-        ),
-    )
-    transition_return_threshold_pct: float = Field(
-        default=0.0,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_return_threshold_pct"),
-            AliasPath("potential", "transition", "return_threshold_pct"),
-            "transition_return_threshold_pct",
-        ),
-    )
-    transition_min_information_bits: float = Field(
-        default=0.001,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_min_information_bits"),
-            AliasPath("potential", "transition", "min_information_bits"),
-            "transition_min_information_bits",
-        ),
-    )
-    transition_min_probability: float = Field(
-        default=0.05,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_min_probability"),
-            AliasPath("potential", "transition", "min_probability"),
-            "transition_min_probability",
-        ),
-    )
-    transition_min_directional_probability: float = Field(
-        default=0.55,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_min_directional_probability"),
-            AliasPath("potential", "transition", "min_directional_probability"),
-            "transition_min_directional_probability",
-        ),
-    )
-    transition_min_reward_risk: float = Field(
-        default=1.0,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_min_reward_risk"),
-            AliasPath("potential", "transition", "min_reward_risk"),
-            "transition_min_reward_risk",
-        ),
-    )
-    transition_max_tail_loss_pct: float = Field(
-        default=20.0,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_max_tail_loss_pct"),
-            AliasPath("potential", "transition", "max_tail_loss_pct"),
-            "transition_max_tail_loss_pct",
-        ),
-    )
-    transition_recent_window: int = Field(
-        default=240,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_recent_window"),
-            AliasPath("potential", "transition", "recent_window"),
-            "transition_recent_window",
-        ),
-    )
-    transition_long_window: int = Field(
-        default=1440,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_long_window"),
-            AliasPath("potential", "transition", "long_window"),
-            "transition_long_window",
-        ),
-    )
-    transition_min_probability_delta: float = Field(
-        default=-0.10,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_min_probability_delta"),
-            AliasPath("potential", "transition", "min_probability_delta"),
-            "transition_min_probability_delta",
-        ),
-    )
-    transition_mae_mfe_horizon: int = Field(
-        default=12,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_mae_mfe_horizon"),
-            AliasPath("potential", "transition", "mae_mfe_horizon"),
-            "transition_mae_mfe_horizon",
-        ),
-    )
-    require_context_for_review: bool = Field(
-        default=True,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "require_context_for_review"),
-            AliasPath("potential", "review", "require_context"),
-            "require_context_for_review",
-        ),
-    )
-    transition_context_scope: Literal["candidates", "all_scanned"] = Field(
-        default="candidates",
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_context_scope"),
-            AliasPath("potential", "sources", "scope"),
-            "transition_context_scope",
-        ),
-    )
-    transition_context_limit: int = Field(
-        default=20,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_context_limit"),
-            AliasPath("potential", "sources", "limit"),
-            "transition_context_limit",
-        ),
-    )
-    transition_scan_budget: int = Field(
-        default=80,
-        validation_alias=AliasChoices(
-            AliasPath("potential", "transition_scan_budget"),
-            AliasPath("potential", "selection", "scan_budget"),
-            "transition_scan_budget",
-        ),
-    )
+    output: Path = Path("data/output/potential/report.md")
+    symbols: tuple[str, ...] = ()
+    universe: str = "research"
+    bar: str = "1H"
+    timeframes: tuple[str, ...] = ("1H", "4H", "1D")
+    days: int = 60
+    refresh_mode: RefreshMode = "incremental"
+    fetch_concurrency: int = 3
+    source_refresh_mode: Literal["inherit", "incremental", "cache_only", "force"] = "inherit"
+    disabled_sources: tuple[str, ...] = ()
+    disabled_symbols: tuple[str, ...] = ()
+    book_mode: BookMode = "snapshot"
+    book_depth: int = 25
+    max_source_staleness_hours: int = 24
+    trade_limit: int = 100
+    funding_limit: int = 100
+    rubik_period: str = "1H"
+    rubik_limit: int = 100
+    rubik_taker_unit: Literal["0", "1", "2"] = "2"
+    transition_horizon: int = 12
+    transition_history_days: int = 0
+    transition_ngram_length: int = 3
+    transition_min_count: int = 20
+    transition_return_threshold_pct: float = 0.0
+    transition_min_information_bits: float = 0.001
+    transition_min_probability: float = 0.05
+    transition_min_directional_probability: float = 0.55
+    transition_min_reward_risk: float = 1.0
+    transition_max_tail_loss_pct: float = 20.0
+    transition_recent_window: int = 240
+    transition_long_window: int = 1440
+    transition_min_probability_delta: float = -0.10
+    transition_mae_mfe_horizon: int = 12
+    require_context_for_review: bool = True
+    transition_context_scope: Literal["candidates", "all_scanned"] = "candidates"
+    transition_context_limit: int = 20
+    transition_scan_budget: int = 80
 
     @model_validator(mode="after")
     def normalize_paths_and_timeframes(self) -> PotentialConfig:
@@ -398,7 +155,8 @@ def run(config_path: Path | str) -> Path:
 def load_config(path: Path) -> PotentialConfig:
     if not path.exists():
         return PotentialConfig()
-    return PotentialConfig.model_validate(tomllib.loads(path.read_text(encoding="utf-8")))
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    return PotentialConfig.model_validate(data.get("potential", data))
 
 
 def target_min_bars(days: int, timeframe: str) -> int:

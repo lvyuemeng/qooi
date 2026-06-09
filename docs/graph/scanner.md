@@ -9,22 +9,22 @@ The scanner module surface stays thin and research-only. `workflow.py` orchestra
 | Architecture object | Current graph/API surface | Artifact surface | Status |
 |---|---|---|---|
 | `U` universe | `workflow.load_config()`, `workflow.resolve_universe()` | config/discovery result only | implemented |
-| `K` kline state | `workflow.load_bars()`, `KlineClassifier.classify()`, `decisions.compute_kline_states()`, `history.kline_path_history_frame()` | `kline-path-history.parquet` | implemented |
-| `S` source state/event | `sources.context.load_source_context()`, `decisions.compute_source_states()`, `source_events.source_events_frame()` | `source-events.parquet` | implemented |
-| `O` observation vector | `evidence.potential_observation_frame()` | `potential-observation.parquet` | implemented |
-| `Y` future outcome | `history.realized_transition_frame()`, `source_events.source_outcomes_frame()`, `evidence.potential_outcome_frame()` | `realized-transition.parquet`, `source-outcomes.parquet` | implemented |
+| `K` kline state | `workflow.load_bars()`, `KlineClassifier.classify()`, `decisions.compute_kline_states()`, `history.kline_path_history_frame()` | `kline-path-history.csv` | implemented |
+| `S` source state/event | `sources.context.load_source_context()`, `decisions.compute_source_states()`, `source_events.source_events_frame()` | `source-events.csv` | implemented |
+| `O` observation vector | `evidence.potential_observation_frame()` | `potential-observation.csv` | implemented |
+| `Y` future outcome | `history.realized_transition_frame()`, `source_events.source_outcomes_frame()`, `evidence.potential_outcome_frame()` | `realized-transition.csv`, `source-outcomes.csv` | implemented |
 | `E` evidence | `evidence.potential_evidence_frame()`, `evidence.add_potential_parent_gain()` | evidence frame | implemented |
-| `E*` selected evidence | `evidence.select_potential_evidence_level()` | `potential-evidence.parquet` | implemented |
-| `C` candidate evidence row | `candidates.candidate_evidence_frame(...)` | `candidate-evidence.parquet` | implemented |
-| `R` ranked candidate | `candidates.rank_candidate_evidence(...)` | `candidate-rank.parquet` | implemented |
-| `B` evidence backtest row | `candidates.backtest_candidate_evidence(...)`, `candidates.compare_candidate_baselines(...)` | `evidence-backtest.parquet`, `evidence-baselines.parquet` | implemented |
+| `E*` selected evidence | `evidence.select_potential_evidence_level()` | `potential-evidence.csv` | implemented |
+| `C` candidate evidence row | `candidates.candidate_evidence_frame(...)` | `candidate-evidence.csv` | implemented |
+| `R` ranked candidate | `candidates.rank_candidate_evidence(...)` | `candidate-rank.csv` | implemented |
+| `B` evidence backtest row | `candidates.backtest_candidate_evidence(...)`, `candidates.compare_candidate_baselines(...)` | `evidence-backtest.csv`, `evidence-baselines.csv` | implemented |
 
 Anything not listed here is not a supported scanner research surface unless another graph section explicitly names it.
 
 ## CLI entry
 
 ```text
-scripts/accumulation_scan.py        # legacy filename, active role = potential scanner CLI
+scripts/potential_scan.py        # potential scanner CLI
   parse_args()
   main()
     -> qooi.scanner.workflow.run(Path(args.config))
@@ -65,7 +65,7 @@ The scanner graph transforms the architecture object contracts into concrete mod
 
 ```text
 U: Universe
-  scripts/accumulation_scan.py
+  scripts/potential_scan.py
     -> workflow.run(config_path)
        -> workflow.load_config(config_path) -> PotentialConfig
        -> workflow.resolve_universe(config) -> PotentialUniverse
@@ -76,29 +76,29 @@ K: Known-at-close kline state
        -> AsyncCacheStore.bars(HistoryRefreshRequest) -> OHLCV frames + coverage
        -> KlineClassifier(timeframe).classify(frame) -> state_frames[(symbol,timeframe)]
     -> decisions.compute_kline_states(...) -> latest SourceStateRow rows
-    -> history.kline_path_history_frame(config, state_frames) -> kline-path-history.parquet
+    -> history.kline_path_history_frame(config, state_frames) -> kline-path-history.csv
 
 S: Known-at-close source state/event
   transitions + source scope
     -> contracts.context_symbols(config, symbols_with_decision_bars, transitions.insights)
     -> sources.context.load_source_context(...) -> source context frames + availability
     -> decisions.compute_source_states(...) -> latest source bundle rows
-    -> source_events.source_events_frame(context.frames, bars, config.bar) -> source-events.parquet
+    -> source_events.source_events_frame(context.frames, bars, config.bar) -> source-events.csv
 
 O: Observation vector
-  kline-path-history.parquet + source-events.parquet
+  kline-path-history.csv + source-events.csv
     -> evidence.potential_observation_frame(
          kline_history,
          source_events,
          decision_timeframe=config.bar,
          max_source_staleness_hours=config.max_source_staleness_hours,
-       ) -> potential-observation.parquet
+       ) -> potential-observation.csv
 
 Y: Future outcome
-  kline-path-history.parquet
-    -> history.realized_transition_frame(kline_history, horizons) -> realized-transition.parquet
-  source-events.parquet + decision-clock OHLCV
-    -> source_events.source_outcomes_frame(source_events, bars) -> source-outcomes.parquet
+  kline-path-history.csv
+    -> history.realized_transition_frame(kline_history, horizons) -> realized-transition.csv
+  source-events.csv + decision-clock OHLCV
+    -> source_events.source_outcomes_frame(source_events, bars) -> source-outcomes.csv
   O + source outcomes + realized transitions
     -> evidence.potential_outcome_frame(...) -> outcome join frame
 
@@ -112,25 +112,25 @@ E: Parent-gated evidence
        )
        -> evidence.add_potential_parent_gain(...)
        -> evidence.select_potential_evidence_level(...)
-       -> potential-evidence.parquet
+       -> potential-evidence.csv
 
 C: Candidate evidence row
   latest O_t + selected E*(O,h) + coverage/freshness diagnostics
-    -> candidates.candidate_evidence_frame(...) -> candidate-evidence.parquet
+    -> candidates.candidate_evidence_frame(...) -> candidate-evidence.csv
 
 R: Ranked candidate
-  candidate-evidence.parquet
-    -> candidates.rank_candidate_evidence(...) -> candidate-rank.parquet
+  candidate-evidence.csv
+    -> candidates.rank_candidate_evidence(...) -> candidate-rank.csv
 
 B: Evidence backtest row
   frozen train E_train*(O,h) + holdout O_t + holdout Y_{t,h}
     -> candidates.backtest_candidate_evidence(...) -> pure evidence-backtest frame
     -> candidates.compare_candidate_baselines(...) -> pure evidence-baseline frame
-  -> diagnostics/evidence-backtest.parquet
-  -> diagnostics/evidence-baselines.parquet
+  -> diagnostics/evidence-backtest.csv
+  -> diagnostics/evidence-baselines.csv
 ```
 
-Current implemented graph reaches `C`, `R`, and `B` diagnostics. Workflow still renders `E` beside legacy latest-bundle watchlist decisions; richer report rendering for `R`/`B` should wait until candidate artifacts are inspected.
+Current implemented graph reaches `C`, `R`, and `B` diagnostics. Workflow renders evidence beside method-grouped latest-bundle review rows; richer report rendering for `R`/`B` should wait until candidate artifacts are inspected.
 
 Primary evidence diagnostics are real columns, including:
 
@@ -270,15 +270,15 @@ workflow.run(...)
   -> PotentialArtifacts.states_dir
 
 diagnostics.write_diagnostics(inputs)
-  -> coverage/evidence/outcome/source/history diagnostic parquet files
-  -> potential-observation.parquet    # O_t
-  -> source-outcomes.parquet          # source-side Y_{t,h}
-  -> realized-transition.parquet      # kline semantic Y_{t,h}
-  -> potential-evidence.parquet       # E and E*
-  -> candidate-evidence.parquet       # C_t = latest O_t + selected E*
-  -> candidate-rank.parquet           # R_t with explicit score components
-  -> evidence-backtest.parquet        # B_t chronological holdout replay rows
-  -> evidence-baselines.parquet       # B_t grouped holdout summaries
+  -> CSV diagnostic files
+  -> potential-observation.csv    # O_t
+  -> source-outcomes.csv          # source-side Y_{t,h}
+  -> realized-transition.csv      # kline semantic Y_{t,h}
+  -> potential-evidence.csv       # E and E*
+  -> candidate-evidence.csv       # C_t = latest O_t + selected E*
+  -> candidate-rank.csv           # R_t with explicit score components
+  -> evidence-backtest.csv        # B_t chronological holdout replay rows
+  -> evidence-baselines.csv       # B_t grouped holdout summaries
 
 report.render_report(inputs)
   -> report text only; no writes

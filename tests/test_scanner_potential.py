@@ -371,108 +371,97 @@ transition_context_limit = 0
     assert "place orders" in report
     assert "mutate baskets" in report
     assert "## Unified Evidence Surface" in report
-    assert (diagnostics / "coverage.parquet").exists()
-    assert (diagnostics / "source-freshness.parquet").exists()
-    assert (diagnostics / "potential-observation.parquet").exists()
-    assert (diagnostics / "potential-evidence.parquet").exists()
-    assert (diagnostics / "candidate-evidence.parquet").exists()
-    assert (diagnostics / "candidate-rank.parquet").exists()
-    assert (diagnostics / "evidence-backtest.parquet").exists()
-    assert (diagnostics / "evidence-baselines.parquet").exists()
-    assert (states / "kline-state.parquet").exists()
+    assert "## Method-Grouped Review Rows" in report
+    assert (diagnostics / "coverage.csv").exists()
+    assert (diagnostics / "source-freshness.csv").exists()
+    assert (diagnostics / "potential-observation.csv").exists()
+    assert (diagnostics / "potential-evidence.csv").exists()
+    assert (diagnostics / "candidate-evidence.csv").exists()
+    assert (diagnostics / "candidate-rank.csv").exists()
+    assert (diagnostics / "evidence-backtest.csv").exists()
+    assert (diagnostics / "evidence-baselines.csv").exists()
+    assert (states / "kline-state.csv").exists()
+    assert not (diagnostics / "candidate-rank.parquet").exists()
+    assert not (states / "kline-state.parquet").exists()
     assert not (report_path.parent / "research-board.csv").exists()
 
 
 
-def test_potential_config_accepts_legacy_and_nested_scanner_shapes(tmp_path: Path) -> None:
+def test_potential_config_rejects_legacy_aliases(
+    tmp_path: Path,
+) -> None:
     legacy_path = tmp_path / "legacy.toml"
     legacy_path.write_text(
         """
 [run]
-universe = "research"
+universe = "legacy-research"
 out = "data/output/accumulation/mvp"
 
 [market]
 bar = "4H"
 days = 30
-book_depth = 10
-book_mode = "off"
 
 [sources.disabled]
 families = ["messages"]
-symbols = ["BAD-USDT-SWAP"]
 """,
         encoding="utf-8",
     )
-    nested_path = tmp_path / "nested.toml"
-    nested_path.write_text(
+    current_path = tmp_path / "current.toml"
+    current_path.write_text(
         """
-[run]
-output = "data/output/potential/report.md"
-
 [potential]
+output = "data/output/potential/report.md"
+universe = "research"
+bar = "4H"
+days = 30
 refresh_mode = "incremental"
-
-[potential.selection]
-scan_budget = 80
-
-[potential.history]
-transition_days = 365
-
-[potential.sources]
-refresh = "incremental"
-concurrency = 8
-scope = "all_scanned"
-limit = 80
-max_staleness_hours = 12
+fetch_concurrency = 8
+transition_scan_budget = 80
+transition_context_scope = "all_scanned"
+transition_context_limit = 80
+transition_history_days = 365
+transition_ngram_length = 4
+transition_horizon = 8
+transition_min_information_bits = 0.01
+require_context_for_review = true
+max_source_staleness_hours = 12
 trade_limit = 50
 funding_limit = 60
 rubik_period = "4H"
 rubik_limit = 70
 rubik_taker_unit = "1"
-
-[potential.sources.disabled]
-families = ["messages"]
-symbols = ["BAD-USDT-SWAP"]
-
-[potential.transition]
-ngram_length = 4
-horizon = 8
-min_count = 12
-min_probability = 0.20
-min_directional_probability = 0.60
-min_reward_risk = 1.25
-max_tail_loss_pct = 15.0
-recent_window = 120
-long_window = 960
-min_probability_delta = -0.05
-mae_mfe_horizon = 8
-min_information_bits = 0.01
-
-[potential.review]
-require_context = true
+disabled_sources = ["messages"]
+disabled_symbols = ["BAD-USDT-SWAP"]
 """,
         encoding="utf-8",
     )
 
     legacy = potential.load_config(legacy_path)
-    nested = potential.load_config(nested_path)
+    current = potential.load_config(current_path)
 
-    assert legacy.output == Path("data/output/accumulation/mvp/potential/report.md")
+    assert legacy.output == Path("data/output/potential/report.md")
     assert legacy.universe == "research"
-    assert legacy.bar == "4H"
-    assert legacy.disabled_sources == ("messages",)
-    assert nested.output == Path("data/output/potential/report.md")
-    assert nested.refresh_mode == "incremental"
-    assert nested.transition_scan_budget == 80
-    assert nested.transition_context_scope == "all_scanned"
-    assert nested.transition_context_limit == 80
-    assert nested.transition_history_days == 365
-    assert nested.transition_ngram_length == 4
-    assert nested.transition_horizon == 8
-    assert nested.transition_min_information_bits == 0.01
-    assert nested.require_context_for_review is True
-
+    assert legacy.bar == "1H"
+    assert legacy.disabled_sources == ()
+    assert current.output == Path("data/output/potential/report.md")
+    assert current.refresh_mode == "incremental"
+    assert current.fetch_concurrency == 8
+    assert current.transition_scan_budget == 80
+    assert current.transition_context_scope == "all_scanned"
+    assert current.transition_context_limit == 80
+    assert current.transition_history_days == 365
+    assert current.transition_ngram_length == 4
+    assert current.transition_horizon == 8
+    assert current.transition_min_information_bits == 0.01
+    assert current.require_context_for_review is True
+    assert current.max_source_staleness_hours == 12
+    assert current.trade_limit == 50
+    assert current.funding_limit == 60
+    assert current.rubik_period == "4H"
+    assert current.rubik_limit == 70
+    assert current.rubik_taker_unit == "1"
+    assert current.disabled_sources == ("messages",)
+    assert current.disabled_symbols == ("BAD-USDT-SWAP",)
 
 def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypatch) -> None:
     discovery = pl.DataFrame(

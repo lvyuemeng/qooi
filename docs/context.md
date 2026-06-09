@@ -48,15 +48,16 @@ Do not use this file for module layouts, detailed call graphs, run reports, or t
 ## Code principles
 
 1. Avoid spaghetti dependencies. A module should have a narrow reason to change.
-2. Avoid redundant helper functions. Prefer one direct, named implementation over parallel compatibility wrappers.
+2. Avoid redundant helper functions. Prefer method-grouped direct implementations over helper proliferation or parallel compatibility wrappers.
 3. Separate side effects from computation. Fetching, cache writes, file writes, report rendering, and trading IO should stay at orchestration boundaries.
 4. Keep research tables known-at-close. Future returns may be outcome columns only, never inputs to state construction or current decision labels.
 5. Prefer Polars-native DataFrame operations. Avoid row loops and pandas-style detours unless there is a measured reason.
 6. Make missing coverage explicit instead of silently dropping symbols, sources, or windows.
 7. Do not hardcode API keys, provider secrets, exchange-wallet labels, or environment-specific paths.
-8. Remove stale APIs instead of adding compatibility layers when current callers can be updated directly.
-9. Keep optional AI/ML dependencies lazy and isolated so normal research and scanner imports remain lightweight.
-10. Treat `strategies/` as an unstable, vague area for now: computation is distributed across several parts, so strategy design should not be considered ideal or stable until promoted through explicit signal contracts and tests.
+8. Remove stale APIs and legacy/backward-compatible config paths instead of preserving aliases when current callers can be updated directly.
+9. Use CSV for user-facing scanner diagnostics and reports; reserve Parquet for downloaded/cache source data where columnar storage matters.
+10. Keep optional AI/ML dependencies lazy and isolated so normal research and scanner imports remain lightweight.
+11. Treat `strategies/` as an unstable, vague area for now: computation is distributed across several parts, so strategy design should not be considered ideal or stable until promoted through explicit signal contracts and tests.
 
 ## Promotion policy
 

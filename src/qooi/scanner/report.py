@@ -32,7 +32,7 @@ def render_report(inputs: ReportInputs) -> str:
         f"- Context source limit: `{config.transition_context_limit}`",
         f"- Transition watch rows: `{watch}`; blocked rows: `{blocked}`",
         f"- Unsupported current transition paths: `{len(inputs.transitions.unsupported)}` "
-        f"in `{inputs.artifacts.diagnostics_dir / 'unsupported-current-paths.parquet'}`",
+        f"in `{inputs.artifacts.diagnostics_dir / 'unsupported-current-paths.csv'}`",
         f"- Diagnostics directory: `{inputs.artifacts.diagnostics_dir}`",
         "",
         "## Unified Evidence Surface",
@@ -47,7 +47,10 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         *_feasibility_report_lines(inputs),
         "",
-        "## Transition Watchlist",
+        "## Method-Grouped Review Rows",
+        "",
+        "These rows are grouped deterministic review methods, not compatibility "
+        "or trading surfaces.",
         "",
         *_candidate_lines(inputs.decisions, "watch", limit=15),
         "",
@@ -57,8 +60,8 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         "## Interpretation",
         "",
-        "- `potential-observation.parquet` is the known-at-close state vector surface.",
-        "- `potential-evidence.parquet` is the primary parent-gated evidence surface.",
+        "- `potential-observation.csv` is the known-at-close state vector surface.",
+        "- `potential-evidence.csv` is the primary parent-gated evidence surface.",
         "- Future returns and transitions are outcome columns only; they do not feed current "
         "state construction.",
         "- Suggestions are neutral research labels; `statistical_direction` carries empirical "
@@ -68,10 +71,10 @@ def render_report(inputs: ReportInputs) -> str:
 
 
 def _potential_evidence_report_lines(inputs: ReportInputs) -> list[str]:
-    path = inputs.artifacts.diagnostics_dir / "potential-evidence.parquet"
+    path = inputs.artifacts.diagnostics_dir / "potential-evidence.csv"
     if not path.exists():
         return [f"- Missing primary evidence artifact: `{path}`"]
-    evidence = pl.read_parquet(path)
+    evidence = pl.read_csv(path)
     if evidence.is_empty():
         return [
             f"- Primary evidence artifact exists but has no rows: `{path}`",
@@ -122,10 +125,10 @@ def _potential_evidence_report_lines(inputs: ReportInputs) -> list[str]:
 
 
 def _potential_observation_report_lines(inputs: ReportInputs) -> list[str]:
-    path = inputs.artifacts.diagnostics_dir / "potential-observation.parquet"
+    path = inputs.artifacts.diagnostics_dir / "potential-observation.csv"
     if not path.exists():
         return [f"- Missing observation artifact: `{path}`"]
-    observations = pl.read_parquet(path)
+    observations = pl.read_csv(path)
     if observations.is_empty():
         return [f"- Observation artifact exists but has no rows: `{path}`"]
     return [
@@ -138,10 +141,10 @@ def _potential_observation_report_lines(inputs: ReportInputs) -> list[str]:
 
 
 def _evidence_gate_lines(inputs: ReportInputs) -> list[str]:
-    evidence_path = inputs.artifacts.diagnostics_dir / "potential-evidence.parquet"
+    evidence_path = inputs.artifacts.diagnostics_dir / "potential-evidence.csv"
     if not evidence_path.exists():
         return ["- Evidence gates could not run because the primary evidence artifact is missing."]
-    evidence = pl.read_parquet(evidence_path)
+    evidence = pl.read_csv(evidence_path)
     if evidence.is_empty():
         return [
             "- Evidence gates produced no rows; inspect coverage and realized-transition artifacts."
@@ -160,14 +163,14 @@ def _evidence_gate_lines(inputs: ReportInputs) -> list[str]:
 
 
 def _feasibility_report_lines(inputs: ReportInputs) -> list[str]:
-    history_path = inputs.artifacts.diagnostics_dir / "history-feasibility.parquet"
-    watchlist_path = inputs.artifacts.diagnostics_dir / "watchlist-feasibility.parquet"
+    history_path = inputs.artifacts.diagnostics_dir / "history-feasibility.csv"
+    watchlist_path = inputs.artifacts.diagnostics_dir / "watchlist-feasibility.csv"
     lines = [
         f"- History feasibility artifact: `{history_path}`",
         f"- Watchlist feasibility artifact: `{watchlist_path}`",
     ]
     if history_path.exists():
-        history = pl.read_parquet(history_path)
+        history = pl.read_csv(history_path)
         if history.is_empty():
             lines.append("- History feasibility: no coverage rows were produced.")
         else:
@@ -177,7 +180,7 @@ def _feasibility_report_lines(inputs: ReportInputs) -> list[str]:
     else:
         lines.append("- History feasibility artifact is missing.")
     if watchlist_path.exists():
-        watchlist = pl.read_parquet(watchlist_path)
+        watchlist = pl.read_csv(watchlist_path)
         if watchlist.is_empty():
             lines.append("- Watchlist feasibility: no decision rows were produced.")
         else:

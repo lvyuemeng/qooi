@@ -93,7 +93,7 @@ Next work:
 Command:
 
 ```bash
-uv run python scripts/accumulation_scan.py --config configs/potential.toml
+uv run python scripts/potential_scan.py --config configs/potential.toml
 ```
 
 Initial offline smoke result:
