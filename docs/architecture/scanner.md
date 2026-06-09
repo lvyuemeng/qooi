@@ -84,14 +84,14 @@ frozen train E_train(O,h) + holdout O_t
   -> optional later strategy hypothesis
 ```
 
-The current code already implements the operational IO, state classification, observation/outcome/evidence artifacts, diagnostics, and report display. The candidate join, ranking contract, and train/holdout evidence backtest are the next implementation surfaces.
+The current code implements operational IO, state classification, observation/outcome/evidence artifacts, candidate joins, ranked candidate diagnostics, chronological evidence replay artifacts, diagnostics, and report display.
 
 The workflow separates expensive IO from Polars-native computation:
 
 - exchange/source modules fetch and cache data;
 - classifier/history/evidence modules compute frame transforms;
 - diagnostics/report modules write or summarize artifacts;
-- candidate/backtest modules, when added, should consume artifacts or frames instead of refetching data;
+- candidate/backtest modules consume artifacts or frames instead of refetching data;
 - no scanner computation should depend on executor/backtest side effects.
 
 ## Probability framework
@@ -183,9 +183,9 @@ O  -> evidence.potential_observation_frame(...)
 Y  -> history.realized_transition_frame(...), source_events.source_outcomes_frame(...), evidence.potential_outcome_frame(...)
 E  -> evidence.potential_evidence_frame(...), evidence.add_potential_parent_gain(...)
 E* -> evidence.select_potential_evidence_level(...)
-C  -> planned candidate_evidence_frame(...)
-R  -> planned rank_candidate_evidence(...)
-B  -> planned backtest_candidate_evidence(...)
+C  -> candidates.candidate_evidence_frame(...)
+R  -> candidates.rank_candidate_evidence(...)
+B  -> candidates.backtest_candidate_evidence(...)
 ```
 
 Rules for transforming architecture to graph docs:

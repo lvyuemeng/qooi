@@ -48,6 +48,8 @@ class DiagnosticFrames:
     potential_evidence: pl.DataFrame
     candidate_evidence: pl.DataFrame
     candidate_rank: pl.DataFrame
+    evidence_backtest: pl.DataFrame
+    evidence_baselines: pl.DataFrame
     source_timeliness: pl.DataFrame
     source_state_predictability: pl.DataFrame
 
@@ -107,6 +109,12 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         potential_evidence,
     )
     candidate_rank = candidate_eval.rank_candidate_evidence(candidate_evidence)
+    evidence_backtest, evidence_baselines = _evidence_replay_frames(
+        potential_observations,
+        source_outcomes,
+        realized_transitions,
+        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+    )
     return DiagnosticFrames(
         coverage=coverage_frame(inputs.bars.coverage),
         history_feasibility=history_feasibility,
@@ -132,12 +140,15 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         potential_evidence=potential_evidence,
         candidate_evidence=candidate_evidence,
         candidate_rank=candidate_rank,
+        evidence_backtest=evidence_backtest,
+        evidence_baselines=evidence_baselines,
         source_timeliness=source_eval.source_timeliness_frame(source_outcomes),
         source_state_predictability=source_eval.source_state_predictability_frame(
             source_outcomes,
             return_threshold_pct=inputs.config.transition_return_threshold_pct,
         ),
     )
+
 
 
 def _build_state_frames(inputs: ReportInputs) -> StateFrames:
@@ -178,6 +189,8 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
     frames.potential_evidence.write_parquet(diagnostics / "potential-evidence.parquet")
     frames.candidate_evidence.write_parquet(diagnostics / "candidate-evidence.parquet")
     frames.candidate_rank.write_parquet(diagnostics / "candidate-rank.parquet")
+    frames.evidence_backtest.write_parquet(diagnostics / "evidence-backtest.parquet")
+    frames.evidence_baselines.write_parquet(diagnostics / "evidence-baselines.parquet")
     frames.source_timeliness.write_parquet(diagnostics / "source-timeliness.parquet")
     frames.source_state_predictability.write_parquet(
         diagnostics / "source-state-predictability.parquet"
@@ -191,6 +204,55 @@ def _write_state_frames(frames: StateFrames, states: Path | str) -> None:
     frames.trades.write_parquet(states / "trade-flow-state.parquet")
     frames.derivatives.write_parquet(states / "derivatives-state.parquet")
     frames.context.write_parquet(states / "context-state.parquet")
+
+
+def _evidence_replay_frames(
+    observations: pl.DataFrame,
+    source_outcomes: pl.DataFrame,
+    realized_transitions: pl.DataFrame,
+    *,
+    return_threshold_pct: float,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Build private chronological evidence replay artifacts without expanding public API."""
+    empty_backtest = pl.DataFrame(schema=candidate_eval.EVIDENCE_BACKTEST_SCHEMA)
+    empty_baseline = pl.DataFrame(schema=candidate_eval.EVIDENCE_BASELINE_SCHEMA)
+    if observations.is_empty() or realized_transitions.is_empty():
+        return empty_backtest, empty_baseline
+    times = observations.get_column("decision_bar_close_ms").drop_nulls().unique().sort().to_list()
+    if len(times) < 2:
+        return empty_backtest, empty_baseline
+    split_index = min(max(1, int(len(times) * 0.7)), len(times) - 1)
+    split_time = times[split_index - 1]
+    train_observations = observations.filter(pl.col("decision_bar_close_ms") <= split_time)
+    holdout_observations = observations.filter(pl.col("decision_bar_close_ms") > split_time)
+    if train_observations.is_empty() or holdout_observations.is_empty():
+        return empty_backtest, empty_baseline
+    train_source_outcomes = (
+        source_outcomes.filter(pl.col("aligned_bar_close_ms") <= split_time)
+        if "aligned_bar_close_ms" in source_outcomes.columns
+        else source_outcomes
+    )
+    train_realized_transitions = realized_transitions.filter(pl.col("bar_close_ms") <= split_time)
+    train_evidence = evidence_eval.potential_evidence_frame(
+        train_observations,
+        train_source_outcomes,
+        train_realized_transitions,
+        return_threshold_pct=return_threshold_pct,
+    )
+    if train_evidence.is_empty():
+        return empty_backtest, empty_baseline
+    holdout_outcomes = evidence_eval.potential_outcome_frame(
+        holdout_observations,
+        source_outcomes,
+        realized_transitions,
+        return_threshold_pct=return_threshold_pct,
+    )
+    backtest = candidate_eval.backtest_candidate_evidence(
+        train_evidence,
+        holdout_observations,
+        holdout_outcomes,
+    )
+    return backtest, candidate_eval.compare_candidate_baselines(backtest)
 
 
 def coverage_frame(coverage: tuple[HistoryCoverage, ...]) -> pl.DataFrame:

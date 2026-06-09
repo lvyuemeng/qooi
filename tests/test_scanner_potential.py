@@ -377,6 +377,8 @@ transition_context_limit = 0
     assert (diagnostics / "potential-evidence.parquet").exists()
     assert (diagnostics / "candidate-evidence.parquet").exists()
     assert (diagnostics / "candidate-rank.parquet").exists()
+    assert (diagnostics / "evidence-backtest.parquet").exists()
+    assert (diagnostics / "evidence-baselines.parquet").exists()
     assert (states / "kline-state.parquet").exists()
     assert not (report_path.parent / "research-board.csv").exists()
 

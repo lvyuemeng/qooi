@@ -17,7 +17,7 @@ The scanner module surface stays thin and research-only. `workflow.py` orchestra
 | `E*` selected evidence | `evidence.select_potential_evidence_level()` | `potential-evidence.parquet` | implemented |
 | `C` candidate evidence row | `candidates.candidate_evidence_frame(...)` | `candidate-evidence.parquet` | implemented |
 | `R` ranked candidate | `candidates.rank_candidate_evidence(...)` | `candidate-rank.parquet` | implemented |
-| `B` evidence backtest row | `candidates.backtest_candidate_evidence(...)`, `candidates.compare_candidate_baselines(...)` | pure API only; not workflow-wired | implemented API, artifact wiring planned |
+| `B` evidence backtest row | `candidates.backtest_candidate_evidence(...)`, `candidates.compare_candidate_baselines(...)` | `evidence-backtest.parquet`, `evidence-baselines.parquet` | implemented |
 
 Anything not listed here is not a supported scanner research surface unless another graph section explicitly names it.
 
@@ -61,7 +61,7 @@ qooi.scanner.workflow
 
 ## Computable object module graph
 
-The scanner graph transforms the architecture object contracts into concrete module calls. Implemented edges are listed as direct calls. Backtest replay is implemented as a pure API but is not yet wired into workflow artifacts because train/holdout splitting is still outside the workflow config.
+The scanner graph transforms the architecture object contracts into concrete module calls. Implemented edges are listed as direct calls. Backtest replay uses a private chronological workflow split, writes holdout artifacts, and keeps the public API limited to the pure candidate functions below.
 
 ```text
 U: Universe
@@ -126,10 +126,11 @@ B: Evidence backtest row
   frozen train E_train*(O,h) + holdout O_t + holdout Y_{t,h}
     -> candidates.backtest_candidate_evidence(...) -> pure evidence-backtest frame
     -> candidates.compare_candidate_baselines(...) -> pure evidence-baseline frame
-  Artifact wiring remains planned until workflow owns a train/holdout split.
+  -> diagnostics/evidence-backtest.parquet
+  -> diagnostics/evidence-baselines.parquet
 ```
 
-Current implemented graph reaches `C` and `R` diagnostics and exposes a pure `B` replay API. Workflow still renders `E` beside legacy latest-bundle watchlist decisions; report rendering for `R` and artifact wiring for `B` should wait until candidate artifacts are inspected.
+Current implemented graph reaches `C`, `R`, and `B` diagnostics. Workflow still renders `E` beside legacy latest-bundle watchlist decisions; richer report rendering for `R`/`B` should wait until candidate artifacts are inspected.
 
 Primary evidence diagnostics are real columns, including:
 
@@ -276,16 +277,11 @@ diagnostics.write_diagnostics(inputs)
   -> potential-evidence.parquet       # E and E*
   -> candidate-evidence.parquet       # C_t = latest O_t + selected E*
   -> candidate-rank.parquet           # R_t with explicit score components
+  -> evidence-backtest.parquet        # B_t chronological holdout replay rows
+  -> evidence-baselines.parquet       # B_t grouped holdout summaries
 
 report.render_report(inputs)
   -> report text only; no writes
-```
-
-Planned artifacts:
-
-```text
-evidence-backtest.parquet             # B_t holdout rows with realized outcomes
-evidence-baselines.parquet            # holdout candidate behavior summaries
 ```
 
 ## Forbidden scanner edges
