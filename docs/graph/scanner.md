@@ -12,12 +12,12 @@ The scanner module surface stays thin and research-only. `workflow.py` orchestra
 | `K` kline state | `workflow.load_bars()`, `KlineClassifier.classify()`, `decisions.compute_kline_states()`, `history.kline_path_history_frame()` | `kline-path-history.csv` | implemented |
 | `S` source state/event | `sources.context.load_source_context()`, `decisions.compute_source_states()`, `source_events.source_events_frame()` | `source-events.csv` | implemented |
 | `O` observation vector | `evidence.potential_observation_frame()` | `potential-observation.csv` | implemented |
-| `Y` future outcome | `history.realized_transition_frame()`, `source_events.source_outcomes_frame()`, `evidence.potential_outcome_frame()` | `realized-transition.csv`, `source-outcomes.csv` | implemented |
-| `E` evidence | `evidence.potential_evidence_frame()`, `evidence.add_potential_parent_gain()` | evidence frame | implemented |
-| `E*` selected evidence | `evidence.select_potential_evidence_level()` | `potential-evidence.csv` | implemented |
+| `O` observation vector | `evidence.potential_observation_frame()` | `potential-observation-summary.csv` | implemented |
+| `E` evidence | `evidence.potential_evidence_frame()`, `evidence.add_potential_parent_gain()` | `potential-evidence-summary.csv`, `potential-evidence-selected.csv` | implemented |
+| `E*` selected evidence | `evidence.select_potential_evidence_level()` | selected evidence rows | implemented |
 | `C` candidate evidence row | `candidates.candidate_evidence_frame(...)` | `candidate-evidence.csv` | implemented |
 | `R` ranked candidate | `candidates.rank_candidate_evidence(...)` | `candidate-rank.csv` | implemented |
-| `B` evidence backtest row | `candidates.backtest_candidate_evidence(...)`, `candidates.compare_candidate_baselines(...)` | `evidence-backtest.csv`, `evidence-baselines.csv` | implemented |
+| `B` evidence backtest row | `candidates.backtest_candidate_evidence(...)`, `candidates.compare_candidate_baselines(...)` | `evidence-backtest.csv`, `evidence-baselines.csv` | removed — high missing rate |
 
 Anything not listed here is not a supported scanner research surface unless another graph section explicitly names it.
 
@@ -92,7 +92,7 @@ O: Observation vector
          source_events,
          decision_timeframe=config.bar,
          max_source_staleness_hours=config.max_source_staleness_hours,
-       ) -> potential-observation.csv
+       ) -> potential-observation-summary.csv
 
 Y: Future outcome
   kline-path-history.csv
@@ -112,7 +112,8 @@ E: Parent-gated evidence
        )
        -> evidence.add_potential_parent_gain(...)
        -> evidence.select_potential_evidence_level(...)
-       -> potential-evidence.csv
+       -> potential-evidence-summary.csv
+       -> potential-evidence-selected.csv
 
 C: Candidate evidence row
   latest O_t + selected E*(O,h) + coverage/freshness diagnostics
@@ -121,16 +122,9 @@ C: Candidate evidence row
 R: Ranked candidate
   candidate-evidence.csv
     -> candidates.rank_candidate_evidence(...) -> candidate-rank.csv
-
-B: Evidence backtest row
-  frozen train E_train*(O,h) + holdout O_t + holdout Y_{t,h}
-    -> candidates.backtest_candidate_evidence(...) -> pure evidence-backtest frame
-    -> candidates.compare_candidate_baselines(...) -> pure evidence-baseline frame
-  -> diagnostics/evidence-backtest.csv
-  -> diagnostics/evidence-baselines.csv
 ```
 
-Current implemented graph reaches `C`, `R`, and `B` diagnostics. Workflow renders evidence beside method-grouped latest-bundle review rows; richer report rendering for `R`/`B` should wait until candidate artifacts are inspected.
+Current implemented graph reaches `C` and `R` diagnostics. `B` was removed; the replay path had a >97% holdout-match failure rate and added no research signal.
 
 Primary evidence diagnostics are real columns, including:
 
@@ -209,9 +203,6 @@ qooi.scanner.transitions
 qooi.scanner.candidates
   candidate_evidence_frame()
   rank_candidate_evidence()
-  backtest_candidate_evidence()
-  compare_candidate_baselines()
-
 ```
 
 ```text
@@ -229,10 +220,6 @@ qooi.scanner.evidence
   potential_outcome_frame()
   add_potential_parent_gain()
   select_potential_evidence_level()
-  pct_change_expr()
-  outcome_bucket_expr()
-  entropy_expr()
-  entropy_term()
 ```
 
 ```text
@@ -248,6 +235,10 @@ qooi.scanner.source_events
   source_outcomes_frame()
   source_timeliness_frame()
   source_state_predictability_frame()
+```
+
+```text
+qooi.scanner (package)
   pct_change_expr()
   outcome_bucket_expr()
   entropy_expr()
@@ -270,18 +261,15 @@ workflow.run(...)
   -> PotentialArtifacts.states_dir
 
 diagnostics.write_diagnostics(inputs)
-  -> CSV diagnostic files
-  -> potential-observation.csv    # O_t
-  -> source-outcomes.csv          # source-side Y_{t,h}
-  -> realized-transition.csv      # kline semantic Y_{t,h}
-  -> potential-evidence.csv       # E and E*
-  -> candidate-evidence.csv       # C_t = latest O_t + selected E*
-  -> candidate-rank.csv           # R_t with explicit score components
-  -> evidence-backtest.csv        # B_t chronological holdout replay rows
-  -> evidence-baselines.csv       # B_t grouped holdout summaries
+  -> compact CSV diagnostic files (summaries, not full raw frames)
+  -> potential-observation-summary.csv    # O_t grouped summary
+  -> potential-evidence-summary.csv       # E grouped by level/status
+  -> potential-evidence-selected.csv      # E* selected rows only
+  -> candidate-evidence.csv               # C_t = latest O_t + selected E*
+  -> candidate-rank.csv                   # R_t with explicit score components
 
 report.render_report(inputs)
-  -> report text only; no writes
+  -> report text with quantitative review rows; no writes
 ```
 
 ## Forbidden scanner edges
