@@ -120,29 +120,6 @@ CANDIDATE_RANK_SCHEMA = CANDIDATE_EVIDENCE_SCHEMA | {
     "rank_reason": pl.String,
 }
 
-EVIDENCE_BACKTEST_SCHEMA = CANDIDATE_RANK_SCHEMA | {
-    "realized_outcome_bucket": pl.String,
-    "realized_forward_return_pct": pl.Float64,
-    "realized_forward_min_return_pct": pl.Float64,
-    "realized_forward_max_return_pct": pl.Float64,
-    "realized_path_range_pct": pl.Float64,
-    "directional_hit": pl.Boolean,
-    "tail_hit": pl.Boolean,
-    "adverse_tail_hit": pl.Boolean,
-}
-
-EVIDENCE_BASELINE_SCHEMA = {
-    "matched_evidence_level": pl.String,
-    "statistical_direction": pl.String,
-    "candidate_status": pl.String,
-    "candidate_count": pl.UInt32,
-    "directional_hit_rate": pl.Float64,
-    "tail_hit_rate": pl.Float64,
-    "adverse_tail_rate": pl.Float64,
-    "avg_realized_forward_return_pct": pl.Float64,
-}
-
-
 def candidate_evidence_frame(
     observations: pl.DataFrame,
     evidence: pl.DataFrame,
@@ -172,7 +149,6 @@ def candidate_evidence_frame(
     if not unmatched.is_empty():
         matched = pl.concat([matched, unmatched], how="vertical_relaxed")
     return _select_schema(matched, CANDIDATE_EVIDENCE_SCHEMA)
-
 
 def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
     """Add transparent review-ordering components to candidate rows."""
@@ -223,89 +199,6 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
     )
     return _select_schema(ranked.sort("rank_score", descending=True), CANDIDATE_RANK_SCHEMA)
 
-
-def backtest_candidate_evidence(
-    train_evidence: pl.DataFrame,
-    holdout_observations: pl.DataFrame,
-    holdout_outcomes: pl.DataFrame,
-) -> pl.DataFrame:
-    """Replay frozen train evidence against holdout observations and outcomes."""
-    if holdout_observations.is_empty():
-        return pl.DataFrame(schema=EVIDENCE_BACKTEST_SCHEMA)
-    ranked = rank_candidate_evidence(
-        candidate_evidence_frame(holdout_observations, train_evidence, latest_only=False)
-    )
-    if ranked.is_empty():
-        return pl.DataFrame(schema=EVIDENCE_BACKTEST_SCHEMA)
-    if holdout_outcomes.is_empty():
-        return _select_schema(_with_empty_outcome_columns(ranked), EVIDENCE_BACKTEST_SCHEMA)
-    outcomes = holdout_outcomes.sort(
-        pl.col("source_state").is_not_null(), descending=True
-    ).unique(
-        subset=("symbol", "decision_timeframe", "decision_bar_close_ms", "outcome_horizon"),
-        keep="first",
-    ).select(
-        "symbol",
-        "decision_timeframe",
-        "decision_bar_close_ms",
-        "outcome_horizon",
-        pl.col("outcome_bucket").alias("realized_outcome_bucket"),
-        pl.col("forward_return_pct").alias("realized_forward_return_pct"),
-        pl.col("forward_min_return_pct").alias("realized_forward_min_return_pct"),
-        pl.col("forward_max_return_pct").alias("realized_forward_max_return_pct"),
-        pl.col("path_range_pct").alias("realized_path_range_pct"),
-        "tail_up",
-        "tail_down",
-    )
-    joined = ranked.join(
-        outcomes,
-        on=("symbol", "decision_timeframe", "decision_bar_close_ms", "outcome_horizon"),
-        how="left",
-    ).with_columns(
-        (
-            _direction_hit_expr("up")
-            | _direction_hit_expr("down")
-            | _direction_hit_expr("flat")
-        ).alias("directional_hit"),
-        (
-            ((pl.col("statistical_direction") == "up") & pl.col("tail_up").fill_null(False))
-            | ((pl.col("statistical_direction") == "down") & pl.col("tail_down").fill_null(False))
-        ).alias("tail_hit"),
-        (
-            ((pl.col("statistical_direction") == "up") & pl.col("tail_down").fill_null(False))
-            | ((pl.col("statistical_direction") == "down") & pl.col("tail_up").fill_null(False))
-        ).alias("adverse_tail_hit"),
-    ).drop("tail_up", "tail_down")
-    return _select_schema(joined, EVIDENCE_BACKTEST_SCHEMA)
-
-
-def compare_candidate_baselines(backtest_rows: pl.DataFrame) -> pl.DataFrame:
-    """Summarize holdout evidence replay rows by candidate/evidence bucket."""
-    if backtest_rows.is_empty():
-        return pl.DataFrame(schema=EVIDENCE_BASELINE_SCHEMA)
-    return _select_schema(
-        backtest_rows.group_by(
-            "matched_evidence_level", "statistical_direction", "candidate_status"
-        ).agg(
-            pl.len().cast(pl.UInt32).alias("candidate_count"),
-            pl.col("directional_hit").mean().alias("directional_hit_rate"),
-            pl.col("tail_hit").mean().alias("tail_hit_rate"),
-            pl.col("adverse_tail_hit").mean().alias("adverse_tail_rate"),
-            pl.col("realized_forward_return_pct").mean().alias(
-                "avg_realized_forward_return_pct"
-            ),
-        ),
-        EVIDENCE_BASELINE_SCHEMA,
-    )
-
-
-def _direction_hit_expr(direction: str) -> pl.Expr:
-    return (pl.col("statistical_direction") == direction) & (
-        pl.col("realized_outcome_bucket") == direction
-    )
-
-
-
 def _candidate_observations(observations: pl.DataFrame, *, latest_only: bool) -> pl.DataFrame:
     base = observations
     if latest_only:
@@ -315,12 +208,10 @@ def _candidate_observations(observations: pl.DataFrame, *, latest_only: bool) ->
         base = base.join(latest, on=("symbol", "decision_bar_close_ms"), how="inner")
     return base
 
-
 def _selected_evidence(evidence: pl.DataFrame) -> pl.DataFrame:
     if evidence.is_empty() or "selected_evidence_level" not in evidence.columns:
         return pl.DataFrame()
     return evidence.filter(pl.col("selected_evidence_level"))
-
 
 def _matches_for_level(
     observations: pl.DataFrame,
@@ -343,7 +234,6 @@ def _matches_for_level(
         pl.lit(level).alias("matched_evidence_level"),
         pl.lit("matched_evidence").alias("candidate_status"),
     )
-
 
 def _best_candidate_per_observation(matched: pl.DataFrame) -> pl.DataFrame:
     if matched.is_empty():
@@ -379,7 +269,6 @@ def _best_candidate_per_observation(matched: pl.DataFrame) -> pl.DataFrame:
         keep="first",
     ).drop("_level_rank", "_information_rank", "_transition_rank")
 
-
 def _unmatched_observations(observations: pl.DataFrame, matched: pl.DataFrame) -> pl.DataFrame:
     if observations.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
@@ -393,7 +282,6 @@ def _unmatched_observations(observations: pl.DataFrame, matched: pl.DataFrame) -
     )
     return _unmatched_candidates(missing, "no_matching_evidence")
 
-
 def _unmatched_candidates(observations: pl.DataFrame, status: str) -> pl.DataFrame:
     if observations.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
@@ -405,19 +293,6 @@ def _unmatched_candidates(observations: pl.DataFrame, status: str) -> pl.DataFra
         pl.lit("insufficient_evidence").alias("research_suggestion"),
     )
     return _select_schema(frame, CANDIDATE_EVIDENCE_SCHEMA)
-
-
-def _with_empty_outcome_columns(frame: pl.DataFrame) -> pl.DataFrame:
-    return frame.with_columns(
-        pl.lit(None, dtype=pl.String).alias("realized_outcome_bucket"),
-        pl.lit(None, dtype=pl.Float64).alias("realized_forward_return_pct"),
-        pl.lit(None, dtype=pl.Float64).alias("realized_forward_min_return_pct"),
-        pl.lit(None, dtype=pl.Float64).alias("realized_forward_max_return_pct"),
-        pl.lit(None, dtype=pl.Float64).alias("realized_path_range_pct"),
-        pl.lit(None, dtype=pl.Boolean).alias("directional_hit"),
-        pl.lit(None, dtype=pl.Boolean).alias("tail_hit"),
-        pl.lit(None, dtype=pl.Boolean).alias("adverse_tail_hit"),
-    )
 
 
 def _select_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:

@@ -44,7 +44,6 @@ def _bullish_pattern() -> scan.TransitionPattern:
         suggestion="rapid_trend_watch",
     )
 
-
 def _state_row(
     family: str,
     direction: str,
@@ -66,7 +65,6 @@ def _state_row(
         reason,
         False,
     )
-
 
 def _decision_bundle(
     *,
@@ -100,7 +98,6 @@ def _decision_bundle(
         transition_patterns=patterns,
     )
 
-
 def _observation(symbol: str, index: int, *, changed: bool) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -133,7 +130,6 @@ def _observation(symbol: str, index: int, *, changed: bool) -> dict[str, object]
         "risk_context": "range_tight|vol_normal",
     }
 
-
 def _source_outcome(symbol: str, index: int, *, changed: bool) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -157,7 +153,6 @@ def _source_outcome(symbol: str, index: int, *, changed: bool) -> dict[str, obje
         "outcome_reason": "available",
     }
 
-
 def _realized_transition(symbol: str, index: int, *, changed: bool) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -179,7 +174,6 @@ def _realized_transition(symbol: str, index: int, *, changed: bool) -> dict[str,
         "time_to_core_change_bars": 1 if changed else None,
         "transition_count": 1 if changed else 0,
     }
-
 
 def _selected_evidence_for_test() -> pl.DataFrame:
     return pl.DataFrame(
@@ -220,8 +214,6 @@ def _selected_evidence_for_test() -> pl.DataFrame:
         }
     )
 
-
-
 def test_candidate_evidence_matches_latest_observation_to_selected_evidence() -> None:
     observations = pl.DataFrame(
         [
@@ -243,7 +235,6 @@ def test_candidate_evidence_matches_latest_observation_to_selected_evidence() ->
     assert row["research_suggestion"] == "rapid_trend_watch"
     assert row["candidate_status"] == "matched_evidence"
 
-
 def test_candidate_evidence_combines_matched_and_unmatched_latest_observations() -> None:
     observations = pl.DataFrame(
         [
@@ -262,7 +253,6 @@ def test_candidate_evidence_combines_matched_and_unmatched_latest_observations()
     assert rows["BTC-USDT-SWAP"]["candidate_status"] == "matched_evidence"
     assert rows["ETH-USDT-SWAP"]["candidate_status"] == "no_matching_evidence"
 
-
 def test_candidate_evidence_emits_unmatched_latest_observation_caveat() -> None:
     observations = pl.DataFrame(
         [_observation("BTC-USDT-SWAP", 1, changed=True)],
@@ -277,8 +267,6 @@ def test_candidate_evidence_emits_unmatched_latest_observation_caveat() -> None:
     assert row["symbol"] == "BTC-USDT-SWAP"
     assert row["candidate_status"] == "no_selected_evidence"
     assert row["matched_evidence_level"] is None
-
-
 
 def test_rank_candidate_evidence_exposes_components_without_trading_signal() -> None:
     observations = pl.DataFrame(
@@ -301,63 +289,6 @@ def test_rank_candidate_evidence_exposes_components_without_trading_signal() -> 
     assert "rank_penalty_component" in ranked.columns
     assert "entry_signal" not in ranked.columns
     assert "position_signal" not in ranked.columns
-
-
-
-def test_backtest_candidate_evidence_uses_frozen_train_evidence_on_holdout_rows() -> None:
-    holdout_observations = pl.DataFrame(
-        [_observation("BTC-USDT-SWAP", 1, changed=True)],
-        schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA,
-    )
-    holdout_outcomes = potential_evidence.potential_outcome_frame(
-        holdout_observations,
-        pl.DataFrame(
-            [_source_outcome("BTC-USDT-SWAP", 1, changed=True)],
-            schema=source_events.SOURCE_OUTCOME_SCHEMA,
-        ),
-        pl.DataFrame(
-            [_realized_transition("BTC-USDT-SWAP", 1, changed=True)],
-            schema=potential_history.REALIZED_TRANSITION_SCHEMA,
-        ),
-        return_threshold_pct=2.0,
-    )
-
-    rows = potential_candidates.backtest_candidate_evidence(
-        _selected_evidence_for_test(),
-        holdout_observations,
-        holdout_outcomes,
-    )
-
-    assert rows.height == 1
-    row = rows.row(0, named=True)
-    assert row["candidate_status"] == "matched_evidence"
-    assert row["realized_outcome_bucket"] == "up"
-    assert row["directional_hit"] is True
-
-
-
-def test_compare_candidate_baselines_summarizes_holdout_rows() -> None:
-    rows = pl.DataFrame(
-        {
-            "matched_evidence_level": ["market_decision", "market_decision"],
-            "statistical_direction": ["up", "up"],
-            "candidate_status": ["matched_evidence", "matched_evidence"],
-            "directional_hit": [True, False],
-            "tail_hit": [True, False],
-            "adverse_tail_hit": [False, True],
-            "realized_forward_return_pct": [3.0, -2.0],
-        }
-    )
-
-    summary = potential_candidates.compare_candidate_baselines(rows)
-
-    assert summary.height == 1
-    row = summary.row(0, named=True)
-    assert row["candidate_count"] == 2
-    assert row["directional_hit_rate"] == 0.5
-    assert row["tail_hit_rate"] == 0.5
-
-
 
 def test_potential_run_writes_report_and_diagnostics_without_trading_artifacts(
     tmp_path: Path, monkeypatch
@@ -423,8 +354,6 @@ transition_context_limit = 0
     assert not (diagnostics / "evidence-backtest.csv").exists()
     assert not (diagnostics / "evidence-baselines.csv").exists()
     assert not (report_path.parent / "research-board.csv").exists()
-
-
 
 def test_potential_config_rejects_legacy_aliases(
     tmp_path: Path,
@@ -536,7 +465,6 @@ def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypat
     assert potential.target_min_bars(10, "15m") == 960
     assert potential.target_min_bars(10, "4H") == 120
 
-
 def test_source_events_are_known_at_close_and_exclude_availability_states() -> None:
     bars = pl.DataFrame(
         {
@@ -584,7 +512,6 @@ def test_source_events_are_known_at_close_and_exclude_availability_states() -> N
     assert "crowded_longs_price_down" in states
     assert not any(str(state).endswith("_observed") for state in states)
     assert "message_observed" not in states
-
 
 def test_source_outcomes_predictability_and_timeliness_report_missing_futures() -> None:
     events = pl.DataFrame(
@@ -660,7 +587,6 @@ def test_source_outcomes_predictability_and_timeliness_report_missing_futures() 
         "timeliness_status"
     ] == "usable_history"
 
-
 def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe() -> None:
     symbols = [f"SYM{i:03d}" for i in range(120)]
     observations = [
@@ -715,7 +641,6 @@ def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe(
     assert configured_timeframe.height == 1
     assert configured_timeframe.row(0, named=True)["terminal_direction"] == "bullish"
 
-
 def test_evidence_gate_excludes_market_background_and_requires_stable_information() -> None:
     symbols = [f"SYM{i:03d}" for i in range(40)]
     observations = [
@@ -740,7 +665,6 @@ def test_evidence_gate_excludes_market_background_and_requires_stable_informatio
     assert not (selected.get_column("evidence_level") == "market_background").any(), (
         "market_background must never be a selected evidence level"
     )
-
 
 def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> None:
     rows = pl.DataFrame(
@@ -785,7 +709,6 @@ def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> N
     assert "forward_return" not in classified.columns
     assert missing.select("missing_flag").item() is True
     assert missing.select("direction_hint").item() == "missing"
-
 
 @pytest.mark.parametrize(
     ("bundle", "config", "expected_group", "expected_direction", "expected_reason"),
@@ -851,7 +774,6 @@ def test_scan_review_decisions_require_transition_quality_and_source_confirmatio
     assert decision.group == expected_group
     assert decision.direction == expected_direction
     assert decision.block_reason == expected_reason
-
 
 def test_transition_matching_and_ngram_work_frame_do_not_use_unrelated_patterns() -> None:
     stages = ["accumulation", "markup", "trend_continuation"] * 8
