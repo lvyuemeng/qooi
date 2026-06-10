@@ -392,15 +392,22 @@ transition_context_limit = 0
     assert "## Method-Grouped Review Rows" in report
     assert (diagnostics / "coverage.csv").exists()
     assert (diagnostics / "source-freshness.csv").exists()
-    assert (diagnostics / "potential-observation.csv").exists()
-    assert (diagnostics / "potential-evidence.csv").exists()
+    assert (diagnostics / "potential-observation-summary.csv").exists()
+    assert (diagnostics / "potential-evidence-summary.csv").exists()
+    assert (diagnostics / "potential-evidence-selected.csv").exists()
     assert (diagnostics / "candidate-evidence.csv").exists()
     assert (diagnostics / "candidate-rank.csv").exists()
-    assert (diagnostics / "evidence-backtest.csv").exists()
     assert (diagnostics / "evidence-baselines.csv").exists()
     assert (states / "kline-state.csv").exists()
+    assert not (diagnostics / "potential-observation.csv").exists()
+    assert not (diagnostics / "potential-evidence.csv").exists()
+    assert not (diagnostics / "evidence-backtest.csv").exists()
+    assert not (diagnostics / "kline-path-history.csv").exists()
+    assert not (diagnostics / "realized-transition.csv").exists()
     (diagnostics / "candidate-rank.parquet").write_text("stale", encoding="utf-8")
     (states / "kline-state.parquet").write_text("stale", encoding="utf-8")
+    (diagnostics / "potential-observation.csv").write_text("stale", encoding="utf-8")
+    (diagnostics / "evidence-backtest.csv").write_text("stale", encoding="utf-8")
 
     second_written = run(config)
 
@@ -409,6 +416,8 @@ transition_context_limit = 0
     assert (states / "kline-state.csv").exists()
     assert not (diagnostics / "candidate-rank.parquet").exists()
     assert not (states / "kline-state.parquet").exists()
+    assert not (diagnostics / "potential-observation.csv").exists()
+    assert not (diagnostics / "evidence-backtest.csv").exists()
     assert not (report_path.parent / "research-board.csv").exists()
 
 

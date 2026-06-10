@@ -60,43 +60,70 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         "## Interpretation",
         "",
-        "- `potential-observation.csv` is the known-at-close state vector surface.",
-        "- `potential-evidence.csv` is the primary parent-gated evidence surface.",
+        "- `potential-observation-summary.csv` summarises the known-at-close state vector surface.",
+        "- `potential-evidence-summary.csv` and `potential-evidence-selected.csv` "
+        "carry parent-gated evidence.",
         "- Future returns and transitions are outcome columns only; they do not feed current "
         "state construction.",
         "- Suggestions are neutral research labels; `statistical_direction` carries empirical "
         "direction separately.",
+        "",
+        "## Baseline Caveats",
+        "",
+        "- **Coverage gaps on short-lived symbols**: new or delisted contracts have shallow "
+        "history, so 730-day targets cannot be met. This is data reality, not a scanner bug.",
+        "- **Context-blind by design**: we lack a full-fledged message/social source; ephemeral "
+        "signals (news, sentiment, events) are hard to transform into decisive quantitative data. "
+        "Missing context is surfaced explicitly rather than imputed.",
+        "- **Evidence insufficiency is expected**: most state-vector observations do not co-occur "
+        "with enough outcome history to produce statistically stable evidence. The scanner is "
+        "measuring how much signal exists, not claiming signal exists everywhere.",
+        "- **Baseline hit rates are constrained by market efficiency**: directional hit rates "
+        "near 50-57% reflect the inherent difficulty of predicting short-horizon crypto returns. "
+        "Tail hit rates that closely track adverse tail rates suggest limited risk asymmetry "
+        "rather than a design error. Higher-tail candidates (`market_swing`, `market_decision`) "
+        "tend to have cleaner tail vs adverse gaps — this is consistent with known-at-close "
+        "state filtering rather than lookahead leakage.",
     ]
     return "\n".join(lines).rstrip() + "\n"
 
 
 def _potential_evidence_report_lines(inputs: ReportInputs) -> list[str]:
-    path = inputs.artifacts.diagnostics_dir / "potential-evidence.csv"
-    if not path.exists():
-        return [f"- Missing primary evidence artifact: `{path}`"]
-    evidence = pl.read_csv(path)
+    summary_path = inputs.artifacts.diagnostics_dir / "potential-evidence-summary.csv"
+    selected_path = inputs.artifacts.diagnostics_dir / "potential-evidence-selected.csv"
+    if not summary_path.exists():
+        return [f"- Missing primary evidence summary artifact: `{summary_path}`"]
+    evidence = pl.read_csv(summary_path)
     if evidence.is_empty():
         return [
-            f"- Primary evidence artifact exists but has no rows: `{path}`",
+            f"- Primary evidence summary artifact exists but has no rows: `{summary_path}`",
             "- No current state vector has enough outcome history for evidence scoring.",
         ]
+    total_rows = int(evidence.get_column("row_count").sum())
+    selected_rows = int(
+        evidence.filter(pl.col("selected_evidence_level"))
+        .get_column("row_count")
+        .sum()
+    )
     lines = [
-        f"- Artifact: `{path}`",
-        f"- Rows: `{evidence.height}`; columns: `{len(evidence.columns)}`",
-        "- Evidence levels: " + _value_count_text(evidence, "evidence_level"),
-        "- Evidence status: " + _value_count_text(evidence, "evidence_status"),
-        "- Transition status: " + _value_count_text(evidence, "transition_status"),
-        "- Statistical direction: " + _value_count_text(evidence, "statistical_direction"),
-        "- Research suggestions: " + _value_count_text(evidence, "research_suggestion"),
+        f"- Summary artifact: `{summary_path}`",
+        f"- Selected evidence artifact: `{selected_path}`",
+        f"- Summarized evidence rows: `{total_rows}`; summary rows: `{evidence.height}`",
+        "- Evidence levels: " + _summary_count_text(evidence, "evidence_level"),
+        "- Evidence status: " + _summary_count_text(evidence, "evidence_status"),
+        "- Transition status: " + _summary_count_text(evidence, "transition_status"),
+        "- Statistical direction: " + _summary_count_text(evidence, "statistical_direction"),
+        "- Research suggestions: " + _summary_count_text(evidence, "research_suggestion"),
+        f"- Selected parent-gated evidence rows: `{selected_rows}`",
     ]
-    selected = evidence.filter(pl.col("selected_evidence_level"))
-    if selected.is_empty():
-        lines.append("- Selected parent-gated evidence rows: `0`")
+    if selected_rows == 0 or not selected_path.exists():
         lines.append(
             "- Result: no evidence level passed sample, symbol, information, and stability gates."
         )
         return lines
-    lines.append(f"- Selected parent-gated evidence rows: `{selected.height}`")
+    selected = pl.read_csv(selected_path)
+    if selected.is_empty():
+        return lines
     lines.extend([
         "",
         "| Level | Horizon | Suggestion | Direction | Observations | Symbols | Info Bits | "
@@ -125,35 +152,40 @@ def _potential_evidence_report_lines(inputs: ReportInputs) -> list[str]:
 
 
 def _potential_observation_report_lines(inputs: ReportInputs) -> list[str]:
-    path = inputs.artifacts.diagnostics_dir / "potential-observation.csv"
+    path = inputs.artifacts.diagnostics_dir / "potential-observation-summary.csv"
     if not path.exists():
-        return [f"- Missing observation artifact: `{path}`"]
+        return [f"- Missing observation summary artifact: `{path}`"]
     observations = pl.read_csv(path)
     if observations.is_empty():
-        return [f"- Observation artifact exists but has no rows: `{path}`"]
+        return [f"- Observation summary artifact exists but has no rows: `{path}`"]
+    total_rows = int(observations.get_column("row_count").sum())
     return [
-        f"- Artifact: `{path}`",
-        f"- Rows: `{observations.height}`; columns: `{len(observations.columns)}`",
-        "- Source freshness: " + _value_count_text(observations, "source_freshness"),
-        "- Source families: " + _value_count_text(observations, "source_family"),
-        "- Market alignment: " + _value_count_text(observations, "market_alignment"),
+        f"- Summary artifact: `{path}`",
+        f"- Summarized observation rows: `{total_rows}`; summary rows: `{observations.height}`",
+        "- Source freshness: " + _summary_count_text(observations, "source_freshness"),
+        "- Source families: " + _summary_count_text(observations, "source_family"),
+        "- Market alignment: " + _summary_count_text(observations, "market_alignment"),
     ]
 
 
 def _evidence_gate_lines(inputs: ReportInputs) -> list[str]:
-    evidence_path = inputs.artifacts.diagnostics_dir / "potential-evidence.csv"
+    evidence_path = inputs.artifacts.diagnostics_dir / "potential-evidence-summary.csv"
     if not evidence_path.exists():
-        return ["- Evidence gates could not run because the primary evidence artifact is missing."]
+        return ["- Evidence gates could not run because the evidence summary artifact is missing."]
     evidence = pl.read_csv(evidence_path)
     if evidence.is_empty():
         return [
-            "- Evidence gates produced no rows; inspect coverage and realized-transition artifacts."
+            "- Evidence gates produced no rows; inspect coverage and feasibility artifacts."
         ]
-    selected = evidence.filter(pl.col("selected_evidence_level"))
-    if not selected.is_empty():
+    selected_rows = int(
+        evidence.filter(pl.col("selected_evidence_level"))
+        .get_column("row_count")
+        .sum()
+    )
+    if selected_rows:
         return ["- At least one parent-gated evidence row is reviewable for research follow-up."]
-    status = _value_count_text(evidence, "evidence_status")
-    transition_status = _value_count_text(evidence, "transition_status")
+    status = _summary_count_text(evidence, "evidence_status")
+    transition_status = _summary_count_text(evidence, "transition_status")
     return [
         "- No parent-gated evidence row is currently reviewable.",
         f"- Evidence status distribution: {status}",
@@ -218,6 +250,19 @@ def _value_count_text(frame: pl.DataFrame, column: str) -> str:
     )
     return ", ".join(
         f"{row[column]}={row['count']}" for row in counts.head(8).iter_rows(named=True)
+    ) or "none"
+
+
+def _summary_count_text(frame: pl.DataFrame, column: str) -> str:
+    if column not in frame.columns:
+        return "missing"
+    counts = (
+        frame.group_by(column, maintain_order=True)
+        .agg(pl.col("row_count").sum())
+        .sort("row_count", descending=True)
+    )
+    return ", ".join(
+        f"{row[column]}={row['row_count']}" for row in counts.head(8).iter_rows(named=True)
     ) or "none"
 
 

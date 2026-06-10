@@ -70,8 +70,21 @@ def write_diagnostics(inputs: ReportInputs) -> None:
     states = inputs.artifacts.states_dir
     diagnostics.mkdir(parents=True, exist_ok=True)
     states.mkdir(parents=True, exist_ok=True)
+    retired_artifacts = {
+        "evidence-backtest.csv",
+        "kline-path-history.csv",
+        "potential-evidence.csv",
+        "potential-observation.csv",
+        "realized-transition.csv",
+        "source-events.csv",
+        "source-outcomes.csv",
+    }
     for directory in (diagnostics, states):
         for stale in directory.glob("*.parquet"):
+            stale.unlink()
+    for stale_name in retired_artifacts:
+        stale = diagnostics / stale_name
+        if stale.exists():
             stale.unlink()
 
     _write_diagnostic_frames(diagnostic_frames, diagnostics)
@@ -237,15 +250,103 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         "rejection-diagnostics": frames.rejection,
         "watchlist-feasibility": frames.watchlist_feasibility,
         "source-state-health": frames.source_state_health,
-        "source-events": frames.source_events,
-        "kline-path-history": frames.kline_history,
-        "source-outcomes": frames.source_outcomes,
-        "realized-transition": frames.realized_transitions,
-        "potential-observation": frames.potential_observations,
-        "potential-evidence": frames.potential_evidence,
+        "potential-observation-summary": (
+            frames.potential_observations.group_by(
+                ["source_family", "source_freshness", "market_alignment"],
+                maintain_order=True,
+            )
+            .len(name="row_count")
+            if not frames.potential_observations.is_empty()
+            else pl.DataFrame(
+                schema={
+                    "source_family": pl.String,
+                    "source_freshness": pl.String,
+                    "market_alignment": pl.String,
+                    "row_count": pl.UInt32,
+                }
+            )
+        ),
+        "potential-evidence-summary": (
+            frames.potential_evidence.group_by(
+                [
+                    "evidence_level",
+                    "evidence_status",
+                    "transition_status",
+                    "statistical_direction",
+                    "research_suggestion",
+                    "selected_evidence_level",
+                ],
+                maintain_order=True,
+            )
+            .agg(
+                pl.len().alias("row_count"),
+                pl.col("conditioned_observations").median().alias(
+                    "median_conditioned_observations"
+                ),
+                pl.col("symbol_count").median().alias("median_symbol_count"),
+                pl.col("information_gain_bits").max().alias("max_information_gain_bits"),
+                pl.col("transition_information_gain_bits")
+                .max()
+                .alias("max_transition_information_gain_bits"),
+            )
+            if not frames.potential_evidence.is_empty()
+            else pl.DataFrame(
+                schema={
+                    "evidence_level": pl.String,
+                    "evidence_status": pl.String,
+                    "transition_status": pl.String,
+                    "statistical_direction": pl.String,
+                    "research_suggestion": pl.String,
+                    "selected_evidence_level": pl.Boolean,
+                    "row_count": pl.UInt32,
+                    "median_conditioned_observations": pl.Float64,
+                    "median_symbol_count": pl.Float64,
+                    "max_information_gain_bits": pl.Float64,
+                    "max_transition_information_gain_bits": pl.Float64,
+                }
+            )
+        ),
+        "potential-evidence-selected": (
+            frames.potential_evidence.filter(pl.col("selected_evidence_level"))
+            if not frames.potential_evidence.is_empty()
+            else frames.potential_evidence
+        ),
         "candidate-evidence": frames.candidate_evidence,
         "candidate-rank": frames.candidate_rank,
-        "evidence-backtest": frames.evidence_backtest,
+        "evidence-backtest-summary": (
+            frames.evidence_backtest.group_by(
+                [
+                    "matched_evidence_level",
+                    "statistical_direction",
+                    "candidate_status",
+                    "source_freshness",
+                ],
+                maintain_order=True,
+            )
+            .agg(
+                pl.len().alias("candidate_count"),
+                pl.col("directional_hit").mean().alias("directional_hit_rate"),
+                pl.col("tail_hit").mean().alias("tail_hit_rate"),
+                pl.col("adverse_tail_hit").mean().alias("adverse_tail_rate"),
+                pl.col("realized_forward_return_pct")
+                .mean()
+                .alias("avg_realized_forward_return_pct"),
+            )
+            if not frames.evidence_backtest.is_empty()
+            else pl.DataFrame(
+                schema={
+                    "matched_evidence_level": pl.String,
+                    "statistical_direction": pl.String,
+                    "candidate_status": pl.String,
+                    "source_freshness": pl.String,
+                    "candidate_count": pl.UInt32,
+                    "directional_hit_rate": pl.Float64,
+                    "tail_hit_rate": pl.Float64,
+                    "adverse_tail_rate": pl.Float64,
+                    "avg_realized_forward_return_pct": pl.Float64,
+                }
+            )
+        ),
         "evidence-baselines": frames.evidence_baselines,
         "source-timeliness": frames.source_timeliness,
         "source-state-predictability": frames.source_state_predictability,
