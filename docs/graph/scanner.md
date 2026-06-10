@@ -188,8 +188,6 @@ qooi.scanner.decisions
   compute_kline_states()
   compute_source_states()
   scan_review_decisions()
-  confidence()
-  value_counts()
 ```
 
 ```text

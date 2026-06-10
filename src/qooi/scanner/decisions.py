@@ -9,6 +9,7 @@ temporal evidence, not separate model scales or trading signals.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import cast
 
 import polars as pl
@@ -345,148 +346,89 @@ def scan_review_decisions(
         families = (bundle.kline, bundle.books, bundle.trades, bundle.derivatives, bundle.context)
         missing = tuple(row.family for row in families if row.direction in {"missing", "blocked"})
         contradictions = _contradictions(bundle)
-        if bundle.kline.direction in {"missing", "blocked"}:
-            decisions.append(
-                _decision(
-                    bundle,
-                    "watch" if bundle.kline.direction == "missing" else "blocked",
-                    "undecided" if bundle.kline.direction == "missing" else "blocked",
-                    "low" if bundle.kline.direction == "missing" else "blocked",
-                    missing,
-                    contradictions,
-                    bundle.kline.missing_reason or "kline_state_missing",
-                )
-            )
-        elif transition_state.direction in {"missing", "neutral"}:
-            decisions.append(
-                _decision(
-                    bundle,
-                    "watch",
-                    "undecided",
-                    "low",
-                    missing,
-                    contradictions,
-                    "transition_path_missing_or_neutral",
-                )
-            )
-        elif bundle.transition.direction in {"bullish", "bearish"} and not transition_supported:
-            decisions.append(
-                _decision(
-                    bundle,
-                    "watch",
-                    bundle.transition.direction,
-                    "low",
-                    missing,
-                    contradictions,
-                    "transition_quality_below_threshold",
-                )
-            )
-        elif transition_supported and not consensus_supported:
-            decisions.append(
-                _decision(
-                    bundle,
-                    "watch",
-                    bundle.transition.direction,
-                    "low",
-                    missing,
-                    contradictions,
-                    "transition_consensus_missing_or_contradicted",
-                )
-            )
-        elif len(contradictions) >= 2:
-            decisions.append(
-                _decision(
-                    bundle,
-                    "blocked",
-                    "blocked",
-                    "blocked",
-                    missing,
-                    contradictions,
-                    "contradictory_source_evidence",
-                )
-            )
-        elif contradictions:
-            decisions.append(
-                _decision(
-                    bundle,
-                    "watch",
-                    transition_state.direction,
-                    "low",
-                    missing,
-                    contradictions,
-                    "contradictory_source_evidence",
-                )
-            )
-        elif config.require_context_for_review and bundle.context.direction == "missing":
-            decisions.append(
-                _decision(
-                    bundle,
-                    "watch",
-                    transition_state.direction,
-                    "low",
-                    missing,
-                    contradictions,
-                    "context_missing",
-                )
-            )
-        else:
-            source_families = (bundle.books, bundle.trades, bundle.derivatives, bundle.context)
-            confirming = [
-                row for row in source_families if row.direction == transition_state.direction
-            ]
-            if (
-                consensus_supported
-                and transition_state.direction in {"bullish", "bearish"}
-                and confirming
-            ):
-                decisions.append(
-                    _decision(
-                        bundle,
-                        transition_state.direction,
-                        transition_state.direction,
-                        confidence(confirming, missing),
-                        missing,
-                        contradictions,
-                        "",
-                    )
-                )
-            elif transition_state.direction in {"bullish", "bearish"}:
-                decisions.append(
-                    _decision(
-                        bundle,
-                        "watch",
-                        transition_state.direction,
-                        "low",
-                        missing,
-                        contradictions,
-                        "needs_source_confirmation",
-                    )
-                )
-            elif len(missing) >= len(families):
-                decisions.append(
-                    _decision(
-                        bundle,
-                        "blocked",
-                        "blocked",
-                        "blocked",
-                        missing,
-                        contradictions,
-                        "all_non_kline_sources_missing",
-                    )
-                )
-            else:
-                decisions.append(
-                    _decision(
-                        bundle,
-                        "watch",
-                        "undecided",
-                        "low",
-                        missing,
-                        contradictions,
-                        "needs_directional_confirmation",
-                    )
-                )
+
+        kline_blocked = bundle.kline.direction in {"missing", "blocked"}
+        transition_missing = transition_state.direction in {"missing", "neutral"}
+        unsupported_dir = (
+            bundle.transition.direction in {"bullish", "bearish"} and not transition_supported
+        )
+        no_consensus = transition_supported and not consensus_supported
+        many_conflicts = len(contradictions) >= 2
+        context_required = (
+            config.require_context_for_review
+            and bundle.context.direction == "missing"
+        )
+
+        source_families = (bundle.books, bundle.trades, bundle.derivatives, bundle.context)
+        confirming = [
+            row for row in source_families if row.direction == transition_state.direction
+        ]
+        fully_supported = (
+            consensus_supported
+            and transition_state.direction in {"bullish", "bearish"}
+            and confirming
+        )
+
+        rules = (
+            (kline_blocked, _D(
+                group="watch" if bundle.kline.direction == "missing" else "blocked",
+                direction="undecided" if bundle.kline.direction == "missing" else "blocked",
+                confidence="low" if bundle.kline.direction == "missing" else "blocked",
+                reason=bundle.kline.missing_reason or "kline_state_missing",
+            )),
+            (transition_missing, _D(reason="transition_path_missing_or_neutral")),
+            (unsupported_dir, _D(
+                direction=bundle.transition.direction,
+                reason="transition_quality_below_threshold",
+            )),
+            (no_consensus, _D(
+                direction=bundle.transition.direction,
+                reason="transition_consensus_missing_or_contradicted",
+            )),
+            (many_conflicts, _D(
+                group="blocked", direction="blocked", confidence="blocked",
+                reason="contradictory_source_evidence",
+            )),
+            (bool(contradictions), _D(
+                direction=transition_state.direction,
+                reason="contradictory_source_evidence",
+            )),
+            (context_required, _D(
+                direction=transition_state.direction, reason="context_missing",
+            )),
+            (fully_supported, _D(
+                group=transition_state.direction, direction=transition_state.direction,
+                confidence=confidence(confirming, missing), reason="",
+            )),
+            (len(missing) >= len(families), _D(
+                group="blocked", direction="blocked", confidence="blocked",
+                reason="all_non_kline_sources_missing",
+            )),
+            (transition_state.direction in {"bullish", "bearish"}, _D(
+                direction=transition_state.direction,
+                reason="needs_source_confirmation",
+            )),
+            (True, _D(
+                direction="undecided",
+                reason="needs_directional_confirmation",
+            )),
+        )
+        for condition, d in rules:
+            if condition:
+                decisions.append(_decision(
+                    bundle, d.group, d.direction, d.confidence,
+                    missing, contradictions, d.reason,
+                ))
+                break
     return decisions
+
+
+@dataclass(frozen=True)
+class _D:
+    group: str = "watch"
+    direction: str = "undecided"
+    confidence: str = "low"
+    reason: str = ""
 
 
 def confidence(confirming: list[SourceStateRow], missing: tuple[str, ...]) -> str:
