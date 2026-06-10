@@ -47,14 +47,13 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         *_feasibility_report_lines(inputs),
         "",
-        "## Scan Review Rows",
-        "",
-        "Deterministic review decisions grouped by the scan decision pipeline. "
-        "No trading authorization.",
+        "## Review Rows",
         "",
         *_candidate_lines(inputs.decisions, "watch", limit=15),
         "",
         "## Certainty-Tiered Candidates",
+        "",
+        "Tiers use quantitative thresholds on evidence, coverage, and rank.",
         "",
         *_certainty_tier_lines(inputs),
         "",
@@ -248,74 +247,52 @@ def _feasibility_report_lines(inputs: ReportInputs) -> list[str]:
 
 def _certainty_tier_lines(inputs: ReportInputs) -> list[str]:
     rank_path = inputs.artifacts.diagnostics_dir / "candidate-rank.csv"
-    feasibility_path = inputs.artifacts.diagnostics_dir / "watchlist-feasibility.csv"
     if not rank_path.exists():
         return ["- Candidate rank artifact is missing; tiers cannot be computed."]
     candidates = pl.read_csv(rank_path)
     if candidates.is_empty():
         return ["- Candidate rank is empty; no candidates to tier."]
     candidates = candidates.sort("rank_score", descending=True)
-    if feasibility_path.exists():
-        feasibility = pl.read_csv(feasibility_path).select(
-            [
-                "symbol",
-                "min_history_coverage_pct",
-                "source_family_rows",
-                "fresh_source_families",
-                "missing_source_families",
-                "watchlist_feasibility",
-            ]
+    decile_cut = candidates.get_column("rank_score").quantile(0.5)
+    scored = candidates.with_columns(
+        pl.when(
+            (pl.col("transition_information_gain_bits") >= 0.3)
+            & (pl.col("symbol_count") >= 15)
+            & (pl.col("rank_score") >= decile_cut)
         )
-        candidates = candidates.join(feasibility, on="symbol", how="left")
-    else:
-        candidates = candidates.with_columns(
-            pl.lit(None, dtype=pl.Float64).alias("min_history_coverage_pct"),
-            pl.lit(None, dtype=pl.Int64).alias("source_family_rows"),
-            pl.lit(None, dtype=pl.Int64).alias("fresh_source_families"),
-            pl.lit(None, dtype=pl.Int64).alias("missing_source_families"),
-            pl.lit("unknown").alias("watchlist_feasibility"),
+        .then(pl.lit("1"))
+        .when(
+            (pl.col("transition_information_gain_bits") >= 0.1)
+            & (pl.col("rank_score") > 0)
         )
+        .then(pl.lit("2"))
+        .when(pl.col("rank_score") > 0)
+        .then(pl.lit("3"))
+        .otherwise(pl.lit("—"))
+        .alias("tier"),
+    ).sort(["tier", "rank_score"], descending=[False, True])
     lines = [
-        "- **T1**: rank ≥ 15, coverage ≥ 60%, ≥ 5 fresh sources, context not blind",
-        "- **T2**: rank ≥ 10, coverage ≥ 30%, ≥ 3 fresh sources",
-        "- **T3**: evidence-matched but below thresholds",
-        "- **T4**: no matched evidence (observation-only)",
+        "**Tier 1**: transition_info_gain ≥ 0.3, ≥ 15 symbols, rank ≥ median",
+        "**Tier 2**: transition_info_gain ≥ 0.1, rank > 0",
+        "**Tier 3**: rank > 0, below info thresholds",
+        "**Tier —**: no matched evidence",
         "",
-        "| Symbol | Tier | Rank | Evidence Level | Obs | Info Bits | "
-        "Cov% | Sources | Context |",
+        "| Symbol | T | InfoGain | Obs | Sym | Tail↑ | Tail↓ | Dir | Rank |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for row in candidates.head(40).iter_rows(named=True):
+    for row in scored.head(30).iter_rows(named=True):
         symbol = row["symbol"]
-        matched = row["candidate_status"] == "matched_evidence"
-        rank = round(float(row.get("rank_score", 0) or 0), 2)
-        level = (row.get("matched_evidence_level") or "none") if matched else "—"
-        obs = int(row.get("conditioned_observations", 0) or 0)
-        info = round(float(row.get("information_gain_bits", 0) or 0), 3)
-        cov = round(float(row.get("min_history_coverage_pct", 0) or 0), 0)
-        src_total = int(row.get("source_family_rows", 0) or 0)
-        src_fresh = int(row.get("fresh_source_families", 0) or 0)
-        src_missing = int(row.get("missing_source_families", 0) or 0)
-        feasible = row.get("watchlist_feasibility", "unknown")
-        context_blind = feasible == "source_blind_review"
-
-        if matched and rank >= 15 and cov >= 60 and src_fresh >= 5 and not context_blind:
-            tier = "T1"
-        elif matched and rank >= 10 and cov >= 30 and src_fresh >= 3:
-            tier = "T2"
-        elif matched:
-            tier = "T3"
-        else:
-            tier = "T4"
-
-        src_str = f"{src_fresh}/{src_total}" if src_total else "—"
-        ctx_ok = "ok" if src_missing == 0 else f"−{src_missing}"
-        context_str = "blind" if context_blind else ctx_ok
-
+        tier = row["tier"]
+        info = _format_float(row["transition_information_gain_bits"])
+        obs = str(row["conditioned_observations"])
+        sym = str(row["symbol_count"])
+        tail_up = _format_float(row["tail_up_rate"])
+        tail_down = _format_float(row["tail_down_rate"])
+        direction = str(row.get("statistical_direction", "—"))
+        rank = _format_float(row["rank_score"])
         lines.append(
-            f"| `{symbol}` | {tier} | {rank:.1f} | {level} | "
-            f"{obs} | {info:.3f} | "
-            f"{cov:.0f}% | {src_str} | {context_str} |"
+            f"| `{symbol}` | {tier} | {info} | {obs} | {sym} | "
+            f"{tail_up} | {tail_down} | {direction} | {rank} |"
         )
     return lines
 
