@@ -49,13 +49,9 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         "## Review Rows",
         "",
-        *_candidate_lines(inputs.decisions, "watch", limit=15),
+        "Tiers: 1=Info≥0.3,Sym≥15  |  2=Info≥0.1  |  3=ranked  |  —=no evidence",
         "",
-        "## Certainty-Tiered Candidates",
-        "",
-        "Tiers use quantitative thresholds on evidence, coverage, and rank.",
-        "",
-        *_certainty_tier_lines(inputs),
+        *_merged_review_lines(inputs, limit=15),
         "",
         "## Evidence Gate Summary",
         "",
@@ -245,58 +241,61 @@ def _feasibility_report_lines(inputs: ReportInputs) -> list[str]:
     return lines
 
 
-def _certainty_tier_lines(inputs: ReportInputs) -> list[str]:
+def _merged_review_lines(inputs: ReportInputs, *, limit: int) -> list[str]:
+    decisions = [d for d in inputs.decisions if d.group == "watch"]
+    if not decisions:
+        return ["- No watchlist candidates."]
     rank_path = inputs.artifacts.diagnostics_dir / "candidate-rank.csv"
-    if not rank_path.exists():
-        return ["- Candidate rank artifact is missing; tiers cannot be computed."]
-    candidates = pl.read_csv(rank_path)
-    if candidates.is_empty():
-        return ["- Candidate rank is empty; no candidates to tier."]
-    candidates = candidates.sort("rank_score", descending=True)
-    decile_cut = candidates.get_column("rank_score").quantile(0.5)
-    scored = candidates.with_columns(
-        pl.when(
-            (pl.col("transition_information_gain_bits") >= 0.3)
-            & (pl.col("symbol_count") >= 15)
-            & (pl.col("rank_score") >= decile_cut)
+    rank_data: dict[str, dict[str, object]] = {}
+    if rank_path.exists():
+        rank_df = pl.read_csv(rank_path).sort("rank_score", descending=True)
+        median = rank_df.get_column("rank_score").quantile(0.5)
+        scored = rank_df.with_columns(
+            pl.when(
+                (pl.col("transition_information_gain_bits") >= 0.3)
+                & (pl.col("symbol_count") >= 15)
+                & (pl.col("rank_score") >= median)
+            ).then(pl.lit("1"))
+            .when(pl.col("transition_information_gain_bits") >= 0.1)
+            .then(pl.lit("2"))
+            .when(pl.col("rank_score") > 0)
+            .then(pl.lit("3"))
+            .otherwise(pl.lit("—"))
+            .alias("tier"),
         )
-        .then(pl.lit("1"))
-        .when(
-            (pl.col("transition_information_gain_bits") >= 0.1)
-            & (pl.col("rank_score") > 0)
-        )
-        .then(pl.lit("2"))
-        .when(pl.col("rank_score") > 0)
-        .then(pl.lit("3"))
-        .otherwise(pl.lit("—"))
-        .alias("tier"),
-    ).sort(["tier", "rank_score"], descending=[False, True])
+        for row in scored.iter_rows(named=True):
+            rank_data[row["symbol"]] = row
     lines = [
-        "**Tier 1**: Info ≥ 0.3 bits, ≥ 15 symbols, rank ≥ median  "
-        "**Tier 2**: Info ≥ 0.1 bits, rank > 0  "
-        "**Tier 3**: rank > 0 but below info thresholds  "
-        "**Tier —**: no matched evidence",
-        "",
-        "| Symbol | T | Info | Obs | Sym | Tail↑ | Tail↓ | Dir | Rank |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-        "| | | bits | N | #coins | rate | rate | up/down/flat | score |",
-        "| | | (higher = less uncertain) | (sample size) | (diversity) | "
-        "(extreme up) | (extreme down) | (net bias) | (composite) |",
+        "| T | Symbol | Info | Rank | Direction | Confidence | "
+        "Suggestion | Missing | Caveat |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for row in scored.head(30).iter_rows(named=True):
-        symbol = row["symbol"]
-        tier = row["tier"]
-        info = _format_float(row["transition_information_gain_bits"])
-        obs = str(row["conditioned_observations"])
-        sym = str(row["symbol_count"])
-        tail_up = _format_float(row["tail_up_rate"])
-        tail_down = _format_float(row["tail_down_rate"])
-        direction = str(row.get("statistical_direction", "—"))
-        rank = _format_float(row["rank_score"])
-        lines.append(
-            f"| `{symbol}` | {tier} | {info} | {obs} | {sym} | "
-            f"{tail_up} | {tail_down} | {direction} | {rank} |"
+    for decision in decisions[:limit]:
+        symbol = decision.symbol
+        rd = rank_data.get(symbol, {})
+        tier = rd.get("tier", "—") if rd else "—"
+        info = _format_float(rd.get("transition_information_gain_bits"))
+        rank = _format_float(rd.get("rank_score"))
+        suggestion = "research review only"
+        evidence_parts = (
+            decision.transition_evidence.split("; ")
+            if decision.transition_evidence
+            else ()
         )
+        for part in evidence_parts:
+            if part.startswith("suggestion="):
+                suggestion = part.removeprefix("suggestion=")
+        if decision.block_reason:
+            suggestion = f"watch: {decision.block_reason}"
+        lines.append(
+            f"| {tier} | `{symbol}` | {info} | {rank} | "
+            f"{decision.direction} | {decision.confidence} | "
+            f"{suggestion} | "
+            f"{_joined_or_none(decision.missing_evidence)} | "
+            f"{decision.review_caveat} |"
+        )
+    if len(decisions) > limit:
+        lines.append(f"- {len(decisions) - limit} additional watch rows omitted.")
     return lines
 
 
