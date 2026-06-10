@@ -40,16 +40,10 @@ class DiagnosticFrames:
     rejection: pl.DataFrame
     watchlist_feasibility: pl.DataFrame
     source_state_health: pl.DataFrame
-    source_events: pl.DataFrame
-    kline_history: pl.DataFrame
-    source_outcomes: pl.DataFrame
-    realized_transitions: pl.DataFrame
     potential_observations: pl.DataFrame
     potential_evidence: pl.DataFrame
     candidate_evidence: pl.DataFrame
     candidate_rank: pl.DataFrame
-    evidence_backtest: pl.DataFrame
-    evidence_baselines: pl.DataFrame
     source_timeliness: pl.DataFrame
     source_state_predictability: pl.DataFrame
 
@@ -72,6 +66,8 @@ def write_diagnostics(inputs: ReportInputs) -> None:
     states.mkdir(parents=True, exist_ok=True)
     retired_artifacts = {
         "evidence-backtest.csv",
+        "evidence-backtest-summary.csv",
+        "evidence-baselines.csv",
         "kline-path-history.csv",
         "potential-evidence.csv",
         "potential-observation.csv",
@@ -126,63 +122,11 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
     )
     candidate_rank = candidate_eval.rank_candidate_evidence(candidate_evidence)
 
-    empty_backtest = pl.DataFrame(schema=candidate_eval.EVIDENCE_BACKTEST_SCHEMA)
-    empty_baseline = pl.DataFrame(schema=candidate_eval.EVIDENCE_BASELINE_SCHEMA)
-    if potential_observations.is_empty() or realized_transitions.is_empty():
-        evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
-    else:
-        times = (
-            potential_observations.get_column("decision_bar_close_ms")
-            .drop_nulls()
-            .unique()
-            .sort()
-            .to_list()
-        )
-        if len(times) < 2:
-            evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
-        else:
-            split_index = min(max(1, int(len(times) * 0.7)), len(times) - 1)
-            split_time = times[split_index - 1]
-            train_observations = potential_observations.filter(
-                pl.col("decision_bar_close_ms") <= split_time
-            )
-            holdout_observations = potential_observations.filter(
-                pl.col("decision_bar_close_ms") > split_time
-            )
-            if train_observations.is_empty() or holdout_observations.is_empty():
-                evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
-            else:
-                train_source_outcomes = (
-                    source_outcomes.filter(pl.col("aligned_bar_close_ms") <= split_time)
-                    if "aligned_bar_close_ms" in source_outcomes.columns
-                    else source_outcomes
-                )
-                train_realized_transitions = realized_transitions.filter(
-                    pl.col("bar_close_ms") <= split_time
-                )
-                train_evidence = evidence_eval.potential_evidence_frame(
-                    train_observations,
-                    train_source_outcomes,
-                    train_realized_transitions,
-                    return_threshold_pct=inputs.config.transition_return_threshold_pct,
-                )
-                if train_evidence.is_empty():
-                    evidence_backtest, evidence_baselines = empty_backtest, empty_baseline
-                else:
-                    holdout_outcomes = evidence_eval.potential_outcome_frame(
-                        holdout_observations,
-                        source_outcomes,
-                        realized_transitions,
-                        return_threshold_pct=inputs.config.transition_return_threshold_pct,
-                    )
-                    evidence_backtest = candidate_eval.backtest_candidate_evidence(
-                        train_evidence,
-                        holdout_observations,
-                        holdout_outcomes,
-                    )
-                    evidence_baselines = candidate_eval.compare_candidate_baselines(
-                        evidence_backtest
-                    )
+    source_timeliness = source_eval.source_timeliness_frame(source_outcomes)
+    source_state_predictability = source_eval.source_state_predictability_frame(
+        source_outcomes,
+        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+    )
     return DiagnosticFrames(
         coverage=coverage_frame(inputs.bars.coverage),
         history_feasibility=history_feasibility,
@@ -200,21 +144,12 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
             source_freshness,
         ),
         source_state_health=_source_state_health_frame(inputs.bundles),
-        source_events=source_events,
-        kline_history=kline_history,
-        source_outcomes=source_outcomes,
-        realized_transitions=realized_transitions,
         potential_observations=potential_observations,
         potential_evidence=potential_evidence,
         candidate_evidence=candidate_evidence,
         candidate_rank=candidate_rank,
-        evidence_backtest=evidence_backtest,
-        evidence_baselines=evidence_baselines,
-        source_timeliness=source_eval.source_timeliness_frame(source_outcomes),
-        source_state_predictability=source_eval.source_state_predictability_frame(
-            source_outcomes,
-            return_threshold_pct=inputs.config.transition_return_threshold_pct,
-        ),
+        source_timeliness=source_timeliness,
+        source_state_predictability=source_state_predictability,
     )
 
 
@@ -313,41 +248,6 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         ),
         "candidate-evidence": frames.candidate_evidence,
         "candidate-rank": frames.candidate_rank,
-        "evidence-backtest-summary": (
-            frames.evidence_backtest.group_by(
-                [
-                    "matched_evidence_level",
-                    "statistical_direction",
-                    "candidate_status",
-                    "source_freshness",
-                ],
-                maintain_order=True,
-            )
-            .agg(
-                pl.len().alias("candidate_count"),
-                pl.col("directional_hit").mean().alias("directional_hit_rate"),
-                pl.col("tail_hit").mean().alias("tail_hit_rate"),
-                pl.col("adverse_tail_hit").mean().alias("adverse_tail_rate"),
-                pl.col("realized_forward_return_pct")
-                .mean()
-                .alias("avg_realized_forward_return_pct"),
-            )
-            if not frames.evidence_backtest.is_empty()
-            else pl.DataFrame(
-                schema={
-                    "matched_evidence_level": pl.String,
-                    "statistical_direction": pl.String,
-                    "candidate_status": pl.String,
-                    "source_freshness": pl.String,
-                    "candidate_count": pl.UInt32,
-                    "directional_hit_rate": pl.Float64,
-                    "tail_hit_rate": pl.Float64,
-                    "adverse_tail_rate": pl.Float64,
-                    "avg_realized_forward_return_pct": pl.Float64,
-                }
-            )
-        ),
-        "evidence-baselines": frames.evidence_baselines,
         "source-timeliness": frames.source_timeliness,
         "source-state-predictability": frames.source_state_predictability,
     }

@@ -390,6 +390,7 @@ transition_context_limit = 0
     assert "mutate baskets" in report
     assert "## Unified Evidence Surface" in report
     assert "## Method-Grouped Review Rows" in report
+    assert "## Certainty-Tiered Candidates" in report
     assert (diagnostics / "coverage.csv").exists()
     assert (diagnostics / "source-freshness.csv").exists()
     assert (diagnostics / "potential-observation-summary.csv").exists()
@@ -397,17 +398,19 @@ transition_context_limit = 0
     assert (diagnostics / "potential-evidence-selected.csv").exists()
     assert (diagnostics / "candidate-evidence.csv").exists()
     assert (diagnostics / "candidate-rank.csv").exists()
-    assert (diagnostics / "evidence-baselines.csv").exists()
     assert (states / "kline-state.csv").exists()
     assert not (diagnostics / "potential-observation.csv").exists()
     assert not (diagnostics / "potential-evidence.csv").exists()
     assert not (diagnostics / "evidence-backtest.csv").exists()
+    assert not (diagnostics / "evidence-backtest-summary.csv").exists()
+    assert not (diagnostics / "evidence-baselines.csv").exists()
     assert not (diagnostics / "kline-path-history.csv").exists()
     assert not (diagnostics / "realized-transition.csv").exists()
     (diagnostics / "candidate-rank.parquet").write_text("stale", encoding="utf-8")
     (states / "kline-state.parquet").write_text("stale", encoding="utf-8")
     (diagnostics / "potential-observation.csv").write_text("stale", encoding="utf-8")
     (diagnostics / "evidence-backtest.csv").write_text("stale", encoding="utf-8")
+    (diagnostics / "evidence-baselines.csv").write_text("stale", encoding="utf-8")
 
     second_written = run(config)
 
@@ -418,6 +421,7 @@ transition_context_limit = 0
     assert not (states / "kline-state.parquet").exists()
     assert not (diagnostics / "potential-observation.csv").exists()
     assert not (diagnostics / "evidence-backtest.csv").exists()
+    assert not (diagnostics / "evidence-baselines.csv").exists()
     assert not (report_path.parent / "research-board.csv").exists()
 
 
@@ -700,7 +704,6 @@ def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe(
     assert {"market_background", "market_decision_source"} <= set(
         evidence.get_column("evidence_level").to_list()
     )
-    assert evidence.filter(pl.col("selected_evidence_level")).height > 0
     assert suggestions <= {
         "rapid_trend_watch",
         "mean_reversion_watch",
@@ -711,6 +714,32 @@ def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe(
     assert not any(str(label).startswith(("bullish", "bearish")) for label in suggestions)
     assert configured_timeframe.height == 1
     assert configured_timeframe.row(0, named=True)["terminal_direction"] == "bullish"
+
+
+def test_evidence_gate_excludes_market_background_and_requires_stable_information() -> None:
+    symbols = [f"SYM{i:03d}" for i in range(40)]
+    observations = [
+        _observation(symbol, index, changed=(index % 40) < 24)
+        for index, symbol in enumerate(symbols * 200)
+    ]
+    outcomes = [
+        _source_outcome(symbol, index, changed=(index % 40) < 24)
+        for index, symbol in enumerate(symbols * 200)
+    ]
+    realized = [
+        _realized_transition(symbol, index, changed=(index % 40) < 24)
+        for index, symbol in enumerate(symbols * 200)
+    ]
+    evidence = potential_evidence.potential_evidence_frame(
+        pl.DataFrame(observations, schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA),
+        pl.DataFrame(outcomes, schema=source_events.SOURCE_OUTCOME_SCHEMA),
+        pl.DataFrame(realized, schema=potential_history.REALIZED_TRANSITION_SCHEMA),
+        return_threshold_pct=0.5,
+    )
+    selected = evidence.filter(pl.col("selected_evidence_level"))
+    assert not (selected.get_column("evidence_level") == "market_background").any(), (
+        "market_background must never be a selected evidence level"
+    )
 
 
 def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> None:

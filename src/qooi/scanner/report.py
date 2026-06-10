@@ -54,6 +54,10 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         *_candidate_lines(inputs.decisions, "watch", limit=15),
         "",
+        "## Certainty-Tiered Candidates",
+        "",
+        *_certainty_tier_lines(inputs),
+        "",
         "## Evidence Gate Summary",
         "",
         *_evidence_gate_lines(inputs),
@@ -239,6 +243,53 @@ def _feasibility_report_lines(inputs: ReportInputs) -> list[str]:
                     )
     else:
         lines.append("- Watchlist feasibility artifact is missing.")
+    return lines
+
+
+def _certainty_tier_lines(inputs: ReportInputs) -> list[str]:
+    rank_path = inputs.artifacts.diagnostics_dir / "candidate-rank.csv"
+    feasibility_path = inputs.artifacts.diagnostics_dir / "watchlist-feasibility.csv"
+    if not rank_path.exists():
+        return ["- Candidate rank artifact is missing; tiers cannot be computed."]
+    candidates = pl.read_csv(rank_path)
+    if candidates.is_empty():
+        return ["- Candidate rank is empty; no candidates to tier."]
+    feasibility = pl.DataFrame()
+    if feasibility_path.exists():
+        feasibility = pl.read_csv(feasibility_path)
+    symbol_feasibility: dict[str, str] = {}
+    if not feasibility.is_empty() and "symbol" in feasibility.columns:
+        for row in feasibility.iter_rows(named=True):
+            symbol_feasibility[row["symbol"]] = row["watchlist_feasibility"]
+    lines = [
+        "Certainty tiers rank candidates by evidence quality, data completeness, and verification.",
+        "",
+        "| Symbol | Tier | Evidence | Suggestion | Freshness | History | Context |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in candidates.head(30).iter_rows(named=True):
+        symbol = row["symbol"]
+        matched = row["candidate_status"] == "matched_evidence"
+        freshness = row.get("source_freshness", "missing")
+        feasible = symbol_feasibility.get(symbol, "unknown")
+        history_ok = feasible in ("reviewable", "reviewable_history")
+        context_ok = feasible not in ("source_blind_review",)
+        if matched and history_ok and context_ok:
+            tier = "T1"
+        elif matched and (history_ok or context_ok):
+            tier = "T2"
+        elif matched:
+            tier = "T2*"
+        else:
+            tier = "T3"
+        lines.append(
+            f"| `{symbol}` | {tier} | "
+            f"{'matched' if matched else 'none'} | "
+            f"{row['research_suggestion']} | "
+            f"{freshness} | "
+            f"{'full' if history_ok else 'limited'} | "
+            f"{'available' if context_ok else 'missing'} |"
+        )
     return lines
 
 

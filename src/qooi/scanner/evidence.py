@@ -852,7 +852,9 @@ def select_potential_evidence_level(evidence: pl.DataFrame) -> pl.DataFrame:
         .otherwise(5)
         .alias("selection_level_rank"),
     )
-    best_status = scored.filter(pl.col("selection_status_rank") > 0).group_by(
+    best_status = scored.filter(
+        (pl.col("selection_status_rank") >= 2) & (pl.col("selection_level_rank") >= 1)
+    ).group_by(
         "outcome_horizon", "statistical_direction"
     ).agg(pl.col("selection_status_rank").max().alias("selection_status_rank"))
     if best_status.is_empty():
