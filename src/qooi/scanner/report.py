@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.scanner.contracts import ReportInputs, ScanDecision
+from qooi.scanner.contracts import ReportInputs
 
 
 def render_report(inputs: ReportInputs) -> str:
@@ -330,95 +330,6 @@ def _format_float(value: object) -> str:
         return f"{float(value):.4f}"
     except (TypeError, ValueError):
         return "n/a"
-
-
-def _candidate_lines(decisions: tuple[ScanDecision, ...], group: str, *, limit: int) -> list[str]:
-    selected = [decision for decision in decisions if decision.group == group]
-    if not selected:
-        return ["- None."]
-    lines = [
-        "| Symbol | Direction | Confidence | Transition Evidence | Outcome Metrics | Suggestion | "
-        "Confirmations | Contradictions | Missing Critical Evidence | Review Caveat | Reason |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
-    ]
-    for decision in selected[:limit]:
-        evidence_parts = (
-            decision.transition_evidence.split("; ") if decision.transition_evidence else ()
-        )
-        outcome_metrics = "; ".join(
-            part
-            for part in evidence_parts
-            if part.startswith(
-                (
-                    "p_up=",
-                    "p_down=",
-                    "p_recent=",
-                    "p_long=",
-                    "p_delta=",
-                    "expected_return=",
-                    "loss_stop=",
-                    "profit_stop=",
-                    "rr=",
-                )
-            )
-        )
-        suggestion = "research review only"
-        for part in evidence_parts:
-            if part.startswith("suggestion="):
-                suggestion = part.removeprefix("suggestion=")
-        if decision.block_reason:
-            suggestion = f"watch: {decision.block_reason}"
-        lines.append(
-            f"| `{decision.symbol}` | {decision.direction} | {decision.confidence} | "
-            f"{_compact_evidence(decision.transition_evidence)} | "
-            f"{outcome_metrics or 'n/a'} | "
-            f"{suggestion} | {_confirmations_text(decision)} | "
-            f"{_joined_or_none(decision.contradictory_evidence)} | "
-            f"{_joined_or_none(decision.missing_evidence)} | "
-            f"{decision.review_caveat} | {decision.block_reason or 'reviewable'} |"
-        )
-    if len(selected) > limit:
-        lines.append(
-            f"- {len(selected) - limit} additional `{group}` rows omitted; "
-            "see diagnostics artifacts."
-        )
-    return lines
-
-
-def _confirmations_text(decision: ScanDecision) -> str:
-    confirmations = []
-    if _evidence_confirms(decision.flow_evidence, decision.direction):
-        confirmations.append("trades")
-    if _evidence_confirms(decision.liquidity_evidence, decision.direction):
-        confirmations.append("books")
-    if _evidence_confirms(decision.derivatives_evidence, decision.direction):
-        confirmations.append("derivatives")
-    if _evidence_confirms(decision.context_evidence, decision.direction):
-        confirmations.append("context")
-    return ", ".join(confirmations) if confirmations else "none"
-
-
-def _evidence_confirms(evidence: str, direction: str) -> bool:
-    if direction not in {"bullish", "bearish"} or "missing" in evidence or "disabled" in evidence:
-        return False
-    terms = (
-        ("buy", "bid", "bull", "constructive")
-        if direction == "bullish"
-        else ("sell", "ask", "bear")
-    )
-    return any(term in evidence.lower() for term in terms)
-
-
-def _compact_evidence(evidence: str) -> str:
-    if not evidence:
-        return "none"
-    parts = evidence.split("; ")
-    selected = [
-        part
-        for part in parts
-        if part.startswith(("timeframe=", "path=", "event=", "p="))
-    ]
-    return "; ".join(selected[:5]) if selected else evidence[:160]
 
 
 def _joined_or_none(values: tuple[str, ...]) -> str:
