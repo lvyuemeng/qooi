@@ -288,13 +288,18 @@ def potential_evidence_frame(
     market = joined.unique(
         subset=["symbol", "decision_bar_close_ms", "outcome_horizon"], keep="first"
     )
+    market_baseline = _outcome_baseline(market)
     levels = [
-        _potential_level_metrics(market, "market_background", ["background_regime"]),
-        _potential_level_metrics(market, "market_swing", ["background_regime", "swing_core"]),
+        _potential_level_metrics(market, "market_background", ["background_regime"],
+                                 baseline=market_baseline),
+        _potential_level_metrics(market, "market_swing",
+                                 ["background_regime", "swing_core"],
+                                 baseline=market_baseline),
         _potential_level_metrics(
             market,
             "market_decision",
             ["background_regime", "swing_core", "decision_core", "decision_transition"],
+            baseline=market_baseline,
         ),
         _potential_level_metrics(
             joined.filter(pl.col("source_state").is_not_null()),
@@ -307,6 +312,7 @@ def potential_evidence_frame(
                 "source_family",
                 "source_state",
             ],
+            baseline=market_baseline,
         ),
         _potential_level_metrics(
             joined.filter(pl.col("source_state").is_not_null()),
@@ -320,6 +326,7 @@ def potential_evidence_frame(
                 "source_state",
                 "risk_context",
             ],
+            baseline=market_baseline,
         ),
     ]
     level_frames = [frame for frame in levels if not frame.is_empty()]
@@ -337,15 +344,18 @@ def potential_evidence_frame(
     recent_market = recent_joined.unique(
         subset=["symbol", "decision_bar_close_ms", "outcome_horizon"], keep="first"
     ) if not recent_joined.is_empty() else pl.DataFrame()
+    recent_baseline = _outcome_baseline(recent_market)
     recent_levels = [
-        _potential_level_metrics(recent_market, "market_background", ["background_regime"]),
-        _potential_level_metrics(
-            recent_market, "market_swing", ["background_regime", "swing_core"]
-        ),
+        _potential_level_metrics(recent_market, "market_background",
+                                 ["background_regime"], baseline=recent_baseline),
+        _potential_level_metrics(recent_market, "market_swing",
+                                 ["background_regime", "swing_core"],
+                                 baseline=recent_baseline),
         _potential_level_metrics(
             recent_market,
             "market_decision",
             ["background_regime", "swing_core", "decision_core", "decision_transition"],
+            baseline=recent_baseline,
         ),
         _potential_level_metrics(
             recent_joined.filter(pl.col("source_state").is_not_null())
@@ -360,6 +370,7 @@ def potential_evidence_frame(
                 "source_family",
                 "source_state",
             ],
+            baseline=recent_baseline,
         ),
         _potential_level_metrics(
             recent_joined.filter(pl.col("source_state").is_not_null())
@@ -375,6 +386,7 @@ def potential_evidence_frame(
                 "source_state",
                 "risk_context",
             ],
+            baseline=recent_baseline,
         ),
     ]
     recent_level_frames = [frame for frame in recent_levels if not frame.is_empty()]
@@ -580,15 +592,10 @@ def _terminal_direction_bucket_expr() -> pl.Expr:
     )
 
 
-def _potential_level_metrics(
-    frame: pl.DataFrame, evidence_level: str, group_columns: list[str]
-) -> pl.DataFrame:
+def _outcome_baseline(frame: pl.DataFrame) -> pl.DataFrame:
     if frame.is_empty():
         return pl.DataFrame()
-    clean = frame.filter(pl.all_horizontal(pl.col(col).is_not_null() for col in group_columns))
-    if clean.is_empty():
-        return pl.DataFrame()
-    baseline = clean.group_by("outcome_horizon").agg(
+    return frame.group_by("outcome_horizon").agg(
         pl.len().cast(pl.UInt32).alias("baseline_observations"),
         (pl.col("outcome_bucket") == "up").mean().alias("baseline_p_up"),
         (pl.col("outcome_bucket") == "down").mean().alias("baseline_p_down"),
@@ -607,6 +614,40 @@ def _potential_level_metrics(
             "baseline_core_change_entropy_bits"
         ),
     )
+
+
+def _potential_level_metrics(
+    frame: pl.DataFrame,
+    evidence_level: str,
+    group_columns: list[str],
+    *,
+    baseline: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    if frame.is_empty():
+        return pl.DataFrame()
+    clean = frame.filter(pl.all_horizontal(pl.col(col).is_not_null() for col in group_columns))
+    if clean.is_empty():
+        return pl.DataFrame()
+    if baseline is None or baseline.is_empty():
+        baseline = clean.group_by("outcome_horizon").agg(
+            pl.len().cast(pl.UInt32).alias("baseline_observations"),
+            (pl.col("outcome_bucket") == "up").mean().alias("baseline_p_up"),
+            (pl.col("outcome_bucket") == "down").mean().alias("baseline_p_down"),
+            (pl.col("outcome_bucket") == "flat").mean().alias("baseline_p_flat"),
+            pl.col("direction_changed").mean().alias("baseline_direction_change_rate"),
+            pl.col("core_context_changed").mean().alias("baseline_core_change_rate"),
+            pl.col("returned_to_origin").mean().alias("baseline_returned_to_origin_rate"),
+        ).with_columns(
+            entropy_expr("baseline_p_up", "baseline_p_down", "baseline_p_flat").alias(
+                "baseline_entropy_bits"
+            ),
+            _binary_entropy_expr("baseline_direction_change_rate").alias(
+                "baseline_direction_change_entropy_bits"
+            ),
+            _binary_entropy_expr("baseline_core_change_rate").alias(
+                "baseline_core_change_entropy_bits"
+            ),
+        )
     conditioned = clean.group_by("outcome_horizon", *group_columns).agg(
         pl.len().cast(pl.UInt32).alias("conditioned_observations"),
         pl.col("symbol").n_unique().cast(pl.UInt32).alias("symbol_count"),
