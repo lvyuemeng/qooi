@@ -9,15 +9,49 @@ The scanner module surface stays thin and research-only. `workflow.py` orchestra
 | Architecture object | Current graph/API surface | Artifact surface | Status |
 |---|---|---|---|
 | `U` universe | `workflow.load_config()`, `workflow.resolve_universe()` | config/discovery result only | implemented |
-| `K` kline state | `workflow.load_bars()`, `KlineClassifier.classify()`, `decisions.compute_kline_states()`, `history.kline_path_history_frame()` | `kline-path-history.csv` | implemented |
-| `S` source state/event | `sources.context.load_source_context()`, `decisions.compute_source_states()`, `source_events.source_events_frame()` | `source-events.csv` | implemented |
-| `O` observation vector | `evidence.potential_observation_frame()` | `potential-observation.csv` | implemented |
+| `K` kline state | `workflow.load_bars()`, `KlineClassifier.classify()`, `decisions.compute_kline_states()`, `history.kline_path_history_frame()` | state frames | implemented |
+| `S` source state/event | `sources.context.load_source_context()`, `decisions.compute_source_states()`, `source_events.source_events_frame()` | source frames | implemented |
 | `O` observation vector | `evidence.potential_observation_frame()` | `potential-observation-summary.csv` | implemented |
-| `E` evidence | `evidence.potential_evidence_frame()`, `evidence.add_potential_parent_gain()` | `potential-evidence-summary.csv`, `potential-evidence-selected.csv` | implemented |
-| `E*` selected evidence | `evidence.select_potential_evidence_level()` | selected evidence rows | implemented |
+| `Y` future outcome | `history.realized_transition_frame()`, `source_events.source_outcomes_frame()`, `evidence.potential_outcome_frame()` | outcome frames | implemented |
+| `E` evidence | `evidence.potential_evidence_frame()`, `evidence.add_potential_parent_gain()` | `potential-evidence-summary.csv` | implemented |
+| `E*` selected evidence | `evidence.select_potential_evidence_level()` | `potential-evidence-selected.csv` | implemented — gate has known bug (market_background still selected via join path) |
 | `C` candidate evidence row | `candidates.candidate_evidence_frame(...)` | `candidate-evidence.csv` | implemented |
 | `R` ranked candidate | `candidates.rank_candidate_evidence(...)` | `candidate-rank.csv` | implemented |
-| `B` evidence backtest row | `candidates.backtest_candidate_evidence(...)`, `candidates.compare_candidate_baselines(...)` | `evidence-backtest.csv`, `evidence-baselines.csv` | removed — high missing rate |
+| `B` evidence backtest row | removed | removed | removed — >97% holdout mismatch rate |
+
+## Architecture: two-lens design
+
+The scanner has two independent evaluation paths that converge in the report:
+
+**Decision lens** — coin-specific, current-state, all source families
+
+```
+workflow.run()
+  → compute_kline_states()         # latest kline state per symbol
+  → compute_transition_insights()  # n-gram patterns from coin's own history
+  → load_source_context()          # books, trades, funding, oi, taker, ratios
+  → compute_source_states()        # per-source direction + contradictions
+  → scan_review_decisions()        # 9-rule table → ScanDecision per symbol
+```
+
+Answers: "What does THIS coin's current state look like across all data sources right now?"
+
+**Evidence lens** — cross-coin, historical, kline-primary state vector
+
+```
+write_diagnostics()
+  → source_events/outcomes         # source forward returns
+  → kline_path_history → realized_transitions  # kline forward paths
+  → potential_observation_frame()  # state vectors at every bar close
+  → potential_evidence_frame()     # group by state → entropy → info gain
+  → select_potential_evidence()    # gate: stable, improving on parent, info > 0
+  → candidate_evidence_frame()     # match latest observations to evidence pool
+  → rank_candidate_evidence()      # composite score: info + tail + stability + quality
+```
+
+Answers: "When this state pattern appeared historically across any coin, what happened next — and how strong is the statistical signal?"
+
+The two lenses use overlapping data (kline + sources) with different methodology. The report presents both in one merged row with provenance labels. Design doc: `docs/architecture/scanner-plan.md`.
 
 Anything not listed here is not a supported scanner research surface unless another graph section explicitly names it.
 
