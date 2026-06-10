@@ -47,10 +47,10 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         *_feasibility_report_lines(inputs),
         "",
-        "## Method-Grouped Review Rows",
+        "## Scan Review Rows",
         "",
-        "These rows are grouped deterministic review methods, not compatibility "
-        "or trading surfaces.",
+        "Deterministic review decisions grouped by the scan decision pipeline. "
+        "No trading authorization.",
         "",
         *_candidate_lines(inputs.decisions, "watch", limit=15),
         "",
@@ -254,41 +254,68 @@ def _certainty_tier_lines(inputs: ReportInputs) -> list[str]:
     candidates = pl.read_csv(rank_path)
     if candidates.is_empty():
         return ["- Candidate rank is empty; no candidates to tier."]
-    feasibility = pl.DataFrame()
+    candidates = candidates.sort("rank_score", descending=True)
     if feasibility_path.exists():
-        feasibility = pl.read_csv(feasibility_path)
-    symbol_feasibility: dict[str, str] = {}
-    if not feasibility.is_empty() and "symbol" in feasibility.columns:
-        for row in feasibility.iter_rows(named=True):
-            symbol_feasibility[row["symbol"]] = row["watchlist_feasibility"]
+        feasibility = pl.read_csv(feasibility_path).select(
+            [
+                "symbol",
+                "min_history_coverage_pct",
+                "source_family_rows",
+                "fresh_source_families",
+                "missing_source_families",
+                "watchlist_feasibility",
+            ]
+        )
+        candidates = candidates.join(feasibility, on="symbol", how="left")
+    else:
+        candidates = candidates.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("min_history_coverage_pct"),
+            pl.lit(None, dtype=pl.Int64).alias("source_family_rows"),
+            pl.lit(None, dtype=pl.Int64).alias("fresh_source_families"),
+            pl.lit(None, dtype=pl.Int64).alias("missing_source_families"),
+            pl.lit("unknown").alias("watchlist_feasibility"),
+        )
     lines = [
-        "Certainty tiers rank candidates by evidence quality, data completeness, and verification.",
+        "- **T1**: rank ≥ 15, coverage ≥ 60%, ≥ 5 fresh sources, context not blind",
+        "- **T2**: rank ≥ 10, coverage ≥ 30%, ≥ 3 fresh sources",
+        "- **T3**: evidence-matched but below thresholds",
+        "- **T4**: no matched evidence (observation-only)",
         "",
-        "| Symbol | Tier | Evidence | Suggestion | Freshness | History | Context |",
-        "|---|---|---|---|---|---|---|",
+        "| Symbol | Tier | Rank | Evidence Level | Obs | Info Bits | "
+        "Cov% | Sources | Context |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for row in candidates.head(30).iter_rows(named=True):
+    for row in candidates.head(40).iter_rows(named=True):
         symbol = row["symbol"]
         matched = row["candidate_status"] == "matched_evidence"
-        freshness = row.get("source_freshness", "missing")
-        feasible = symbol_feasibility.get(symbol, "unknown")
-        history_ok = feasible in ("reviewable", "reviewable_history")
-        context_ok = feasible not in ("source_blind_review",)
-        if matched and history_ok and context_ok:
+        rank = round(float(row.get("rank_score", 0) or 0), 2)
+        level = (row.get("matched_evidence_level") or "none") if matched else "—"
+        obs = int(row.get("conditioned_observations", 0) or 0)
+        info = round(float(row.get("information_gain_bits", 0) or 0), 3)
+        cov = round(float(row.get("min_history_coverage_pct", 0) or 0), 0)
+        src_total = int(row.get("source_family_rows", 0) or 0)
+        src_fresh = int(row.get("fresh_source_families", 0) or 0)
+        src_missing = int(row.get("missing_source_families", 0) or 0)
+        feasible = row.get("watchlist_feasibility", "unknown")
+        context_blind = feasible == "source_blind_review"
+
+        if matched and rank >= 15 and cov >= 60 and src_fresh >= 5 and not context_blind:
             tier = "T1"
-        elif matched and (history_ok or context_ok):
+        elif matched and rank >= 10 and cov >= 30 and src_fresh >= 3:
             tier = "T2"
         elif matched:
-            tier = "T2*"
-        else:
             tier = "T3"
+        else:
+            tier = "T4"
+
+        src_str = f"{src_fresh}/{src_total}" if src_total else "—"
+        ctx_ok = "ok" if src_missing == 0 else f"−{src_missing}"
+        context_str = "blind" if context_blind else ctx_ok
+
         lines.append(
-            f"| `{symbol}` | {tier} | "
-            f"{'matched' if matched else 'none'} | "
-            f"{row['research_suggestion']} | "
-            f"{freshness} | "
-            f"{'full' if history_ok else 'limited'} | "
-            f"{'available' if context_ok else 'missing'} |"
+            f"| `{symbol}` | {tier} | {rank:.1f} | {level} | "
+            f"{obs} | {info:.3f} | "
+            f"{cov:.0f}% | {src_str} | {context_str} |"
         )
     return lines
 

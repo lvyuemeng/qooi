@@ -389,7 +389,7 @@ transition_context_limit = 0
     assert "place orders" in report
     assert "mutate baskets" in report
     assert "## Unified Evidence Surface" in report
-    assert "## Method-Grouped Review Rows" in report
+    assert "## Scan Review Rows" in report
     assert "## Certainty-Tiered Candidates" in report
     assert (diagnostics / "coverage.csv").exists()
     assert (diagnostics / "source-freshness.csv").exists()
