@@ -272,13 +272,16 @@ def _certainty_tier_lines(inputs: ReportInputs) -> list[str]:
         .alias("tier"),
     ).sort(["tier", "rank_score"], descending=[False, True])
     lines = [
-        "**Tier 1**: transition_info_gain ≥ 0.3, ≥ 15 symbols, rank ≥ median",
-        "**Tier 2**: transition_info_gain ≥ 0.1, rank > 0",
-        "**Tier 3**: rank > 0, below info thresholds",
+        "**Tier 1**: Info ≥ 0.3 bits, ≥ 15 symbols, rank ≥ median  "
+        "**Tier 2**: Info ≥ 0.1 bits, rank > 0  "
+        "**Tier 3**: rank > 0 but below info thresholds  "
         "**Tier —**: no matched evidence",
         "",
-        "| Symbol | T | InfoGain | Obs | Sym | Tail↑ | Tail↓ | Dir | Rank |",
+        "| Symbol | T | Info | Obs | Sym | Tail↑ | Tail↓ | Dir | Rank |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| | | bits | N | #coins | rate | rate | up/down/flat | score |",
+        "| | | (higher = less uncertain) | (sample size) | (diversity) | "
+        "(extreme up) | (extreme down) | (net bias) | (composite) |",
     ]
     for row in scored.head(30).iter_rows(named=True):
         symbol = row["symbol"]
