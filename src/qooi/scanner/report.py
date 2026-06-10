@@ -49,7 +49,11 @@ def render_report(inputs: ReportInputs) -> str:
         "",
         "## Review Rows",
         "",
-        "Tiers: 1=Info≥0.3,Sym≥15  |  2=Info≥0.1  |  3=ranked  |  —=no evidence",
+        "Tiers: 1=top-decile Info,Sym≥15  |  2=top-quartile Info  |  3=ranked  |  —=no evidence",
+        "",
+        "Evidence is cross-coin (trained on all symbols with outcome history). "
+        "Decision is coin-specific (current kline + source states). "
+        "Context source (messages/social) is structurally absent — surfaced once, not per-row.",
         "",
         *_merged_review_lines(inputs, limit=15),
         "",
@@ -249,14 +253,14 @@ def _merged_review_lines(inputs: ReportInputs, *, limit: int) -> list[str]:
     rank_data: dict[str, dict[str, object]] = {}
     if rank_path.exists():
         rank_df = pl.read_csv(rank_path).sort("rank_score", descending=True)
-        median = rank_df.get_column("rank_score").quantile(0.5)
+        decile_cut = rank_df.get_column("rank_score").quantile(0.9)
+        quartile_cut = rank_df.get_column("rank_score").quantile(0.75)
         scored = rank_df.with_columns(
             pl.when(
-                (pl.col("transition_information_gain_bits") >= 0.3)
+                (pl.col("transition_information_gain_bits") >= decile_cut)
                 & (pl.col("symbol_count") >= 15)
-                & (pl.col("rank_score") >= median)
             ).then(pl.lit("1"))
-            .when(pl.col("transition_information_gain_bits") >= 0.1)
+            .when(pl.col("transition_information_gain_bits") >= quartile_cut)
             .then(pl.lit("2"))
             .when(pl.col("rank_score") > 0)
             .then(pl.lit("3"))
@@ -266,9 +270,10 @@ def _merged_review_lines(inputs: ReportInputs, *, limit: int) -> list[str]:
         for row in scored.iter_rows(named=True):
             rank_data[row["symbol"]] = row
     lines = [
-        "| T | Symbol | Info | Rank | Direction | Confidence | "
-        "Suggestion | Missing | Caveat |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "< evidence (cross-coin) | decision (coin-specific) >",
+        "| T | Symbol | Info | Rank | Direction | Suggestion | Caveat |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+        "| | | bits | score | | | |",
     ]
     for decision in decisions[:limit]:
         symbol = decision.symbol
@@ -289,9 +294,8 @@ def _merged_review_lines(inputs: ReportInputs, *, limit: int) -> list[str]:
             suggestion = f"watch: {decision.block_reason}"
         lines.append(
             f"| {tier} | `{symbol}` | {info} | {rank} | "
-            f"{decision.direction} | {decision.confidence} | "
+            f"{decision.direction} | "
             f"{suggestion} | "
-            f"{_joined_or_none(decision.missing_evidence)} | "
             f"{decision.review_caveat} |"
         )
     if len(decisions) > limit:
@@ -331,6 +335,3 @@ def _format_float(value: object) -> str:
     except (TypeError, ValueError):
         return "n/a"
 
-
-def _joined_or_none(values: tuple[str, ...]) -> str:
-    return ", ".join(values) if values else "none"

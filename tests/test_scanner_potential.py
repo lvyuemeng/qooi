@@ -321,7 +321,7 @@ transition_context_limit = 0
     assert "mutate baskets" in report
     assert "## Unified Evidence Surface" in report
     assert "## Review Rows" in report
-    assert "Tiers: 1=Info" in report
+    assert "Tiers: 1=top-decile" in report
     assert (diagnostics / "coverage.csv").exists()
     assert (diagnostics / "source-freshness.csv").exists()
     assert (diagnostics / "potential-observation-summary.csv").exists()
