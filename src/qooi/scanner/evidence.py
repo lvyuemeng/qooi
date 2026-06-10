@@ -906,14 +906,17 @@ def select_potential_evidence_level(evidence: pl.DataFrame) -> pl.DataFrame:
         return scored.with_columns(pl.lit(False).alias("selected_evidence_level")).drop(
             "selection_status_rank", "selection_level_rank"
         )
-    best_level = scored.filter(
-        (pl.col("selection_status_rank") >= 2) & (pl.col("selection_level_rank") >= 1)
-    ).join(
+    eligible = scored.filter(
+        (pl.col("selection_status_rank") >= 2)
+        & (pl.col("selection_level_rank") >= 1)
+        & (pl.col("information_gain_bits") > 0.0)
+    )
+    best_level = eligible.join(
         best_status, on=("outcome_horizon", "statistical_direction", "selection_status_rank")
     ).group_by("outcome_horizon", "statistical_direction", "selection_status_rank").agg(
         pl.col("selection_level_rank").min().alias("selection_level_rank")
     )
-    return scored.join(
+    return eligible.join(
         best_level.with_columns(pl.lit(True).alias("selected_evidence_level")),
         on=(
             "outcome_horizon",
