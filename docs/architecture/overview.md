@@ -78,7 +78,7 @@ configs/potential*.toml
   -> OHLCV/source cache and diagnostics
   -> deterministic known-at-close state classification
   -> observation/outcome/evidence surfaces
-  -> Markdown research report and parquet artifacts
+  -> Markdown research report and CSV diagnostics
 ```
 
 ## Promotion boundary

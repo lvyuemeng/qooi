@@ -858,26 +858,33 @@ def select_potential_evidence_level(evidence: pl.DataFrame) -> pl.DataFrame:
         (pl.col("information_gain_over_parent") > 0.0)
         | (pl.col("transition_information_gain_over_parent") > 0.0)
     )
+    is_source_level = pl.col("evidence_level").str.contains("_source")
+    absolute_source = (
+        is_source_level
+        & (pl.col("information_gain_bits") > 0.1)
+        & (pl.col("symbol_count") >= 5)
+    )
+    passes = improves_parent | absolute_source
     scored = evidence.with_columns(
-        pl.when((pl.col("evidence_status") == "usable_stable_information") & improves_parent)
+        pl.when((pl.col("evidence_status") == "usable_stable_information") & passes)
         .then(3)
-        .when((pl.col("evidence_status") == "usable_unstable_information") & improves_parent)
+        .when((pl.col("evidence_status") == "usable_unstable_information") & passes)
         .then(2)
-        .when((pl.col("evidence_status") == "exploratory_information") & improves_parent)
+        .when((pl.col("evidence_status") == "exploratory_information") & passes)
         .then(1)
         .when(
             (pl.col("transition_status") == "usable_stable_transition_information")
-            & improves_parent
+            & passes
         )
         .then(3)
         .when(
             (pl.col("transition_status") == "usable_unstable_transition_information")
-            & improves_parent
+            & passes
         )
         .then(2)
         .when(
             (pl.col("transition_status") == "exploratory_transition_information")
-            & improves_parent
+            & passes
         )
         .then(1)
         .otherwise(0)
@@ -916,7 +923,7 @@ def select_potential_evidence_level(evidence: pl.DataFrame) -> pl.DataFrame:
     ).group_by("outcome_horizon", "statistical_direction", "selection_status_rank").agg(
         pl.col("selection_level_rank").min().alias("selection_level_rank")
     )
-    return eligible.join(
+    return scored.join(
         best_level.with_columns(pl.lit(True).alias("selected_evidence_level")),
         on=(
             "outcome_horizon",
