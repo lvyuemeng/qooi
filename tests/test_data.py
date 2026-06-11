@@ -188,7 +188,7 @@ def test_source_aware_index_mark_parser_uses_confirm_not_volume():
 
     assert parsed.height == 1
     assert parsed["timestamp"].to_list() == [1_000]
-    assert parsed["vol"].to_list() == [0.0]
+    assert parsed["volume"].to_list() == [0.0]
 
 
 def test_okx_index_inst_id_mapping_is_explicit():

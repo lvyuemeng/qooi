@@ -175,7 +175,9 @@ def _write_frame(df: pl.DataFrame, path: Path) -> None:
 def _normalize_bars(df: pl.DataFrame) -> pl.DataFrame:
     if df.is_empty():
         return df
-    cols = ("timestamp", "datetime", "open", "high", "low", "close", "vol")
+    if "volume" not in df.columns and "vol" in df.columns:
+        df = df.rename({"vol": "volume"})
+    cols = ("timestamp", "datetime", "open", "high", "low", "close", "volume")
     keep = [col for col in cols if col in df.columns]
     return df.select(keep).sort("timestamp")
 
@@ -189,7 +191,7 @@ def _merge_bars(left: pl.DataFrame, right: pl.DataFrame, target_bars: int) -> pl
         common_cols &= set(frame.columns)
     ordered_cols = [
         col
-        for col in ("timestamp", "datetime", "open", "high", "low", "close", "vol")
+        for col in ("timestamp", "datetime", "open", "high", "low", "close", "volume")
         if col in common_cols
     ]
     merged = pl.concat([frame.select(ordered_cols) for frame in frames])

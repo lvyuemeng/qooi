@@ -28,7 +28,7 @@ SOURCE_BARS_SCHEMA: dict[str, pl.DataType] = {
     "high": pl.Float64,
     "low": pl.Float64,
     "close": pl.Float64,
-    "vol": pl.Float64,
+    "volume": pl.Float64,
 }
 
 SOURCE_BOOKS_SCHEMA: dict[str, pl.DataType] = {

@@ -866,7 +866,7 @@ def _parse_bars(raw: list[list], *, source: CandleSource = "trade") -> pl.DataFr
                 "high": float(row[2]),
                 "low": float(row[3]),
                 "close": float(row[4]),
-                "vol": 0.0 if source in {"mark", "index"} else float(row[5]),
+                "volume": 0.0 if source in {"mark", "index"} else float(row[5]),
             }
         )
     if not rows:
