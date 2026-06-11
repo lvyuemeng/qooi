@@ -1,243 +1,244 @@
-# Potential Scanner Architecture
+# Scanner Architecture
 
 ## Purpose
 
-The scanner is the active deterministic workflow for finding potential altcoins for research review. Its output is trading information aid: probability diagnostics, path-risk context, missing-data coverage, and source context that help a human decide what deserves deeper trading research.
+The scanner is a deterministic research workflow for finding symbols whose known-at-close state vectors materially change the probability or severity of future extreme behavior. It emits research diagnostics and review candidates only; it does not authorize live trading, allocation, executor actions, or wallet operations.
 
-It is research-only decision support. It does not place orders, mutate baskets, call the executor, or authorize allocation.
-
-## Domain thesis
-
-The scanner is built around a diagnostics probability framework, not a market-imitation model.
-
-Working assumptions:
-
-- Profit opportunities come from extreme path behavior, not the average market distribution.
-- The whole market can be treated as alternating or mixing between consolidation and trend behavior.
-- Potential candidates are symbols whose current known-at-close state vector materially changes the probability of future extreme behavior.
-- Classification should preserve interpretable geometric/state roles so statistical tests can ask whether a state changes future tails, transitions, or path risk.
-- Source context is conditional information and data-quality evidence; it is not trading authorization.
-
-The practical theory base is geometric information theory plus large-deviation style tail diagnostics:
-
-- geometry: describe market state by regime, structure, range, volatility, transition path, alignment, and source roles;
-- information: ask whether child state vectors reduce uncertainty or add information beyond parent market context;
-- large deviation: emphasize tail rates, excursion distributions, returned-to-origin behavior, and recent instability rather than fitting the whole return distribution.
-
-## Owned modules
+## Module layout
 
 ```text
-src/qooi/scanner/workflow.py       # config, orchestration, artifact/report writes
-src/qooi/scanner/contracts.py      # scanner contracts and ranking helpers
-src/qooi/scanner/classifiers.py    # deterministic kline state classifier
-src/qooi/scanner/transitions.py    # transition/path evidence discovery
-src/qooi/scanner/decisions.py      # latest research-review decisions
-src/qooi/scanner/diagnostics.py    # diagnostic/state artifact construction
-src/qooi/scanner/history.py        # kline path history and realized transitions
-src/qooi/scanner/source_events.py  # source-native event/outcome diagnostics
-src/qooi/scanner/evidence.py       # unified observation and evidence ladder
-src/qooi/scanner/report.py         # Markdown report rendering
+src/qooi/scanner/
+├── workflow.py       # CLI orchestration: config, universe, fetch/cache, staged calls
+├── contracts.py      # dataclasses/protocols shared by scanner modules
+├── classifiers.py    # OHLCV → categorical kline state labels
+├── features.py       # bars/source frames → continuous features keyed by symbol,timestamp
+├── transitions.py    # n-gram transition/path discovery for the decision lens
+├── decisions.py      # current-state/source-state review lens
+├── history.py        # kline path history and realized transition frames
+├── source_events.py  # source event/outcome frames from source context
+├── evidence.py       # shared observations/outcomes + fixed ladder evidence path
+├── tailtree.py       # LightGBM + GPD tail evidence path; optional deps
+├── candidates.py     # candidate matching and ranking
+├── diagnostics.py    # artifact writing and one evidence-path dispatch
+├── report.py         # markdown renderer from computed artifacts
+└── __init__.py       # shared scalar expressions/utilities
 ```
 
-## Architecture workflow
-
-The scanner architecture is a reproducible computation from known-at-close observations to evidence-backed research candidates. The workflow has three layers:
+## Dependency direction
 
 ```text
-operational IO
-  -> known-at-close state and outcome surfaces
-  -> current candidate / backtest review surfaces
+workflow
+  → classifiers, features, decisions, transitions, source_events,
+    evidence, diagnostics, report
+
+diagnostics
+  → evidence, tailtree, candidates
+  → owns the single evidence dispatch point
+
+features
+  → no outcomes, no future returns
+  → emits known-at-close continuous features only
+
+evidence
+  → shared observation/outcome frames
+  → fixed ladder evidence path
+  → does not import tailtree
+
+tailtree
+  → LightGBM + scipy only inside the tailtree path
+  → does not import evidence path internals except shared frames by schema
+
+candidates
+  → matches latest observations to path result data
+  → ranks candidates from numeric evidence columns
 ```
 
-Operational IO:
+Forbidden:
+
+- `qooi.scanner` must not import executor/basket/recovery/live-trading modules.
+- `features.py` must not use future return/outcome columns.
+- `evidence.py` and `tailtree.py` must not cross-import each other as evidence paths.
+- Timestamp-only joins are forbidden in source-derived feature construction.
+
+## Composable pipeflow, not monolithic data bag
+
+The scanner shares by **behavior and data product**, not by passing a global `MaterializedScannerFrames` object.
 
 ```text
-load config
-  -> resolve bounded universe
-  -> load/cache OHLCV efficiently across symbols/timeframes
-  -> select source-context symbols
-  -> load/cache source context
+bars + state_frames
+  → qooi.scanner.features.extract_continuous_features
+  → continuous_features(symbol,timestamp,...)
+
+kline_history + source_events + continuous_features
+  → qooi.scanner.evidence.potential_observation_frame
+  → observations(symbol,decision_bar_close_ms,...)
+
+observations + source_outcomes + realized_transitions
+  → qooi.scanner.evidence.potential_outcome_frame
+  → outcomes(symbol,decision_bar_close_ms,horizon,...)
+
+observations + outcomes
+  → one evidence dispatch
+  → LadderResult | TailtreeResult
+
+result.evidence + latest observations
+  → candidates + ranked + report
 ```
 
-Research computation:
+Each stage consumes the smallest named data products it needs. No downstream function should accept the whole workflow state and select fields opportunistically.
+
+## Data products and invariants
+
+### `continuous_features`
+
+Owner: `qooi.scanner.features.extract_continuous_features(...)`
+
+Key:
 
 ```text
-OHLCV + source context
-  -> classify known-at-close states
-  -> build observation vector O_t
-  -> build future outcome Y_{t,h}
-  -> calculate parent-gated evidence E(O_t,h)
-  -> select useful evidence rows
+(symbol, timestamp)
 ```
 
-Current review and validation:
+Invariants:
+
+- one row per `(symbol, timestamp)`;
+- all feature values are known at or before `timestamp`;
+- cached OHLCV bars use canonical `volume`; old `vol` cache columns are migrated at read time;
+- source frames preserve their native event/snapshot timestamp, then materialize known-at-close feature rows with `join_asof(..., by="symbol")`;
+- source feature rows include `*_age_ms` columns so ephemeral values are not treated as fresh forever;
+- source reducers group and join by `("symbol", "timestamp")` after known-at-close materialization;
+- missing source families produce null numeric columns, not dropped decision rows;
+- no outcome/future-return columns are allowed.
+
+### `observations`
+
+Owner: `qooi.scanner.evidence.potential_observation_frame(...)`
+
+Key:
 
 ```text
-latest O_t + selected E(O_t,h)
-  -> candidate row C_t
-  -> candidate rank components and coverage caveats
-  -> Markdown research report
-
-frozen train E_train(O,h) + holdout O_t
-  -> holdout candidate rows
-  -> out-of-sample evidence validation
-  -> optional later strategy hypothesis
+(symbol, decision_bar_close_ms, source_family)
 ```
 
-The current code implements operational IO, state classification, observation/outcome/evidence artifacts, candidate joins, ranked candidate diagnostics, chronological evidence replay artifacts, diagnostics, and report display.
+Invariants:
 
-The workflow separates expensive IO from Polars-native computation:
+- categorical kline/source state columns describe known-at-close context;
+- continuous features are joined by `(symbol, decision_bar_close_ms) = (symbol, timestamp)`;
+- continuous feature availability is independent of whether source events are present;
+- source freshness and source alignment are explicit columns.
 
-- exchange/source modules fetch and cache data;
-- classifier/history/evidence modules compute frame transforms;
-- diagnostics/report modules write or summarize artifacts;
-- candidate/backtest modules consume artifacts or frames instead of refetching data;
-- no scanner computation should depend on executor/backtest side effects.
+Source event timestamps are **not rewritten** into bar-close timestamps. The raw source event/snapshot time remains source-native. The materialized feature row timestamp is the decision close at which that source value is known; source age columns quantify staleness.
 
-## Probability framework
+### `outcomes`
 
-The scanner should answer this question for each candidate row:
+Owner: `qooi.scanner.evidence.potential_outcome_frame(...)`
+
+Key:
 
 ```text
-Given this known-at-close observation vector, how different is the future path distribution from its parent market context, especially in the extreme tails?
+(symbol, decision_bar_close_ms, outcome_horizon)
 ```
 
-Primary probability diagnostics:
+Invariants:
 
-- `p_up`, `p_down`, `p_flat`: directional posterior mass after thresholding forward returns.
-- `lift_up`, `lift_down`, `lift_flat`: posterior change versus parent/baseline context.
-- `information_gain_bits`: uncertainty reduction versus the parent level.
-- `transition_information_gain_bits`: transition-structure information beyond parent context.
-- `tail_up_rate`, `tail_down_rate`: large-move frequency, not average-return mimicry.
-- `avg_forward_max_return_pct`, `avg_forward_min_return_pct`, `avg_path_range_pct`: favorable/adverse excursion and path amplitude.
-- `path_skew`: directional asymmetry of the future path.
-- `returned_to_origin_rate`: failure-to-trend or mean-reversion diagnostic.
-- `information_stability` and `transition_information_stability`: recent-vs-long evidence stability.
+- outcome columns are future diagnostics only;
+- missing horizons remain explicit through coverage/artifact diagnostics;
+- outcomes do not feed feature construction.
 
-The report should prefer candidates with enough count/symbol support, parent improvement, stable information, and favorable path-risk diagnostics. It should reject or down-rank unsupported rare states even when their point estimate looks attractive.
+## Evidence path contracts
 
-## Evidence ladder
+The scanner has one dispatch point, keyed by:
+
+```toml
+evidence = "ladder" | "tailtree"
+```
+
+### `LadderResult`
 
 ```text
-market_background
-  -> market_swing
-  -> market_decision
-  -> market_decision_source
-  -> market_decision_source_risk
+LadderResult
+├── evidence: pl.DataFrame
+├── candidates: pl.DataFrame
+└── ranked: pl.DataFrame
 ```
 
-Rules:
+The ladder path groups observations by fixed categorical evidence levels and computes probability/information diagnostics.
 
-- Use one decision clock first, normally `1H`.
-- Attach slower states by as-of join: latest closed `4H`/`1D` where timestamp <= decision time.
-- Attach source rows with known-at timestamp <= decision time.
-- Keep vector roles as real columns; do not collapse into an opaque key.
-- Future returns/transitions are outcome columns only.
-- Let empirical outcomes decide statistical direction.
-- Child levels are useful only when they beat their parent by support, information, stability, and path quality.
-
-## Computable research workflow
-
-The scanner workflow should be expressed as one reproducible computation, not a loose list of diagnostics.
-
-Goal:
+### `TailtreeResult`
 
 ```text
-Find symbols whose current state vector has statistically useful conditional evidence for future extreme/path behavior, then present them as research-review candidates with explicit coverage and risk caveats.
+TailtreeResult
+├── evidence: pl.DataFrame
+├── candidates: pl.DataFrame
+├── ranked: pl.DataFrame
+├── tree_up: TailTreeModel
+└── tree_down: TailTreeModel
 ```
 
-Definitions:
+The tailtree path trains direction-specific LightGBM trees on extreme exceedances and evaluates per-leaf tail evidence against the full observation population.
 
-- `O_t`: known-at-close observation vector at decision close `t`.
-- `P(O_t)`: parent context for `O_t`, such as background or swing/decision level.
-- `Y_{t,h}`: future outcome over horizon `h`, stored only as an outcome column.
-- `E(O_t, h)`: evidence row comparing `Y_{t,h} | O_t` against `Y_{t,h} | P(O_t)`.
-- `C_t`: current candidate row for a symbol, built by joining latest `O_t` to the best matching evidence row.
+Leaf selection is auditable rather than silent:
 
-Procedure and owned object contracts:
+- `selection_mode = "hard_gate"` when leaves pass the configured count/lift/stability gates;
+- if no leaf passes, `selection_mode = "best_available"` writes top-ranked leaves with `selected_evidence_level = false` so review can inspect why the gate failed without promoting weak evidence.
 
-| Step | Object | Computes | Input boundary | Consumer |
-|---|---|---|---|---|
-| 1 | Universe `U` | Bounded symbol set and eligibility notes. | Config and exchange discovery/cache only. | OHLCV/source loaders. |
-| 2 | Kline state `K_t` | Closed-bar geometric roles: regime, structure, range, volatility, event, transition, direction hint. | OHLCV up to bar close. | Observation/outcome builders and latest bundles. |
-| 3 | Source event `S_t` | Source-family state, direction, known-at timestamp, availability/freshness. | Provider/cache rows known at or before decision close. | Observation builder and source diagnostics. |
-| 4 | Observation `O_t` | Decision/swing/background/source/risk vector. | `K_t`, `S_t`, as-of joins where timestamp <= decision close. | Evidence, current candidate join, holdout replay. |
-| 5 | Outcome `Y_{t,h}` | Forward return, MFE/MAE, path range, return-to-origin, semantic transition. | Future bars only; never classifier input. | Evidence and backtest scoring. |
-| 6 | Evidence `E(O_t,h)` | Posterior probabilities, lift, information, tail/path diagnostics versus parent context. | Historical `O_t` joined to `Y_{t,h}`. | Evidence selector, report, candidate join. |
-| 7 | Selected evidence `E*` | Parent-gated useful evidence rows. | `E(O_t,h)` support, information, stability, path-quality gates. | Current candidate join and train/holdout freeze. |
-| 8 | Candidate `C_t` | Latest/holdout observation matched to best selected evidence with caveats. | `O_t`, `E*`, coverage/freshness diagnostics. | Ranking, report, research review. |
-| 9 | Ranked candidate `R_t` | Explicit score components for information, transition, tail/path, stability, data quality. | `C_t` only; no executor state. | Human research review and backtest summaries. |
-| 10 | Backtest row `B_t` | Holdout candidate plus realized `Y_{t,h}` and baseline comparisons. | Frozen train `E*`, holdout `O_t`, holdout outcomes. | Promotion decision for a future strategy hypothesis. |
+Result types are decisive: no `Any | None` tree fields, no variant tuples, and no report/candidate branching on config outside the evidence dispatcher.
 
-This makes every build task answer: which object does it compute, from which known-at-close inputs, and which downstream decision-review step consumes it?
+## Tailtree / GPD model interface
 
-## Architecture to module graph transformation
+The tailtree path is an extreme-value evidence path. It does not model the full return distribution and does not replace broad up/down/flat probability diagnostics.
 
-The module graph should be derived directly from the object contracts above:
+For each direction (`up`, `down`):
+
+1. Label all aligned observation/outcome rows with a tail flag and exceedance magnitude.
+2. Train the LightGBM tree on rows where that direction tail occurred.
+3. Use a GPD negative-log-likelihood objective over positive exceedance magnitudes.
+4. Project all aligned observations through the trained tree to compute per-leaf denominators.
+5. Fit/report per-leaf GPD parameters from tail rows only.
+6. Compute `tail_rate` and `tail_lift` from all rows assigned to each leaf.
+
+Thus:
+
+| Quantity | Population | Meaning |
+|---|---|---|
+| `tail_rate` | all rows assigned to the leaf | probability of entering the tail |
+| `tail_lift` | all rows assigned to the leaf vs global baseline | concentration of tail frequency |
+| `gpd_shape_xi` | tail exceedances in the leaf | tail heaviness/severity shape |
+| `gpd_scale_sigma` | tail exceedances in the leaf | exceedance dispersion |
+
+GPD is only for threshold exceedance severity:
 
 ```text
-U  -> workflow.resolve_universe(...)
-K  -> workflow.load_bars(...), KlineClassifier.classify(...), history.kline_path_history_frame(...)
-S  -> sources.context.load_source_context(...), source_events.source_events_frame(...)
-O  -> evidence.potential_observation_frame(...)
-Y  -> history.realized_transition_frame(...), source_events.source_outcomes_frame(...), evidence.potential_outcome_frame(...)
-E  -> evidence.potential_evidence_frame(...), evidence.add_potential_parent_gain(...)
-E* -> evidence.select_potential_evidence_level(...)
-C  -> candidates.candidate_evidence_frame(...)
-R  -> candidates.rank_candidate_evidence(...)
-B  -> candidates.backtest_candidate_evidence(...)
+up_excess   = forward_max_return_pct - threshold_pct      where tail_up
+down_excess = abs(forward_min_return_pct) - threshold_pct where tail_down
 ```
 
-Rules for transforming architecture to graph docs:
+It is not a whole-return distribution model, not a classifier, and not a candidate ranking substitute by itself.
 
-- only public functions/classes that compute one of the objects above should be listed as supported graph surfaces;
-- helper functions stay private unless another module imports them as a boundary;
-- module graph docs must show both the current implemented edge and the next planned edge when the architecture object exists but code does not;
-- artifacts are graph surfaces only when they are written/read across module boundaries;
-- report sections are consumers of graph objects, not primary architecture objects.
+## Artifact boundaries
 
-## Backtest and validation workflow
+Materialization artifacts:
 
-The first backtest is a research backtest of the computation, not an executor trade simulation.
+```text
+diagnostics/continuous-features.csv
+diagnostics/potential-observations.csv
+diagnostics/potential-outcomes.csv
+```
 
-1. Split history by time: train/calibration window first, holdout/evaluation window second.
-2. On train only, compute selected evidence rows `E_train(O, h)` and freeze their grouping columns and gates.
-3. On holdout, build observations `O_holdout` using only known-at-close fields.
-4. Match each holdout observation to the frozen train evidence rows.
-5. Produce candidate rows only when the train evidence row passed parent gates and the holdout observation has acceptable coverage/freshness.
-6. Score holdout outcomes with no refitting: tail hit rate, directional hit rate, lift over parent baseline, information stability, max adverse excursion, max favorable excursion, returned-to-origin rate, and candidate frequency.
-7. Compare against baselines: parent context only, random same-universe same-frequency rows, and simple momentum/range heuristics.
-8. Promote only if holdout evidence remains stable across time splits and symbols. Promotion still means research hypothesis, then later normal signal columns and execution-aware backtests.
+Evidence artifacts:
 
-Executor backtests happen only after the research backtest defines explicit signal columns, sizing assumptions, and exits. Until then, scanner validation is about whether the probability computation finds useful extreme-behavior candidates.
+```text
+ladder:   potential-evidence-summary.csv, potential-evidence-selected.csv
+tailtree: tail-tree-up.json, tail-tree-down.json,
+          potential-leaf-evidence-*.csv, potential-leaves-selected-*.csv
+```
 
-## Candidate semantics
+Review artifacts:
 
-Candidate labels must remain information-aid labels, not trading commands.
+```text
+candidate-evidence.csv
+candidate-rank.csv
+report.md
+```
 
-Allowed readout style:
-
-- `rapid_trend_watch`: posterior/tail/path diagnostics favor trend continuation or expansion.
-- `mean_reversion_watch`: path diagnostics favor return-to-origin or relief behavior.
-- `volatility_expansion_watch`: extreme movement rate or path range rises without clean direction.
-- `chop_avoid`: evidence points to noisy, low-quality, or adverse path behavior.
-- `insufficient_evidence`: support, coverage, source freshness, or parent lift is not enough.
-
-Do not hardcode a bullish or bearish conclusion from a state name. `statistical_direction` comes from outcome distributions and path diagnostics.
-
-## Data scale and efficiency
-
-The framework requires large history, many symbols, and multiple source families. Keep computation/fetching efficient:
-
-- use bounded universe discovery and scan budgets before expensive source context;
-- fetch OHLCV/source data through cache-aware APIs with explicit coverage rows;
-- classify symbol/timeframe frames in parallel where safe;
-- use Polars-native joins, groups, and expressions instead of row loops;
-- write diagnostic Parquet artifacts so later report/research steps can reuse them;
-- make shallow/missing/stale data explicit rather than silently dropping symbols.
-
-## Boundary from AI and execution
-
-Scanner decisions use deterministic classifier/source states only. `qooi.dynamic` learned states are not scanner inputs unless a future explicit promotion rewrites this architecture.
-
-Scanner artifacts are not strategy signals. A potential evidence row can only motivate research follow-up. Promotion to trading requires normal signal columns plus execution-aware validation under the project promotion policy.
+A model iteration should be able to reuse materialized artifacts; code should not skip stages ad hoc to finish a scan. Reduce config when necessary, or split materialization from evidence/review in a later workflow command.

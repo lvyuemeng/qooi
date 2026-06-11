@@ -1,316 +1,257 @@
 # Scanner Module Graph
 
-This is the applied architecture-to-module-graph contract for scanner research. It maps the scanner architecture objects (`U`, `K`, `S`, `O`, `Y`, `E`, `E*`, `C`, `R`, `B`) to concrete current public calls, artifacts, and public calls, artifacts, and implementation status.
+Shared scanner skeleton: CLI orchestration, known-at-close feature/observation products, one evidence dispatch, candidate/rank/report. Path internals live in `docs/graph/evidence.md` and `docs/graph/tailtree.md`.
 
-The scanner module surface stays thin and research-only. `workflow.py` orchestrates; scanner submodules expose only functions needed by workflow, diagnostics, report rendering, tests, or research artifact consumers. Helper functions remain private implementation details.
+Design doc: `docs/architecture/scanner.md`.
 
-## Implementation status
-
-| Architecture object | Current graph/API surface | Artifact surface | Status |
-|---|---|---|---|
-| `U` universe | `workflow.load_config()`, `workflow.resolve_universe()` | config/discovery result only | implemented |
-| `K` kline state | `workflow.load_bars()`, `KlineClassifier.classify()`, `decisions.compute_kline_states()`, `history.kline_path_history_frame()` | state frames | implemented |
-| `S` source state/event | `sources.context.load_source_context()`, `decisions.compute_source_states()`, `source_events.source_events_frame()` | source frames | implemented |
-| `O` observation vector | `evidence.potential_observation_frame()` | `potential-observation-summary.csv` | implemented |
-| `Y` future outcome | `history.realized_transition_frame()`, `source_events.source_outcomes_frame()`, `evidence.potential_outcome_frame()` | outcome frames | implemented |
-| `E` evidence | `evidence.potential_evidence_frame()`, `evidence.add_potential_parent_gain()` | `potential-evidence-summary.csv` | implemented |
-| `E*` selected evidence | `evidence.select_potential_evidence_level()` | `potential-evidence-selected.csv` | implemented — gate has known bug (market_background still selected via join path) |
-| `C` candidate evidence row | `candidates.candidate_evidence_frame(...)` | `candidate-evidence.csv` | implemented |
-| `R` ranked candidate | `candidates.rank_candidate_evidence(...)` | `candidate-rank.csv` | implemented |
-| `B` evidence backtest row | removed | removed | removed — >97% holdout mismatch rate |
-
-## Architecture: two-lens design
-
-The scanner has two independent evaluation paths that converge in the report:
-
-**Decision lens** — coin-specific, current-state, all source families
-
-```
-workflow.run()
-  → compute_kline_states()         # latest kline state per symbol
-  → compute_transition_insights()  # n-gram patterns from coin's own history
-  → load_source_context()          # books, trades, funding, oi, taker, ratios
-  → compute_source_states()        # per-source direction + contradictions
-  → scan_review_decisions()        # 9-rule table → ScanDecision per symbol
-```
-
-Answers: "What does THIS coin's current state look like across all data sources right now?"
-
-**Evidence lens** — cross-coin, historical, kline-primary state vector
-
-```
-write_diagnostics()
-  → source_events/outcomes         # source forward returns
-  → kline_path_history → realized_transitions  # kline forward paths
-  → potential_observation_frame()  # state vectors at every bar close
-  → potential_evidence_frame()     # group by state → entropy → info gain
-  → select_potential_evidence()    # gate: stable, improving on parent, info > 0
-  → candidate_evidence_frame()     # match latest observations to evidence pool
-  → rank_candidate_evidence()      # composite score: info + tail + stability + quality
-```
-
-Answers: "When this state pattern appeared historically across any coin, what happened next — and how strong is the statistical signal?"
-
-The two lenses use overlapping data (kline + sources) with different methodology. The report presents both in one merged row with provenance labels. Design doc: `docs/architecture/scanner-plan.md`.
-
-Anything not listed here is not a supported scanner research surface unless another graph section explicitly names it.
+---
 
 ## CLI entry
 
 ```text
-scripts/potential_scan.py        # potential scanner CLI
-  parse_args()
+scripts/potential_scan.py
   main()
-    -> qooi.scanner.workflow.run(Path(args.config))
+    → qooi.scanner.workflow.run(Path(args.config))
 ```
 
-## Orchestrator flow
+---
+
+## Orchestrator: `qooi.scanner.workflow`
 
 ```text
-qooi.scanner.workflow
-  PotentialConfig                 # TOML-backed scanner config model
-  DiscoveryWorkflowConfig         # adapter for exchange discovery
+qooi.scanner.workflow.run(config_path: Path) -> None
 
-  run(config_path)
-    -> load_config(config_path)
-    -> resolve_universe(config)
-    -> load_bars(config, universe.symbols)
-       -> _classify_kline_frames(...)
-          -> qooi.scanner.classifiers.KlineClassifier(scale).classify(frame)
-    -> qooi.scanner.decisions.compute_kline_states(...)
-    -> qooi.scanner.transitions.compute_transition_insights(...)
-    -> qooi.scanner.contracts.context_symbols(...)
-    -> qooi.sources.context.load_source_context(...)
-    -> qooi.scanner.decisions.compute_source_states(...)
-    -> qooi.scanner.decisions.scan_review_decisions(...)
-    -> qooi.scanner.diagnostics.write_diagnostics(...)
-    -> qooi.scanner.report.render_report(...)
-    -> writes report Markdown and diagnostics/state artifacts
-
-  load_config(config_path)
-  target_min_bars(days, timeframe)
-  resolve_universe(config)
-  load_bars(config, symbols)
+  1. qooi.scanner.workflow.load_config(config_path) -> PotentialConfig
+  2. qooi.scanner.workflow.resolve_universe(config) -> PotentialUniverse
+  3. qooi.scanner.workflow.load_bars(config, symbols) -> BarFetchResult
+  4. qooi.scanner.transitions.compute_transition_insights(...)
+  5. qooi.sources.context.load_source_context(...)
+  6. qooi.scanner.decisions.compute_source_states(...)
+  7. qooi.scanner.decisions.scan_review_decisions(...)       # decision lens
+  8. qooi.scanner.diagnostics.write_diagnostics(inputs)       # evidence lens
+  9. qooi.scanner.report.render_report(inputs) -> str
 ```
 
-## Computable object module graph
+`workflow.py` passes named data products between modules. It must not grow a global materialized-data bag that every downstream consumer accepts.
 
-The scanner graph transforms the architecture object contracts into concrete module calls. Implemented edges are listed as direct calls. Backtest replay uses a private chronological workflow split, writes holdout artifacts, and keeps the public API limited to the pure candidate functions below.
+---
+
+## Shared data pipeflow
 
 ```text
-U: Universe
-  scripts/potential_scan.py
-    -> workflow.run(config_path)
-       -> workflow.load_config(config_path) -> PotentialConfig
-       -> workflow.resolve_universe(config) -> PotentialUniverse
+bars/state_frames/source_frames
+  → qooi.scanner.features.extract_continuous_features(...)
+  → continuous_features
 
-K: Known-at-close kline state
-  PotentialUniverse.symbols + PotentialConfig.timeframes
-    -> workflow.load_bars(config, symbols) -> BarFetchResult
-       -> AsyncCacheStore.bars(HistoryRefreshRequest) -> OHLCV frames + coverage
-       -> KlineClassifier(timeframe).classify(frame) -> state_frames[(symbol,timeframe)]
-    -> decisions.compute_kline_states(...) -> latest SourceStateRow rows
-    -> history.kline_path_history_frame(config, state_frames) -> kline-path-history.csv
+kline_history/source_events/continuous_features
+  → qooi.scanner.evidence.potential_observation_frame(...)
+  → observations
 
-S: Known-at-close source state/event
-  transitions + source scope
-    -> contracts.context_symbols(config, symbols_with_decision_bars, transitions.insights)
-    -> sources.context.load_source_context(...) -> source context frames + availability
-    -> decisions.compute_source_states(...) -> latest source bundle rows
-    -> source_events.source_events_frame(context.frames, bars, config.bar) -> source-events.csv
+observations/source_outcomes/realized_transitions
+  → qooi.scanner.evidence.potential_outcome_frame(...)
+  → outcomes
 
-O: Observation vector
-  kline-path-history.csv + source-events.csv
-    -> evidence.potential_observation_frame(
-         kline_history,
-         source_events,
-         decision_timeframe=config.bar,
-         max_source_staleness_hours=config.max_source_staleness_hours,
-       ) -> potential-observation-summary.csv
+observations/outcomes
+  → qooi.scanner.diagnostics._run_pipeline(...)
+  → LadderResult | TailtreeResult
 
-Y: Future outcome
-  kline-path-history.csv
-    -> history.realized_transition_frame(kline_history, horizons) -> realized-transition.csv
-  source-events.csv + decision-clock OHLCV
-    -> source_events.source_outcomes_frame(source_events, bars) -> source-outcomes.csv
-  O + source outcomes + realized transitions
-    -> evidence.potential_outcome_frame(...) -> outcome join frame
-
-E: Parent-gated evidence
-  O + Y
-    -> evidence.potential_evidence_frame(
-         observations,
-         source_outcomes,
-         realized_transitions,
-         return_threshold_pct=config.transition_return_threshold_pct,
-       )
-       -> evidence.add_potential_parent_gain(...)
-       -> evidence.select_potential_evidence_level(...)
-       -> potential-evidence-summary.csv
-       -> potential-evidence-selected.csv
-
-C: Candidate evidence row
-  latest O_t + selected E*(O,h) + coverage/freshness diagnostics
-    -> candidates.candidate_evidence_frame(...) -> candidate-evidence.csv
-
-R: Ranked candidate
-  candidate-evidence.csv
-    -> candidates.rank_candidate_evidence(...) -> candidate-rank.csv
+result.evidence/latest_observations
+  → qooi.scanner.candidates.candidate_evidence_frame(...)
+  → qooi.scanner.candidates.rank_candidate_evidence(...)
+  → candidate artifacts + report
 ```
 
-Current implemented graph reaches `C` and `R` diagnostics. `B` was removed; the replay path had a >97% holdout-match failure rate and added no research signal.
+---
 
-Primary evidence diagnostics are real columns, including:
+## Continuous features: `qooi.scanner.features`
 
 ```text
-baseline_p_up / conditioned_p_up
-baseline_p_down / conditioned_p_down
-lift_up / lift_down / lift_flat
-information_gain_bits
-transition_information_gain_bits
-tail_up_rate / tail_down_rate
-avg_forward_max_return_pct / avg_forward_min_return_pct / avg_path_range_pct
-path_skew
-returned_to_origin_rate
-information_stability / transition_information_stability
-statistical_direction
-research_suggestion
+qooi.scanner.features.extract_continuous_features(
+    bars: dict[tuple[str, str], pl.DataFrame],
+    state_frames: dict[tuple[str, str], pl.DataFrame],
+    source_frames: dict[str, pl.DataFrame],
+    *,
+    decision_timeframe: str,
+) -> pl.DataFrame
 ```
 
-These columns support extreme-behavior review. They should not be collapsed into one opaque score or treated as execution signals.
-
-## Public scanner module surface
+Output key:
 
 ```text
-qooi.scanner.classifiers
-  ClassifierHealthResult
-  KlineClassifier.classify()
-  classifier_health()
-  validate_state_frame()
+(symbol, timestamp)
 ```
 
-Detailed classifier graph: `docs/graph/classifier.md`.
+Required invariant:
 
 ```text
-qooi.scanner.contracts
-  PotentialScanConfig
-  PotentialUniverse
-  PotentialArtifacts
-  BarFetchResult
-  SourceStateRow
-  TransitionPattern
-  TransitionInsight
-  TransitionEdge
-  UnsupportedTransitionPath
-  TransitionAnalysis
-  SymbolStateBundle
-  ScanDecision
-  ReportInputs
-
-  missing_state()
-  float_value()
-  float_or_none()
-  fmt()
-  max_timestamp()
-  best_transition_pattern()
-  transition_consensus_passes()
-  context_symbols()
+one row per (symbol, timestamp)
 ```
+
+Source reducer rule:
 
 ```text
-qooi.scanner.decisions
-  compute_kline_states()
-  compute_source_states()
-  scan_review_decisions()
+GOOD: group_by(["symbol", "timestamp"]), join(on=["symbol", "timestamp"])
+BAD:  group_by("timestamp"), join(on="timestamp")
 ```
+
+Important columns:
+
+| Column | Type | Source |
+|---|---|---|
+| `symbol` | String | bars/source frame |
+| `timestamp` | Int64 | decision/source timestamp |
+| `atr_percentile` | Float64 | kline state frame |
+| `range_width_atr` | Float64 | kline state frame |
+| `return_1bar` | Float64 | bar close returns |
+| `return_4bar` | Float64 | bar close returns |
+| `return_24bar` | Float64 | bar close returns |
+| `vol_anomaly` | Float64 | bar volume / rolling mean |
+| `close_to_range_high_ratio` | Float64 | close position in state range |
+| `imbalance_value` | Float64 | order-book imbalance |
+| `spread_bps` | Float64 | order-book spread |
+| `buy_sell_ratio` | Float64 | trade notional imbalance |
+| `funding_rate` | Float64 | funding source |
+| `oi_delta` | Float64 | open-interest change |
+| `taker_buy_sell_ratio` | Float64 | taker volume source |
+| `long_short_ratio` | Float64 | long/short account ratio |
+
+---
+
+## Observation + outcome: `qooi.scanner.evidence`
 
 ```text
-qooi.scanner.transitions
-  compute_transition_insights()
-  transition_edges()
-  transition_insight()
+qooi.scanner.evidence.potential_observation_frame(
+    kline_history: pl.DataFrame,
+    source_events: pl.DataFrame,
+    continuous_features: pl.DataFrame | None,
+    *,
+    decision_timeframe: str,
+    max_source_staleness_hours: int,
+) -> pl.DataFrame
 ```
+
+Observation contract:
 
 ```text
-qooi.scanner.candidates
-  candidate_evidence_frame()
-  rank_candidate_evidence()
+key: symbol, decision_bar_close_ms, source_family
+continuous join: (symbol, decision_bar_close_ms) = (symbol, timestamp)
 ```
+
+Continuous features are joined on every path, including no-source/stale-source paths.
 
 ```text
-qooi.scanner.diagnostics
-  DiagnosticFrames
-  StateFrames
-  write_diagnostics()
-  coverage_frame()
+qooi.scanner.evidence.potential_outcome_frame(
+    observations: pl.DataFrame,
+    source_outcomes: pl.DataFrame,
+    realized_transitions: pl.DataFrame,
+    *,
+    return_threshold_pct: float,
+) -> pl.DataFrame
 ```
+
+Outcome contract:
 
 ```text
-qooi.scanner.evidence
-  potential_observation_frame()
-  potential_evidence_frame()
-  potential_outcome_frame()
-  add_potential_parent_gain()
-  select_potential_evidence_level()
+key: symbol, decision_bar_close_ms, outcome_horizon
+contains future-return/path diagnostics only
 ```
+
+---
+
+## Evidence dispatch: `qooi.scanner.diagnostics`
 
 ```text
-qooi.scanner.history
-  kline_path_history_frame()
-  kline_path_rows()
-  realized_transition_frame()
+qooi.scanner.diagnostics._run_pipeline(
+    observations,
+    source_outcomes,
+    realized_transitions,
+    inputs,
+) -> LadderResult | TailtreeResult
 ```
+
+One dispatch point:
 
 ```text
-qooi.scanner.source_events
-  source_events_frame()
-  source_outcomes_frame()
-  source_timeliness_frame()
-  source_state_predictability_frame()
+if inputs.config.evidence == "tailtree":
+    return _run_tailtree_pipeline(...)
+return _run_ladder_pipeline(...)
 ```
+
+Downstream code consumes concrete result fields:
 
 ```text
-qooi.scanner (package)
-  pct_change_expr()
-  outcome_bucket_expr()
-  entropy_expr()
-  entropy_term()
+result.evidence
+result.candidates
+result.ranked
 ```
+
+No variant tuple, no `tree_up: None`, no `if config.evidence` in report sections.
+
+---
+
+## Result contracts
 
 ```text
-qooi.scanner.report
-  render_report()
+qooi.scanner.contracts.LadderResult
+├── evidence: pl.DataFrame
+├── candidates: pl.DataFrame
+└── ranked: pl.DataFrame
+
+qooi.scanner.contracts.TailtreeResult
+├── evidence: pl.DataFrame
+├── candidates: pl.DataFrame
+├── ranked: pl.DataFrame
+├── tree_up: TailTreeModel
+└── tree_down: TailTreeModel
 ```
 
-## Artifact ownership
+---
 
-Implemented artifacts:
+## Candidate + ranking graph: `qooi.scanner.candidates`
 
 ```text
-workflow.run(...)
-  -> PotentialArtifacts.report        # Markdown report
-  -> PotentialArtifacts.diagnostics_dir
-  -> PotentialArtifacts.states_dir
-
-diagnostics.write_diagnostics(inputs)
-  -> compact CSV diagnostic files (summaries, not full raw frames)
-  -> potential-observation-summary.csv    # O_t grouped summary
-  -> potential-evidence-summary.csv       # E grouped by level/status
-  -> potential-evidence-selected.csv      # E* selected rows only
-  -> candidate-evidence.csv               # C_t = latest O_t + selected E*
-  -> candidate-rank.csv                   # R_t with explicit score components
-
-report.render_report(inputs)
-  -> report text with quantitative review rows; no writes
+qooi.scanner.candidates.candidate_evidence_frame(
+    latest_observations: pl.DataFrame,
+    evidence: pl.DataFrame,
+    *,
+    coverage_frame: pl.DataFrame,
+    freshness_frame: pl.DataFrame,
+    tree_up: TailTreeModel | None = None,
+    tree_down: TailTreeModel | None = None,
+) -> pl.DataFrame
 ```
 
-## Forbidden scanner edges
+The only caller that supplies tree models is the tailtree pipeline. Candidate internals should prefer path-specific helpers rather than spreading config checks.
 
-- No executor, live-trading, order, wallet, or basket mutation ownership.
-- No dynamic/AI state input to scanner decisions unless a future architecture rewrite explicitly promotes it.
-- No future returns/transitions in current-state classification; outcomes are diagnostics/evidence only.
-- No secret, API key, or exchange-wallet label hardcoding.
+```text
+qooi.scanner.candidates.rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame
+```
 
-## Boundary tests
+Ranking uses numeric columns that are present:
 
-`tests/test_module_boundaries.py` guards scanner dependencies from execution/trading/AI boundaries. Add to it before expanding scanner dependencies.
+- ladder: information gain, stability, support, path quality, data quality;
+- tailtree: tail lift, tail stability, support, path quality, data quality.
+
+---
+
+## Diagnostics and report
+
+```text
+qooi.scanner.diagnostics.write_diagnostics(inputs: ReportInputs) -> DiagnosticFrames
+qooi.scanner.report.render_report(inputs: ReportInputs) -> str
+```
+
+Diagnostics writes path-specific artifacts after the one dispatch. Report renders the frames it receives; path-specific sections are composed before rendering, not by branching inside every section.
+
+---
+
+## Removed/stale API references
+
+These must not appear in current scanner docs/code contracts:
+
+```text
+use_tail_tree                 # replaced by evidence = "ladder" | "tailtree"
+leaf_path / leaf_paths        # removed; leaf_id + numeric stats are enough
+to_pandas training path       # optional pyarrow/pandas path is not required
+fobj custom-objective arg     # LightGBM 4 custom objective is params["objective"]
+```
