@@ -8,7 +8,8 @@ import pytest
 import qooi.scanner.workflow as potential
 from qooi.exchange.discovery import DiscoveryResult, empty_discovery_frame
 from qooi.scanner import candidates as potential_candidates
-from qooi.scanner import classifiers, decisions, source_events, transitions
+from qooi.scanner import classifiers, decisions, features, source_events, transitions
+from qooi.scanner.tailtree import select_tail_leaves, _tailtree_outcome_by_decision
 from qooi.scanner import contracts as scan
 from qooi.scanner import evidence as potential_evidence
 from qooi.scanner import history as potential_history
@@ -830,3 +831,112 @@ def test_transition_matching_and_ngram_work_frame_do_not_use_unrelated_patterns(
     assert analysis.insights["BTC-USDT-SWAP"].patterns == ()
     assert analysis.unsupported
     assert any(path.path == expected_current_path for path in analysis.unsupported)
+
+
+def test_continuous_features_use_canonical_volume_column() -> None:
+    bar_frame = pl.DataFrame(
+        {
+            "timestamp": list(range(30)),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.5 + index for index in range(30)],
+            "volume": [10.0 + index for index in range(30)],
+        }
+    )
+    state_frame = pl.DataFrame({"timestamp": list(range(30))})
+
+    result = features.extract_continuous_features(
+        {("BTC-USDT-SWAP", "1H"): bar_frame},
+        {("BTC-USDT-SWAP", "1H"): state_frame},
+        {},
+    )
+
+    assert result.height == 30
+    assert "vol_anomaly" in result.columns
+    assert result.select(pl.col("vol_anomaly").is_not_null().sum()).item() > 0
+
+
+def test_source_features_align_as_known_at_close_without_rewriting_source_time() -> None:
+    bar_frame = pl.DataFrame(
+        {
+            "timestamp": [1000, 2000, 3000],
+            "open": [1.0, 2.0, 3.0],
+            "high": [2.0, 3.0, 4.0],
+            "low": [0.5, 1.5, 2.5],
+            "close": [1.5, 2.5, 3.5],
+            "volume": [10.0, 20.0, 30.0],
+        }
+    )
+    state_frame = pl.DataFrame({"timestamp": [1000, 2000, 3000]})
+    source_frames = {
+        "funding": pl.DataFrame(
+            {
+                "symbol": ["BTC-USDT-SWAP", "BTC-USDT-SWAP"],
+                "timestamp": [900, 2500],
+                "funding_rate": [0.01, 0.03],
+            }
+        )
+    }
+
+    result = features.extract_continuous_features(
+        {("BTC-USDT-SWAP", "1H"): bar_frame},
+        {("BTC-USDT-SWAP", "1H"): state_frame},
+        source_frames,
+    ).sort("timestamp")
+
+    rows = {row["timestamp"]: row for row in result.iter_rows(named=True)}
+    assert rows[1000]["funding_rate"] == pytest.approx(0.01)
+    assert rows[2000]["funding_rate"] == pytest.approx(0.01)
+    assert rows[3000]["funding_rate"] == pytest.approx(0.03)
+    assert rows[1000]["funding_age_ms"] == 100
+    assert rows[2000]["funding_age_ms"] == 1100
+    assert rows[3000]["funding_age_ms"] == 500
+
+
+def test_select_tail_leaves_returns_best_available_when_strict_gate_is_empty() -> None:
+    leaf_evidence = pl.DataFrame(
+        {
+            "leaf_id": [1, 2, 3],
+            "tree_direction": ["up", "up", "up"],
+            "N_total": [1000, 1000, 1000],
+            "N_tail_exceedances": [20, 25, 10],
+            "tail_lift": [1.4, 1.2, 1.1],
+            "tail_lift_stability": [0.6, 0.8, 0.2],
+            "gpd_shape_xi": [0.1, 0.2, 0.3],
+            "gpd_scale_sigma": [1.0, 1.1, 1.2],
+            "leaf_tail_rate": [0.02, 0.025, 0.01],
+            "global_tail_rate": [0.015, 0.015, 0.015],
+        }
+    )
+
+    selected = select_tail_leaves(leaf_evidence, fallback_top_n=2)
+
+    assert selected.height == 2
+    assert selected["selection_mode"].to_list() == ["best_available", "best_available"]
+    assert selected["selected_evidence_level"].to_list() == [False, False]
+    assert selected["tail_evidence_score"].to_list()[0] >= selected["tail_evidence_score"].to_list()[1]
+
+
+def test_tailtree_outcome_aggregation_preserves_source_tail_labels() -> None:
+    outcomes = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP", "BTC-USDT-SWAP", "BTC-USDT-SWAP"],
+            "decision_bar_close_ms": [1000, 1000, 2000],
+            "outcome_bucket": ["flat", "up", "down"],
+            "tail_up": [False, True, False],
+            "tail_down": [False, False, True],
+            "direction_changed": [False, True, False],
+            "returned_to_origin": [False, False, True],
+        }
+    )
+
+    collapsed = _tailtree_outcome_by_decision(outcomes).sort("decision_bar_close_ms")
+    rows = {row["decision_bar_close_ms"]: row for row in collapsed.iter_rows(named=True)}
+
+    assert collapsed.height == 2
+    assert rows[1000]["outcome_bucket"] == "up"
+    assert rows[1000]["tail_up"] is True
+    assert rows[1000]["tail_down"] is False
+    assert rows[2000]["outcome_bucket"] == "down"
+    assert rows[2000]["tail_down"] is True

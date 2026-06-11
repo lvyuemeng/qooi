@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import polars as pl
 from qooi.exchange.store import HistoryCoverage
 from qooi.scanner import candidates as candidate_eval
 from qooi.scanner import evidence as evidence_eval
+from qooi.scanner import features as features_eval
 from qooi.scanner import history as history_eval
 from qooi.scanner import source_events as source_eval
 from qooi.scanner.classifiers import STATE_FRAME_SCHEMA, validate_state_frame
@@ -24,6 +26,34 @@ from qooi.scanner.contracts import (
     UnsupportedTransitionPath,
 )
 from qooi.sources.context import SourceAvailability
+
+
+@dataclass(frozen=True)
+class LadderResult:
+    """Ladder path pipeline result. Every field has a concrete type."""
+    evidence: pl.DataFrame
+    candidates: pl.DataFrame
+    ranked: pl.DataFrame
+    sections: tuple
+
+
+@dataclass(frozen=True)
+class TailtreeResult:
+    """Tailtree path pipeline result. Every field has a concrete type."""
+    evidence: pl.DataFrame
+    candidates: pl.DataFrame
+    ranked: pl.DataFrame
+    tree_up: object | None
+    tree_down: object | None
+    sections: tuple
+
+
+@dataclass(frozen=True)
+class TailtreeEvidenceResult:
+    """Tailtree evidence/model build result before candidate matching."""
+    evidence: pl.DataFrame
+    tree_up: object | None
+    tree_down: object | None
 
 
 @dataclass(frozen=True)
@@ -59,6 +89,10 @@ class StateFrames:
 
 def write_diagnostics(inputs: ReportInputs) -> None:
     diagnostic_frames = _build_diagnostic_frames(inputs)
+
+    from qooi.scanner.report import report_sections_for
+    inputs.report_sections = report_sections_for(inputs.config.evidence)
+
     state_frames = _build_state_frames(inputs)
     diagnostics = inputs.artifacts.diagnostics_dir
     states = inputs.artifacts.states_dir
@@ -88,6 +122,8 @@ def write_diagnostics(inputs: ReportInputs) -> None:
 
 
 def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
+    logger = logging.getLogger("qooi.scanner")
+    logger.info("features begin")
     history_feasibility = _history_feasibility_frame(inputs.bars.coverage)
     source_freshness = _source_freshness_frame(inputs.context.availability)
     bars = _bars_with_symbol(inputs.bars.frames, inputs.config.bar)
@@ -104,23 +140,33 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         if not source_outcomes.is_empty()
         else (inputs.config.transition_horizon,),
     )
+
+    continuous_features = features_eval.extract_continuous_features(
+        inputs.bars.frames,
+        inputs.bars.state_frames,
+        inputs.context.frames,
+        decision_timeframe=inputs.config.bar,
+    )
+
     potential_observations = evidence_eval.potential_observation_frame(
         kline_history,
         source_events,
+        continuous_features,
         decision_timeframe=inputs.config.bar,
         max_source_staleness_hours=inputs.config.max_source_staleness_hours,
     )
-    potential_evidence = evidence_eval.potential_evidence_frame(
-        potential_observations,
-        source_outcomes,
-        realized_transitions,
-        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+    logger.info("observation rows=%d", len(potential_observations))
+
+    logger.info("evidence begin path=%s", inputs.config.evidence)
+    pipeline_result = _run_pipeline(
+        potential_observations, source_outcomes, realized_transitions, inputs
     )
-    candidate_evidence = candidate_eval.candidate_evidence_frame(
-        potential_observations,
-        potential_evidence,
-    )
-    candidate_rank = candidate_eval.rank_candidate_evidence(candidate_evidence)
+    logger.info("evidence rows=%d", len(pipeline_result.evidence))
+    logger.info("candidates matched=%d ranked=%d",
+                pipeline_result.candidates.height, pipeline_result.ranked.height)
+    # Populate report sections for render_report
+    from qooi.scanner.report import report_sections_for
+    inputs.report_sections = report_sections_for(inputs.config.evidence)
 
     source_timeliness = source_eval.source_timeliness_frame(source_outcomes)
     source_state_predictability = source_eval.source_state_predictability_frame(
@@ -145,9 +191,9 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         ),
         source_state_health=_source_state_health_frame(inputs.bundles),
         potential_observations=potential_observations,
-        potential_evidence=potential_evidence,
-        candidate_evidence=candidate_evidence,
-        candidate_rank=candidate_rank,
+        potential_evidence=pipeline_result.evidence,
+        candidate_evidence=pipeline_result.candidates,
+        candidate_rank=pipeline_result.ranked,
         source_timeliness=source_timeliness,
         source_state_predictability=source_state_predictability,
     )
@@ -201,51 +247,8 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
                 }
             )
         ),
-        "potential-evidence-summary": (
-            frames.potential_evidence.group_by(
-                [
-                    "evidence_level",
-                    "evidence_status",
-                    "transition_status",
-                    "statistical_direction",
-                    "research_suggestion",
-                    "selected_evidence_level",
-                ],
-                maintain_order=True,
-            )
-            .agg(
-                pl.len().alias("row_count"),
-                pl.col("conditioned_observations").median().alias(
-                    "median_conditioned_observations"
-                ),
-                pl.col("symbol_count").median().alias("median_symbol_count"),
-                pl.col("information_gain_bits").max().alias("max_information_gain_bits"),
-                pl.col("transition_information_gain_bits")
-                .max()
-                .alias("max_transition_information_gain_bits"),
-            )
-            if not frames.potential_evidence.is_empty()
-            else pl.DataFrame(
-                schema={
-                    "evidence_level": pl.String,
-                    "evidence_status": pl.String,
-                    "transition_status": pl.String,
-                    "statistical_direction": pl.String,
-                    "research_suggestion": pl.String,
-                    "selected_evidence_level": pl.Boolean,
-                    "row_count": pl.UInt32,
-                    "median_conditioned_observations": pl.Float64,
-                    "median_symbol_count": pl.Float64,
-                    "max_information_gain_bits": pl.Float64,
-                    "max_transition_information_gain_bits": pl.Float64,
-                }
-            )
-        ),
-        "potential-evidence-selected": (
-            frames.potential_evidence.filter(pl.col("selected_evidence_level"))
-            if not frames.potential_evidence.is_empty()
-            else frames.potential_evidence
-        ),
+        "potential-evidence-summary": _potential_evidence_summary(frames.potential_evidence),
+        "potential-evidence-selected": _selected_potential_evidence(frames.potential_evidence),
         "candidate-evidence": frames.candidate_evidence,
         "candidate-rank": frames.candidate_rank,
         "source-timeliness": frames.source_timeliness,
@@ -253,6 +256,67 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
     }
     for name, frame in frame_groups.items():
         frame.write_csv(diagnostics / f"{name}.csv")
+
+
+def _potential_evidence_summary(evidence: pl.DataFrame) -> pl.DataFrame:
+    if evidence.is_empty():
+        return pl.DataFrame(
+            schema={
+                "evidence_level": pl.String,
+                "evidence_status": pl.String,
+                "transition_status": pl.String,
+                "statistical_direction": pl.String,
+                "research_suggestion": pl.String,
+                "selected_evidence_level": pl.Boolean,
+                "row_count": pl.UInt32,
+                "median_conditioned_observations": pl.Float64,
+                "median_symbol_count": pl.Float64,
+                "max_information_gain_bits": pl.Float64,
+                "max_transition_information_gain_bits": pl.Float64,
+            }
+        )
+    if "evidence_level" in evidence.columns:
+        return evidence.group_by(
+            [
+                "evidence_level",
+                "evidence_status",
+                "transition_status",
+                "statistical_direction",
+                "research_suggestion",
+                "selected_evidence_level",
+            ],
+            maintain_order=True,
+        ).agg(
+            pl.len().alias("row_count"),
+            pl.col("conditioned_observations").median().alias("median_conditioned_observations"),
+            pl.col("symbol_count").median().alias("median_symbol_count"),
+            pl.col("information_gain_bits").max().alias("max_information_gain_bits"),
+            pl.col("transition_information_gain_bits").max().alias("max_transition_information_gain_bits"),
+        )
+    return evidence.group_by(
+        ["tree_direction", "statistical_direction", "research_suggestion"],
+        maintain_order=True,
+    ).agg(
+        pl.len().alias("row_count"),
+        pl.col("N_total").median().alias("median_N_total"),
+        pl.col("N_tail_exceedances").median().alias("median_N_tail_exceedances"),
+        pl.col("tail_lift").max().alias("max_tail_lift"),
+        pl.col("information_gain_bits").max().alias("max_information_gain_bits"),
+    )
+
+
+def _selected_potential_evidence(evidence: pl.DataFrame) -> pl.DataFrame:
+    if evidence.is_empty():
+        return evidence
+    if "selected_evidence_level" in evidence.columns:
+        return evidence.filter(pl.col("selected_evidence_level"))
+    if {"N_tail_exceedances", "tail_lift", "tail_lift_stability"}.issubset(evidence.columns):
+        return evidence.filter(
+            (pl.col("N_tail_exceedances") >= 30)
+            & (pl.col("tail_lift") >= 1.5)
+            & (pl.col("tail_lift_stability") >= 0.3)
+        )
+    return evidence.head(0)
 
 
 def _write_state_frames(frames: StateFrames, states: Path | str) -> None:
@@ -775,3 +839,117 @@ def _symbol_source_feasibility(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+
+
+def _run_pipeline(
+    observations, source_outcomes, realized_transitions, inputs,
+) -> LadderResult | TailtreeResult:
+    """One dispatch. Returns concrete type — no downstream branching."""
+    if inputs.config.evidence == "tailtree":
+        return _run_tailtree_pipeline(observations, source_outcomes, realized_transitions, inputs)
+    return _run_ladder_pipeline(observations, source_outcomes, realized_transitions, inputs)
+
+
+def _run_ladder_pipeline(
+    observations, source_outcomes, realized_transitions, inputs,
+) -> LadderResult:
+    """Self-contained ladder pipeline: evidence + candidates."""
+    evidence = evidence_eval.potential_evidence_frame(
+        observations, source_outcomes, realized_transitions,
+        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+    )
+    candidates = candidate_eval.candidate_evidence_frame(observations, evidence)
+    ranked = candidate_eval.rank_candidate_evidence(candidates)
+    return LadderResult(evidence=evidence, candidates=candidates, ranked=ranked, sections=())
+
+
+def _run_tailtree_pipeline(
+    observations, source_outcomes, realized_transitions, inputs,
+) -> TailtreeResult:
+    """Self-contained tailtree pipeline: evidence + candidates + trees."""
+    result = _build_tail_tree_evidence(
+        observations, source_outcomes, realized_transitions, inputs,
+    )
+    candidates = candidate_eval.candidate_evidence_frame(
+        observations, result.evidence, tree_up=result.tree_up, tree_down=result.tree_down,
+    )
+    ranked = candidate_eval.rank_candidate_evidence(candidates)
+    return TailtreeResult(
+        evidence=result.evidence, candidates=candidates, ranked=ranked,
+        tree_up=result.tree_up, tree_down=result.tree_down, sections=(),
+    )
+
+
+def _build_tail_tree_evidence(
+    observations, source_outcomes, realized_transitions, inputs,
+) -> TailtreeEvidenceResult:
+    from qooi.scanner.tailtree import (
+        TrainConfig, label_tail_exceedances, leaf_context_frame,
+        leaf_evidence_frame, select_tail_leaves, tailtree_training_frame,
+    )
+    from qooi.scanner.tailtree import TailTreeModel as TTM
+
+    logger = logging.getLogger("qooi.scanner")
+    inputs.artifacts.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+    outcome_frame = evidence_eval.potential_outcome_frame(
+        observations, source_outcomes, realized_transitions,
+        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+    )
+    if outcome_frame.is_empty():
+        return TailtreeEvidenceResult(pl.DataFrame(), None, None)
+
+    outcome_frame = label_tail_exceedances(outcome_frame, threshold_pct=inputs.config.tail_threshold_pct)
+    logger.info("outcome rows=%d tail_up=%d tail_down=%d",
+                len(outcome_frame),
+                int(outcome_frame.get_column("tail_up").sum()) if "tail_up" in outcome_frame.columns else 0,
+                int(outcome_frame.get_column("tail_down").sum()) if "tail_down" in outcome_frame.columns else 0)
+    config = TrainConfig(
+        num_leaves=inputs.config.tail_tree_num_leaves,
+        min_data_in_leaf=inputs.config.tail_tree_min_data_in_leaf,
+        learning_rate=inputs.config.tail_tree_learning_rate,
+        num_iterations=inputs.config.tail_tree_num_iterations,
+        early_stopping_rounds=inputs.config.tail_tree_early_stopping,
+    )
+    cat = ["background_regime","swing_core","decision_core","decision_transition",
+           "decision_direction","source_family","source_state","risk_context","market_alignment"]
+    con = ["atr_percentile", "range_width_atr", "return_1bar", "return_4bar",
+           "return_24bar", "vol_anomaly", "close_to_range_high_ratio",
+           "imbalance_value", "spread_bps", "buy_sell_ratio", "funding_rate",
+           "oi_delta", "taker_buy_sell_ratio", "long_short_ratio",
+           "book_age_ms", "trade_age_ms", "funding_age_ms", "oi_age_ms",
+           "taker_age_ms", "lsr_age_ms"]
+    cat = [c for c in cat if c in observations.columns]
+    con = [c for c in con if c in observations.columns]
+
+    all_evidence = []
+    trees = {}
+    for direction in ("up", "down"):
+        training = tailtree_training_frame(observations, outcome_frame, direction=direction)
+        if not training.has_min_exceedances(config.min_data_in_leaf):
+            continue
+
+        tree = TTM.train(
+            training.tail_observations,
+            training.exceedance_values,
+            config=config,
+            categorical_features=cat,
+            continuous_features=con,
+            direction=direction,
+            global_tail_rate=training.global_tail_rate,
+            train_n_observations=training.train_n_observations,
+        )
+        tree.to_json(inputs.artifacts.diagnostics_dir / f"tail-tree-{direction}.json")
+        trees[direction] = tree
+
+        lev = leaf_evidence_frame(tree, observations, outcome_frame)
+        if lev.is_empty():
+            continue
+        lctx = leaf_context_frame(tree, observations, outcome_frame)
+        merged = lev.join(lctx, on="leaf_id", how="left")
+        selected = select_tail_leaves(merged)
+        selected.write_csv(inputs.artifacts.diagnostics_dir / f"potential-leaves-selected-{direction}.csv")
+        all_evidence.append(merged)
+
+    ev = pl.concat(all_evidence, how="diagonal_relaxed") if all_evidence else pl.DataFrame()
+    return TailtreeEvidenceResult(ev, trees.get("up"), trees.get("down"))

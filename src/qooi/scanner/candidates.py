@@ -106,6 +106,15 @@ CANDIDATE_EVIDENCE_SCHEMA = {
     "source_age_ms": pl.Int64,
     "market_alignment": pl.String,
     "source_market_alignment": pl.String,
+    # Tree path columns (nullable — ladder path produces null)
+    "tail_lift": pl.Float64,
+    "gpd_shape_xi": pl.Float64,
+    "gpd_scale_sigma": pl.Float64,
+    "tail_lift_stability": pl.Float64,
+    "N_tail_exceedances": pl.UInt32,
+    "leaf_id": pl.Int32,
+    "tree_direction": pl.String,
+    "leaf_path": pl.String,
 }
 
 CANDIDATE_RANK_SCHEMA = CANDIDATE_EVIDENCE_SCHEMA | {
@@ -125,10 +134,23 @@ def candidate_evidence_frame(
     evidence: pl.DataFrame,
     *,
     latest_only: bool = True,
+    tree_up: Any | None = None,
+    tree_down: Any | None = None,
 ) -> pl.DataFrame:
-    """Match observation rows to selected potential evidence rows."""
+    """Match observation rows to selected evidence rows.
+
+    If tree_up/tree_down provided (tailtree path), traverses trees to assign
+    leaf_ids, then joins evidence on (leaf_id, tree_direction).
+    Otherwise uses the fixed ladder-level matching (evidence path).
+    """
     if observations.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
+
+    # Tree path: traverse trees → leaf_id → join evidence
+    if tree_up is not None or tree_down is not None:
+        return _candidate_from_trees(observations, evidence, tree_up, tree_down, latest_only=latest_only)
+
+    # Ladder path: match by evidence level columns
     base = _candidate_observations(observations, latest_only=latest_only)
     selected = _selected_evidence(evidence)
     if selected.is_empty():
@@ -150,37 +172,121 @@ def candidate_evidence_frame(
         matched = pl.concat([matched, unmatched], how="vertical_relaxed")
     return _select_schema(matched, CANDIDATE_EVIDENCE_SCHEMA)
 
+
+def _candidate_from_trees(
+    observations: pl.DataFrame,
+    evidence: pl.DataFrame,
+    tree_up: Any | None,
+    tree_down: Any | None,
+    *,
+    latest_only: bool = True,
+) -> pl.DataFrame:
+    """Match observations to tree evidence via leaf traversal."""
+    base = _candidate_observations(observations, latest_only=latest_only)
+    if base.is_empty():
+        return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
+
+    frames = []
+    for tree, direction in ((tree_up, "up"), (tree_down, "down")):
+        if tree is None:
+            continue
+        try:
+            with_leaf = tree.predict_leaf(base)
+        except Exception:
+            continue
+        dir_evidence = evidence.filter(pl.col("tree_direction") == direction) if "tree_direction" in evidence.columns else evidence
+        if dir_evidence.is_empty():
+            continue
+        matched = with_leaf.join(
+            dir_evidence,
+            left_on="leaf_id",
+            right_on="leaf_id",
+            how="inner",
+        )
+        if matched.is_empty():
+            continue
+        matched = matched.with_columns(
+            pl.lit(f"tree_{direction}").alias("matched_evidence_level"),
+            pl.lit("matched_evidence").alias("candidate_status"),
+        )
+        frames.append(matched)
+
+    if not frames:
+        return _unmatched_candidates(base, "no_tree_match")
+
+    result = pl.concat(frames, how="diagonal_relaxed")
+    return _select_schema(result, CANDIDATE_EVIDENCE_SCHEMA)
+
+
 def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
-    """Add transparent review-ordering components to candidate rows."""
+    """Add transparent review-ordering components to candidate rows.
+
+    Detects tail_lift presence → uses tail-first scoring.
+    Falls back to entropy-first scoring for ladder path.
+    """
     if candidates.is_empty():
         return pl.DataFrame(schema=CANDIDATE_RANK_SCHEMA)
-    ranked = _select_schema(candidates, CANDIDATE_EVIDENCE_SCHEMA).with_columns(
-        pl.max_horizontal(pl.col("information_gain_bits").fill_null(0.0), pl.lit(0.0)).alias(
-            "rank_information_component"
-        ),
-        pl.max_horizontal(
-            pl.col("transition_information_gain_bits").fill_null(0.0), pl.lit(0.0)
-        ).alias("rank_transition_component"),
-        pl.max_horizontal(
-            pl.col("tail_up_rate").fill_null(0.0), pl.col("tail_down_rate").fill_null(0.0)
-        ).alias("rank_tail_component"),
-        (pl.max_horizontal(pl.col("avg_path_range_pct").fill_null(0.0), pl.lit(0.0)) / 10.0).alias(
-            "rank_path_component"
-        ),
-        pl.min_horizontal(
+
+    has_tail_lift = (
+        "tail_lift" in candidates.columns
+        and candidates["tail_lift"].drop_nulls().len() > 0
+    )
+
+    ranked = _select_schema(candidates, CANDIDATE_EVIDENCE_SCHEMA)
+
+    if has_tail_lift:
+        ranked = ranked.with_columns(
+            pl.col("tail_lift").fill_null(1.0).alias("rank_information_component"),
+            pl.lit(0.0).alias("rank_transition_component"),
             pl.max_horizontal(
-                pl.col("information_stability").fill_null(0.0),
-                pl.col("transition_information_stability").fill_null(0.0),
+                pl.col("tail_lift").fill_null(1.0), pl.lit(1.0)
+            ).alias("rank_tail_component"),
+            (pl.col("tail_lift_stability").fill_null(0.0)).alias("rank_stability_component"),
+            (pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log().alias("rank_path_component"),
+        )
+    else:
+        ranked = ranked.with_columns(
+            pl.max_horizontal(pl.col("information_gain_bits").fill_null(0.0), pl.lit(0.0)).alias(
+                "rank_information_component"
             ),
-            pl.lit(2.0),
-        ).alias("rank_stability_component"),
+            pl.max_horizontal(
+                pl.col("transition_information_gain_bits").fill_null(0.0), pl.lit(0.0)
+            ).alias("rank_transition_component"),
+            pl.max_horizontal(
+                pl.col("tail_up_rate").fill_null(0.0), pl.col("tail_down_rate").fill_null(0.0)
+            ).alias("rank_tail_component"),
+            (pl.max_horizontal(pl.col("avg_path_range_pct").fill_null(0.0), pl.lit(0.0)) / 10.0).alias(
+                "rank_path_component"
+            ),
+            pl.min_horizontal(
+                pl.max_horizontal(
+                    pl.col("information_stability").fill_null(0.0),
+                    pl.col("transition_information_stability").fill_null(0.0),
+                ),
+                pl.lit(2.0),
+            ).alias("rank_stability_component"),
+        )
+
+    ranked = ranked.with_columns(
+        (pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0).log().alias("rank_quality_component") if not has_tail_lift
+        else pl.lit(0.0).alias("rank_quality_component"),
+    )
+
+    # Fix: need proper quality component for both paths
+    if has_tail_lift:
+        ranked = ranked.with_columns(
+            ((pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log() / 10.0).alias("rank_quality_component"),
+        )
+    else:
+        ranked = ranked.with_columns(
+            ((pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0).log()
+             + (pl.col("symbol_count").fill_null(0).cast(pl.Float64) + 1.0).log()).alias("rank_quality_component"),
+        )
+
+    ranked = ranked.with_columns(
         (
-            (pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0).log()
-            + (pl.col("symbol_count").fill_null(0).cast(pl.Float64) + 1.0).log()
-        ).alias("rank_quality_component"),
-        (
-            pl.when(pl.col("source_freshness") == "stale").then(1.0).otherwise(0.0)
-            + pl.when(pl.col("candidate_status") != "matched_evidence").then(2.0).otherwise(0.0)
+            pl.when(pl.col("source_freshness") == "stale").then(pl.lit(1.0)).otherwise(pl.lit(0.0))
+            + pl.when(pl.col("candidate_status") != "matched_evidence").then(pl.lit(2.0)).otherwise(pl.lit(0.0))
         ).alias("rank_penalty_component"),
     ).with_columns(
         (
@@ -197,7 +303,10 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
         .otherwise(pl.col("candidate_status"))
         .alias("rank_reason"),
     )
-    return _select_schema(ranked.sort("rank_score", descending=True), CANDIDATE_RANK_SCHEMA)
+    ranked = _select_schema(ranked.sort("rank_score", descending=True), CANDIDATE_RANK_SCHEMA)
+    if has_tail_lift and "tree_direction" in ranked.columns:
+        ranked = ranked.unique(subset=["symbol", "tree_direction"], keep="first", maintain_order=True)
+    return ranked
 
 def _candidate_observations(observations: pl.DataFrame, *, latest_only: bool) -> pl.DataFrame:
     base = observations

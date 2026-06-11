@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -76,6 +77,13 @@ class PotentialConfig(BaseModel):
     transition_context_scope: Literal["candidates", "all_scanned"] = "candidates"
     transition_context_limit: int = 20
     transition_scan_budget: int = 80
+    evidence: Literal["ladder", "tailtree"] = "ladder"
+    tail_threshold_pct: float = 5.0
+    tail_tree_num_leaves: int = 64
+    tail_tree_min_data_in_leaf: int = 30
+    tail_tree_learning_rate: float = 0.05
+    tail_tree_num_iterations: int = 200
+    tail_tree_early_stopping: int = 20
 
     @model_validator(mode="after")
     def normalize_paths_and_timeframes(self) -> PotentialConfig:
@@ -143,12 +151,24 @@ def run(config_path: Path | str) -> Path:
         config, universe.symbols, kline_states, transitions.insights, bars.coverage, context
     )
     decisions = tuple(scan_review_decisions(config, bundles))
+
+    log_path = config.output.parent / "scan.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(str(log_path), encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-5s | %(name)s | %(message)s"))
+    logger = logging.getLogger("qooi.scanner")
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
     inputs = ReportInputs(
-        config, artifacts, universe, bars, context, transitions, bundles, decisions
+        config, artifacts, universe, bars, context, transitions, bundles, decisions,
     )
     write_diagnostics(inputs)
     artifacts.report.parent.mkdir(parents=True, exist_ok=True)
     artifacts.report.write_text(render_report(inputs), encoding="utf-8")
+
+    logger.removeHandler(handler)
+    handler.close()
     return artifacts.report
 
 

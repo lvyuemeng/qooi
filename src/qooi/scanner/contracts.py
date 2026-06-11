@@ -194,7 +194,7 @@ class ScanDecision:
     review_caveat: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class ReportInputs:
     config: PotentialScanConfig
     artifacts: PotentialArtifacts
@@ -204,6 +204,7 @@ class ReportInputs:
     transitions: TransitionAnalysis
     bundles: tuple[SymbolStateBundle, ...]
     decisions: tuple[ScanDecision, ...]
+    report_sections: tuple = ()
 
 
 def missing_state(

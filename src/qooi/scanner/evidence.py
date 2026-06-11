@@ -102,6 +102,7 @@ POTENTIAL_EVIDENCE_SCHEMA = {
 def potential_observation_frame(
     kline_history: pl.DataFrame,
     source_events: pl.DataFrame,
+    continuous_features: pl.DataFrame | None = None,
     *,
     decision_timeframe: str,
     max_source_staleness_hours: int,
@@ -144,7 +145,9 @@ def potential_observation_frame(
         pl.concat_str("decision_range", "decision_vol", separator="|").alias("risk_context"),
     )
     if source_events.is_empty():
-        return _potential_observation_without_source(observations)
+        return _join_continuous_features(
+            _potential_observation_without_source(observations), continuous_features
+        )
     source_rows = source_events.filter(pl.col("source_state").is_not_null()).select(
         "symbol",
         "source_family",
@@ -153,7 +156,9 @@ def potential_observation_frame(
         pl.col("known_at_ms").alias("source_known_at_ms"),
     )
     if source_rows.is_empty():
-        return _potential_observation_without_source(observations)
+        return _join_continuous_features(
+            _potential_observation_without_source(observations), continuous_features
+        )
     frames = []
     max_age_ms = max_source_staleness_hours * 60 * 60 * 1000
     for family in source_rows.get_column("source_family").drop_nulls().unique().to_list():
@@ -189,8 +194,40 @@ def potential_observation_frame(
             )
         )
     if not frames:
-        return _potential_observation_without_source(observations)
-    return pl.concat(frames, how="vertical_relaxed").select(*POTENTIAL_OBSERVATION_SCHEMA.keys())
+        result = _potential_observation_without_source(observations)
+    else:
+        result = pl.concat(frames, how="vertical_relaxed").select(*POTENTIAL_OBSERVATION_SCHEMA.keys())
+
+    return _join_continuous_features(result, continuous_features)
+
+
+def _join_continuous_features(
+    observations: pl.DataFrame, continuous_features: pl.DataFrame | None
+) -> pl.DataFrame:
+    if continuous_features is None or continuous_features.is_empty():
+        return observations
+    if not {
+        "symbol",
+        "decision_bar_close_ms",
+    }.issubset(observations.columns) or not {"symbol", "timestamp"}.issubset(
+        continuous_features.columns
+    ):
+        return observations
+    cf_cols = [
+        c
+        for c in continuous_features.columns
+        if c not in ("symbol", "timestamp") and c not in observations.columns
+    ]
+    if not cf_cols:
+        return observations
+    return observations.join(
+        continuous_features.select(["symbol", "timestamp"] + cf_cols).unique(
+            subset=["symbol", "timestamp"], keep="last"
+        ),
+        left_on=["symbol", "decision_bar_close_ms"],
+        right_on=["symbol", "timestamp"],
+        how="left",
+    )
 
 
 def _potential_observation_without_source(observations: pl.DataFrame) -> pl.DataFrame:
