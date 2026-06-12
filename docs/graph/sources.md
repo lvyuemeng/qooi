@@ -110,7 +110,31 @@ sources.artifacts.ArtifactSpec(name, relative_path, schema, required)
 
 sources.bundle.SourceBundle(...)
 
-sources.context.SourceAvailability(family, symbol, rows, latest_timestamp, status, warning)
+sources.context.SourceAvailability(
+  family,
+  symbol,
+  rows,
+  latest_timestamp,
+  latest_age_hours,
+  freshness_threshold_hours,
+  frame_fresh_int,
+  frame_missing_int,
+  usable_int,
+  latest_fetch_status,
+  latest_fetch_warning,
+)
+
+sources.coverage.SourceFetchObservation(
+  family,
+  raw_source,
+  symbol,
+  status,
+  warning,
+  endpoint,
+  status_code=None,
+  provider_code=None,
+  response_body_prefix=None,
+)
 
 sources.context.SourceContextResult(manifest, frames, availability)
 ```
@@ -134,8 +158,21 @@ load_source_context
   -> collect_source_context
   -> merge/write source artifacts
   -> source_availability
+       -> summarize materialized frame rows by family/symbol
+       -> compute latest_age_hours vs freshness_threshold_hours
+       -> join latest fetch observation from manifest for provenance only
   -> SourceContextResult
 ```
+
+Availability rule:
+
+```text
+frame_missing_int = rows == 0
+frame_fresh_int   = rows > 0 and latest_age_hours <= freshness_threshold_hours
+usable_int        = frame_fresh_int for fresh-required source families
+```
+
+The latest manifest row can set `latest_fetch_status` and `latest_fetch_warning`; it must not set frame rows, latest timestamp, age, or usability by itself.
 
 Allowed side effects:
 
@@ -234,14 +271,52 @@ Merge keys come from `SourceFamily`, not local duplicate maps.
 Pure observation/availability API:
 
 ```text
-observe_sources(bundle, manifest, needs) -> tuple[SourceAvailability, ...]
-latest_manifest_rows(manifest) -> DataFrame
-latest_manifest_status(manifest, raw_source_or_family, symbol) -> status
-stale_symbols(observed, freshness_ms) -> tuple[str, ...]
-eligible_fetch_symbols(observed, need) -> tuple[str, ...]
-missing_evidence_for_symbol(observed, symbol) -> dict[str, int]
-compute_source_coverage_score(observed) -> float
+source_frame_observations(
+    frames: dict[str, DataFrame],
+    families: tuple[SourceFamily, ...],
+    symbols: tuple[str, ...],
+    *,
+    now_ms: int,
+    freshness_ms_by_family: dict[str, int],
+) -> tuple[SourceAvailability, ...]
+
+latest_fetch_observations(manifest: DataFrame) -> tuple[SourceFetchObservation, ...]
+
+join_fetch_provenance(
+    availability: tuple[SourceAvailability, ...],
+    fetches: tuple[SourceFetchObservation, ...],
+) -> tuple[SourceAvailability, ...]
+
+stale_symbols(availability, freshness_ms) -> tuple[str, ...]
+eligible_fetch_symbols(availability, need) -> tuple[str, ...]
+missing_evidence_for_symbol(availability, symbol) -> dict[str, int]
+compute_source_coverage_score(availability) -> float
 ```
+
+Frame observation owns quantitative state:
+
+```text
+rows
+latest_timestamp
+latest_age_hours
+freshness_threshold_hours
+frame_fresh_int
+frame_missing_int
+usable_int
+```
+
+Fetch observation owns provider provenance:
+
+```text
+latest_fetch_status
+latest_fetch_warning
+endpoint
+status_code
+provider_code
+response_body_prefix
+```
+
+`latest_fetch_status="missing"` after an empty incremental page does not make `frame_missing_int=1` when cached frame rows exist.
 
 No concrete `exchange.store` import in target state.
 
@@ -267,6 +342,28 @@ Provider wrappers return:
 
 ```text
 SourceResult(frame, manifest)
+```
+
+Provider manifest rows must include sanitized transport diagnostics when available:
+
+```text
+status_code              # HTTP status, e.g. 403
+provider_code            # provider payload/code/body token, e.g. 1010
+response_body_prefix     # short sanitized body prefix, no secrets
+endpoint
+params_shape             # sanitized parameter shape when useful
+```
+
+Historical pagers should preserve page-level stop evidence:
+
+```text
+fetch_stop
+fetch_page_index
+fetch_pages
+fetch_cursor
+fetch_oldest_ts
+fetch_status_code
+fetch_provider_code
 ```
 
 They do not decide scanner demand, artifact merge, or source availability.

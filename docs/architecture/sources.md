@@ -6,18 +6,31 @@
 
 It does not own OHLCV exchange cache, scanner evidence/ranking, strategy computation, research promotion, basket lifecycle, executor accounting, dynamic/learned-state logic, or trading IO.
 
-## Demand pipeline
+## Demand and availability pipeline
 
 ```text
 scanner config + symbols
   -> SourceNeed
   -> source collection execution
-  -> provider SourceResult
+  -> provider SourceResult(frame, manifest)
   -> SourceBundle materialization
   -> SourceAvailability diagnostics
 ```
 
 `SourceNeed` construction is pure. Provider calls and writes are side-effect boundaries.
+
+Availability is computed from materialized frames first, not from the latest fetch manifest alone:
+
+```text
+frame rows + latest event/known-at timestamp + configured threshold
+  -> frame_freshness
+latest manifest row
+  -> fetch provenance/status
+frame_freshness + fetch provenance
+  -> review usability diagnostics
+```
+
+A latest empty or failed incremental provider fetch must not overwrite usable cached frame rows. The manifest explains the latest fetch attempt; the frame determines observed rows, age, and whether the family is currently usable.
 
 ## Module layout
 
@@ -50,10 +63,11 @@ Removed target: source collection must not live in `qooi.exchange.context`.
 | `SourceFamily` | `sources.artifacts` | Small family/artifact/raw-source/timestamp/merge-key contract. |
 | `ArtifactSpec` | `sources.artifacts` | Persisted CSV artifact path and schema. |
 | `SourceBundle` | `sources.bundle` | Loaded source artifacts. |
-| `SourceAvailability` | `sources.context` or `sources.coverage` | Quantitative per-family/per-symbol observed state. |
+| `SourceAvailability` | `sources.context` or `sources.coverage` | Quantitative per-family/per-symbol observed frame state: rows, latest timestamp, age, freshness threshold, and usability. |
+| `SourceFetchObservation` | `sources.coverage` | Latest provider/raw-source attempt state from the manifest: status, warning, endpoint, transport, and optional HTTP diagnostics. |
 | `SourceContextResult` | `sources.context` | Scanner-facing source frames, manifest, availability. |
 
-Do not add fields or modules that do not answer a current demand question.
+Do not add fields or modules that do not answer a current demand question. Availability fields should be numeric/evaluable before qualitative: rows, latest timestamp, age hours, threshold hours, fresh bit, usable bit, and missing bit.
 
 ## Family/artifact contract
 
@@ -118,6 +132,8 @@ sources.context -> exchange.context
 - Fetch provider source rows through provider wrappers.
 - Normalize provider payloads into `SourceResult` frames and manifests.
 - Merge/write source artifacts by declared keys and schemas.
+- Derive frame-level source availability from persisted rows, latest timestamps, and configured staleness thresholds.
+- Preserve latest fetch-attempt provenance separately from frame usability.
 - Emit explicit missing/stale/shallow availability for diagnostics.
 
 ## Non-responsibilities

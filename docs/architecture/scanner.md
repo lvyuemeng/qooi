@@ -155,6 +155,41 @@ Each stage consumes the smallest named data products it needs. No downstream fun
 
 ## Data products and invariants
 
+### `source_availability`
+
+Owner: `qooi.sources.context.load_source_context(...)`; consumed by `qooi.scanner.decisions`, `qooi.scanner.diagnostics`, and `qooi.scanner.report`.
+
+Key:
+
+```text
+(symbol, source_family)
+```
+
+Invariants:
+
+- source acquisition owns raw-source provenance, artifact schemas, and frame availability;
+- scanner may consume availability but must not infer provider fetch success from source feature nulls;
+- frame availability is numeric: rows, latest timestamp, latest age, freshness threshold, fresh bit, missing bit, usable bit;
+- latest fetch status is provenance only and must not overwrite observed frame rows;
+- messages/context absence is an explicit source-family coverage count, not an implicit per-symbol model failure.
+
+### `history_feasibility`
+
+Owner: scanner diagnostics/report from OHLCV cache coverage and configured review thresholds.
+
+Key:
+
+```text
+(symbol, bar)
+```
+
+Invariants:
+
+- evidence training coverage and current-review coverage are separate lenses;
+- a deep evidence horizon may use a long history target, while current review may use a shorter explicit review window;
+- report columns should expose both `history_target_coverage_pct` and `review_window_coverage_pct` when the windows differ;
+- provider fetch-stop diagnostics remain visible rather than collapsed into a qualitative label.
+
 ### `continuous_features`
 
 Owner: `qooi.scanner.features.extract_continuous_features(...)`
@@ -230,10 +265,11 @@ Promotion-quality evidence should not rely on excursion alone. It should report 
 
 ## Evidence path contracts
 
-The scanner has one dispatch point, keyed by:
+The scanner has one dispatch point, keyed by the nested evidence section:
 
 ```toml
-evidence = "ladder" | "tailtree"
+[potential.evidence]
+kind = "ladder" # or "tailtree"
 ```
 
 ### `LadderResult`

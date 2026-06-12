@@ -68,6 +68,97 @@ helpers. There are no `qooi.scanner.contracts`, `qooi.scanner.evidence`, or
 
 ---
 
+## Source context + feasibility inputs
+
+```text
+qooi.sources.context.load_source_context(...)
+  -> SourceContextResult(
+       manifest,
+       frames,
+       availability,
+     )
+```
+
+`availability` is the scanner's source-feasibility input. Scanner modules consume numeric availability fields; they do not reinterpret provider manifests directly.
+
+Current implemented availability columns:
+
+```text
+source_family
+symbol
+rows
+latest_timestamp
+status
+warning
+```
+
+Target availability columns for the source-availability fix:
+
+```text
+symbol
+source_family
+rows
+latest_timestamp
+latest_age_hours
+freshness_threshold_hours
+frame_fresh_int
+frame_missing_int
+usable_int
+latest_fetch_status
+latest_fetch_warning
+latest_fetch_status_code
+latest_fetch_provider_code
+```
+
+History feasibility artifacts:
+
+```text
+diagnostics/history-feasibility.csv
+  key: symbol, bar
+  current columns:
+    target_rows
+    actual_rows
+    coverage_pct
+    range_start
+    range_end
+    newest_age_hours
+    gap_count
+    duplicate_timestamps
+    refreshed
+    feasibility_status
+    feasibility_reason
+    notes
+  target columns after review-window split:
+    observed_rows
+    target_rows
+    history_target_coverage_pct
+    review_window_rows
+    review_window_coverage_pct
+    fetch_limited_int
+    history_start_limited_int
+    reviewable_history_int
+    fetch_stop
+    fetch_status_code
+    fetch_provider_code
+```
+
+Source freshness artifacts:
+
+```text
+diagnostics/source-freshness.csv
+  key: symbol, source_family
+  columns from SourceAvailability
+```
+
+These artifacts preserve two separate questions:
+
+```text
+Can evidence train/evaluate on the available cross-coin history?
+Can this current symbol row be reviewed with enough local history and fresh source context?
+```
+
+---
+
 ## Continuous features: `qooi.scanner.features`
 
 ```text
@@ -396,7 +487,7 @@ strategies semantics → scanner classifiers
 These must not appear in current scanner docs/code contracts:
 
 ```text
-use_tail_tree                 # replaced by evidence = "ladder" | "tailtree"
+use_tail_tree                 # replaced by [potential.evidence] kind = "ladder" | "tailtree"
 leaf_path / leaf_paths        # removed; leaf_id + numeric stats are enough
 to_pandas training path       # optional pyarrow/pandas path is not required
 fobj custom-objective arg     # LightGBM 4 custom objective is params["objective"]
