@@ -51,10 +51,10 @@ def compute_transition_insights(
         transition_counts = _transition_counts(rows)
         rows_sorted = rows.sort("symbol", "timestamp")
         long_rows = rows_sorted.group_by("symbol").tail(
-            max(config.transition_long_window, config.transition_min_count)
+            max(config.transition.long_window, config.transition.min_count)
         )
         recent_rows = rows_sorted.group_by("symbol").tail(
-            max(config.transition_recent_window, config.transition_min_count)
+            max(config.transition.recent_window, config.transition.min_count)
         )
         long_counts = _transition_counts(long_rows).rename(
             {"transition_probability": "long_transition_probability"}
@@ -144,29 +144,29 @@ def compute_transition_insights(
             .with_columns(
                 (
                     pl.col("count").is_not_null()
-                    & (pl.col("count") >= config.transition_min_count)
+                    & (pl.col("count") >= config.transition.min_count)
                     & (
                         pl.col("transition_probability").fill_null(0.0)
-                        >= config.transition_min_probability
+                        >= config.transition.min_probability
                     )
                     & (
                         pl.col("recent_transition_probability").fill_null(0.0)
-                        >= config.transition_min_probability
+                        >= config.transition.min_probability
                     )
                     & (
                         pl.col("probability_delta").fill_null(-1.0)
-                        >= config.transition_min_probability_delta
+                        >= config.transition.min_probability_delta
                     )
                     & (
                         pl.col("directional_probability").fill_null(0.0)
-                        >= config.transition_min_directional_probability
+                        >= config.transition.min_directional_probability
                     )
-                    & (pl.col("reward_risk").fill_null(0.0) >= config.transition_min_reward_risk)
+                    & (pl.col("reward_risk").fill_null(0.0) >= config.transition.min_reward_risk)
                     & (
                         pl.col("loss_stop_pct").fill_null(float("inf"))
-                        <= config.transition_max_tail_loss_pct
+                        <= config.transition.max_tail_loss_pct
                     )
-                    & (pl.col("information_bits") >= config.transition_min_information_bits)
+                    & (pl.col("information_bits") >= config.transition.min_information_bits)
                     & pl.col("direction").is_in(["bullish", "bearish"])
                 ).alias("gate_pass")
             )
@@ -260,7 +260,7 @@ def _classified_symbol_frame(
         if (
             frame.is_empty()
             or states.is_empty()
-            or frame.height < config.transition_horizon + config.transition_ngram_length + 1
+            or frame.height < config.transition.horizon + config.transition.ngram_length + 1
         ):
             continue
         if "volume" not in frame.columns and "vol" in frame.columns:
@@ -287,8 +287,8 @@ def _classified_symbol_frame(
 
 
 def _transition_work_frame(classified: pl.DataFrame, config: PotentialScanConfig) -> pl.DataFrame:
-    horizon = max(1, config.transition_mae_mfe_horizon)
-    ngram_length = max(2, config.transition_ngram_length)
+    horizon = max(1, config.transition.mae_mfe_horizon)
+    ngram_length = max(2, config.transition.ngram_length)
     forward_max_high = pl.max_horizontal(
         *(pl.col("high").shift(-offset).over("symbol") for offset in range(1, horizon + 1))
     )
@@ -309,7 +309,7 @@ def _transition_work_frame(classified: pl.DataFrame, config: PotentialScanConfig
         ).alias("transition_path"),
         (
             (
-                pl.col("close").shift(-config.transition_horizon).over("symbol") / pl.col("close")
+                pl.col("close").shift(-config.transition.horizon).over("symbol") / pl.col("close")
                 - 1.0
             )
             * 100.0
@@ -335,13 +335,13 @@ def _pattern_frame(rows: pl.DataFrame, config: PotentialScanConfig) -> pl.DataFr
         .agg(
             pl.len().alias("count"),
             pl.col("symbol").n_unique().alias("symbol_count"),
-            (pl.col("forward_return_pct") > config.transition_return_threshold_pct)
+            (pl.col("forward_return_pct") > config.transition.return_threshold_pct)
             .mean()
             .alias("win_rate"),
-            (pl.col("forward_return_pct") > config.transition_return_threshold_pct)
+            (pl.col("forward_return_pct") > config.transition.return_threshold_pct)
             .mean()
             .alias("p_up"),
-            (pl.col("forward_return_pct") < -config.transition_return_threshold_pct)
+            (pl.col("forward_return_pct") < -config.transition.return_threshold_pct)
             .mean()
             .alias("p_down"),
             pl.col("forward_return_pct").mean().alias("average_forward_return_pct"),
@@ -361,9 +361,9 @@ def _pattern_frame(rows: pl.DataFrame, config: PotentialScanConfig) -> pl.DataFr
             .sum()
             .alias("losses"),
         )
-        .filter(pl.col("count") >= config.transition_min_count)
+        .filter(pl.col("count") >= config.transition.min_count)
         .with_columns(
-            (pl.col("count") / max(1, config.transition_horizon)).alias("effective_count"),
+            (pl.col("count") / max(1, config.transition.horizon)).alias("effective_count"),
             (
                 pl.col("gains")
                 / pl.when(pl.col("losses") > 0.0).then(pl.col("losses")).otherwise(1.0)
@@ -371,9 +371,9 @@ def _pattern_frame(rows: pl.DataFrame, config: PotentialScanConfig) -> pl.DataFr
         )
         .with_columns(
             ((pl.col("win_rate") * pl.col("omega")) / (1.0 + pl.col("omega"))).alias("pwpr"),
-            pl.when(pl.col("average_forward_return_pct") > config.transition_return_threshold_pct)
+            pl.when(pl.col("average_forward_return_pct") > config.transition.return_threshold_pct)
             .then(pl.lit("bullish"))
-            .when(pl.col("average_forward_return_pct") < -config.transition_return_threshold_pct)
+            .when(pl.col("average_forward_return_pct") < -config.transition.return_threshold_pct)
             .then(pl.lit("bearish"))
             .otherwise(pl.lit("neutral"))
             .alias("direction"),
@@ -403,7 +403,7 @@ def _pattern_frame(rows: pl.DataFrame, config: PotentialScanConfig) -> pl.DataFr
             .alias("reward_risk"),
         )
         .with_columns(
-            pl.when(pl.col("reward_risk") >= config.transition_min_reward_risk)
+            pl.when(pl.col("reward_risk") >= config.transition.min_reward_risk)
             .then(pl.lit("rapid_trend_watch"))
             .when(pl.col("p_up") + pl.col("p_down") >= 0.75)
             .then(pl.lit("volatility_expansion_watch"))

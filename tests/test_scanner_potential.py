@@ -14,6 +14,7 @@ from qooi.scanner import history as potential_history
 from qooi.scanner import ladder as potential_ladder
 from qooi.scanner import rank as potential_rank
 from qooi.scanner.classifiers import STATE_FRAME_SCHEMA
+from qooi.scanner.config import TransitionConfig
 from qooi.scanner.tailtree import _tailtree_outcome_by_decision, select_tail_leaves
 from qooi.scanner.workflow import run
 
@@ -399,15 +400,21 @@ bar = "4H"
 days = 30
 refresh_mode = "incremental"
 fetch_concurrency = 8
-transition_scan_budget = 80
-transition_context_scope = "all_scanned"
-transition_context_limit = 80
-transition_history_days = 365
-transition_ngram_length = 4
-transition_horizon = 8
-transition_min_information_bits = 0.01
-require_context_for_review = true
-max_source_staleness_hours = 12
+
+[potential.transition]
+scan_budget = 80
+context_scope = "all_scanned"
+context_limit = 80
+history_days = 365
+ngram_length = 4
+horizon = 8
+min_information_bits = 0.01
+
+[potential.review]
+require_context = true
+
+[potential.source]
+max_staleness_hours = 12
 trade_limit = 50
 funding_limit = 60
 rubik_period = "4H"
@@ -425,26 +432,26 @@ disabled_symbols = ["BAD-USDT-SWAP"]
     assert legacy.output == Path("data/output/potential/report.md")
     assert legacy.universe == "research"
     assert legacy.bar == "1H"
-    assert legacy.disabled_sources == ()
+    assert legacy.source.disabled_sources == ()
     assert current.output == Path("data/output/potential/report.md")
     assert current.refresh_mode == "incremental"
     assert current.fetch_concurrency == 8
-    assert current.transition_scan_budget == 80
-    assert current.transition_context_scope == "all_scanned"
-    assert current.transition_context_limit == 80
-    assert current.transition_history_days == 365
-    assert current.transition_ngram_length == 4
-    assert current.transition_horizon == 8
-    assert current.transition_min_information_bits == 0.01
-    assert current.require_context_for_review is True
-    assert current.max_source_staleness_hours == 12
-    assert current.trade_limit == 50
-    assert current.funding_limit == 60
-    assert current.rubik_period == "4H"
-    assert current.rubik_limit == 70
-    assert current.rubik_taker_unit == "1"
-    assert current.disabled_sources == ("messages",)
-    assert current.disabled_symbols == ("BAD-USDT-SWAP",)
+    assert current.transition.scan_budget == 80
+    assert current.transition.context_scope == "all_scanned"
+    assert current.transition.context_limit == 80
+    assert current.transition.history_days == 365
+    assert current.transition.ngram_length == 4
+    assert current.transition.horizon == 8
+    assert current.transition.min_information_bits == 0.01
+    assert current.review.require_context is True
+    assert current.source.max_staleness_hours == 12
+    assert current.source.trade_limit == 50
+    assert current.source.funding_limit == 60
+    assert current.source.rubik_period == "4H"
+    assert current.source.rubik_limit == 70
+    assert current.source.rubik_taker_unit == "1"
+    assert current.source.disabled_sources == ("messages",)
+    assert current.source.disabled_symbols == ("BAD-USDT-SWAP",)
 
 
 def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypatch) -> None:
@@ -464,9 +471,13 @@ def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypat
         ),
     )
 
-    universe = potential.resolve_universe(potential.PotentialConfig(transition_scan_budget=2))
+    universe = potential.resolve_universe(
+        potential.PotentialConfig(transition=TransitionConfig(scan_budget=2))
+    )
     all_context = scan.context_symbols(
-        potential.PotentialConfig(transition_context_scope="all_scanned"), universe.symbols, {}
+        potential.PotentialConfig(transition=TransitionConfig(context_scope="all_scanned")),
+        universe.symbols,
+        {},
     )
     no_patterns = {
         symbol: scan.TransitionInsight(symbol, _state_row("transition", "missing"), ())
@@ -768,7 +779,7 @@ def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> N
         ),
         (
             _decision_bundle(transition=_state_row("transition", "bullish", score=0.2)),
-            potential.PotentialConfig(transition_min_directional_probability=0.9),
+            potential.PotentialConfig(transition=TransitionConfig(min_directional_probability=0.9)),
             "watch",
             "bullish",
             "transition_quality_below_threshold",
@@ -837,9 +848,11 @@ def test_transition_matching_and_ngram_work_frame_do_not_use_unrelated_patterns(
         potential.PotentialConfig(
             symbols=("BTC-USDT-SWAP",),
             timeframes=("1H",),
-            transition_horizon=1,
-            transition_min_count=4,
-            transition_ngram_length=4,
+            transition=TransitionConfig(
+                horizon=1,
+                min_count=4,
+                ngram_length=4,
+            ),
         ),
         ("BTC-USDT-SWAP",),
         {("BTC-USDT-SWAP", "1H"): frame},

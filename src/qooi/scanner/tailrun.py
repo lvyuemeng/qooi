@@ -7,7 +7,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 import polars as pl
 
@@ -17,6 +17,31 @@ if TYPE_CHECKING:
     from qooi.scanner import ReportInputs
 
 
+class TailtreeModelMetadata(Protocol):
+    categorical_features: list[str]
+    continuous_features: list[str]
+
+
+class TailtreeArtifactTree(Protocol):
+    metadata: TailtreeModelMetadata
+
+    def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame: ...
+    def to_json(self, path: Path) -> None: ...
+
+
+class TailtreeArtifactMetadata(TypedDict):
+    bar: str
+    horizon_bars: int
+    threshold_pct: float
+    categorical_features: list[str]
+    continuous_features: list[str]
+    feature_schema_hash: str
+    model_tag: str
+
+
+TailtreeDirection = Literal["up", "down"]
+
+
 @dataclass(frozen=True)
 class TailtreeResult:
     """Tailtree path pipeline result. Every field has a concrete type."""
@@ -24,8 +49,8 @@ class TailtreeResult:
     evidence: pl.DataFrame
     candidates: pl.DataFrame
     ranked: pl.DataFrame
-    tree_up: object | None
-    tree_down: object | None
+    tree_up: TailtreeArtifactTree | None
+    tree_down: TailtreeArtifactTree | None
     sections: tuple
 
 
@@ -34,8 +59,8 @@ class TailtreeEvidenceResult:
     """Tailtree evidence/model build result before candidate matching."""
 
     evidence: pl.DataFrame
-    tree_up: object | None
-    tree_down: object | None
+    tree_up: TailtreeArtifactTree | None
+    tree_down: TailtreeArtifactTree | None
 
 
 def run(
@@ -46,7 +71,7 @@ def run(
 ) -> TailtreeEvidenceResult:
     """Run the explicit tailtree lifecycle selected by config."""
 
-    if inputs.config.tailtree.lifecycle == "load_predict":
+    if inputs.config.evidence.tailtree.lifecycle == "load_predict":
         return load_predict(observations, inputs)
     return train_evaluate_predict(observations, source_outcomes, realized_transitions, inputs)
 
@@ -72,7 +97,9 @@ def load_predict(
 
 
 def _tailtree_model_root(inputs) -> Path:
-    return Path(inputs.config.tailtree.model_dir) / inputs.config.tailtree.model_tag
+    return (
+        Path(inputs.config.evidence.tailtree.model_dir) / inputs.config.evidence.tailtree.model_tag
+    )
 
 
 def _tailtree_feature_schema_hash(
@@ -89,8 +116,8 @@ def _tailtree_feature_schema_hash(
 
 
 def _tailtree_artifact_metadata(
-    inputs, tree_up: object | None, tree_down: object | None
-) -> dict[str, object]:
+    inputs, tree_up: TailtreeArtifactTree | None, tree_down: TailtreeArtifactTree | None
+) -> TailtreeArtifactMetadata:
     categorical_features: list[str] = []
     continuous_features: list[str] = []
     for tree in (tree_up, tree_down):
@@ -102,21 +129,21 @@ def _tailtree_artifact_metadata(
         break
     return {
         "bar": inputs.config.bar,
-        "horizon_bars": inputs.config.transition_mae_mfe_horizon,
-        "threshold_pct": inputs.config.tail_threshold_pct,
+        "horizon_bars": inputs.config.transition.mae_mfe_horizon,
+        "threshold_pct": inputs.config.evidence.tailtree.threshold_pct,
         "categorical_features": categorical_features,
         "continuous_features": continuous_features,
         "feature_schema_hash": _tailtree_feature_schema_hash(
             categorical_features, continuous_features
         ),
-        "model_tag": inputs.config.tailtree.model_tag,
+        "model_tag": inputs.config.evidence.tailtree.model_tag,
     }
 
 
 def _write_tailtree_artifacts(
     inputs,
     evidence_by_direction: dict[str, pl.DataFrame],
-    trees: dict[str, object],
+    trees: dict[TailtreeDirection, TailtreeArtifactTree],
 ) -> None:
     root = _tailtree_model_root(inputs)
     root.mkdir(parents=True, exist_ok=True)
@@ -148,9 +175,9 @@ def _load_tail_tree_evidence(observations: pl.DataFrame, inputs) -> TailtreeEvid
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     expected = {
         "bar": inputs.config.bar,
-        "horizon_bars": inputs.config.transition_mae_mfe_horizon,
-        "threshold_pct": inputs.config.tail_threshold_pct,
-        "model_tag": inputs.config.tailtree.model_tag,
+        "horizon_bars": inputs.config.transition.mae_mfe_horizon,
+        "threshold_pct": inputs.config.evidence.tailtree.threshold_pct,
+        "model_tag": inputs.config.evidence.tailtree.model_tag,
     }
     mismatches = [key for key, value in expected.items() if metadata.get(key) != value]
     if mismatches:
@@ -159,7 +186,7 @@ def _load_tail_tree_evidence(observations: pl.DataFrame, inputs) -> TailtreeEvid
         )
         raise ValueError(f"tailtree load_predict artifact mismatch: {details}")
 
-    trees: dict[str, object] = {}
+    trees: dict[TailtreeDirection, TailtreeArtifactTree] = {}
     evidence_frames: list[pl.DataFrame] = []
     for direction in ("up", "down"):
         model_path = root / f"tail-tree-{direction}.json"
@@ -210,13 +237,13 @@ def _build_tail_tree_evidence(
         observations,
         source_outcomes,
         realized_transitions,
-        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+        return_threshold_pct=inputs.config.transition.return_threshold_pct,
     )
     if outcome_frame.is_empty():
         return TailtreeEvidenceResult(pl.DataFrame(), None, None)
 
     outcome_frame = label_tail_exceedances(
-        outcome_frame, threshold_pct=inputs.config.tail_threshold_pct
+        outcome_frame, threshold_pct=inputs.config.evidence.tailtree.threshold_pct
     )
     tail_up_count = (
         int(outcome_frame.get_column("tail_up").sum()) if "tail_up" in outcome_frame.columns else 0
@@ -233,11 +260,11 @@ def _build_tail_tree_evidence(
         tail_down_count,
     )
     config = TrainConfig(
-        num_leaves=inputs.config.tail_tree_num_leaves,
-        min_data_in_leaf=inputs.config.tail_tree_min_data_in_leaf,
-        learning_rate=inputs.config.tail_tree_learning_rate,
-        num_iterations=inputs.config.tail_tree_num_iterations,
-        early_stopping_rounds=inputs.config.tail_tree_early_stopping,
+        num_leaves=inputs.config.evidence.tailtree.num_leaves,
+        min_data_in_leaf=inputs.config.evidence.tailtree.min_data_in_leaf,
+        learning_rate=inputs.config.evidence.tailtree.learning_rate,
+        num_iterations=inputs.config.evidence.tailtree.num_iterations,
+        early_stopping_rounds=inputs.config.evidence.tailtree.early_stopping_rounds,
     )
     cat = [
         "background_regime",
@@ -276,8 +303,8 @@ def _build_tail_tree_evidence(
     con = [c for c in con if c in observations.columns]
 
     all_evidence = []
-    evidence_by_direction: dict[str, pl.DataFrame] = {}
-    trees = {}
+    evidence_by_direction: dict[TailtreeDirection, pl.DataFrame] = {}
+    trees: dict[TailtreeDirection, TailtreeArtifactTree] = {}
     for direction in ("up", "down"):
         training = tailtree_training_frame(observations, outcome_frame, direction=direction)
         if not training.has_min_exceedances(config.min_data_in_leaf):

@@ -10,11 +10,23 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal, Protocol
 
 import numpy as np
 import polars as pl
 from pydantic import BaseModel, Field
+
+
+class LightGbmBooster(Protocol):
+    def predict(self, data: np.ndarray, *, pred_leaf: bool = False) -> np.ndarray: ...
+    def feature_importance(self, *, importance_type: str) -> np.ndarray: ...
+    def model_to_string(self) -> str: ...
+    def num_trees(self) -> int: ...
+
+
+class LightGbmDataset(Protocol):
+    def get_label(self) -> np.ndarray: ...
+
 
 # ── pydantic models ──────────────────────────────────────────────────────────
 
@@ -91,7 +103,7 @@ class TailTreeModel:
     Construct via TailTreeModel.train() or TailTreeModel.from_json().
     """
 
-    booster: Any  # lightgbm.Booster
+    booster: str
     metadata: TreeMetadata
 
     # ── static factory: train ────────────────────────────────────────────────
@@ -253,7 +265,7 @@ class TailTreeModel:
     # ── prediction ───────────────────────────────────────────────────────────
 
     @property
-    def _booster(self) -> Any:
+    def _booster(self) -> LightGbmBooster:
         """Reconstruct lightgbm Booster from stored model string."""
         import lightgbm as lgb
 
@@ -315,7 +327,7 @@ class TailTreeModel:
 
 def _gpd_xi_objective(
     preds: np.ndarray,
-    train_data: Any,  # lgb.Dataset
+    train_data: LightGbmDataset,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Custom LightGBM objective: GPD NLL gradient w.r.t. xi.
 
@@ -350,7 +362,7 @@ def _gpd_xi_objective(
 
 def _gpd_nll_eval(
     preds: np.ndarray,
-    train_data: Any,
+    train_data: LightGbmDataset,
 ) -> tuple[str, float, bool]:
     """LightGBM eval metric for early stopping."""
     y = train_data.get_label()

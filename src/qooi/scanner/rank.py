@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Protocol
 
 import polars as pl
+
+
+class TailTreePredictor(Protocol):
+    def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame: ...
+
 
 EVIDENCE_LEVEL_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("market_background", ("background_regime",)),
@@ -138,8 +143,8 @@ def candidate_evidence_frame(
     evidence: pl.DataFrame,
     *,
     latest_only: bool = True,
-    tree_up: Any | None = None,
-    tree_down: Any | None = None,
+    tree_up: TailTreePredictor | None = None,
+    tree_down: TailTreePredictor | None = None,
 ) -> pl.DataFrame:
     """Match observation rows to selected evidence rows."""
     if observations.is_empty():
@@ -172,8 +177,8 @@ def candidate_evidence_frame(
 def _candidate_from_trees(
     observations: pl.DataFrame,
     evidence: pl.DataFrame,
-    tree_up: Any | None,
-    tree_down: Any | None,
+    tree_up: TailTreePredictor | None,
+    tree_down: TailTreePredictor | None,
     *,
     latest_only: bool = True,
 ) -> pl.DataFrame:

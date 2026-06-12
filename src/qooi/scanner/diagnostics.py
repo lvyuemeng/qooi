@@ -71,7 +71,7 @@ def write_diagnostics(inputs: ReportInputs) -> None:
 
     from qooi.scanner.report import report_sections_for
 
-    inputs.report_sections = report_sections_for(inputs.config.evidence)
+    inputs.report_sections = report_sections_for(inputs.config.evidence.kind)
 
     state_frames = _build_state_frames(inputs)
     diagnostics = inputs.artifacts.diagnostics_dir
@@ -119,7 +119,7 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         kline_history,
         tuple(source_outcomes.get_column("outcome_horizon").unique().to_list())
         if not source_outcomes.is_empty()
-        else (inputs.config.transition_horizon,),
+        else (inputs.config.transition.horizon,),
     )
 
     continuous_features = features_eval.extract_continuous_features(
@@ -134,11 +134,11 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         source_events,
         continuous_features,
         decision_timeframe=inputs.config.bar,
-        max_source_staleness_hours=inputs.config.max_source_staleness_hours,
+        max_source_staleness_hours=inputs.config.source.max_staleness_hours,
     )
     logger.info("observation rows=%d", len(potential_observations))
 
-    logger.info("evidence begin path=%s", inputs.config.evidence)
+    logger.info("evidence begin path=%s", inputs.config.evidence.kind)
     pipeline_result = _run_pipeline(
         potential_observations, source_outcomes, realized_transitions, inputs
     )
@@ -151,12 +151,12 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
     # Populate report sections for render_report
     from qooi.scanner.report import report_sections_for
 
-    inputs.report_sections = report_sections_for(inputs.config.evidence)
+    inputs.report_sections = report_sections_for(inputs.config.evidence.kind)
 
     source_timeliness = source_eval.source_timeliness_frame(source_outcomes)
     source_state_predictability = source_eval.source_state_predictability_frame(
         source_outcomes,
-        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+        return_threshold_pct=inputs.config.transition.return_threshold_pct,
     )
     return DiagnosticFrames(
         coverage=coverage_frame(inputs.bars.coverage),
@@ -830,7 +830,7 @@ def _run_pipeline(
     inputs,
 ) -> LadderResult | TailtreeResult:
     """One dispatch. Returns concrete type — no downstream branching."""
-    if inputs.config.evidence == "tailtree":
+    if inputs.config.evidence.kind == "tailtree":
         return _run_tailtree_pipeline(observations, source_outcomes, realized_transitions, inputs)
     return _run_ladder_pipeline(observations, source_outcomes, realized_transitions, inputs)
 
@@ -846,7 +846,7 @@ def _run_ladder_pipeline(
         observations,
         source_outcomes,
         realized_transitions,
-        return_threshold_pct=inputs.config.transition_return_threshold_pct,
+        return_threshold_pct=inputs.config.transition.return_threshold_pct,
     )
     candidates = candidate_eval.candidate_evidence_frame(observations, evidence)
     ranked = rank_eval.rank_candidates(candidates)
@@ -889,15 +889,17 @@ def _tailtree_feature_schema_hash(
 
 
 def _tailtree_artifact_metadata(
-    inputs, tree_up: object | None, tree_down: object | None
-) -> dict[str, object]:
+    inputs,
+    tree_up: tailrun_eval.TailtreeArtifactTree | None,
+    tree_down: tailrun_eval.TailtreeArtifactTree | None,
+) -> tailrun_eval.TailtreeArtifactMetadata:
     return tailrun_eval._tailtree_artifact_metadata(inputs, tree_up, tree_down)
 
 
 def _write_tailtree_artifacts(
     inputs,
-    evidence_by_direction: dict[str, pl.DataFrame],
-    trees: dict[str, object],
+    evidence_by_direction: dict[tailrun_eval.TailtreeDirection, pl.DataFrame],
+    trees: dict[tailrun_eval.TailtreeDirection, tailrun_eval.TailtreeArtifactTree],
 ) -> None:
     tailrun_eval._write_tailtree_artifacts(inputs, evidence_by_direction, trees)
 

@@ -8,6 +8,7 @@ import pytest
 import qooi.scanner.diagnostics as diagnostics
 import qooi.scanner.workflow as potential
 from qooi.scanner import PotentialArtifacts
+from qooi.scanner.config import EvidenceConfig, TailtreeConfig, TransitionConfig
 
 
 class _TreeMetadata:
@@ -37,13 +38,17 @@ def test_tailtree_lifecycle_config_loads_named_instance(tmp_path: Path) -> None:
     config_path.write_text(
         """
 [potential]
-evidence = "tailtree"
 output = "data/output/potential/lifecycle/report.md"
 bar = "1H"
-transition_mae_mfe_horizon = 12
-tail_threshold_pct = 5.0
 
-[potential.tailtree]
+[potential.transition]
+mae_mfe_horizon = 12
+
+[potential.evidence]
+kind = "tailtree"
+
+[potential.evidence.tailtree]
+threshold_pct = 5.0
 lifecycle = "load_predict"
 model_dir = "data/output/potential/lifecycle/models"
 model_tag = "tailtree-1h-12h-v1"
@@ -53,19 +58,21 @@ model_tag = "tailtree-1h-12h-v1"
 
     config = potential.load_config(config_path)
 
-    assert config.evidence == "tailtree"
-    assert config.tailtree.lifecycle == "load_predict"
-    assert config.tailtree.model_dir == Path("data/output/potential/lifecycle/models")
-    assert config.tailtree.model_tag == "tailtree-1h-12h-v1"
+    assert config.evidence.kind == "tailtree"
+    assert config.evidence.tailtree.lifecycle == "load_predict"
+    assert config.evidence.tailtree.model_dir == Path("data/output/potential/lifecycle/models")
+    assert config.evidence.tailtree.model_tag == "tailtree-1h-12h-v1"
 
 
 def test_tailtree_load_predict_fails_without_frozen_artifacts(tmp_path: Path) -> None:
     config = potential.PotentialConfig(
-        evidence="tailtree",
-        tailtree=potential.TailtreeConfig(
-            lifecycle="load_predict",
-            model_dir=tmp_path / "models",
-            model_tag="missing-model",
+        evidence=EvidenceConfig(
+            kind="tailtree",
+            tailtree=TailtreeConfig(
+                lifecycle="load_predict",
+                model_dir=tmp_path / "models",
+                model_tag="missing-model",
+            ),
         ),
     )
     observations = pl.DataFrame(
@@ -87,15 +94,17 @@ def test_tailtree_load_predict_fails_without_frozen_artifacts(tmp_path: Path) ->
 
 def test_tailtree_train_lifecycle_writes_frozen_artifact_set(tmp_path: Path) -> None:
     config = potential.PotentialConfig(
-        evidence="tailtree",
-        bar="1H",
-        transition_mae_mfe_horizon=12,
-        tail_threshold_pct=5.0,
-        tailtree=potential.TailtreeConfig(
-            lifecycle="train",
-            model_dir=tmp_path / "models",
-            model_tag="tailtree-test-v1",
+        evidence=EvidenceConfig(
+            kind="tailtree",
+            tailtree=TailtreeConfig(
+                threshold_pct=5.0,
+                lifecycle="train",
+                model_dir=tmp_path / "models",
+                model_tag="tailtree-test-v1",
+            ),
         ),
+        bar="1H",
+        transition=TransitionConfig(mae_mfe_horizon=12),
     )
     inputs = _Inputs(config, tmp_path / "diagnostics")
     evidence = pl.DataFrame(

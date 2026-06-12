@@ -133,3 +133,33 @@ def test_path_result_contracts_live_with_path_modules() -> None:
     assert "LadderResult" not in diagnostics_classes
     assert "TailtreeResult" not in diagnostics_classes
     assert "TailtreeEvidenceResult" not in diagnostics_classes
+
+
+def test_workflow_does_not_own_scanner_config_models() -> None:
+    source = (SCANNER_ROOT / "workflow.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    workflow_classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+
+    assert "PotentialConfig" not in workflow_classes
+    assert "TailtreeConfig" not in workflow_classes
+    assert "BaseModel" not in source
+    assert "ConfigDict" not in source
+
+
+def test_scanner_config_is_composed_by_domain_sections() -> None:
+    config_module = importlib.import_module("qooi.scanner.config")
+    config = config_module.PotentialConfig(
+        transition={"horizon": 8, "scan_budget": 13},
+        evidence={"kind": "tailtree", "tailtree": {"model_tag": "unit"}},
+    )
+
+    assert config.transition.horizon == 8
+    assert config.transition.scan_budget == 13
+    assert config.evidence.kind == "tailtree"
+    assert config.evidence.tailtree.model_tag == "unit"
+
+    fields = set(config_module.PotentialConfig.model_fields)
+    assert "transition_horizon" not in fields
+    assert "transition_scan_budget" not in fields
+    assert "tail_tree_num_leaves" not in fields
+    assert "tail_threshold_pct" not in fields

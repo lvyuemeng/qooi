@@ -203,7 +203,7 @@ def _trade_state(
     frame = source_frames.get(("trades", symbol), pl.DataFrame())
     if frame.is_empty():
         return missing_state(symbol, "trades", "trades_missing")
-    rows = frame.sort("timestamp").tail(max(20, min(config.trade_limit, 100)))
+    rows = frame.sort("timestamp").tail(max(20, min(config.source.trade_limit, 100)))
     buy = _sum_side(rows, "buy")
     sell = _sum_side(rows, "sell")
     ratio = buy / sell if sell > 0.0 else (buy if buy > 0.0 else 1.0)
@@ -247,7 +247,7 @@ def _derivative_state(
         ("taker_volume", taker),
         ("long_short_ratios", ratios),
     ):
-        if family in config.disabled_sources:
+        if family in config.source.disabled_sources:
             missing.append(f"{family}_disabled")
         elif frame.is_empty():
             missing.append(f"{family}_missing")
@@ -302,7 +302,7 @@ def _message_context_state(
     symbol: str,
     source_frames: dict[tuple[str, str], pl.DataFrame],
 ) -> SourceStateRow:
-    if "messages" in config.disabled_sources:
+    if "messages" in config.source.disabled_sources:
         return missing_state(symbol, "context", "messages_disabled", blocked=True)
     messages = source_frames.get(("messages", symbol), pl.DataFrame())
     classifications = source_frames.get(("message_classifications", symbol), pl.DataFrame())
@@ -354,9 +354,7 @@ def scan_review_decisions(
         )
         no_consensus = transition_supported and not consensus_supported
         many_conflicts = len(contradictions) >= 2
-        context_required = (
-            config.require_context_for_review and bundle.context.direction == "missing"
-        )
+        context_required = config.review.require_context and bundle.context.direction == "missing"
 
         source_families = (bundle.books, bundle.trades, bundle.derivatives, bundle.context)
         confirming = [row for row in source_families if row.direction == transition_state.direction]

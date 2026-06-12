@@ -61,7 +61,9 @@ class _ScanScopeSection:
         watch = sum(1 for d in inputs.decisions if d.group == "watch")
         blocked = sum(1 for d in inputs.decisions if d.group == "blocked")
         evidence_path = (
-            "tailtree (LightGBM + GPD)" if c.evidence == "tailtree" else "ladder (fixed 5-level)"
+            "tailtree (LightGBM + GPD)"
+            if c.evidence.kind == "tailtree"
+            else "ladder (fixed 5-level)"
         )
         return "\n".join(
             [
@@ -75,14 +77,14 @@ class _ScanScopeSection:
                 f"- Universe: `{c.universe}`",
                 f"- Bar: `{c.bar}`",
                 f"- Days: `{c.days}`",
-                f"- Transition history days: `{max(c.days, c.transition_history_days)}`",
-                f"- Transition n-gram length: `{c.transition_ngram_length}`",
+                f"- Transition history days: `{max(c.days, c.transition.history_days)}`",
+                f"- Transition n-gram length: `{c.transition.ngram_length}`",
                 f"- Evidence path: **{evidence_path}**",
                 f"- Selected symbols scanned: `{len(inputs.universe.symbols)}` of "
                 f"`{inputs.universe.eligible_count}` eligible symbols",
-                f"- Transition scan budget: `{c.transition_scan_budget}`",
+                f"- Transition scan budget: `{c.transition.scan_budget}`",
                 f"- Refresh mode: `{c.refresh_mode}`",
-                f"- Source context scope: `{c.transition_context_scope}`",
+                f"- Source context scope: `{c.transition.context_scope}`",
                 f"- Transition watch rows: `{watch}`; blocked rows: `{blocked}`",
                 f"- Unsupported current transition paths: `{len(inputs.transitions.unsupported)}` "
                 f"in `{inputs.artifacts.diagnostics_dir / 'unsupported-current-paths.csv'}`",
@@ -167,7 +169,7 @@ class _CoverageSection:
 
 class _CaveatsSection:
     def render(self, inputs: ReportInputs) -> str:
-        use_tree = inputs.config.evidence == "tailtree"
+        use_tree = inputs.config.evidence.kind == "tailtree"
         base = [
             "## Baseline Caveats",
             "",

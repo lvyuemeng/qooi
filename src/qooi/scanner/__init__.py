@@ -10,7 +10,7 @@ import polars as pl
 
 from qooi.exchange.store import HistoryCoverage
 from qooi.scanner.classifiers import StateDirection
-from qooi.sources.collect import BookMode
+from qooi.scanner.config import EvidenceConfig, ReviewConfig, SourceConfig, TransitionConfig
 from qooi.sources.context import SourceContextResult
 
 
@@ -50,34 +50,10 @@ class PotentialScanConfig(Protocol):
     days: int
     refresh_mode: Literal["incremental", "cache_only", "force"]
     fetch_concurrency: int
-    disabled_sources: tuple[str, ...]
-    disabled_symbols: tuple[str, ...]
-    book_mode: BookMode
-    book_depth: int
-    max_source_staleness_hours: int
-    trade_limit: int
-    funding_limit: int
-    rubik_period: str
-    rubik_limit: int
-    rubik_taker_unit: Literal["0", "1", "2"]
-    transition_horizon: int
-    transition_history_days: int
-    transition_ngram_length: int
-    transition_min_count: int
-    transition_return_threshold_pct: float
-    transition_min_information_bits: float
-    transition_min_probability: float
-    transition_min_directional_probability: float
-    transition_min_reward_risk: float
-    transition_max_tail_loss_pct: float
-    transition_recent_window: int
-    transition_long_window: int
-    transition_min_probability_delta: float
-    transition_mae_mfe_horizon: int
-    require_context_for_review: bool
-    transition_context_scope: Literal["candidates", "all_scanned"]
-    transition_context_limit: int
-    transition_scan_budget: int
+    source: SourceConfig
+    transition: TransitionConfig
+    review: ReviewConfig
+    evidence: EvidenceConfig
 
 
 @dataclass(frozen=True)
@@ -284,12 +260,12 @@ def _transition_pattern_passes(config: PotentialScanConfig, pattern: TransitionP
     directional_probability = pattern.p_up if pattern.direction == "bullish" else pattern.p_down
     tail_loss = pattern.loss_stop_pct
     return (
-        pattern.count >= config.transition_min_count
-        and pattern.transition_probability >= config.transition_min_probability
-        and directional_probability >= config.transition_min_directional_probability
-        and pattern.reward_risk >= config.transition_min_reward_risk
-        and tail_loss <= config.transition_max_tail_loss_pct
-        and information >= config.transition_min_information_bits
+        pattern.count >= config.transition.min_count
+        and pattern.transition_probability >= config.transition.min_probability
+        and directional_probability >= config.transition.min_directional_probability
+        and pattern.reward_risk >= config.transition.min_reward_risk
+        and tail_loss <= config.transition.max_tail_loss_pct
+        and information >= config.transition.min_information_bits
         and pattern.direction in {"bullish", "bearish"}
     )
 
@@ -329,7 +305,7 @@ def _rank_transition_symbols(
         key=lambda insight: insight.rank_score,
         reverse=True,
     )
-    return tuple(insight.symbol for insight in ranked[: config.transition_context_limit])
+    return tuple(insight.symbol for insight in ranked[: config.transition.context_limit])
 
 
 def context_symbols(
@@ -337,6 +313,6 @@ def context_symbols(
     symbols: tuple[str, ...],
     transitions: dict[str, TransitionInsight],
 ) -> tuple[str, ...]:
-    if config.symbols or config.transition_context_scope == "all_scanned":
+    if config.symbols or config.transition.context_scope == "all_scanned":
         return symbols
     return _rank_transition_symbols(config, transitions)

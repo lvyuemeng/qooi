@@ -62,7 +62,7 @@ def kline_path_history_frame(config, frames: dict[tuple[str, str], pl.DataFrame]
             rows = frame
             if rows.is_empty() or rows.get_column("missing_flag").all():
                 continue
-            histories.append(kline_path_rows(rows, config.transition_ngram_length))
+            histories.append(kline_path_rows(rows, config.transition.ngram_length))
     if not histories:
         return pl.DataFrame(schema=KLINE_PATH_HISTORY_SCHEMA)
     return pl.concat(histories, how="vertical_relaxed").select(*KLINE_PATH_HISTORY_SCHEMA.keys())

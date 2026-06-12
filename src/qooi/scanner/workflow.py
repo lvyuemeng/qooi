@@ -8,10 +8,8 @@ import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import polars as pl
-from pydantic import BaseModel, ConfigDict, model_validator
 
 from qooi.exchange.discovery import DiscoveryConfig, discover_candidates, empty_discovery_frame
 from qooi.exchange.store import AsyncCacheStore, HistoryCoverage, HistoryRefreshRequest
@@ -23,6 +21,7 @@ from qooi.scanner import (
     context_symbols,
 )
 from qooi.scanner.classifiers import KlineClassifier
+from qooi.scanner.config import PotentialConfig
 from qooi.scanner.decisions import (
     compute_kline_states,
     compute_source_states,
@@ -31,95 +30,7 @@ from qooi.scanner.decisions import (
 from qooi.scanner.diagnostics import write_diagnostics
 from qooi.scanner.report import render_report
 from qooi.scanner.transitions import compute_transition_insights
-from qooi.sources.collect import BookMode
 from qooi.sources.context import load_source_context
-
-RefreshMode = Literal["incremental", "cache_only", "force"]
-TailtreeLifecycle = Literal["train", "load_predict"]
-
-
-class TailtreeConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    lifecycle: TailtreeLifecycle = "train"
-    model_dir: Path = Path("data/output/potential/models")
-    model_tag: str = "tailtree-current"
-
-
-class PotentialConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    output: Path = Path("data/output/potential/report.md")
-    symbols: tuple[str, ...] = ()
-    universe: str = "research"
-    bar: str = "1H"
-    timeframes: tuple[str, ...] = ("1H", "4H", "1D")
-    days: int = 60
-    refresh_mode: RefreshMode = "incremental"
-    fetch_concurrency: int = 3
-    source_refresh_mode: Literal["inherit", "incremental", "cache_only", "force"] = "inherit"
-    disabled_sources: tuple[str, ...] = ()
-    disabled_symbols: tuple[str, ...] = ()
-    book_mode: BookMode = "snapshot"
-    book_depth: int = 25
-    max_source_staleness_hours: int = 24
-    trade_limit: int = 100
-    funding_limit: int = 100
-    rubik_period: str = "1H"
-    rubik_limit: int = 100
-    rubik_taker_unit: Literal["0", "1", "2"] = "2"
-    transition_horizon: int = 12
-    transition_history_days: int = 0
-    transition_ngram_length: int = 3
-    transition_min_count: int = 20
-    transition_return_threshold_pct: float = 0.0
-    transition_min_information_bits: float = 0.001
-    transition_min_probability: float = 0.05
-    transition_min_directional_probability: float = 0.55
-    transition_min_reward_risk: float = 1.0
-    transition_max_tail_loss_pct: float = 20.0
-    transition_recent_window: int = 240
-    transition_long_window: int = 1440
-    transition_min_probability_delta: float = -0.10
-    transition_mae_mfe_horizon: int = 12
-    require_context_for_review: bool = True
-    transition_context_scope: Literal["candidates", "all_scanned"] = "candidates"
-    transition_context_limit: int = 20
-    transition_scan_budget: int = 80
-    evidence: Literal["ladder", "tailtree"] = "ladder"
-    tail_threshold_pct: float = 5.0
-    tail_tree_num_leaves: int = 64
-    tail_tree_min_data_in_leaf: int = 30
-    tail_tree_learning_rate: float = 0.05
-    tail_tree_num_iterations: int = 200
-    tail_tree_early_stopping: int = 20
-    tailtree: TailtreeConfig = TailtreeConfig()
-
-    @model_validator(mode="after")
-    def normalize_paths_and_timeframes(self) -> PotentialConfig:
-        output = (
-            self.output
-            if self.output.name == "report.md"
-            else self.output / "potential" / "report.md"
-        )
-        timeframes = tuple(dict.fromkeys((*self.timeframes, self.bar)))
-        transition_history_days = max(0, self.transition_history_days)
-        transition_ngram_length = max(2, self.transition_ngram_length)
-        if (
-            output == self.output
-            and timeframes == self.timeframes
-            and transition_history_days == self.transition_history_days
-            and transition_ngram_length == self.transition_ngram_length
-        ):
-            return self
-        return self.model_copy(
-            update={
-                "output": output,
-                "timeframes": timeframes,
-                "transition_history_days": transition_history_days,
-                "transition_ngram_length": transition_ngram_length,
-            }
-        )
 
 
 @dataclass(frozen=True)
@@ -234,12 +145,12 @@ def resolve_universe(config: PotentialConfig) -> PotentialUniverse:
             missing_reason=f"{type(exc).__name__}: {exc}",
         )
     if result.discovery.is_empty() or "symbol" not in result.discovery.columns:
-        symbols = result.symbols[: config.transition_scan_budget]
+        symbols = result.symbols[: config.transition.scan_budget]
     else:
         frame = result.discovery.filter(pl.col("symbol").is_in(result.symbols))
         if "rank_score" in frame.columns:
             frame = frame.sort("rank_score", descending=True)
-        symbols = tuple(frame.head(config.transition_scan_budget).get_column("symbol").to_list())
+        symbols = tuple(frame.head(config.transition.scan_budget).get_column("symbol").to_list())
     return PotentialUniverse(
         symbols=symbols,
         discovery=result.discovery,
@@ -266,9 +177,9 @@ async def load_bars(config: PotentialConfig, symbols: tuple[str, ...]) -> BarFet
             request = HistoryRefreshRequest(
                 inst_id=symbol,
                 bar=timeframe,
-                days=max(config.days, config.transition_history_days),
+                days=max(config.days, config.transition.history_days),
                 min_bars=target_min_bars(
-                    max(config.days, config.transition_history_days), timeframe
+                    max(config.days, config.transition.history_days), timeframe
                 ),
                 refresh=config.refresh_mode in {"incremental", "force"},
                 incremental=config.refresh_mode != "force",
