@@ -71,13 +71,8 @@ class TrainingConfig(StrictConfigModel):
             return torch.device("cpu")
         device = torch.device(requested)
         if device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(
-                "learn.train.device requests CUDA, but torch.cuda is unavailable"
-            )
+            raise RuntimeError("learn.train.device requests CUDA, but torch.cuda is unavailable")
         mps = getattr(torch.backends, "mps", None)
         if device.type == "mps" and (mps is None or not mps.is_available()):
-            raise RuntimeError(
-                "learn.train.device requests MPS, but torch MPS is unavailable"
-            )
+            raise RuntimeError("learn.train.device requests MPS, but torch MPS is unavailable")
         return device
-

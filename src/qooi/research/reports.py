@@ -339,9 +339,11 @@ def _timeframe_classifier_output(
 ) -> tuple[list[list[str]], list[str], dict[str, pl.DataFrame]]:
     frame, text = _timeframe_classifier_artifact(_prepare_timeframe_frames(command))
     sections = ["Timeframe classifier diagnostics\n" + text] if text else []
-    return [["timeframe-classifier", f"rows={frame.height}"]], sections, {
-        "timeframe-classifier.csv": frame
-    }
+    return (
+        [["timeframe-classifier", f"rows={frame.height}"]],
+        sections,
+        {"timeframe-classifier.csv": frame},
+    )
 
 
 def _dynamic_transition_output(
@@ -911,4 +913,3 @@ async def _stream_cache_refresh(requests, concurrency: int) -> None:
         async for event in store.stream_many(requests, concurrency=concurrency):
             if event.kind in {"completed", "failed", "summary"}:
                 logger.info("%s", event.message)
-

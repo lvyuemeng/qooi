@@ -48,9 +48,7 @@ def _command():
     return config.model_copy(
         update={
             "run": config.run.model_copy(update={"profile": "smoke"}),
-            "req": config.req.model_copy(
-                update={"days": 10, "min": 10, "cov": 0.0}
-            ),
+            "req": config.req.model_copy(update={"days": 10, "min": 10, "cov": 0.0}),
         }
     )
 
@@ -266,5 +264,3 @@ def test_research_evaluation_resolves_reduced_outputs_only():
         "pattern-quality",
         "trade-record-modulation",
     )
-
-

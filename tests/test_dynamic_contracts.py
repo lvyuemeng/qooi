@@ -38,5 +38,3 @@ def test_code_sequence_validates_lengths_and_values() -> None:
 
     with pytest.raises(ValueError, match="non-negative"):
         CodeSequence(codes=(-1,), distances=(0.1,), row_index=(0,), splits=("train",))
-
-

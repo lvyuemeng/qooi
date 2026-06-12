@@ -16,9 +16,7 @@ from qooi.strategies.specs import (
 def _command(**overrides):
     config = ResearchCommandConfig()
     run_updates = {
-        key: overrides[key]
-        for key in ("profile", "universe", "ds", "symbol")
-        if key in overrides
+        key: overrides[key] for key in ("profile", "universe", "ds", "symbol") if key in overrides
     }
     req_updates = {key: overrides[key] for key in ("days", "min", "cov") if key in overrides}
     strategy_updates = {
@@ -144,13 +142,9 @@ def test_exit_config_is_canonical_runtime_shape():
 def test_removed_research_api_wrappers_are_absent():
     root = Path(__file__).resolve().parents[1]
     learned = (root / "scripts" / "learned_states.py").read_text(encoding="utf-8")
-    reports = (root / "src" / "qooi" / "research" / "reports.py").read_text(
-        encoding="utf-8"
-    )
+    reports = (root / "src" / "qooi" / "research" / "reports.py").read_text(encoding="utf-8")
     data = (root / "src" / "qooi" / "research" / "data.py").read_text(encoding="utf-8")
-    config = (root / "src" / "qooi" / "research" / "config.py").read_text(
-        encoding="utf-8"
-    )
+    config = (root / "src" / "qooi" / "research" / "config.py").read_text(encoding="utf-8")
 
     assert "RunCtx" not in learned
     assert "def pipe" not in learned
@@ -162,5 +156,3 @@ def test_removed_research_api_wrappers_are_absent():
     assert "backtest_frame_options_from_command" not in reports
     assert "strategy_selection_from_config" not in reports
     assert "ExitConfigRequest" not in config
-
-

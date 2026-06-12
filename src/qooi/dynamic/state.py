@@ -89,9 +89,7 @@ class PreparedStateDiscovery:
             prepared_sequences.append(sequences)
             sequence_provenances.append(sequence_provenance)
             split_counts = split_frame.group_by("split").agg(pl.len().alias("rows"))
-            split_rows = {
-                row["split"]: row["rows"] for row in split_counts.iter_rows(named=True)
-            }
+            split_rows = {row["split"]: row["rows"] for row in split_counts.iter_rows(named=True)}
             logger.info(
                 "prepare_frame index=%s/%s input_rows=%s feature_rows=%s train_rows=%s "
                 "valid_rows=%s test_rows=%s windows=%s elapsed_s=%.2f",
@@ -262,9 +260,7 @@ class PreparedStateDiscovery:
         checkpoint: vq_rssm.VqRssmCheckpoint,
     ) -> states.StateSequence:
         provenance = (
-            self.sequence_provenance
-            if self.config.input == "sequence"
-            else self.provenance
+            self.sequence_provenance if self.config.input == "sequence" else self.provenance
         )
         codes = self.predict_codes(checkpoint)
         if self.config.postprocess.min_state_duration > 0:
@@ -278,4 +274,3 @@ class PreparedStateDiscovery:
             codes,
             state_column=self.config.state_column,
         )
-

@@ -150,9 +150,7 @@ def test_learned_schedule_uses_composable_stage_overrides() -> None:
     assert stage.reset_dead_codes is False
     assert stage.lr == pytest.approx(0.0005)
     assert stage.freeze_encoder_blocks == ("encoder_input", "latent_projection", "rssm")
-    disabled = states.LearnedStateConfig(
-        schedule={"enabled": False, "stage": [{"future": 1.0}]}
-    )
+    disabled = states.LearnedStateConfig(schedule={"enabled": False, "stage": [{"future": 1.0}]})
     assert disabled.schedule.stages == ()
     with pytest.raises(ValueError, match="unknown freeze encoder blocks"):
         states.LearnedStateConfig(
@@ -210,9 +208,7 @@ def test_postprocess_config_validates_min_state_duration() -> None:
 
 
 def test_schedule_config_accepts_lr_override() -> None:
-    config = states.LearnedStateConfig(
-        schedule={"enabled": True, "stage": [{"lr": 0.0005}]}
-    )
+    config = states.LearnedStateConfig(schedule={"enabled": True, "stage": [{"lr": 0.0005}]})
 
     assert config.schedule.stages[0].lr == pytest.approx(0.0005)
     with pytest.raises(ValueError, match="schedule stage lr"):
@@ -228,9 +224,7 @@ def test_training_config_accepts_best_metric_and_patience() -> None:
     assert config.train.best_mode == "min"
     assert config.train.early_stop_patience == 3
     with pytest.raises(ValueError, match="best_mode"):
-        states.LearnedStateConfig(
-            train={"best_metric": "valid_future_loss", "best_mode": "lowest"}
-        )
+        states.LearnedStateConfig(train={"best_metric": "valid_future_loss", "best_mode": "lowest"})
 
 
 def test_vq_ema_config_rejects_commitment_and_invalid_decay() -> None:
@@ -297,18 +291,18 @@ def test_causal_volatility_scaling_is_per_symbol() -> None:
     features = config.window.features(frame, config.columns, config.volatility_scaling)
     first_by_symbol = features.group_by("symbol", maintain_order=True).first()
 
-    btc_first_scale = first_by_symbol.filter(pl.col("symbol") == "BTC").select(
-        "volatility_scale"
-    ).item()
-    eth_first_scale = first_by_symbol.filter(pl.col("symbol") == "ETH").select(
-        "volatility_scale"
-    ).item()
-    btc_max_scale = features.filter(pl.col("symbol") == "BTC").select(
-        "volatility_scale"
-    ).max().item()
-    eth_max_scale = features.filter(pl.col("symbol") == "ETH").select(
-        "volatility_scale"
-    ).max().item()
+    btc_first_scale = (
+        first_by_symbol.filter(pl.col("symbol") == "BTC").select("volatility_scale").item()
+    )
+    eth_first_scale = (
+        first_by_symbol.filter(pl.col("symbol") == "ETH").select("volatility_scale").item()
+    )
+    btc_max_scale = (
+        features.filter(pl.col("symbol") == "BTC").select("volatility_scale").max().item()
+    )
+    eth_max_scale = (
+        features.filter(pl.col("symbol") == "ETH").select("volatility_scale").max().item()
+    )
 
     assert btc_first_scale == pytest.approx(0.001)
     assert eth_first_scale == pytest.approx(0.001)
@@ -423,9 +417,7 @@ def test_volume_log_rel_not_scaled_is_explicit() -> None:
 
 
 def test_method_flow_preserves_window_alignment_and_strips_provenance() -> None:
-    config = states.LearnedStateConfig(
-        win={"len": 3, "stride": 1, "train": 0.6, "valid": 0.2}
-    )
+    config = states.LearnedStateConfig(win={"len": 3, "stride": 1, "train": 0.6, "valid": 0.2})
     features = config.window.features(_frame(), config.columns)
     split = config.window.split(features.height)
     split_frame = config.window.assign_split(features, split, config.columns)
@@ -441,9 +433,7 @@ def test_method_flow_preserves_window_alignment_and_strips_provenance() -> None:
 
 
 def test_prepare_many_splits_per_symbol_and_merges_provenance() -> None:
-    config = states.LearnedStateConfig(
-        win={"len": 2, "stride": 1, "train": 0.4, "valid": 0.2}
-    )
+    config = states.LearnedStateConfig(win={"len": 2, "stride": 1, "train": 0.4, "valid": 0.2})
 
     prepared = config.prepare_many(
         (_frame_for_symbol("BTC"), _frame_for_symbol("ETH", multiplier=10.0))
@@ -456,9 +446,7 @@ def test_prepare_many_splits_per_symbol_and_merges_provenance() -> None:
 
 
 def test_codes_to_states_and_research_frame() -> None:
-    config = states.LearnedStateConfig(
-        win={"len": 3, "stride": 1, "train": 0.6, "valid": 0.2}
-    )
+    config = states.LearnedStateConfig(win={"len": 3, "stride": 1, "train": 0.6, "valid": 0.2})
     prepared = config.prepare(_frame())
     codes = CodeSequence(
         codes=(7, 8, 9),
@@ -568,12 +556,15 @@ def test_min_state_duration_zero_preserves_codes() -> None:
         splits=("train",) * 3,
     )
 
-    assert states.filter_short_state_runs(
-        codes,
-        symbols=("BTC",) * 3,
-        splits=("train",) * 3,
-        min_duration=0,
-    ) is codes
+    assert (
+        states.filter_short_state_runs(
+            codes,
+            symbols=("BTC",) * 3,
+            splits=("train",) * 3,
+            min_duration=0,
+        )
+        is codes
+    )
 
 
 def test_state_stability_summary_tracks_dwell_and_overlap() -> None:
@@ -670,5 +661,3 @@ def test_sequence_runtime_config_maps_research_config_once() -> None:
     assert runtime.warmup == 2
     assert runtime.stride == 2
     assert runtime.carry is False
-
-

@@ -176,11 +176,7 @@ def summarize_state_diagnostics(
                 ((pl.col("_future_close") - pl.col("close")) / pl.col("close") * 100.0).alias(
                     "forward_return_pct"
                 ),
-                (
-                    (pl.col("_future_high") - pl.col("_future_low"))
-                    / pl.col("close")
-                    * 100.0
-                ).alias(
+                ((pl.col("_future_high") - pl.col("_future_low")) / pl.col("close") * 100.0).alias(
                     "forward_range_pct"
                 ),
                 (pl.col("_future_high") > pl.col("_prior_high")).alias("breakout_up"),

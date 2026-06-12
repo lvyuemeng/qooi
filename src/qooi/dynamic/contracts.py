@@ -129,4 +129,3 @@ def _validate_windows(
                 raise ValueError("each feature row must match feature_columns width")
             if any(not math.isfinite(value) for value in row):
                 raise ValueError("feature values must be finite floats")
-

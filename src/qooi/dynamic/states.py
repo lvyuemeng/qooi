@@ -43,6 +43,7 @@ _FREEZE_ENCODER_BLOCKS = {
     "future_head",
 }
 
+
 class FeatureColumns(StrictConfigModel):
     open: str = "open"
     high: str = "high"
@@ -451,14 +452,18 @@ class WindowConfig(StrictConfigModel):
     ) -> pl.DataFrame:
         if split.valid_end > frame.height:
             raise ValueError("valid_end must be <= frame height")
-        return frame.with_row_index("__split_row").with_columns(
-            pl.when(pl.col("__split_row") < split.train_end)
-            .then(pl.lit("train"))
-            .when(pl.col("__split_row") < split.valid_end)
-            .then(pl.lit("valid"))
-            .otherwise(pl.lit("test"))
-            .alias(columns.split)
-        ).drop("__split_row")
+        return (
+            frame.with_row_index("__split_row")
+            .with_columns(
+                pl.when(pl.col("__split_row") < split.train_end)
+                .then(pl.lit("train"))
+                .when(pl.col("__split_row") < split.valid_end)
+                .then(pl.lit("valid"))
+                .otherwise(pl.lit("test"))
+                .alias(columns.split)
+            )
+            .drop("__split_row")
+        )
 
     def windows(
         self,
@@ -551,8 +556,7 @@ class WindowConfig(StrictConfigModel):
             if part.is_empty():
                 continue
             feature_rows = tuple(
-                tuple(float(value) for value in row)
-                for row in part.select(feature_columns).rows()
+                tuple(float(value) for value in row) for row in part.select(feature_columns).rows()
             )
             source_row_index = tuple(int(value) for value in part.get_column(_ROW_INDEX).to_list())
             timestamps = tuple(_timestamp_values(part, columns.timestamp))
@@ -686,9 +690,7 @@ class VqRssmConfig(StrictConfigModel):
             raise ValueError("reset_dead_codes requires normalize=true")
         if self.diversity_weight < 0.0 or not math.isfinite(self.diversity_weight):
             raise ValueError("diversity_weight must be a finite non-negative float")
-        if not -1.0 <= self.diversity_margin < 1.0 or not math.isfinite(
-            self.diversity_margin
-        ):
+        if not -1.0 <= self.diversity_margin < 1.0 or not math.isfinite(self.diversity_margin):
             raise ValueError("diversity_margin must be finite and satisfy -1 <= margin < 1")
         if self.diversity_weight > 0.0 and not self.normalize:
             raise ValueError("diversity_weight requires normalize=true")
@@ -726,8 +728,7 @@ class LearnedStateConfig(StrictConfigModel):
         if (
             "future_infonce" in self.objective.terms
             and self.objective.future > 0.0
-            and self.future_contrast.standard_weight
-            + self.future_contrast.future_similarity_weight
+            and self.future_contrast.standard_weight + self.future_contrast.future_similarity_weight
             <= 0.0
         ):
             raise ValueError(
@@ -792,6 +793,7 @@ class LearnedStateConfig(StrictConfigModel):
         from qooi.dynamic.state import PreparedStateDiscovery
 
         return PreparedStateDiscovery.from_frames(tuple(frames), self)
+
 
 def summarize_hidden(
     states: StateSequence,
@@ -1094,9 +1096,7 @@ class WindowProvenance:
                     state_column: codes.codes,
                     "code_distance": codes.distances,
                     **(
-                        {"volatility_scale": self.volatility_scale}
-                        if self.volatility_scale
-                        else {}
+                        {"volatility_scale": self.volatility_scale} if self.volatility_scale else {}
                     ),
                 }
             ),
@@ -1151,7 +1151,6 @@ class StateSequence:
             on=keys,
             how="inner",
         )
-
 
 
 def summarize_state_stability(states: StateSequence) -> pl.DataFrame:
@@ -1396,10 +1395,7 @@ def _apply_volatility_scaling(
         raise ValueError(f"volatility return column missing: {scaling.return_column}")
     if columns.symbol in frame.columns:
         parts = frame.partition_by(columns.symbol, maintain_order=True)
-        scaled = [
-            _apply_volatility_scaling_to_symbol(part, scaling)
-            for part in parts
-        ]
+        scaled = [_apply_volatility_scaling_to_symbol(part, scaling) for part in parts]
         return pl.concat(scaled, how="diagonal_relaxed") if scaled else frame
     return _apply_volatility_scaling_to_symbol(frame, scaling)
 
@@ -1452,4 +1448,3 @@ def _causal_ewm_std(
         scale = math.sqrt(max(variance, 0.0)) if count >= min_periods else floor
         scales.append(min(max(scale, floor), cap))
     return tuple(scales)
-

@@ -420,5 +420,3 @@ def test_behavior_helpers_return_typed_empty_frames() -> None:
     assert rule_primitives.summarize_rule_primitives(empty).schema == pl.Schema(
         rule_primitives.RULE_PRIMITIVE_SUMMARY_SCHEMA
     )
-
-

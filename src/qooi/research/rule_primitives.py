@@ -485,10 +485,6 @@ def _max_drawdown(values: list[float]) -> float:
     return max_drawdown
 
 
-
-
-
-
 def _ensure_columns(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
     return ensure_columns(frame, schema)
 

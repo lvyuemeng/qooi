@@ -105,6 +105,7 @@ CANDIDATE_REGIME_SCHEMA: dict[str, pl.DataType] = {
     "mean_excess_return_pct": pl.Float64,
 }
 
+
 def build_candidate_nonoverlap_trades(
     patterns: pl.DataFrame,
     market_frame: pl.DataFrame,
@@ -563,8 +564,6 @@ def _max_drawdown(values: list[float]) -> float:
         peak = max(peak, equity)
         max_drawdown = min(max_drawdown, equity - peak)
     return max_drawdown
-
-
 
 
 def _ensure_columns(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:

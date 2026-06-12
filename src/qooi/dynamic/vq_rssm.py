@@ -17,6 +17,7 @@ from qooi.dynamic.training import TrainingConfig
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass(frozen=True)
 class VqRssmSpec:
     input_dim: int = 5
@@ -88,9 +89,7 @@ class VqRssmSpec:
             raise ValueError("reset_dead_codes requires normalize_codebook=True")
         if self.diversity_weight < 0.0 or not math.isfinite(self.diversity_weight):
             raise ValueError("diversity_weight must be a finite non-negative float")
-        if not -1.0 <= self.diversity_margin < 1.0 or not math.isfinite(
-            self.diversity_margin
-        ):
+        if not -1.0 <= self.diversity_margin < 1.0 or not math.isfinite(self.diversity_margin):
             raise ValueError("diversity_margin must be finite and satisfy -1 <= margin < 1")
         if self.diversity_weight > 0.0 and not self.normalize_codebook:
             raise ValueError("diversity_weight requires normalize_codebook=True")
@@ -133,9 +132,7 @@ class VqRssmSpec:
                 raise ValueError(f"{name} must be a finite non-negative float")
         if self.future_similarity_top_k <= 0:
             raise ValueError("future_similarity_top_k must be positive")
-        if self.future_detrend_half_life <= 0.0 or not math.isfinite(
-            self.future_detrend_half_life
-        ):
+        if self.future_detrend_half_life <= 0.0 or not math.isfinite(self.future_detrend_half_life):
             raise ValueError("future_detrend_half_life must be a finite positive float")
         if self.future_similarity_weight > 0.0 and (
             self.future_similarity_mse_weight + self.future_similarity_cosine_weight <= 0.0
@@ -161,9 +158,7 @@ class VqRssmSpec:
         if self.temporal_consistency_temperature <= 0.0 or not math.isfinite(
             self.temporal_consistency_temperature
         ):
-            raise ValueError(
-                "temporal_consistency_temperature must be a finite positive float"
-            )
+            raise ValueError("temporal_consistency_temperature must be a finite positive float")
 
 
 @dataclass(frozen=True)
@@ -859,9 +854,7 @@ class VqRssmModel(nn.Module):
             prev_state = prev_state_embedding
         for step in range(seq_len):
             state = self._step(x[:, step, :], h, prev_embed, prev_state)
-            recon_loss = recon_loss + torch.nn.functional.mse_loss(
-                state["recon"], x[:, step, :]
-            )
+            recon_loss = recon_loss + torch.nn.functional.mse_loss(state["recon"], x[:, step, :])
             code_counts = code_counts + torch.bincount(
                 state["code"].detach(), minlength=self.spec.num_codes
             )
@@ -1677,9 +1670,7 @@ def _predict_window_outputs(
         torch.set_num_threads(cfg.threads)
     device = cfg.torch_device()
     if not dataset.features:
-        return InferenceDiagnostics(
-            codes=(), distances=(), hidden_states=(), reconstructions=()
-        )
+        return InferenceDiagnostics(codes=(), distances=(), hidden_states=(), reconstructions=())
     start_time = time.perf_counter()
     logger.info(
         "predict_windows_start rows=%s batch=%s device=%s diagnostics=%s",
@@ -1698,9 +1689,7 @@ def _predict_window_outputs(
     indices = tuple(range(len(dataset.features)))
     batch_count = math.ceil(len(indices) / cfg.pred_batch_rows)
     with torch.no_grad():
-        for batch_index, start in enumerate(
-            range(0, len(indices), cfg.pred_batch_rows), start=1
-        ):
+        for batch_index, start in enumerate(range(0, len(indices), cfg.pred_batch_rows), start=1):
             batch_indices = indices[start : start + cfg.pred_batch_rows]
             features = torch.as_tensor(
                 [dataset.features[index] for index in batch_indices],
@@ -1724,9 +1713,7 @@ def _predict_window_outputs(
         codes=tuple(int(code) for code in codes),
         distances=tuple(float(distance) for distance in distances),
         hidden_states=tuple(tuple(float(value) for value in row) for row in hidden_states),
-        reconstructions=tuple(
-            tuple(float(value) for value in row) for row in reconstructions
-        ),
+        reconstructions=tuple(tuple(float(value) for value in row) for row in reconstructions),
     )
 
 
@@ -1840,9 +1827,7 @@ def _sequence_validation_loss(
             ):
                 batch = sequence_batch.batch
                 future_targets = (
-                    _future_segments(
-                        tensors, sequence_batch, model.spec, 0
-                    )
+                    _future_segments(tensors, sequence_batch, model.spec, 0)
                     if future_enabled
                     else None
                 )
@@ -1856,8 +1841,7 @@ def _sequence_validation_loss(
                 )
                 _raise_if_nonfinite_loss(
                     bundle.total,
-                    "sequence validation "
-                    f"streams={batch.shape[0]} steps={batch.shape[1]}",
+                    f"sequence validation streams={batch.shape[0]} steps={batch.shape[1]}",
                 )
                 batch_rows = batch.shape[0] * batch.shape[1]
                 acc.add(bundle, batch_rows)
@@ -2008,9 +1992,7 @@ def _parallel_sequence_batches(
                 if any(hidden is not None for hidden in hidden_rows):
                     h = torch.cat(
                         [
-                            hidden
-                            if hidden is not None
-                            else batch.new_zeros((1, hidden_dim))
+                            hidden if hidden is not None else batch.new_zeros((1, hidden_dim))
                             for hidden in hidden_rows
                         ],
                         dim=0,
@@ -2034,9 +2016,7 @@ def _parallel_sequence_batches(
                     if any(value is not None for value in prev_state_rows):
                         prev_state = torch.cat(
                             [
-                                value
-                                if value is not None
-                                else batch.new_zeros((1, latent_dim))
+                                value if value is not None else batch.new_zeros((1, latent_dim))
                                 for value in prev_state_rows
                             ],
                             dim=0,
@@ -2126,4 +2106,3 @@ def _cuda_memory_summary(device: torch.device) -> str:
 
 def _split_indices(dataset: WindowDataset, split_name: str) -> tuple[int, ...]:
     return tuple(index for index, split in enumerate(dataset.splits) if split == split_name)
-

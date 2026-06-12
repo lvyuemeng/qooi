@@ -825,4 +825,3 @@ def _joint_entropy(frame: pl.DataFrame, columns: tuple[str, ...]) -> float:
 
 def _reason(condition: pl.Expr, text: str) -> pl.Expr:
     return pl.when(condition).then(pl.lit(text)).otherwise(pl.lit(""))
-
