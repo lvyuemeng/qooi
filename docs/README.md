@@ -21,7 +21,7 @@ Durable design boundaries live under `docs/architecture/`.
 | Document | Purpose |
 |---|---|
 | `architecture/overview.md` | Canonical module-family layout and system-wide dependency direction. |
-| `architecture/data.md` | Data/exchange adapters, cache, universe, coverage, and trading-IO boundaries. |
+| `architecture/exchange.md` | Exchange adapters, cache, universe, coverage, and trading-IO boundaries. |
 | `architecture/sources.md` | Source collectors, manifests, source bundles, freshness, and missing-data behavior. |
 | `architecture/strategy.md` | Strategy/signal layer and required signal-column contract. |
 | `architecture/core.md` | Basket lifecycle, recovery, executor, accounting, and evaluation boundaries. |
@@ -37,7 +37,7 @@ Concrete implementation-facing module graphs live under `docs/graph/`.
 | Document | Purpose |
 |---|---|
 | `graph/overview.md` | Whole-system graph and default active workflow. |
-| `graph/data.md` | Exchange/cache/universe/context module graph. |
+| `graph/exchange.md` | Exchange/cache/universe/context module graph. |
 | `graph/sources.md` | Source collector and artifact module graph. |
 | `graph/strategy.md` | Strategy/signal module graph. |
 | `graph/classifier.md` | Cross-cutting deterministic strategy/scanner classifier module graph. |

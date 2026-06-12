@@ -1,71 +1,131 @@
-# Source Collector Architecture
+# Sources Architecture
 
 ## Purpose
 
-The source layer collects, normalizes, stores, and audits provider/context data for scanner and research workflows. It is ingestion and artifact infrastructure only.
+`qooi.sources` owns scanner source demand, provider source normalization, source artifact contracts, source fetch planning, materialization, and quantitative source availability.
 
-## Owned modules
+It does not own OHLCV exchange cache, scanner evidence/ranking, strategy computation, research promotion, basket lifecycle, executor accounting, dynamic/learned-state logic, or trading IO.
+
+## Demand pipeline
 
 ```text
-src/qooi/sources/artifacts.py   # generic artifact path/read/write/coercion
-src/qooi/sources/bundle.py      # source bundle IO and keyed merge behavior
-src/qooi/sources/context.py     # source context availability/loading/merging
-src/qooi/sources/coverage.py    # manifests, coverage, freshness, missing evidence
-src/qooi/sources/manifest.py    # source manifest helpers
-src/qooi/sources/models.py      # SourceResult model
-src/qooi/sources/schema.py      # shared schemas
-src/qooi/sources/http.py        # shared HTTP helpers and sanitized errors
-src/qooi/sources/okx.py         # OKX public source helpers
-src/qooi/sources/okx_ws.py      # OKX websocket public source helpers
-src/qooi/sources/coingecko.py   # CoinGecko helpers
-src/qooi/sources/coinpaprika.py # CoinPaprika helpers
-src/qooi/sources/defillama.py   # DeFiLlama helpers
-src/qooi/sources/cryptopanic.py # CryptoPanic helpers
-src/qooi/sources/polymarket.py  # Polymarket helpers
-src/qooi/sources/messages.py    # local message normalization/classification
+scanner config + symbols
+  -> SourceNeed
+  -> source collection execution
+  -> provider SourceResult
+  -> SourceBundle materialization
+  -> SourceAvailability diagnostics
+```
+
+`SourceNeed` construction is pure. Provider calls and writes are side-effect boundaries.
+
+## Module layout
+
+| Module | Ownership |
+|---|---|
+| `qooi.sources.models` | Minimal result contracts shared by provider wrappers. |
+| `qooi.sources.schema` | Persisted source CSV schemas. |
+| `qooi.sources.artifacts` | Artifact paths, schema coercion, and small family/artifact table. |
+| `qooi.sources.bundle` | Source bundle read/write, source-frame lookup, keyed merge. |
+| `qooi.sources.coverage` | Pure availability, staleness, shallow/deep coverage, fetch eligibility. |
+| `qooi.sources.context` | Scanner-facing `load_source_context(...)` boundary. |
+| `qooi.sources.collect` | Source needs, collection request/result contracts, and source fetch execution. |
+| `qooi.sources.http` | Sanitized HTTP JSON helpers. |
+| `qooi.sources.okx` | OKX provider endpoint wrappers and payload normalizers. |
+| provider modules | CoinGecko, CoinPaprika, DeFiLlama, CryptoPanic, Polymarket wrappers. |
+| `qooi.sources.messages` | Local message normalization/classification. |
+| `qooi.sources.__init__` | Shared source primitives used by sibling modules. |
+
+Removed target: source collection must not live in `qooi.exchange.context`.
+
+## Core abstractions
+
+| Abstraction | Owner | Meaning |
+|---|---|---|
+| `SourceNeed` | `sources.collect` | Scanner demand for family/symbol/time/depth/freshness. |
+| `SourceFetchPlan` | `sources.collect` | Value contract for one provider/raw-source fetch decision. |
+| `SourceCollectRequest` | `sources.collect` | Source collection execution inputs. |
+| `SourceCollectResult` | `sources.collect` | Provider-collected manifest and family frames. |
+| `SourceResult` | `sources.models` | Provider-normalized frame plus manifest. |
+| `SourceFamily` | `sources.artifacts` | Small family/artifact/raw-source/timestamp/merge-key contract. |
+| `ArtifactSpec` | `sources.artifacts` | Persisted CSV artifact path and schema. |
+| `SourceBundle` | `sources.bundle` | Loaded source artifacts. |
+| `SourceAvailability` | `sources.context` or `sources.coverage` | Quantitative per-family/per-symbol observed state. |
+| `SourceContextResult` | `sources.context` | Scanner-facing source frames, manifest, availability. |
+
+Do not add fields or modules that do not answer a current demand question.
+
+## Family/artifact contract
+
+One small family table should derive:
+
+```text
+family -> artifact
+raw source -> family
+family -> timestamp column
+family -> merge key
+family -> row-kind semantics when needed
+```
+
+Current scanner families:
+
+| Family | Raw source examples | Artifact |
+|---|---|---|
+| `books` | `books` | `sources/books.csv` |
+| `trades` | `trades` | `sources/trades.csv` |
+| `funding` | `funding`, `funding_rate` | `sources/funding.csv` |
+| `open_interest` | `open_interest_history` | `sources/open-interest.csv` |
+| `taker_volume` | `taker_volume_contract` | `sources/taker-volume-contract.csv` |
+| `long_short_ratios` | OKX long/short raw sources | `sources/long-short-ratios.csv` |
+| `messages` | local message rows | local message artifacts |
+
+Funding semantics:
+
+```text
+funding_source_kind=history -> settled historical funding rows; count for depth
+funding_source_kind=current -> current known-at snapshot; count for freshness
+```
+
+## Dependency policy
+
+Target dependencies:
+
+```text
+sources.artifacts -> sources.schema
+sources.bundle    -> sources.artifacts
+sources.coverage  -> sources.artifacts + sources.manifest
+sources.context   -> sources.collect + sources.bundle + sources.coverage
+sources.collect   -> sources.artifacts + sources.bundle + sources.coverage + sources.okx
+sources.okx       -> sources.http + sources.manifest + sources.models + exchange.market helpers
+provider modules  -> sources.http + sources.manifest + sources.models
+```
+
+Forbidden dependencies:
+
+```text
+sources -> scanner evidence/rank/report modules
+sources -> research policy/report interpretation
+sources -> strategies
+sources -> core basket/executor/recovery
+sources -> exchange.trading
+sources.context -> exchange.context
 ```
 
 ## Responsibilities
 
-- Fetch provider/source payloads when configured.
-- Normalize provider JSON before the Polars/DataFrame boundary.
-- Produce source frames, source manifests, and source bundles.
-- Report missing API keys, missing rows, stale rows, freshness, and coverage status explicitly.
-- Keep source-family, availability, and known-at/fetched-at semantics visible to downstream scanner/research consumers.
+- Convert scanner/source demand into explicit `SourceNeed` rows.
+- Execute source collection through source-owned request/result contracts.
+- Fetch provider source rows through provider wrappers.
+- Normalize provider payloads into `SourceResult` frames and manifests.
+- Merge/write source artifacts by declared keys and schemas.
+- Emit explicit missing/stale/shallow availability for diagnostics.
 
 ## Non-responsibilities
 
-- No trading signals.
-- No scanner candidate ranking or suggestion policy.
-- No strategy promotion.
-- No basket lifecycle, executor, recovery, or allocation logic.
-- No hardcoded provider secrets, API keys, wallet labels, or exchange-wallet truth.
+- No exchange OHLCV cache ownership.
+- No scanner evidence, tailtree, rank, ladder, or report policy.
+- No strategy signal semantics.
+- No research promotion policy.
+- No live trading or account IO.
 
-## Allowed dependencies
-
-- Standard library, HTTP/runtime helpers, Polars/Pydantic-style data models where needed.
-- Other `qooi.sources` modules.
-- Data-only exchange cache/coverage helpers only where the current source coverage path requires them.
-
-## Forbidden dependencies
-
-- `qooi.scanner`
-- `qooi.research`
-- `qooi.strategies`
-- `qooi.core.basket`
-- `qooi.core.executor`
-- `qooi.core.recovery`
-- `qooi.exchange.trading`
-- `qooi.dynamic`
-
-## Missing-data policy
-
-Missing or stale source evidence is not neutral evidence. It must appear as manifest/coverage/freshness diagnostics so scanner and research reports can show confidence caveats.
-
-Derivative source context such as open interest, taker volume, funding, long/short ratios, news/context heat, or local messages can describe conditional source state. It does not authorize trading and does not replace empirical posterior/path diagnostics.
-
-Exchange address books and wallet labels are partial research labels only. Do not hardcode them as complete truth.
-
-## Integration boundary
-
-Scanner and research modules consume normalized source frames, source bundles, and manifest/coverage rows. Concrete source implementation mappings live in `docs/graph/sources.md`.
+Concrete target APIs live in `docs/graph/sources.md`.

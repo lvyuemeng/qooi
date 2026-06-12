@@ -10,7 +10,7 @@ scripts/
     -> qooi.dynamic + qooi.research prepared frames
 
 qooi.exchange
-  -> market/cache/universe/context data
+  -> market/cache/universe/context/trading IO
 qooi.sources
   -> provider/source artifacts
 qooi.scanner

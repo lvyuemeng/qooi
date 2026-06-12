@@ -14,7 +14,7 @@ AI/learned-state work is isolated in `qooi.dynamic` because it is not the active
 
 | Architecture part | Package/path | Role |
 |---|---|---|
-| Data / Exchange | `qooi.exchange` | Exchange adapters, OHLCV/history cache, market discovery, data coverage, thin trading IO wrapper. |
+| Exchange | `qooi.exchange` | Exchange adapters, OHLCV/history cache, market discovery, data coverage, thin trading IO wrapper. |
 | Sources | `qooi.sources` | Provider/source collectors, source normalization, manifests, bundles, freshness, missing-data diagnostics. |
 | Strategy / Signal | `qooi.strategies` | Indicators, market-structure semantics, strategy specs, portfolio qualification, explicit signal columns. |
 | Core / Execution | `qooi.core` | Basket lifecycle, executor/backtests, recovery policies, evaluation, metrics, soft/live state. |

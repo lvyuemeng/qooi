@@ -44,7 +44,7 @@ uv run python scripts/risk_test.py                   # risk configs on BTC 1D
 
 Any OKX instrument ID works. Common crypto: `BTC-USDT`, `ETH-USDT`, `SOL-USDT`, `XRP-USDT`, `DOGE-USDT`. Commodity perp: `XAU-USDT-SWAP` (gold, listed 2025-12-31, ~125 bars of 1D data). Use 4H/1H for more data points.
 
-See `docs/graph/data.md` for exchange/data graph details and `docs/context.md` for domain glossary.
+See `docs/graph/exchange.md` for exchange graph details and `docs/context.md` for domain glossary.
 
 ### Project structure
 

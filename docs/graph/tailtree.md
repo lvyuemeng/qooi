@@ -51,6 +51,16 @@ Division of labor:
 
 GPD is not a full-return model and not an up/down/flat classifier.
 
+Horizon semantics:
+
+```text
+bar = scanner config bar
+outcome_horizon = N bars
+label time scale = N * bar duration
+```
+
+For the daily-deep config, `bar = "1H"` and `transition_mae_mfe_horizon = 12`, so the implemented label is a 12-hour path-extreme touch. This label can count burst-then-fade paths as successful excursions. Continuation/exhaustion semantics require additional path-shape diagnostics, not a different interpretation of `tail_up`/`tail_down`.
+
 ---
 
 ## Public data products
@@ -72,6 +82,29 @@ tail_up: bool
 tail_down: bool
 tail_exceedance_value_up: float
 tail_exceedance_value_down: float
+```
+
+Planned path-shape extension should keep the excursion label but add retention/exhaustion columns:
+
+```text
+time_to_max_bar: int
+time_to_min_bar: int
+close_retention_ratio: float
+post_peak_drawdown_pct: float
+path_efficiency: float
+entry_delay_bars: int
+```
+
+These columns let downstream selection distinguish:
+
+```text
+up_touch          # high excursion only
+up_continuation   # excursion retained into terminal close
+up_exhaustion     # excursion unwound after peak
+down_touch
+down_continuation
+down_exhaustion
+volatility        # both directions show elevated tail lift
 ```
 
 ### Tailtree training frame
@@ -192,6 +225,75 @@ model = TailTreeModel.train(
 
 ---
 
+## Train/load-predict lifecycle
+
+Training and current prediction are different scanner modes. The tailtree path exposes a lifecycle config instead of always training during every scan.
+
+Implemented config shape:
+
+```toml
+[potential.tailtree]
+lifecycle = "train"        # "train" or "load_predict"
+model_dir = "data/output/potential/daily-deep/models"
+model_tag = "tailtree-1h-12h-v1"
+```
+
+Implemented lifecycle calls:
+
+```text
+qooi.scanner.tailrun.run(...)
+    if config.tailtree.lifecycle == "train":
+        → qooi.scanner.tailrun.train_evaluate_predict(...)
+        → write model_dir/model_tag/tail-tree-up.json
+        → write model_dir/model_tag/tail-tree-down.json
+        → write model_dir/model_tag/potential-leaf-evidence-up.csv
+        → write model_dir/model_tag/potential-leaf-evidence-down.csv
+        → write model_dir/model_tag/tailtree-artifact.json
+    if config.tailtree.lifecycle == "load_predict":
+        → qooi.scanner.tailrun.load_predict(...)
+        → load frozen models/evidence
+        → validate artifact metadata against config
+        → return TailtreeEvidenceResult
+
+qooi.scanner.tailtree
+    → statistical/model code only: labels, training frame, TailTreeModel,
+      leaf evidence, selection
+
+qooi.scanner.tailrun
+    → lifecycle code: artifact root, metadata hash, save/load, validation,
+      train-vs-load dispatch
+```
+
+Compatibility note: `qooi.scanner.diagnostics._build_tail_tree_evidence`,
+`_load_tail_tree_evidence`, and `_write_tailtree_artifacts` remain thin wrappers
+for existing tests and internal callers; implementation ownership is `tailrun`.
+
+Do not move lifecycle dispatch into report, candidate, or ranking modules.
+
+Mode semantics:
+
+| Lifecycle | Input contract | Model action | Output contract |
+|---|---|---|---|
+| `train` | observations + outcomes | train, validate, persist `tail-tree-up/down.json` | evidence + model + candidates |
+| `load_predict` | latest observations + frozen evidence/model artifact | load only; no outcome dependency for prediction | candidates from frozen evidence/model |
+
+`load_predict` must validate artifact compatibility before ranking:
+
+```text
+bar
+horizon_bars
+threshold_pct
+categorical_features
+continuous_features
+feature_schema_hash
+training_window_ms
+model_tag
+```
+
+A mismatch is a hard diagnostic error, not a silent retrain or fallback.
+
+---
+
 ## Leaf diagnostics graph
 
 ```text
@@ -222,6 +324,57 @@ Leaf evidence and leaf context must use the same decision-key outcome aggregatio
 
 ---
 
+## Planned rolling validation graph
+
+Rolling validation is time-blocked by `decision_bar_close_ms`; it must not randomly split rows across time.
+
+Planned public data product:
+
+```text
+qooi.scanner.tailtree.rolling_leaf_validation_frame(
+    observations: pl.DataFrame,
+    labeled_outcomes: pl.DataFrame,
+    *,
+    direction: Literal["up", "down"],
+    train_window_bars: int,
+    validation_window_bars: int,
+    step_bars: int,
+) -> pl.DataFrame
+```
+
+Planned output columns:
+
+```text
+split_id
+train_start_ms
+train_end_ms
+valid_start_ms
+valid_end_ms
+leaf_id
+tree_direction
+valid_N_total
+valid_N_tail_exceedances
+valid_tail_rate
+valid_tail_lift
+valid_close_retention_ratio
+valid_post_peak_drawdown_pct
+```
+
+Planned leaf promotion aggregate:
+
+```text
+leaf_selected_window_count
+median_valid_tail_lift
+min_valid_tail_lift
+valid_lift_decay
+median_valid_close_retention_ratio
+median_valid_post_peak_drawdown_pct
+```
+
+Selection should promote leaves that are stable across rolling windows, not merely strong in one in-sample tree.
+
+---
+
 ## Selection graph
 
 ```text
@@ -246,6 +399,17 @@ selected_evidence_level = false     # fallback row, not promoted
 ```
 
 Selection is a research filter, not a trading authorization.
+
+Planned promotion rule additions:
+
+```text
+selected_evidence_level
+and rolling validation passes
+and path-shape quality passes
+and freshness/cost gates pass at candidate time
+```
+
+Multi-horizon output should preserve one row per `(horizon_bars, tree_direction, leaf_id)` so rank can compare short-burst, medium-continuation, and long-horizon setups quantitatively.
 
 ---
 
