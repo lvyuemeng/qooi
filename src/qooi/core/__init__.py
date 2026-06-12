@@ -493,4 +493,3 @@ def _exit_action(
         signal_strength=signal.strength,
         snapshot=snapshot,
     )
-

@@ -172,5 +172,3 @@ def test_zscore_recovery_blocks_volatility_expansion():
         adx=20.0,
     )
     assert actions == []
-
-

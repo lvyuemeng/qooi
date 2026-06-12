@@ -103,4 +103,3 @@ def allocate_portfolio_weights(
         raw = {k: v * 0.7 for k, v in raw.items()}
 
     return raw
-

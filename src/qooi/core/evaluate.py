@@ -228,8 +228,8 @@ def _trades_frame(trades: list[dict]) -> pl.DataFrame:
             df = df.with_columns(pl.lit("other").alias("exit_family"))
     return _with_regime_buckets(
         df.with_columns(
-        pl.col("pnl").cast(pl.Float64),
-        pl.col("pnl_usd").cast(pl.Float64),
+            pl.col("pnl").cast(pl.Float64),
+            pl.col("pnl_usd").cast(pl.Float64),
         )
     )
 
@@ -317,10 +317,7 @@ def _with_regime_buckets(df: pl.DataFrame) -> pl.DataFrame:
             .otherwise(pl.lit("high"))
             .alias("entry_event_quality_bucket")
         )
-    if (
-        "entry_atr_percentile_100" in df.columns
-        and "entry_atr_percentile_bucket" not in df.columns
-    ):
+    if "entry_atr_percentile_100" in df.columns and "entry_atr_percentile_bucket" not in df.columns:
         atr_pct = pl.col("entry_atr_percentile_100").cast(pl.Float64)
         expressions.append(
             pl.when(atr_pct.is_null())
@@ -1464,4 +1461,3 @@ def format_backtest_report(
 def format_signal_diagnostics(label: str, diagnostics: dict[str, float]) -> str:
     parts = [f"{key}={value:.1f}" for key, value in sorted(diagnostics.items())]
     return f"  {label}: " + "  ".join(parts)
-

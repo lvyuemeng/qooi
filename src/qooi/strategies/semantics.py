@@ -18,6 +18,8 @@ class StructureState:
     DOWNTREND = "downtrend"
     RANGE = "range"
     UNKNOWN = "unknown"
+
+
 class MarketStage:
     WARMUP = "warmup"
     DATA_ERROR = "data_error"
@@ -120,4 +122,3 @@ class LossCause:
     STOP_NO_REVERSION = "stop_no_reversion"
     EXIT_MISMATCH_OR_NO_REVERSION = "exit_mismatch_or_no_reversion"
     UNCLASSIFIED = "unclassified"
-

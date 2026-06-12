@@ -15,14 +15,18 @@ IndicatorFn = Callable[[pl.DataFrame], pl.DataFrame]
 
 
 def uptrend(ema_mid: int = 50, ema_slow: int = 200) -> pl.Expr:
-    return (pl.col(f"ema_{ema_mid}") > 0) & (pl.col(f"ema_{ema_slow}") > 0) & (
-        pl.col(f"ema_{ema_mid}") > pl.col(f"ema_{ema_slow}")
+    return (
+        (pl.col(f"ema_{ema_mid}") > 0)
+        & (pl.col(f"ema_{ema_slow}") > 0)
+        & (pl.col(f"ema_{ema_mid}") > pl.col(f"ema_{ema_slow}"))
     )
 
 
 def downtrend(ema_mid: int = 50, ema_slow: int = 200) -> pl.Expr:
-    return (pl.col(f"ema_{ema_mid}") > 0) & (pl.col(f"ema_{ema_slow}") > 0) & (
-        pl.col(f"ema_{ema_mid}") < pl.col(f"ema_{ema_slow}")
+    return (
+        (pl.col(f"ema_{ema_mid}") > 0)
+        & (pl.col(f"ema_{ema_slow}") > 0)
+        & (pl.col(f"ema_{ema_mid}") < pl.col(f"ema_{ema_slow}"))
     )
 
 
@@ -444,9 +448,7 @@ def add_garch_like_volatility(
     def _add(df: pl.DataFrame) -> pl.DataFrame:
         closes = [float(v) if v is not None else None for v in df["close"].to_list()]
         returns = [
-            None
-            if prev is None or curr is None or prev <= 0 or curr <= 0
-            else log(curr / prev)
+            None if prev is None or curr is None or prev <= 0 or curr <= 0 else log(curr / prev)
             for prev, curr in zip([None, *closes[:-1]], closes, strict=False)
         ]
         variance = 0.0
@@ -592,4 +594,3 @@ def _bar_interval_ms(df: pl.DataFrame) -> int:
     deltas = [int(timestamps[i] - timestamps[i - 1]) for i in range(1, len(timestamps))]
     positive = [delta for delta in deltas if delta > 0]
     return min(positive) if positive else 3_600_000
-

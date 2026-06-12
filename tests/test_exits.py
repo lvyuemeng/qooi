@@ -183,5 +183,3 @@ def test_trail_updates_high_low():
     t.update(104.0, 96.0)
     assert t.trail_high == 105.0
     assert t.trail_low == 95.0
-
-

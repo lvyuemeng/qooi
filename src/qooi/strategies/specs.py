@@ -273,9 +273,7 @@ def _failed_breakout_entry_conditions(
     require_volume_impulse: bool,
 ) -> tuple[pl.Expr, pl.Expr]:
     volume_gate = (
-        pl.col("volume_impulse").fill_null(False)
-        if require_volume_impulse
-        else pl.lit(True)
+        pl.col("volume_impulse").fill_null(False) if require_volume_impulse else pl.lit(True)
     )
     quality_gate = pl.col("event_quality_score").cast(pl.Float64) >= event_quality_min
     long_entry = (
@@ -505,9 +503,7 @@ def strategy_signal_diagnostics(df: pl.DataFrame, strategy: StrategyBehavior) ->
             "held_signal_pct": _expr_pct(signal_df, pl.col("signal") != 0),
         }
         if "ofi_flow_score" in signal_df.columns:
-            diagnostics["ofi_threshold_pct"] = _expr_pct(
-                signal_df, pl.col("signal") != 0
-            )
+            diagnostics["ofi_threshold_pct"] = _expr_pct(signal_df, pl.col("signal") != 0)
         if "regime_score" in signal_df.columns:
             diagnostics["regime_gate_pass_pct"] = _expr_pct(
                 signal_df, pl.col("regime_score").abs() <= 0.7
@@ -620,16 +616,13 @@ def apply_strategy_spec(df: pl.DataFrame, spec: StrategySpec) -> pl.DataFrame:
     )
     entry_events = _entry_events(work["raw_entry_signal"].to_list(), position, spec)
     strength_expr = pl.when(pl.col("raw_entry_signal") != 0).then(1.0).otherwise(0.0)
-    return (
-        work.with_columns(
-            pl.Series("entry_signal", entry_events, dtype=pl.Float64),
-            pl.Series("position_signal", position, dtype=pl.Float64),
-            pl.Series("exit_signal", exit_events, dtype=pl.Boolean),
-            strength_expr.alias("signal_strength"),
-            pl.Series("signal", position, dtype=pl.Float64),
-        )
-        .drop("_exit_long_signal", "_exit_short_signal")
-    )
+    return work.with_columns(
+        pl.Series("entry_signal", entry_events, dtype=pl.Float64),
+        pl.Series("position_signal", position, dtype=pl.Float64),
+        pl.Series("exit_signal", exit_events, dtype=pl.Boolean),
+        strength_expr.alias("signal_strength"),
+        pl.Series("signal", position, dtype=pl.Float64),
+    ).drop("_exit_long_signal", "_exit_short_signal")
 
 
 def _exit_expr(expr: pl.Expr | None, *, fallback: pl.Expr | None = None) -> pl.Expr:
@@ -726,4 +719,3 @@ def _hold_signal(
         exit_events.append(did_exit)
         signal.append(pos)
     return signal, exit_events
-

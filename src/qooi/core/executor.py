@@ -561,9 +561,7 @@ class BacktestExecutor:
                         _drawdown_pct(_portfolio_value(float(market.close))), 6
                     ),
                     "exit_total_notional_pct_before": round(
-                        _notional_exposure(float(market.close))
-                        / self._initial_capital
-                        * 100.0
+                        _notional_exposure(float(market.close)) / self._initial_capital * 100.0
                         if self._initial_capital
                         else 0.0,
                         6,
@@ -597,13 +595,11 @@ class BacktestExecutor:
             strength = max(float(signal.strength or 0.0), 1e-9)
             risk_pct = max(float(getattr(pair.asset, "max_risk_pct", 0.0)), 1e-9)
             leverage = max(float(getattr(pair.asset, "leverage", 0.0)), 1e-9)
-            notional_pct = max(
-                float(getattr(pair.asset, "max_notional_pct_per_basket", 0.0)), 1e-9
-            )
+            notional_pct = max(float(getattr(pair.asset, "max_notional_pct_per_basket", 0.0)), 1e-9)
             notional_per_contract = abs(entry_px * pair.asset.ct_val)
             required_capital_risk = min_contracts * sizing.risk_per_contract / (risk_pct * strength)
-            required_capital_notional = min_contracts * notional_per_contract / (
-                leverage * notional_pct
+            required_capital_notional = (
+                min_contracts * notional_per_contract / (leverage * notional_pct)
             )
             required_risk_pct = (
                 min_contracts * sizing.risk_per_contract / (pair.asset.capital * strength) * 100.0
@@ -986,9 +982,7 @@ class BacktestExecutor:
         self._last_signals = signals
         self._last_action_events = action_events
         bars_held = [float(t.get("bars_held", 0.0) or 0.0) for t in trades]
-        stacked_trades = [
-            t for t in trades if int(t.get("entry_active_baskets", 0) or 0) > 0
-        ]
+        stacked_trades = [t for t in trades if int(t.get("entry_active_baskets", 0) or 0) > 0]
         stacked_entry_net_pnl_usd = sum(
             float(t.get("net_pnl_usd", t.get("pnl_usd", 0.0)) or 0.0) for t in stacked_trades
         )
@@ -1201,4 +1195,3 @@ class BacktestExecutor:
             diagnostics=getattr(self, "_last_diagnostics", None),
             run_metadata=metadata,
         )
-

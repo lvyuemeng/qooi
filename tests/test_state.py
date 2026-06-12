@@ -182,5 +182,3 @@ def test_basket_and_okx_client_id_helpers_encode_state_identity():
     assert client_id.startswith("qooi")
     assert len(client_id) <= 32
     assert client_id.isalnum()
-
-

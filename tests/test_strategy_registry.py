@@ -106,8 +106,7 @@ def _structural_event_frame(**overrides) -> pl.DataFrame:
     data.update(overrides)
     rows = max(len(value) for value in data.values())
     data = {
-        key: value * rows if len(value) == 1 and rows > 1 else value
-        for key, value in data.items()
+        key: value * rows if len(value) == 1 and rows > 1 else value for key, value in data.items()
     }
     return pl.DataFrame(data)
 
@@ -202,9 +201,7 @@ def test_compute_signal_frame_rejects_non_spec_and_can_prepare_raw_ohlcv():
 
 
 def test_generic_stat_features_add_explicit_columns_without_division_errors():
-    df = _ohlcv_frame(220, close_step=0.0).drop(
-        "atr_14", "ema_50", "ema_200", "adx_14", "rsi_14"
-    )
+    df = _ohlcv_frame(220, close_step=0.0).drop("atr_14", "ema_50", "ema_200", "adx_14", "rsi_14")
     for feature in (
         add_volatility_regime(short_span=12, long_span=36),
         add_garch_like_volatility(),

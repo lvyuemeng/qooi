@@ -377,4 +377,3 @@ def _find_position(positions: list[dict], symbol: str) -> dict | None:
 
 def _position_qty(position: dict) -> float:
     return float(position.get("pos", 0) or 0)
-

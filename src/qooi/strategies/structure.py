@@ -171,10 +171,7 @@ def add_liquidity_sweep_features(
             vol_avg = pl.col(vol_col).shift(1).rolling_mean(volume_period)
             volume_exprs = [
                 vol_avg.alias("liquidity_sweep_volume_avg"),
-                (
-                    vol_avg.is_not_null()
-                    & (pl.col(vol_col) > vol_avg * volume_mult)
-                )
+                (vol_avg.is_not_null() & (pl.col(vol_col) > vol_avg * volume_mult))
                 .fill_null(False)
                 .alias("volume_impulse"),
             ]
@@ -185,9 +182,11 @@ def add_liquidity_sweep_features(
             ]
 
         if vol_col:
-            volume_boost = pl.when(
-                vol_avg.is_not_null() & (pl.col(vol_col) > vol_avg * volume_mult)
-            ).then(1.0).otherwise(0.0)
+            volume_boost = (
+                pl.when(vol_avg.is_not_null() & (pl.col(vol_col) > vol_avg * volume_mult))
+                .then(1.0)
+                .otherwise(0.0)
+            )
         else:
             volume_boost = pl.lit(0.0)
 
@@ -316,9 +315,7 @@ def add_price_structure_stage_features(
         swing_high = prior_high_window.is_not_null() & (
             pl.col("high").shift(1) >= prior_high_window
         )
-        swing_low = prior_low_window.is_not_null() & (
-            pl.col("low").shift(1) <= prior_low_window
-        )
+        swing_low = prior_low_window.is_not_null() & (pl.col("low").shift(1) <= prior_low_window)
         swing_high_value = pl.when(swing_high).then(pl.col("high").shift(1)).otherwise(None)
         swing_low_value = pl.when(swing_low).then(pl.col("low").shift(1)).otherwise(None)
         last_swing_high = swing_high_value.forward_fill()
@@ -542,9 +539,7 @@ def add_none_context_diagnostics(
         percentiles: list[float | None] = []
         for idx, value in enumerate(atr_values):
             window = [
-                v
-                for v in atr_values[max(0, idx - atr_period + 1) : idx + 1]
-                if v is not None
+                v for v in atr_values[max(0, idx - atr_period + 1) : idx + 1] if v is not None
             ]
             if value is None or len(window) < atr_period:
                 percentiles.append(None)
@@ -611,4 +606,3 @@ def add_none_context_diagnostics(
         )
 
     return _add
-

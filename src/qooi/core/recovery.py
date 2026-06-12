@@ -361,4 +361,3 @@ def _reversal_size(
         return 1
     sz = math.ceil(loss_usd / zone_profit_per_contract)
     return max(1, sz)
-

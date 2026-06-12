@@ -361,9 +361,7 @@ class BasketBook:
 
     def active_for_strategy(self, symbol: str, strategy: str) -> list[Basket]:
         return [
-            b
-            for b in self.baskets
-            if b.symbol == symbol and b.strategy == strategy and b.is_active
+            b for b in self.baskets if b.symbol == symbol and b.strategy == strategy and b.is_active
         ]
 
     def active(self) -> list[Basket]:
@@ -623,4 +621,3 @@ def evaluate_hard_exits(
         px=stop_px,
         fraction=1.0,
     )
-
