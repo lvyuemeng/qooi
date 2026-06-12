@@ -198,5 +198,3 @@ def select_candidate_symbols(
         if top_n is not None and len(selected) >= top_n:
             break
     return tuple(selected if top_n is None else selected[:top_n])
-
-

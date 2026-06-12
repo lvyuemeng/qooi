@@ -161,4 +161,3 @@ def _coerce(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame
         else:
             frame = frame.with_columns(pl.col(col).cast(dtype, strict=False).alias(col))
     return frame.select(schema.keys())
-

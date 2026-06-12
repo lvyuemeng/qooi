@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 
 import polars as pl
 
-from qooi.exchange.store import HistoryCoverage
 from qooi.sources.manifest import manifest_frame, now_ms, source_manifest_row
 
 __all__ = [
     "compute_source_coverage_score",
+    "eligible_backfill_symbols",
     "eligible_fetch_symbols",
     "latest_manifest_rows",
     "latest_manifest_status",
@@ -23,8 +23,19 @@ __all__ = [
 ]
 
 
+class HistoryCoverageLike(Protocol):
+    inst_id: str
+    bar: str
+    source: str
+    actual_bars: int
+    actual_start_ms: int | None
+    actual_end_ms: int | None
+    coverage_pct: float
+    notes: tuple[str, ...]
+
+
 def manifest_row_from_history_coverage(
-    coverage: HistoryCoverage,
+    coverage: HistoryCoverageLike,
     *,
     phase: str = "collect-market",
     status: str | None = None,
@@ -122,6 +133,50 @@ def stale_symbols(
     )
 
 
+def eligible_backfill_symbols(
+    frame: pl.DataFrame,
+    symbols: tuple[str, ...],
+    *,
+    target_start_ms: int,
+    now_ms: int,
+    max_age_ms: int,
+    min_rows: int,
+    refresh: bool,
+    timestamp_col: str = "timestamp",
+) -> tuple[str, ...]:
+    if refresh:
+        return symbols
+    if frame.is_empty() or "symbol" not in frame.columns or timestamp_col not in frame.columns:
+        return symbols
+    ranges = frame.group_by("symbol").agg(
+        pl.col(timestamp_col).min().alias("earliest"),
+        pl.col(timestamp_col).max().alias("latest"),
+        pl.len().alias("rows"),
+    )
+    by_symbol = {str(row["symbol"]): row for row in ranges.iter_rows(named=True)}
+    eligible: list[str] = []
+    for symbol in symbols:
+        row = by_symbol.get(symbol)
+        if row is None:
+            eligible.append(symbol)
+            continue
+        earliest = row["earliest"]
+        latest = row["latest"]
+        rows = row["rows"]
+        if earliest is None or latest is None:
+            eligible.append(symbol)
+            continue
+        if int(latest) < now_ms - max_age_ms:
+            eligible.append(symbol)
+            continue
+        if int(earliest) > target_start_ms:
+            eligible.append(symbol)
+            continue
+        if int(rows) < min_rows:
+            eligible.append(symbol)
+    return tuple(eligible)
+
+
 def eligible_fetch_symbols(
     frame: pl.DataFrame,
     symbols: tuple[str, ...],
@@ -158,4 +213,3 @@ def _note_value(notes: tuple[str, ...], key: str) -> str:
         if note.startswith(prefix):
             return note.removeprefix(prefix)
     return ""
-

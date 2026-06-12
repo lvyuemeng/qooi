@@ -1,4 +1,4 @@
-"""OKX public context collection for scanner orchestration."""
+"""Demand-first source collection planning and execution."""
 
 from __future__ import annotations
 
@@ -12,14 +12,21 @@ from typing import Literal
 import httpx
 import polars as pl
 
+from qooi.sources import (
+    HOUR_MS,
+    funding_min_rows,
+    normalize_funding_artifact_frame,
+    period_min_rows,
+)
 from qooi.sources.artifacts import SOURCE_ARTIFACT_SPECS, artifact_path
-from qooi.sources.coverage import eligible_fetch_symbols
+from qooi.sources.coverage import eligible_backfill_symbols, eligible_fetch_symbols
 from qooi.sources.manifest import manifest_frame, now_ms, source_manifest_row
 from qooi.sources.models import SourceResult
 from qooi.sources.okx import (
     OKX_BASE_URL,
     fetch_okx_book_snapshot,
     fetch_okx_funding_history,
+    fetch_okx_funding_rate,
     fetch_okx_long_short_account_ratio_contract,
     fetch_okx_open_interest_history,
     fetch_okx_recent_trades,
@@ -28,12 +35,80 @@ from qooi.sources.okx import (
     fetch_okx_top_trader_long_short_position_ratio_contract,
 )
 
-HOUR_MS = 60 * 60 * 1000
 BookMode = Literal["snapshot", "sample", "off"]
 
 
 @dataclass(frozen=True)
-class MarketContextRequest:
+class SourceNeed:
+    family: str
+    symbols: tuple[str, ...]
+    start_ms: int | None
+    end_ms: int | None
+    min_rows: int
+    freshness_ms: int | None
+    mode: Literal["snapshot", "history", "both", "local"]
+
+
+@dataclass(frozen=True)
+class SourceFetchPlan:
+    family: str
+    raw_source: str
+    symbol: str
+    start_ms: int | None
+    end_ms: int | None
+    limit: int
+    reason: str
+
+
+def source_needs_from_config(
+    config: object,
+    *,
+    symbols: tuple[str, ...],
+    context_symbols: tuple[str, ...],
+    start_ms: int | None,
+    end_ms: int | None,
+) -> tuple[SourceNeed, ...]:
+    target_symbols = context_symbols or symbols
+    disabled = set(getattr(config, "disabled_sources", ()))
+    freshness_ms = int(getattr(config, "max_source_staleness_hours", 0)) * HOUR_MS
+    days = max(
+        int(getattr(config, "days", 0)),
+        int(getattr(config, "transition_history_days", 0)),
+    )
+    rubik_rows = period_min_rows(days, str(getattr(config, "rubik_period", "1H")))
+    candidates = (
+        SourceNeed("books", target_symbols, None, end_ms, 1, freshness_ms, "snapshot"),
+        SourceNeed("trades", target_symbols, None, end_ms, 1, freshness_ms, "snapshot"),
+        SourceNeed(
+            "funding",
+            target_symbols,
+            start_ms,
+            end_ms,
+            funding_min_rows(days),
+            freshness_ms,
+            "both",
+        ),
+        SourceNeed(
+            "open_interest", target_symbols, start_ms, end_ms, rubik_rows, freshness_ms, "history"
+        ),
+        SourceNeed(
+            "taker_volume", target_symbols, start_ms, end_ms, rubik_rows, freshness_ms, "history"
+        ),
+        SourceNeed(
+            "long_short_ratios",
+            target_symbols,
+            start_ms,
+            end_ms,
+            rubik_rows,
+            freshness_ms,
+            "history",
+        ),
+    )
+    return tuple(need for need in candidates if need.family not in disabled)
+
+
+@dataclass(frozen=True)
+class SourceCollectRequest:
     output_dir: Path
     symbols: tuple[str, ...]
     discovery: pl.DataFrame
@@ -51,16 +126,20 @@ class MarketContextRequest:
     refresh_bars: bool = False
     refresh_trades: bool = False
     refresh_context: bool = False
+    target_source_start_ms: int | None = None
+    target_source_end_ms: int | None = None
+    funding_min_rows: int = 0
+    rubik_min_rows: int = 0
     existing_frames: dict[str, pl.DataFrame] | None = None
 
 
 @dataclass(frozen=True)
-class MarketContextResult:
+class SourceCollectResult:
     manifest: pl.DataFrame
     frames: dict[str, pl.DataFrame]
 
 
-async def collect_market_context(request: MarketContextRequest) -> MarketContextResult:
+async def collect_source_context(request: SourceCollectRequest) -> SourceCollectResult:
     existing_frames = request.existing_frames or {}
     request_budget = asyncio.Semaphore(max(1, request.concurrency))
     async with httpx.AsyncClient(base_url=OKX_BASE_URL, timeout=20.0) as client:
@@ -122,17 +201,16 @@ async def collect_market_context(request: MarketContextRequest) -> MarketContext
         ]
         gathered = await asyncio.gather(*(collector for _name, collector in collectors))
     frames = {
-        name: result.frame
-        for (name, _collector), result in zip(collectors, gathered, strict=True)
+        name: result.frame for (name, _collector), result in zip(collectors, gathered, strict=True)
     }
     manifests = [result.manifest for result in gathered if not result.manifest.is_empty()]
     manifest = pl.concat(manifests, how="diagonal_relaxed") if manifests else manifest_frame([])
-    return MarketContextResult(manifest=manifest, frames=frames)
+    return SourceCollectResult(manifest=manifest, frames=frames)
 
 
 async def _collect_books_source(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     existing: pl.DataFrame,
     request_budget: asyncio.Semaphore,
 ) -> SourceResult:
@@ -175,7 +253,7 @@ async def _collect_books_source(
 
 async def _collect_trades_source(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     existing: pl.DataFrame,
     request_budget: asyncio.Semaphore,
 ) -> SourceResult:
@@ -222,11 +300,15 @@ async def _collect_trades_source(
 
 async def _collect_funding_source(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     existing: pl.DataFrame,
     request_budget: asyncio.Semaphore,
+    fetch: Callable[[str, str | None, str | None], Awaitable[SourceResult]] | None = None,
+    current_fetch: Callable[[str], Awaitable[SourceResult]] | None = None,
 ) -> SourceResult:
+    existing = normalize_funding_artifact_frame(existing)
     timestamp_col = "funding_time" if "funding_time" in existing.columns else "timestamp"
+    historical_existing = _funding_history_frame(existing)
     disabled_symbols = tuple(
         symbol for symbol in request.symbols if _source_disabled(request, "funding", symbol)
     )
@@ -236,11 +318,12 @@ async def _collect_funding_source(
     disabled_manifest = _market_manifest_rows(
         disabled_symbols, source="funding", status="skipped", warning="funding_disabled"
     )
-    eligible = _eligible_symbols(
-        existing,
+    eligible = _eligible_historical_symbols(
+        historical_existing,
         active_symbols,
         refresh=request.refresh_context,
         request=request,
+        min_rows=request.funding_min_rows,
         timestamp_col=timestamp_col,
     )
     local = _local_frame_manifest(
@@ -252,13 +335,40 @@ async def _collect_funding_source(
     )
     local_symbols = tuple(symbol for symbol in active_symbols if symbol not in set(eligible))
 
-    async def fetch(symbol: str) -> SourceResult:
-        result = await fetch_okx_funding_history(client, symbol, limit=request.funding_limit)
-        return SourceResult(_with_symbol(result.frame, symbol), result.manifest)
+    if fetch is None:
 
-    fetched = await _collect_symbol_results(eligible, request_budget, fetch)
+        async def fetch(symbol: str, after: str | None, before: str | None) -> SourceResult:
+            result = await fetch_okx_funding_history(
+                client,
+                symbol,
+                limit=request.funding_limit,
+                after=after,
+                before=before,
+            )
+            return SourceResult(_with_symbol(result.frame, symbol), result.manifest)
+
+    if current_fetch is None:
+
+        async def current_fetch(symbol: str) -> SourceResult:
+            result = await fetch_okx_funding_rate(client, symbol)
+            return SourceResult(_with_symbol(result.frame, symbol), result.manifest)
+
+    async def run(symbol: str) -> SourceResult:
+        return await _collect_historical_pages(
+            symbol,
+            historical_existing,
+            request,
+            fetch=fetch,
+            cursor_fn=_incremental_funding_window,
+            min_rows=request.funding_min_rows,
+            page_limit=request.funding_limit,
+            timestamp_col=timestamp_col,
+        )
+
+    fetched = await _collect_symbol_results(eligible, request_budget, run)
+    current = await _collect_symbol_results(active_symbols, request_budget, current_fetch)
     return _combine_source_results(
-        fetched,
+        [*fetched, *current],
         local_frame=_local_frame(existing, local_symbols),
         local_manifest=_concat_frames(disabled_manifest, local),
     )
@@ -266,7 +376,7 @@ async def _collect_funding_source(
 
 async def _collect_open_interest_source(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     existing: pl.DataFrame,
     request_budget: asyncio.Semaphore,
 ) -> SourceResult:
@@ -290,7 +400,7 @@ async def _collect_open_interest_source(
 
 async def _collect_taker_volume_source(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     existing: pl.DataFrame,
     request_budget: asyncio.Semaphore,
 ) -> SourceResult:
@@ -315,7 +425,7 @@ async def _collect_taker_volume_source(
 
 async def _collect_long_short_ratios_source(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     existing: pl.DataFrame,
     request_budget: asyncio.Semaphore,
 ) -> SourceResult:
@@ -336,7 +446,7 @@ async def _collect_long_short_ratios_source(
 
 async def _collect_rubik_source(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     existing: pl.DataFrame,
     *,
     frame_source: str,
@@ -364,8 +474,12 @@ async def _collect_rubik_source(
         if disabled_symbols
         else pl.DataFrame()
     )
-    eligible = _eligible_symbols(
-        existing, active_symbols, refresh=request.refresh_context, request=request
+    eligible = _eligible_historical_symbols(
+        existing,
+        active_symbols,
+        refresh=request.refresh_context,
+        request=request,
+        min_rows=request.rubik_min_rows,
     )
     local = _local_frame_manifest(
         tuple(symbol for symbol in active_symbols if symbol not in set(eligible)),
@@ -376,9 +490,16 @@ async def _collect_rubik_source(
     local_symbols = tuple(symbol for symbol in active_symbols if symbol not in set(eligible))
 
     async def run(symbol: str) -> SourceResult:
-        begin, end = _incremental_rubik_window(existing, symbol, request)
-        result = await fetch(symbol, begin, end)
-        return SourceResult(_with_symbol(result.frame, symbol), result.manifest)
+        return await _collect_historical_pages(
+            symbol,
+            existing,
+            request,
+            fetch=fetch,
+            cursor_fn=_incremental_rubik_window,
+            min_rows=request.rubik_min_rows,
+            page_limit=request.rubik_limit,
+            timestamp_col="timestamp",
+        )
 
     fetched = await _collect_symbol_results(eligible, request_budget, run)
     return _combine_source_results(
@@ -388,15 +509,139 @@ async def _collect_rubik_source(
     )
 
 
+async def _collect_historical_pages(
+    symbol: str,
+    existing: pl.DataFrame,
+    request: SourceCollectRequest,
+    *,
+    fetch: Callable[[str, str | None, str | None], Awaitable[SourceResult]],
+    cursor_fn: Callable[[pl.DataFrame, str, SourceCollectRequest], tuple[str | None, str | None]],
+    min_rows: int,
+    page_limit: int,
+    timestamp_col: str,
+) -> SourceResult:
+    merged = _local_frame(existing, (symbol,)) if not request.refresh_context else pl.DataFrame()
+    pages: list[SourceResult] = []
+    max_pages = _historical_max_pages(min_rows, page_limit)
+    for _page_index in range(max_pages):
+        if _historical_depth_satisfied(
+            merged, symbol, request, min_rows, timestamp_col=timestamp_col
+        ):
+            break
+        begin, end = cursor_fn(merged, symbol, request)
+        if begin is None and end is None and not merged.is_empty():
+            break
+        before_earliest = _source_symbol_summary(merged, timestamp_col=timestamp_col).get(
+            symbol, (0, None, None)
+        )[1]
+        result = await fetch(symbol, begin, end)
+        page = _with_symbol(result.frame, symbol)
+        pages.append(SourceResult(page, result.manifest))
+        if page.is_empty():
+            break
+        page_earliest = _source_symbol_summary(page, timestamp_col=timestamp_col).get(
+            symbol, (0, None, None)
+        )[1]
+        if page_earliest is None:
+            break
+        if before_earliest is not None and page_earliest >= before_earliest:
+            break
+        merged = _merge_historical_symbol_frame(merged, page, timestamp_col=timestamp_col)
+    return _combine_source_results(
+        pages,
+        local_frame=_local_frame(existing, (symbol,))
+        if not request.refresh_context
+        else pl.DataFrame(),
+        local_manifest=manifest_frame([]),
+    )
+
+
+def _historical_max_pages(min_rows: int, page_limit: int) -> int:
+    if min_rows <= 0:
+        return 1
+    limit = max(1, page_limit)
+    return max(1, min(25, (min_rows + limit - 1) // limit + 2))
+
+
+def _funding_history_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty() or "funding_source_kind" not in frame.columns:
+        return frame
+    return frame.filter(
+        pl.col("funding_source_kind").is_null() | (pl.col("funding_source_kind") == "history")
+    )
+
+
+def _historical_depth_satisfied(
+    frame: pl.DataFrame,
+    symbol: str,
+    request: SourceCollectRequest,
+    min_rows: int,
+    *,
+    timestamp_col: str,
+) -> bool:
+    rows, earliest, latest = _source_symbol_summary(frame, timestamp_col=timestamp_col).get(
+        symbol, (0, None, None)
+    )
+    if rows == 0:
+        return False
+    has_rows = min_rows <= 0 or rows >= min_rows
+    has_start = request.target_source_start_ms is None or (
+        earliest is not None and earliest <= request.target_source_start_ms
+    )
+    has_recent = request.target_source_end_ms is None or (
+        latest is not None
+        and latest >= request.target_source_end_ms - request.max_source_staleness_hours * HOUR_MS
+    )
+    return has_rows and has_start and has_recent
+
+
+def _merge_historical_symbol_frame(
+    existing: pl.DataFrame, page: pl.DataFrame, *, timestamp_col: str
+) -> pl.DataFrame:
+    frames = [frame for frame in (existing, page) if not frame.is_empty()]
+    if not frames:
+        return pl.DataFrame()
+    merged = pl.concat(frames, how="diagonal_relaxed")
+    if "symbol" in merged.columns and timestamp_col in merged.columns:
+        merged = merged.unique(subset=["symbol", timestamp_col], keep="first")
+    return merged.sort(timestamp_col) if timestamp_col in merged.columns else merged
+
+
 def _incremental_rubik_window(
-    existing: pl.DataFrame, symbol: str, request: MarketContextRequest
+    existing: pl.DataFrame, symbol: str, request: SourceCollectRequest
 ) -> tuple[str | None, str | None]:
     if request.refresh_context:
         return None, None
-    latest = _symbol_latest_timestamp(existing, symbol)
-    if latest is None:
+    summary = _source_symbol_summary(existing).get(symbol)
+    if summary is None:
         return None, None
-    return str(latest + 1), str(now_ms())
+    rows, earliest, latest = summary
+    if earliest is None or latest is None:
+        return None, None
+    if request.target_source_start_ms is not None and earliest > request.target_source_start_ms:
+        return None, str(earliest - 1)
+    if request.rubik_min_rows and rows < request.rubik_min_rows:
+        return None, str(earliest - 1)
+    return str(latest + 1), str(request.target_source_end_ms or now_ms())
+
+
+def _incremental_funding_window(
+    existing: pl.DataFrame, symbol: str, request: SourceCollectRequest
+) -> tuple[str | None, str | None]:
+    timestamp_col = "funding_time" if "funding_time" in existing.columns else "timestamp"
+    if request.refresh_context:
+        return None, None
+    summary = _source_symbol_summary(existing, timestamp_col=timestamp_col).get(symbol)
+    if summary is None:
+        return None, None
+    rows, earliest, latest = summary
+    if earliest is None or latest is None:
+        return None, None
+    if request.target_source_start_ms is not None and earliest > request.target_source_start_ms:
+        return str(earliest), None
+    if request.funding_min_rows and rows < request.funding_min_rows:
+        return str(earliest), None
+    return None, str(latest)
 
 
 def _eligible_symbols(
@@ -404,7 +649,7 @@ def _eligible_symbols(
     symbols: tuple[str, ...],
     *,
     refresh: bool,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     timestamp_col: str = "timestamp",
 ) -> tuple[str, ...]:
     return eligible_fetch_symbols(
@@ -412,6 +657,35 @@ def _eligible_symbols(
         symbols,
         now_ms=now_ms(),
         max_age_ms=request.max_source_staleness_hours * HOUR_MS,
+        refresh=refresh,
+        timestamp_col=timestamp_col,
+    )
+
+
+def _eligible_historical_symbols(
+    existing: pl.DataFrame,
+    symbols: tuple[str, ...],
+    *,
+    refresh: bool,
+    request: SourceCollectRequest,
+    min_rows: int,
+    timestamp_col: str = "timestamp",
+) -> tuple[str, ...]:
+    if request.target_source_start_ms is None:
+        return _eligible_symbols(
+            existing,
+            symbols,
+            refresh=refresh,
+            request=request,
+            timestamp_col=timestamp_col,
+        )
+    return eligible_backfill_symbols(
+        existing,
+        symbols,
+        target_start_ms=request.target_source_start_ms,
+        now_ms=request.target_source_end_ms or now_ms(),
+        max_age_ms=request.max_source_staleness_hours * HOUR_MS,
+        min_rows=min_rows,
         refresh=refresh,
         timestamp_col=timestamp_col,
     )
@@ -434,7 +708,7 @@ def _combine_source_results(
     frames = [frame for frame in frames if not frame.is_empty()]
     manifests = [local_manifest, *(result.manifest for result in results)]
     return SourceResult(
-        pl.concat(frames, how="vertical_relaxed") if frames else pl.DataFrame(),
+        pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame(),
         _concat_frames(*manifests),
     )
 
@@ -474,7 +748,7 @@ def _local_frame(existing: pl.DataFrame, symbols: tuple[str, ...]) -> pl.DataFra
     return existing.filter(pl.col("symbol").is_in(symbols))
 
 
-def _source_endpoint(request: MarketContextRequest, artifact_name: str) -> str:
+def _source_endpoint(request: SourceCollectRequest, artifact_name: str) -> str:
     return str(artifact_path(request.output_dir, SOURCE_ARTIFACT_SPECS[artifact_name]))
 
 
@@ -538,7 +812,7 @@ def _discovery_contract_metadata(discovery: pl.DataFrame) -> dict[str, dict[str,
 
 async def _fetch_long_short_ratios(
     client: httpx.AsyncClient,
-    request: MarketContextRequest,
+    request: SourceCollectRequest,
     symbol: str,
     begin: str | None,
     end: str | None,
@@ -661,11 +935,11 @@ def _max_timestamp(frame: pl.DataFrame) -> int | None:
     )
 
 
-def _family_disabled(request: MarketContextRequest, family: str) -> bool:
+def _family_disabled(request: SourceCollectRequest, family: str) -> bool:
     return _matches_any(family, request.disabled_sources)
 
 
-def _source_disabled(request: MarketContextRequest, family: str, symbol: str = "") -> bool:
+def _source_disabled(request: SourceCollectRequest, family: str, symbol: str = "") -> bool:
     return _family_disabled(request, family) or bool(
         symbol and _matches_any(symbol, request.disabled_symbols)
     )
@@ -684,4 +958,3 @@ def _with_symbol(frame: pl.DataFrame, symbol: str) -> pl.DataFrame:
     if frame.is_empty():
         return frame
     return frame.with_columns(pl.lit(symbol).alias("symbol"))
-

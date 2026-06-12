@@ -533,5 +533,3 @@ def test_missing_higher_timeframe_context_marks_unavailable():
     out = _add_missing_context_columns(base, "d1")
 
     assert out["d1_context_available"].to_list() == [False]
-
-

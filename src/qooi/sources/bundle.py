@@ -10,6 +10,7 @@ import polars as pl
 
 from qooi.sources.artifacts import (
     ArtifactSpec,
+    artifact_merge_keys,
     artifact_path,
     coerce_frame,
     read_frame_artifact,
@@ -52,23 +53,6 @@ SOURCE_BUNDLE_FIELDS: dict[str, str] = {
 
 SOURCE_FRAME_ARTIFACTS: dict[str, str] = {value: key for key, value in SOURCE_BUNDLE_FIELDS.items()}
 
-_MERGE_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
-    "source_bars": (("symbol", "timestamp"),),
-    "source_books": (("symbol", "timestamp"),),
-    "source_trades": (
-        ("symbol", "trade_id"),
-        ("symbol", "timestamp", "price", "size", "side"),
-    ),
-    "source_funding": (("symbol", "funding_time"), ("symbol", "timestamp")),
-    "source_open_interest": (("symbol", "timestamp"),),
-    "source_taker_volume": (("symbol", "timestamp"),),
-    "source_long_short_ratios": (("symbol", "timestamp"),),
-    "source_messages": (("source", "source_id"), ("symbol", "timestamp", "text_hash")),
-    "source_polymarket_events": (("symbol", "event_id"),),
-    "source_polymarket_markets": (("symbol", "market_id"),),
-    "message_classifications": (("symbol", "message_id"),),
-}
-
 
 def read_source_bundle(output_dir: Path, catalog: Mapping[str, ArtifactSpec]) -> SourceBundle:
     return SourceBundle(
@@ -84,9 +68,7 @@ def read_source_bundle(output_dir: Path, catalog: Mapping[str, ArtifactSpec]) ->
         messages=read_frame_artifact(output_dir, catalog["source_messages"]),
         polymarket_events=read_frame_artifact(output_dir, catalog["source_polymarket_events"]),
         polymarket_markets=read_frame_artifact(output_dir, catalog["source_polymarket_markets"]),
-        message_classifications=read_frame_artifact(
-            output_dir, catalog["message_classifications"]
-        ),
+        message_classifications=read_frame_artifact(output_dir, catalog["message_classifications"]),
         manifest=read_frame_artifact(output_dir, catalog["source_manifest"]),
     )
 
@@ -204,7 +186,7 @@ def merge_source_frames(
 def _merge_key(
     artifact_name: str, existing: pl.DataFrame, incoming: pl.DataFrame
 ) -> tuple[str, ...] | None:
-    for key in _MERGE_KEYS.get(artifact_name, ()):  # source-specific append/dedupe keys
+    for key in artifact_merge_keys(artifact_name):
         if set(key).issubset(existing.columns) and set(key).issubset(incoming.columns):
             return key
     if "symbol" in existing.columns and "symbol" in incoming.columns:
@@ -226,4 +208,3 @@ def _merge_by_key(
 def _replace_symbols(existing: pl.DataFrame, incoming: pl.DataFrame) -> pl.DataFrame:
     # Fallback preserves the old source-bundle behavior when a resource key is unavailable.
     return replace_symbol_rows(existing, incoming)
-

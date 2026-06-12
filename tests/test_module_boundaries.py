@@ -30,8 +30,7 @@ def _assert_no_forbidden_imports(package: str, forbidden_prefixes: tuple[str, ..
             if module == "qooi" or not module.startswith("qooi."):
                 continue
             if any(
-                module == prefix or module.startswith(f"{prefix}.")
-                for prefix in forbidden_prefixes
+                module == prefix or module.startswith(f"{prefix}.") for prefix in forbidden_prefixes
             ):
                 rel = path.relative_to(ROOT).as_posix()
                 violations.append(f"{rel} imports {module}")
@@ -80,6 +79,35 @@ def test_sources_do_not_import_research_scanner_strategy_or_execution() -> None:
             "qooi.dynamic",
         ),
     )
+
+
+def test_sources_context_does_not_import_exchange_context() -> None:
+    modules = _imported_modules(SRC / "sources" / "context.py")
+
+    assert "qooi.exchange.context" not in modules
+
+
+def test_sources_coverage_does_not_import_concrete_exchange_store() -> None:
+    modules = _imported_modules(SRC / "sources" / "coverage.py")
+
+    assert "qooi.exchange.store" not in modules
+
+
+def test_source_bundle_does_not_keep_parallel_merge_key_table() -> None:
+    text = (SRC / "sources" / "bundle.py").read_text(encoding="utf-8")
+
+    assert "_MERGE_KEYS" not in text
+
+
+def test_source_period_row_helpers_have_one_package_owner() -> None:
+    for rel in ("sources/context.py", "sources/collect.py"):
+        text = (SRC / rel).read_text(encoding="utf-8")
+        assert "def _funding_min_rows" not in text
+        assert "def _period_min_rows" not in text
+
+
+def test_exchange_context_module_is_removed_from_target_graph() -> None:
+    assert not (SRC / "exchange" / "context.py").exists()
 
 
 def test_strategies_do_not_import_io_scanner_or_execution_boundaries() -> None:

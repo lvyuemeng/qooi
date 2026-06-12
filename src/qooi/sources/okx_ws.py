@@ -25,11 +25,7 @@ class OkxWsCollectionResult:
 def okx_ws_subscribe_message(
     symbols: tuple[str, ...], *, channels: tuple[str, ...] = ("trades", "books5")
 ) -> dict[str, object]:
-    args = [
-        {"channel": channel, "instId": symbol}
-        for symbol in symbols
-        for channel in channels
-    ]
+    args = [{"channel": channel, "instId": symbol} for symbol in symbols for channel in channels]
     return {"op": "subscribe", "args": args}
 
 
@@ -367,4 +363,3 @@ _BOOK_SCHEMA = {
     "ask_depth_bps_50": pl.Float64,
     "spread_bps": pl.Float64,
 }
-

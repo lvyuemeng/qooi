@@ -1,23 +1,47 @@
 from __future__ import annotations
 
+import asyncio
+import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import polars as pl
 import pytest
 
+from qooi.sources.artifacts import coerce_frame, source_manifest_family
 from qooi.sources.bundle import (
+    SourceBundle,
     latest_timestamp,
     missing_symbols,
     replace_symbol_rows,
     source_symbols,
 )
 from qooi.sources.coingecko import fetch_coingecko_trending
-from qooi.sources.coverage import eligible_fetch_symbols, latest_manifest_status, stale_symbols
+from qooi.sources.collect import (
+    SourceCollectRequest,
+    _collect_funding_source,
+    _collect_rubik_source,
+    _combine_source_results,
+    _incremental_rubik_window,
+)
+from qooi.sources.context import (
+    manifest_latest_maps,
+    merge_context_frames,
+)
+from qooi.sources.coverage import (
+    eligible_backfill_symbols,
+    eligible_fetch_symbols,
+    latest_manifest_status,
+    stale_symbols,
+)
 from qooi.sources.http import SourceHttpError, request_json, request_json_sync, sanitize_error
 from qooi.sources.manifest import manifest_frame, source_manifest_row
+from qooi.sources.models import SourceResult
 from qooi.sources.okx import (
     _fetch_okx_frame,
+    _normalize_current_funding,
+    _normalize_funding,
     _normalize_instruments,
     _normalize_open_interest_history,
     _normalize_ratio_rows,
@@ -31,6 +55,163 @@ from qooi.sources.okx_ws import (
     normalize_okx_ws_trades,
     okx_ws_subscribe_message,
 )
+from qooi.sources.schema import SOURCE_FUNDING_SCHEMA
+
+
+def test_collect_module_exposes_demand_first_contracts() -> None:
+    collect = importlib.import_module("qooi.sources.collect")
+
+    need = collect.SourceNeed(
+        family="funding",
+        symbols=("BTC-USDT-SWAP",),
+        start_ms=1_000,
+        end_ms=2_000,
+        min_rows=2,
+        freshness_ms=3_600_000,
+        mode="both",
+    )
+    plan = collect.SourceFetchPlan(
+        family="funding",
+        raw_source="funding_rate",
+        symbol="BTC-USDT-SWAP",
+        start_ms=None,
+        end_ms=2_000,
+        limit=1,
+        reason="current_freshness",
+    )
+
+    assert need.mode == "both"
+    assert plan.raw_source == "funding_rate"
+
+
+def test_source_needs_from_config_derives_quantitative_family_demand() -> None:
+    collect = importlib.import_module("qooi.sources.collect")
+    config = SimpleNamespace(
+        days=2,
+        transition_history_days=3,
+        max_source_staleness_hours=6,
+        book_depth=20,
+        trade_limit=50,
+        funding_limit=400,
+        rubik_limit=144,
+        book_mode="snapshot",
+        rubik_period="1H",
+        disabled_sources=("trades",),
+    )
+
+    needs = collect.source_needs_from_config(
+        config,
+        symbols=("BTC-USDT-SWAP",),
+        context_symbols=("ETH-USDT-SWAP",),
+        start_ms=1_000,
+        end_ms=2_000,
+    )
+    by_family = {need.family: need for need in needs}
+
+    assert "trades" not in by_family
+    assert by_family["books"].mode == "snapshot"
+    assert by_family["books"].min_rows == 1
+    assert by_family["books"].freshness_ms == 6 * 60 * 60 * 1000
+    assert by_family["funding"].mode == "both"
+    assert by_family["funding"].symbols == ("ETH-USDT-SWAP",)
+    assert by_family["funding"].min_rows == 9
+    assert by_family["open_interest"].mode == "history"
+    assert by_family["open_interest"].min_rows == 72
+
+
+def test_source_family_table_derives_manifest_aliases_and_merge_keys() -> None:
+    from qooi.sources.artifacts import source_family, source_manifest_family
+
+    funding = source_family("funding")
+
+    assert source_manifest_family("funding_rate") == "funding"
+    assert funding.artifact == "source_funding"
+    assert funding.timestamp_col == "known_at_ms"
+    assert funding.raw_sources == ("funding", "funding_rate")
+    assert funding.row_kind_col == "funding_source_kind"
+    assert funding.history_kind == "history"
+    assert funding.merge_keys == (("symbol", "funding_time"), ("symbol", "timestamp"))
+
+
+def test_funding_history_normalizer_marks_history_rows() -> None:
+    out = _normalize_funding([{"fundingTime": "1000", "fundingRate": "0.0001"}])
+
+    assert out.to_dicts() == [
+        {
+            "timestamp": 1000,
+            "funding_time": 1000,
+            "funding_rate": 0.0001,
+            "funding_source_kind": "history",
+            "known_at_ms": 1000,
+            "next_funding_rate": None,
+            "next_funding_time": None,
+        }
+    ]
+
+
+def test_current_funding_normalizer_preserves_known_at_and_next_fields() -> None:
+    out = _normalize_current_funding(
+        [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "ts": "2000",
+                "fundingRate": "0.0002",
+                "fundingTime": "3000",
+                "nextFundingRate": "0.0003",
+                "nextFundingTime": "4000",
+            }
+        ],
+        symbol="BTC-USDT-SWAP",
+    )
+
+    assert out.to_dicts() == [
+        {
+            "symbol": "BTC-USDT-SWAP",
+            "timestamp": 2000,
+            "funding_rate": 0.0002,
+            "next_funding_rate": 0.0003,
+            "funding_time": 3000,
+            "next_funding_time": 4000,
+            "funding_source_kind": "current",
+            "known_at_ms": 2000,
+        }
+    ]
+
+
+def test_funding_schema_keeps_current_and_history_semantics() -> None:
+    frame = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP", "BTC-USDT-SWAP"],
+            "timestamp": [1000, 2000],
+            "funding_time": [1000, 3000],
+            "funding_rate": [0.0001, 0.0002],
+            "funding_source_kind": ["history", "current"],
+            "known_at_ms": [1000, 2000],
+            "next_funding_rate": [None, 0.0003],
+            "next_funding_time": [None, 4000],
+            "provider_extra": ["dropped", "dropped"],
+        }
+    )
+
+    out = coerce_frame(frame, SOURCE_FUNDING_SCHEMA)
+
+    assert out.columns == list(SOURCE_FUNDING_SCHEMA)
+    assert out.select(
+        "funding_source_kind", "known_at_ms", "next_funding_rate", "next_funding_time"
+    ).to_dicts() == [
+        {
+            "funding_source_kind": "history",
+            "known_at_ms": 1000,
+            "next_funding_rate": None,
+            "next_funding_time": None,
+        },
+        {
+            "funding_source_kind": "current",
+            "known_at_ms": 2000,
+            "next_funding_rate": 0.0003,
+            "next_funding_time": 4000,
+        },
+    ]
 
 
 def test_swap_trade_notional_uses_contract_value() -> None:
@@ -107,9 +288,10 @@ def test_source_freshness_helpers_select_missing_stale_and_refresh_symbols() -> 
     assert eligible_fetch_symbols(
         frame, symbols, now_ms=10_000, max_age_ms=5_000, refresh=False
     ) == ("BTC-USDT-SWAP", "SOL-USDT-SWAP")
-    assert eligible_fetch_symbols(
-        frame, symbols, now_ms=10_000, max_age_ms=5_000, refresh=True
-    ) == symbols
+    assert (
+        eligible_fetch_symbols(frame, symbols, now_ms=10_000, max_age_ms=5_000, refresh=True)
+        == symbols
+    )
 
 
 def test_source_freshness_uses_configurable_timestamp_column() -> None:
@@ -123,6 +305,720 @@ def test_source_freshness_uses_configurable_timestamp_column() -> None:
         refresh=False,
         timestamp_col="funding_time",
     ) == ("BTC-USDT-SWAP",)
+
+
+def test_source_backfill_eligibility_fetches_shallow_but_fresh_history() -> None:
+    frame = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50 + ["ETH-USDT-SWAP"] * 720,
+            "timestamp": list(range(51_000, 101_000, 1_000))
+            + list(range(-619_000, 101_000, 1_000)),
+        }
+    )
+
+    assert eligible_backfill_symbols(
+        frame,
+        ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"),
+        target_start_ms=-619_000,
+        now_ms=101_000,
+        max_age_ms=5_000,
+        min_rows=720,
+        refresh=False,
+    ) == ("BTC-USDT-SWAP", "SOL-USDT-SWAP")
+
+
+def test_rubik_incremental_window_backfills_before_existing_earliest_history() -> None:
+    frame = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50,
+            "timestamp": list(range(51_000, 101_000, 1_000)),
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=-619_000,
+        target_source_end_ms=101_000,
+        rubik_min_rows=720,
+    )
+
+    assert _incremental_rubik_window(frame, "BTC-USDT-SWAP", request) == (
+        None,
+        "50999",
+    )
+
+
+def test_rubik_backfill_fetches_multiple_pages_until_depth() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50,
+            "timestamp": list(range(51_000, 101_000, 1_000)),
+            "open_interest": [float(i) for i in range(50)],
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=-49_000,
+        target_source_end_ms=101_000,
+        rubik_min_rows=150,
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fetch(symbol: str, begin: str | None, end: str | None) -> SourceResult:
+        assert symbol == "BTC-USDT-SWAP"
+        calls.append((begin, end))
+        if len(calls) == 1:
+            timestamps = list(range(1_000, 51_000, 1_000))
+        elif len(calls) == 2:
+            timestamps = list(range(-49_000, 1_000, 1_000))
+        else:
+            timestamps = []
+        return SourceResult(
+            pl.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "open_interest": [float(i) for i in range(len(timestamps))],
+                }
+            ),
+            manifest_frame([]),
+        )
+
+    out = asyncio.run(
+        _collect_rubik_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            frame_source="open_interest_history",
+            artifact_name="source_open_interest",
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch,
+        )
+    ).frame.sort("timestamp")
+
+    assert calls == [(None, "50999"), (None, "999")]
+    assert out.height == 150
+    assert out.get_column("timestamp").n_unique() == 150
+    assert out.get_column("timestamp").min() == -49_000
+    assert out.get_column("timestamp").max() == 100_000
+
+
+def test_rubik_backfill_stops_on_empty_page() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50,
+            "timestamp": list(range(51_000, 101_000, 1_000)),
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=-49_000,
+        target_source_end_ms=101_000,
+        rubik_min_rows=150,
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fetch(symbol: str, begin: str | None, end: str | None) -> SourceResult:
+        calls.append((begin, end))
+        return SourceResult(pl.DataFrame(), manifest_frame([]))
+
+    out = asyncio.run(
+        _collect_rubik_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            frame_source="open_interest_history",
+            artifact_name="source_open_interest",
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch,
+        )
+    ).frame
+
+    assert calls == [(None, "50999")]
+    assert out.height == 50
+
+
+def test_rubik_backfill_stops_on_repeated_earliest_page() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50,
+            "timestamp": list(range(51_000, 101_000, 1_000)),
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=-49_000,
+        target_source_end_ms=101_000,
+        rubik_min_rows=150,
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fetch(symbol: str, begin: str | None, end: str | None) -> SourceResult:
+        calls.append((begin, end))
+        return SourceResult(
+            pl.DataFrame(
+                {
+                    "timestamp": list(range(51_000, 101_000, 1_000)),
+                    "open_interest": [1.0] * 50,
+                }
+            ),
+            manifest_frame([]),
+        )
+
+    out = asyncio.run(
+        _collect_rubik_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            frame_source="open_interest_history",
+            artifact_name="source_open_interest",
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch,
+        )
+    ).frame
+
+    assert calls == [(None, "50999")]
+    assert out.select("symbol", "timestamp").unique().height == 50
+
+
+def test_funding_backfill_fetches_multiple_pages_until_depth() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50,
+            "funding_time": list(range(51_000, 101_000, 1_000)),
+            "funding_rate": [float(i) for i in range(50)],
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=-49_000,
+        target_source_end_ms=101_000,
+        funding_min_rows=150,
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fetch(symbol: str, after: str | None, before: str | None) -> SourceResult:
+        assert symbol == "BTC-USDT-SWAP"
+        calls.append((after, before))
+        if len(calls) == 1:
+            timestamps = list(range(1_000, 51_000, 1_000))
+        elif len(calls) == 2:
+            timestamps = list(range(-49_000, 1_000, 1_000))
+        else:
+            timestamps = []
+        return SourceResult(
+            pl.DataFrame(
+                {
+                    "funding_time": timestamps,
+                    "funding_rate": [float(i) for i in range(len(timestamps))],
+                }
+            ),
+            manifest_frame([]),
+        )
+
+    out = asyncio.run(
+        _collect_funding_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch,
+        )
+    ).frame.sort("funding_time")
+
+    assert calls == [("51000", None), ("1000", None)]
+    assert out.height == 150
+    assert out.get_column("funding_time").n_unique() == 150
+    assert out.get_column("funding_time").min() == -49_000
+    assert out.get_column("funding_time").max() == 100_000
+
+
+def test_funding_backfill_stops_on_empty_page() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50,
+            "funding_time": list(range(51_000, 101_000, 1_000)),
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=-49_000,
+        target_source_end_ms=101_000,
+        funding_min_rows=150,
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fetch(symbol: str, after: str | None, before: str | None) -> SourceResult:
+        calls.append((after, before))
+        return SourceResult(pl.DataFrame(), manifest_frame([]))
+
+    out = asyncio.run(
+        _collect_funding_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch,
+        )
+    ).frame
+
+    assert calls == [("51000", None)]
+    assert out.height == 50
+
+
+def test_funding_backfill_stops_on_repeated_earliest_page() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 50,
+            "funding_time": list(range(51_000, 101_000, 1_000)),
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=-49_000,
+        target_source_end_ms=101_000,
+        funding_min_rows=150,
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fetch(symbol: str, after: str | None, before: str | None) -> SourceResult:
+        calls.append((after, before))
+        return SourceResult(
+            pl.DataFrame(
+                {
+                    "funding_time": list(range(51_000, 101_000, 1_000)),
+                    "funding_rate": [1.0] * 50,
+                }
+            ),
+            manifest_frame([]),
+        )
+
+    out = asyncio.run(
+        _collect_funding_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch,
+        )
+    ).frame
+
+    assert calls == [("51000", None)]
+    assert out.select("symbol", "funding_time").unique().height == 50
+
+
+def test_funding_source_fetches_current_rate_when_history_is_deep() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"] * 150,
+            "timestamp": list(range(1_000, 151_000, 1_000)),
+            "funding_time": list(range(1_000, 151_000, 1_000)),
+            "funding_rate": [0.01] * 150,
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=1_000,
+        target_source_end_ms=200_000,
+        funding_min_rows=150,
+    )
+    history_calls: list[tuple[str | None, str | None]] = []
+    current_calls: list[str] = []
+
+    async def fetch_history(symbol: str, after: str | None, before: str | None) -> SourceResult:
+        history_calls.append((after, before))
+        return SourceResult(pl.DataFrame(), manifest_frame([]))
+
+    async def fetch_current(symbol: str) -> SourceResult:
+        current_calls.append(symbol)
+        return SourceResult(
+            pl.DataFrame(
+                {
+                    "symbol": [symbol],
+                    "timestamp": [200_000],
+                    "funding_time": [208_800_000],
+                    "funding_rate": [0.02],
+                }
+            ),
+            manifest_frame(
+                [
+                    source_manifest_row(
+                        symbol=symbol,
+                        source="funding_rate",
+                        phase="collect-market",
+                        status="ok",
+                        rows=1,
+                        range_start=200_000,
+                        range_end=200_000,
+                    )
+                ]
+            ),
+        )
+
+    result = asyncio.run(
+        _collect_funding_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch_history,
+            current_fetch=fetch_current,
+        )
+    )
+
+    assert history_calls == []
+    assert current_calls == ["BTC-USDT-SWAP"]
+    assert result.frame.filter(pl.col("timestamp") == 200_000).height == 1
+    assert result.frame.get_column("timestamp").max() == 200_000
+
+
+def test_merge_context_frames_migrates_cached_funding_rows_to_history_kind() -> None:
+    empty = pl.DataFrame()
+    bundle = SourceBundle(
+        discovery=empty,
+        bars=empty,
+        books=empty,
+        trades=empty,
+        funding=pl.DataFrame(
+            {
+                "symbol": ["ACH-USDT-SWAP"],
+                "timestamp": [1_000],
+                "funding_time": [1_000],
+                "funding_rate": [0.01],
+            }
+        ),
+        open_interest=empty,
+        taker_volume=empty,
+        long_short_ratios=empty,
+        onchain_flows=empty,
+        messages=empty,
+        polymarket_events=empty,
+        polymarket_markets=empty,
+        message_classifications=empty,
+        manifest=manifest_frame([]),
+    )
+
+    out = merge_context_frames(bundle, {})["funding"]
+
+    assert out.select("funding_source_kind", "known_at_ms").to_dicts() == [
+        {"funding_source_kind": "history", "known_at_ms": 1_000}
+    ]
+
+
+def test_funding_source_migrates_cached_rows_to_history_kind() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"],
+            "timestamp": [1_000],
+            "funding_time": [1_000],
+            "funding_rate": [0.01],
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=1_000,
+        target_source_end_ms=1_000,
+        funding_min_rows=1,
+    )
+
+    async def fetch_history(symbol: str, after: str | None, before: str | None) -> SourceResult:
+        raise AssertionError("cached historical row should satisfy historical funding depth")
+
+    async def fetch_current(symbol: str) -> SourceResult:
+        return SourceResult(pl.DataFrame(), manifest_frame([]))
+
+    result = asyncio.run(
+        _collect_funding_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch_history,
+            current_fetch=fetch_current,
+        )
+    )
+
+    assert result.frame.select(
+        "funding_source_kind", "known_at_ms", "next_funding_rate", "next_funding_time"
+    ).to_dicts() == [
+        {
+            "funding_source_kind": "history",
+            "known_at_ms": 1_000,
+            "next_funding_rate": None,
+            "next_funding_time": None,
+        }
+    ]
+
+
+def test_funding_source_fetches_history_when_only_current_rows_exist() -> None:
+    existing = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"],
+            "timestamp": [200_000],
+            "funding_time": [208_800_000],
+            "funding_rate": [0.02],
+            "funding_source_kind": ["current"],
+            "known_at_ms": [200_000],
+        }
+    )
+    request = SourceCollectRequest(
+        output_dir=Path("data/output/test"),
+        symbols=("BTC-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        concurrency=1,
+        book_mode="off",
+        book_depth=0,
+        max_source_staleness_hours=24,
+        trade_limit=50,
+        funding_limit=50,
+        rubik_period="1H",
+        rubik_limit=50,
+        rubik_taker_unit="2",
+        disabled_sources=(),
+        disabled_symbols=(),
+        target_source_start_ms=1_000,
+        target_source_end_ms=200_000,
+        funding_min_rows=150,
+    )
+    history_calls: list[tuple[str | None, str | None]] = []
+
+    async def fetch_history(symbol: str, after: str | None, before: str | None) -> SourceResult:
+        history_calls.append((after, before))
+        return SourceResult(
+            pl.DataFrame(
+                {
+                    "symbol": [symbol],
+                    "timestamp": [1_000],
+                    "funding_time": [1_000],
+                    "funding_rate": [0.01],
+                    "funding_source_kind": ["history"],
+                    "known_at_ms": [1_000],
+                }
+            ),
+            manifest_frame([]),
+        )
+
+    async def fetch_current(symbol: str) -> SourceResult:
+        return SourceResult(pl.DataFrame(), manifest_frame([]))
+
+    asyncio.run(
+        _collect_funding_source(
+            httpx.AsyncClient(),
+            request,
+            existing,
+            request_budget=asyncio.Semaphore(1),
+            fetch=fetch_history,
+            current_fetch=fetch_current,
+        )
+    )
+
+    assert history_calls
+    assert history_calls[0] == (None, None)
+
+
+def test_funding_rate_manifest_maps_to_funding_family() -> None:
+    manifest = manifest_frame(
+        [
+            source_manifest_row(
+                symbol="BTC-USDT-SWAP",
+                source="funding_rate",
+                phase="collect-market",
+                status="ok",
+                rows=1,
+                timestamp=2,
+            )
+        ]
+    )
+
+    status, warning = manifest_latest_maps(manifest)
+
+    assert source_manifest_family("funding_rate") == "funding"
+    assert status[("funding", "BTC-USDT-SWAP")] == "ok"
+    assert warning[("funding", "BTC-USDT-SWAP")] == ""
+
+
+def test_long_short_manifest_sources_map_to_long_short_ratios_family() -> None:
+    assert source_manifest_family("long_short_ratio_contract") == "long_short_ratios"
+    assert (
+        source_manifest_family("top_trader_long_short_account_ratio_contract")
+        == "long_short_ratios"
+    )
+    assert (
+        source_manifest_family("top_trader_long_short_position_ratio_contract")
+        == "long_short_ratios"
+    )
+
+
+def test_funding_rate_manifest_status_overrides_older_funding_history_status() -> None:
+    manifest = manifest_frame(
+        [
+            source_manifest_row(
+                symbol="BTC-USDT-SWAP",
+                source="funding_rate",
+                phase="collect-market",
+                status="ok",
+                rows=1,
+                timestamp=2,
+            ),
+            source_manifest_row(
+                symbol="BTC-USDT-SWAP",
+                source="funding",
+                phase="collect-market",
+                status="missing",
+                rows=100,
+                warning="funding_missing",
+                timestamp=1,
+            ),
+        ]
+    )
+
+    status, warning = manifest_latest_maps(manifest)
+
+    assert status[("funding", "BTC-USDT-SWAP")] == "ok"
+    assert warning[("funding", "BTC-USDT-SWAP")] == ""
+
+
+def test_combine_source_results_accepts_different_column_order() -> None:
+    local_frame = pl.DataFrame(
+        {
+            "symbol": ["BTC-USDT-SWAP"],
+            "timestamp": [100],
+            "open_interest": [10.0],
+        }
+    )
+    fetched_frame = pl.DataFrame(
+        {
+            "timestamp": [50],
+            "open_interest": [8.0],
+            "symbol": ["BTC-USDT-SWAP"],
+        }
+    )
+
+    out = _combine_source_results(
+        [SourceResult(frame=fetched_frame, manifest=manifest_frame([]))],
+        local_frame=local_frame,
+        local_manifest=manifest_frame([]),
+    ).frame.sort("timestamp")
+
+    assert out.select("symbol", "timestamp", "open_interest").to_dicts() == [
+        {"symbol": "BTC-USDT-SWAP", "timestamp": 50, "open_interest": 8.0},
+        {"symbol": "BTC-USDT-SWAP", "timestamp": 100, "open_interest": 10.0},
+    ]
 
 
 def test_latest_manifest_status_uses_latest_symbol_source_row() -> None:
@@ -336,6 +1232,8 @@ async def test_okx_current_funding_rate_normalizes_snapshot() -> None:
             "next_funding_rate": -0.0001,
             "funding_time": 2000,
             "next_funding_time": 3000,
+            "funding_source_kind": "current",
+            "known_at_ms": 1000,
         }
     ]
     assert result.manifest["source"][0] == "funding_rate"
@@ -512,5 +1410,3 @@ async def test_okx_ws_collector_reports_stale_and_errors() -> None:
     assert "channel rejected" in trades["warning"][0]
     assert "okx_ws_stale" in trades["warning"][0]
     assert books["status"][0] == "failed"
-
-

@@ -8,15 +8,25 @@ from typing import Literal, Protocol
 
 import polars as pl
 
-from qooi.exchange.context import BookMode, MarketContextRequest, collect_market_context
-from qooi.sources.artifacts import SOURCE_ARTIFACT_SPECS, write_frame_artifact
+from qooi.sources import (
+    DAY_MS,
+    funding_min_rows,
+    normalize_funding_artifact_frame,
+    period_min_rows,
+)
+from qooi.sources.artifacts import (
+    SOURCE_ARTIFACT_SPECS,
+    source_manifest_family,
+    write_frame_artifact,
+)
 from qooi.sources.bundle import (
     SOURCE_FRAME_ARTIFACTS,
     SourceBundle,
     merge_source_frames,
     read_source_bundle,
 )
-from qooi.sources.coverage import latest_manifest_rows
+from qooi.sources.collect import BookMode, SourceCollectRequest, collect_source_context
+from qooi.sources.manifest import now_ms
 
 CONTEXT_FAMILIES = (
     "books",
@@ -31,6 +41,8 @@ CONTEXT_FAMILIES = (
 
 class PotentialSourceConfig(Protocol):
     output: Path
+    days: int
+    transition_history_days: int
     fetch_concurrency: int
     source_refresh_mode: Literal["inherit", "incremental", "cache_only", "force"]
     book_mode: BookMode
@@ -85,7 +97,10 @@ async def load_source_context(
         )
     if context_symbols:
         force_refresh = refresh_mode == "force"
-        request = MarketContextRequest(
+        target_end_ms = now_ms()
+        target_days = max(config.days, config.transition_history_days)
+        target_start_ms = target_end_ms - target_days * DAY_MS
+        request = SourceCollectRequest(
             output_dir=config.output.parent,
             symbols=context_symbols,
             discovery=discovery,
@@ -102,10 +117,14 @@ async def load_source_context(
             disabled_symbols=config.disabled_symbols,
             refresh_trades=force_refresh,
             refresh_context=force_refresh,
+            target_source_start_ms=target_start_ms,
+            target_source_end_ms=target_end_ms,
+            funding_min_rows=funding_min_rows(target_days),
+            rubik_min_rows=period_min_rows(target_days, config.rubik_period),
             existing_frames=context_frames(bundle, {}),
         )
         try:
-            result = await collect_market_context(request)
+            result = await collect_source_context(request)
             frames = merge_context_frames(bundle, result.frames)
             write_context_frames(config.output.parent, frames)
             write_frame_artifact(
@@ -160,7 +179,10 @@ def merge_context_frames(
         if artifact_name is None or spec is None:
             merged[family] = _prefer_frame(incoming, cached)
             continue
-        merged[family] = merge_source_frames(artifact_name, cached, incoming, spec)
+        merged_frame = merge_source_frames(artifact_name, cached, incoming, spec)
+        merged[family] = (
+            normalize_funding_artifact_frame(merged_frame) if family == "funding" else merged_frame
+        )
     return merged
 
 
@@ -212,9 +234,9 @@ def source_availability(
             availability = symbol_frame.join(grouped, on="symbol", how="left").with_columns(
                 pl.col("rows").fill_null(0),
             )
-        availability_rows = availability.select(
-            "symbol", "rows", "latest_timestamp"
-        ).iter_rows(named=True)
+        availability_rows = availability.select("symbol", "rows", "latest_timestamp").iter_rows(
+            named=True
+        )
         for current in availability_rows:
             symbol = str(current["symbol"])
             if family in config.disabled_sources or symbol in config.disabled_symbols:
@@ -245,30 +267,38 @@ def manifest_latest_maps(
         manifest.columns
     ):
         return {}, {}
-    rows = latest_manifest_rows(manifest)
-    status: dict[tuple[str, str], str] = {}
-    warning: dict[tuple[str, str], str] = {}
-    for row in rows.select("symbol", "source", "status", "warning").iter_rows(named=True):
+    family_rows = []
+    for row in manifest.select("timestamp", "symbol", "source", "status", "warning").iter_rows(
+        named=True
+    ):
         source = str(row["source"] or "")
-        symbol = str(row["symbol"] or "")
         family = source_manifest_family(source)
         if not family:
             continue
-        key = (family, symbol)
+        family_rows.append(
+            {
+                "timestamp": int(row["timestamp"] or 0),
+                "symbol": str(row["symbol"] or ""),
+                "source_family": family,
+                "status": str(row["status"] or ""),
+                "warning": str(row["warning"] or ""),
+            }
+        )
+    if not family_rows:
+        return {}, {}
+    rows = (
+        pl.DataFrame(family_rows)
+        .sort("timestamp")
+        .unique(subset=["symbol", "source_family"], keep="last")
+    )
+    status: dict[tuple[str, str], str] = {}
+    warning: dict[tuple[str, str], str] = {}
+    for row in rows.select("symbol", "source_family", "status", "warning").iter_rows(named=True):
+        key = (str(row["source_family"] or ""), str(row["symbol"] or ""))
         status[key] = str(row["status"] or "")
         warning[key] = str(row["warning"] or "")
     return status, warning
 
 
-def source_manifest_family(source: str) -> str:
-    aliases = {
-        "open_interest_history": "open_interest",
-        "taker_volume_contract": "taker_volume",
-        "long_short_ratio_contract": "long_short_ratios",
-    }
-    return aliases.get(source, source if source in CONTEXT_FAMILIES else "")
-
-
 def _prefer_frame(collected: pl.DataFrame | None, cached: pl.DataFrame) -> pl.DataFrame:
     return collected if collected is not None and not collected.is_empty() else cached
-

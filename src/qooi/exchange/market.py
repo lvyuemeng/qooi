@@ -874,9 +874,7 @@ def _parse_bars(raw: list[list], *, source: CandleSource = "trade") -> pl.DataFr
     return pl.DataFrame(rows).sort("timestamp")
 
 
-def _fallback_audit(
-    endpoint: str, source: CandleSource, audit: OkxBarsAudit
-) -> tuple[str, ...]:
+def _fallback_audit(endpoint: str, source: CandleSource, audit: OkxBarsAudit) -> tuple[str, ...]:
     return (
         "fetch_backend=okx",
         f"fetch_endpoint={endpoint}",
@@ -978,4 +976,3 @@ def _okx_timeframe(timeframe: str) -> str:
     if timeframe.endswith("w"):
         return f"{timeframe[:-1]}W"
     return timeframe
-

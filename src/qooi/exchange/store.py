@@ -841,9 +841,7 @@ def history_coverage_error_row(
     }
 
 
-def _refresh_event_message(
-    result: HistoryRefreshResult, completed: int, total: int
-) -> str:
+def _refresh_event_message(result: HistoryRefreshResult, completed: int, total: int) -> str:
     coverage = result.coverage
     fetch_pages = _note_value(coverage.notes, "fetch_pages")
     fetch_stop = _note_value(coverage.notes, "fetch_stop")
@@ -893,4 +891,3 @@ def _bar_interval_ms(bar: str) -> int:
     if unit == "W":
         return value * 7 * 86_400_000
     return 0
-

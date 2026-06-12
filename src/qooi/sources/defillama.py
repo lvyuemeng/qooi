@@ -125,4 +125,3 @@ def _max_timestamp(frame: pl.DataFrame) -> int | None:
 
 def _float_or_none(value: Any) -> float | None:
     return None if value in {None, ""} else float(value)
-

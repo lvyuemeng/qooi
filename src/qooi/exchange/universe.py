@@ -248,9 +248,11 @@ def build_okx_first_potential_universe(
     joined = okx.join(market_by_base, on="base_ccy", how="left")
     has_market = pl.col("market_cap_usd").is_not_null() & pl.col("volume_24h_usd").is_not_null()
     volume = pl.coalesce([pl.col("volume_24h_usd"), pl.col("_okx_volume_24h_usd")])
-    turnover = pl.when(pl.col("market_cap_usd") > 0.0).then(
-        volume / pl.col("market_cap_usd")
-    ).otherwise(None)
+    turnover = (
+        pl.when(pl.col("market_cap_usd") > 0.0)
+        .then(volume / pl.col("market_cap_usd"))
+        .otherwise(None)
+    )
     base_excluded = pl.col("base_ccy").str.to_uppercase().is_in(sorted(excluded))
     volume_low = volume.fill_null(0.0) < config.min_volume_24h_usd
     turnover_low = turnover.fill_null(0.0) < config.min_turnover_ratio
@@ -469,9 +471,7 @@ def rank_broad_candidates(
     return _coerce_candidates(frame)
 
 
-def rank_potential_board_universe(
-    market: pl.DataFrame, config: BroadScanConfig
-) -> pl.DataFrame:
+def rank_potential_board_universe(market: pl.DataFrame, config: BroadScanConfig) -> pl.DataFrame:
     if market.is_empty():
         return empty_broad_candidate_frame()
     frame = _dedupe_market(market)
@@ -481,9 +481,11 @@ def rank_potential_board_universe(
     market_cap_low = pl.col("market_cap_usd").fill_null(0.0) < config.min_market_cap_usd
     market_cap_high = pl.col("market_cap_usd").fill_null(float("inf")) > config.max_market_cap_usd
     volume_low = pl.col("volume_24h_usd").fill_null(0.0) < config.min_volume_24h_usd
-    turnover = pl.when(pl.col("market_cap_usd") > 0.0).then(
-        pl.col("volume_24h_usd") / pl.col("market_cap_usd")
-    ).otherwise(None)
+    turnover = (
+        pl.when(pl.col("market_cap_usd") > 0.0)
+        .then(pl.col("volume_24h_usd") / pl.col("market_cap_usd"))
+        .otherwise(None)
+    )
     turnover_low = turnover.fill_null(0.0) < config.min_turnover_ratio
     trending = pl.col("trending_rank").is_not_null()
     trending_top5 = pl.col("trending_rank") <= 5
@@ -563,9 +565,11 @@ def _clean_source_score_input(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def _evaluate_accumulation_source(frame: pl.DataFrame, config: BroadScanConfig) -> pl.DataFrame:
-    turnover = pl.when(pl.col("market_cap_usd") > 0.0).then(
-        pl.col("volume_24h_usd") / pl.col("market_cap_usd")
-    ).otherwise(None)
+    turnover = (
+        pl.when(pl.col("market_cap_usd") > 0.0)
+        .then(pl.col("volume_24h_usd") / pl.col("market_cap_usd"))
+        .otherwise(None)
+    )
     active_1h = pl.col("price_change_pct_1h").abs().fill_null(0.0) >= 1.0
     active_24h = pl.col("price_change_pct_24h").abs().fill_null(0.0) >= 3.0
     turnover_ok = turnover.fill_null(0.0) >= config.min_turnover_ratio
@@ -589,17 +593,17 @@ def _evaluate_accumulation_source(frame: pl.DataFrame, config: BroadScanConfig) 
         [
             pl.when(fired).then(score).otherwise(0.0).alias("accumulation_source_score"),
             fired.alias("accumulation_source_fired"),
-            pl.when(fired).then(reasons).otherwise(pl.lit("")).alias(
-                "accumulation_source_reasons"
-            ),
+            pl.when(fired).then(reasons).otherwise(pl.lit("")).alias("accumulation_source_reasons"),
         ]
     )
 
 
 def _evaluate_oversold_source(frame: pl.DataFrame, config: BroadScanConfig) -> pl.DataFrame:
-    turnover = pl.when(pl.col("market_cap_usd") > 0.0).then(
-        pl.col("volume_24h_usd") / pl.col("market_cap_usd")
-    ).otherwise(None)
+    turnover = (
+        pl.when(pl.col("market_cap_usd") > 0.0)
+        .then(pl.col("volume_24h_usd") / pl.col("market_cap_usd"))
+        .otherwise(None)
+    )
     market_gate = (
         (pl.col("market_cap_usd") >= config.oversold_min_market_cap_usd)
         & (pl.col("market_cap_usd") <= config.max_market_cap_usd)
@@ -629,13 +633,12 @@ def _evaluate_oversold_source(frame: pl.DataFrame, config: BroadScanConfig) -> p
     ).str.strip_chars(";")
     return frame.with_columns(
         [
-            pl.when(pass_gate).then(selloff + liquidity + turnover_score).otherwise(0.0).alias(
-                "oversold_source_score"
-            ),
+            pl.when(pass_gate)
+            .then(selloff + liquidity + turnover_score)
+            .otherwise(0.0)
+            .alias("oversold_source_score"),
             pass_gate.alias("oversold_source_fired"),
-            pl.when(pass_gate).then(reasons).otherwise(pl.lit("")).alias(
-                "oversold_source_reasons"
-            ),
+            pl.when(pass_gate).then(reasons).otherwise(pl.lit("")).alias("oversold_source_reasons"),
         ]
     )
 
@@ -663,9 +666,7 @@ def _finalize_discovery_sources(frame: pl.DataFrame) -> pl.DataFrame:
             .otherwise(pl.lit("")),
             pl.when(pl.col("oversold_source_reasons") != "")
             .then(
-                pl.concat_str(
-                    [pl.lit("oversold:"), pl.col("oversold_source_reasons"), pl.lit(";")]
-                )
+                pl.concat_str([pl.lit("oversold:"), pl.col("oversold_source_reasons"), pl.lit(";")])
             )
             .otherwise(pl.lit("")),
         ]
@@ -904,5 +905,3 @@ def _coerce_candidates(frame: pl.DataFrame) -> pl.DataFrame:
 def _concat_or_empty(frames: list[pl.DataFrame], empty: pl.DataFrame) -> pl.DataFrame:
     frames = [frame for frame in frames if not frame.is_empty()]
     return pl.concat(frames, how="vertical_relaxed") if frames else empty
-
-

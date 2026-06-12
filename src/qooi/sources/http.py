@@ -199,4 +199,3 @@ def _safe_endpoint(url: str) -> str:
     if parsed.scheme and parsed.netloc:
         return parsed.path or "/"
     return url.split("?", 1)[0]
-

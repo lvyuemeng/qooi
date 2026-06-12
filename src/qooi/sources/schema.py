@@ -64,6 +64,10 @@ SOURCE_FUNDING_SCHEMA: dict[str, pl.DataType] = {
     "timestamp": pl.Int64,
     "funding_time": pl.Int64,
     "funding_rate": pl.Float64,
+    "funding_source_kind": pl.String,
+    "known_at_ms": pl.Int64,
+    "next_funding_rate": pl.Float64,
+    "next_funding_time": pl.Int64,
 }
 
 SOURCE_OPEN_INTEREST_SCHEMA: dict[str, pl.DataType] = {
@@ -187,4 +191,3 @@ MESSAGE_CLASSIFICATION_SCHEMA: dict[str, pl.DataType] = {
     "model_version": pl.String,
     "data_quality_warning": pl.String,
 }
-

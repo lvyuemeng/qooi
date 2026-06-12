@@ -59,4 +59,3 @@ def source_manifest_row(
         "warning": warning,
         "stop_reason": stop_reason,
     }
-

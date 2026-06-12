@@ -18,9 +18,7 @@ from qooi.sources.models import SourceResult
 OKX_BASE_URL = "https://www.okx.com"
 
 
-async def fetch_okx_instruments(
-    client: httpx.AsyncClient, inst_type: str = "SWAP"
-) -> SourceResult:
+async def fetch_okx_instruments(client: httpx.AsyncClient, inst_type: str = "SWAP") -> SourceResult:
     return await _fetch_okx_frame(
         client,
         endpoint="/api/v5/public/instruments",
@@ -31,9 +29,7 @@ async def fetch_okx_instruments(
     )
 
 
-async def fetch_okx_tickers(
-    client: httpx.AsyncClient, inst_type: str = "SWAP"
-) -> SourceResult:
+async def fetch_okx_tickers(client: httpx.AsyncClient, inst_type: str = "SWAP") -> SourceResult:
     return await _fetch_okx_frame(
         client,
         endpoint="/api/v5/market/tickers",
@@ -83,12 +79,22 @@ async def fetch_okx_recent_trades(
 
 
 async def fetch_okx_funding_history(
-    client: httpx.AsyncClient, inst_id: str, *, limit: int = 100
+    client: httpx.AsyncClient,
+    inst_id: str,
+    *,
+    limit: int = 100,
+    after: str | None = None,
+    before: str | None = None,
 ) -> SourceResult:
+    params = {"instId": inst_id, "limit": str(limit)}
+    if after is not None:
+        params["after"] = after
+    if before is not None:
+        params["before"] = before
     return await _fetch_okx_frame(
         client,
         endpoint="/api/v5/public/funding-rate-history",
-        params={"instId": inst_id, "limit": str(limit)},
+        params=params,
         source="funding",
         symbol=inst_id,
         normalizer=_normalize_funding,
@@ -193,9 +199,7 @@ async def fetch_okx_top_trader_long_short_account_ratio_contract(
         params=_rubik_params(inst_id, period=period, limit=limit, begin=begin, end=end),
         source="top_trader_long_short_account_ratio_contract",
         symbol=inst_id,
-        normalizer=lambda rows: _normalize_ratio_rows(
-            rows, "top_trader_long_short_account_ratio"
-        ),
+        normalizer=lambda rows: _normalize_ratio_rows(rows, "top_trader_long_short_account_ratio"),
     )
 
 
@@ -214,9 +218,7 @@ async def fetch_okx_top_trader_long_short_position_ratio_contract(
         params=_rubik_params(inst_id, period=period, limit=limit, begin=begin, end=end),
         source="top_trader_long_short_position_ratio_contract",
         symbol=inst_id,
-        normalizer=lambda rows: _normalize_ratio_rows(
-            rows, "top_trader_long_short_position_ratio"
-        ),
+        normalizer=lambda rows: _normalize_ratio_rows(rows, "top_trader_long_short_position_ratio"),
     )
 
 
@@ -368,28 +370,37 @@ def _normalize_tickers(rows: list[dict[str, Any]]) -> pl.DataFrame:
 
 
 def _normalize_funding(rows: list[dict[str, Any]]) -> pl.DataFrame:
-    out = [
-        {
-            "timestamp": _int(row.get("fundingTime")),
-            "funding_time": _int(row.get("fundingTime")),
-            "funding_rate": _float(row.get("fundingRate")),
-        }
-        for row in rows
-    ]
+    out = []
+    for row in rows:
+        funding_time = _int(row.get("fundingTime"))
+        out.append(
+            {
+                "timestamp": funding_time,
+                "funding_time": funding_time,
+                "funding_rate": _float(row.get("fundingRate")),
+                "funding_source_kind": "history",
+                "known_at_ms": funding_time,
+                "next_funding_rate": None,
+                "next_funding_time": None,
+            }
+        )
     return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
 
 
 def _normalize_current_funding(rows: list[dict[str, Any]], *, symbol: str) -> pl.DataFrame:
     out = []
     for row in rows:
+        known_at = _int(row.get("ts"))
         out.append(
             {
                 "symbol": str(row.get("instId") or symbol),
-                "timestamp": _int(row.get("ts")),
+                "timestamp": known_at,
                 "funding_rate": _float(row.get("fundingRate")),
                 "next_funding_rate": _float_or_none(row.get("nextFundingRate")),
                 "funding_time": _int_or_none(row.get("fundingTime")),
                 "next_funding_time": _int_or_none(row.get("nextFundingTime")),
+                "funding_source_kind": "current",
+                "known_at_ms": known_at,
             }
         )
     return pl.DataFrame(out).sort("timestamp") if out else pl.DataFrame()
@@ -571,4 +582,3 @@ def _infer_base_quote(inst_id: str) -> tuple[str, str]:
     if len(parts) >= 2:
         return parts[0], parts[1]
     return "", ""
-

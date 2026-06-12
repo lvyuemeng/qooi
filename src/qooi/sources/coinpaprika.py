@@ -141,4 +141,3 @@ def _float_or_none(value: Any) -> float | None:
 
 def _int_or_none(value: Any) -> int | None:
     return None if value in {None, ""} else int(value)
-

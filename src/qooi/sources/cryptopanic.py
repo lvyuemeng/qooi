@@ -164,4 +164,3 @@ def _min_timestamp(frame: pl.DataFrame) -> int | None:
 
 def _max_timestamp(frame: pl.DataFrame) -> int | None:
     return int(frame["timestamp"].max()) if not frame.is_empty() else None
-
