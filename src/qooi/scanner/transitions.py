@@ -6,8 +6,7 @@ from typing import cast
 
 import polars as pl
 
-from qooi.scanner.classifiers import StateDirection
-from qooi.scanner.contracts import (
+from qooi.scanner import (
     PotentialScanConfig,
     SourceStateRow,
     TransitionAnalysis,
@@ -17,6 +16,7 @@ from qooi.scanner.contracts import (
     UnsupportedTransitionPath,
     missing_state,
 )
+from qooi.scanner.classifiers import StateDirection
 
 
 def compute_transition_insights(
@@ -86,38 +86,43 @@ def compute_transition_insights(
                 for row in current.iter_rows(named=True)
             )
             continue
-        patterns = pattern_frame.join(
-            transition_counts,
-            on=("prev_state", "state_key"),
-            how="left",
-        ).join(
-            long_counts.select("prev_state", "state_key", "long_transition_probability"),
-            on=("prev_state", "state_key"),
-            how="left",
-        ).join(
-            recent_counts.select("prev_state", "state_key", "recent_transition_probability"),
-            on=("prev_state", "state_key"),
-            how="left",
-        ).join(
-            event_information.select(
-                "prev_state",
-                "state_key",
-                "contextual_event",
-                "transition_information_bits",
-                "conditional_transition_information_bits",
-            ),
-            on=("prev_state", "state_key", "contextual_event"),
-            how="left",
-        ).with_columns(
-            (
-                pl.col("recent_transition_probability").fill_null(0.0)
-                - pl.col("long_transition_probability").fill_null(0.0)
-            ).alias("probability_delta")
+        patterns = (
+            pattern_frame.join(
+                transition_counts,
+                on=("prev_state", "state_key"),
+                how="left",
+            )
+            .join(
+                long_counts.select("prev_state", "state_key", "long_transition_probability"),
+                on=("prev_state", "state_key"),
+                how="left",
+            )
+            .join(
+                recent_counts.select("prev_state", "state_key", "recent_transition_probability"),
+                on=("prev_state", "state_key"),
+                how="left",
+            )
+            .join(
+                event_information.select(
+                    "prev_state",
+                    "state_key",
+                    "contextual_event",
+                    "transition_information_bits",
+                    "conditional_transition_information_bits",
+                ),
+                on=("prev_state", "state_key", "contextual_event"),
+                how="left",
+            )
+            .with_columns(
+                (
+                    pl.col("recent_transition_probability").fill_null(0.0)
+                    - pl.col("long_transition_probability").fill_null(0.0)
+                ).alias("probability_delta")
+            )
         )
         current = (
             work.filter(
-                pl.col("transition_path").is_not_null()
-                & pl.col("contextual_event").is_not_null()
+                pl.col("transition_path").is_not_null() & pl.col("contextual_event").is_not_null()
             )
             .sort("timestamp")
             .group_by("symbol")
@@ -195,9 +200,7 @@ def compute_transition_insights(
                     row["conditional_transition_information_bits"] or 0.0
                 ),
                 direction=cast(StateDirection, str(row["direction"])),
-                recent_transition_probability=float(
-                    row["recent_transition_probability"] or 0.0
-                ),
+                recent_transition_probability=float(row["recent_transition_probability"] or 0.0),
                 long_transition_probability=float(row["long_transition_probability"] or 0.0),
                 probability_delta=float(row["probability_delta"] or 0.0),
                 p_up=float(row["p_up"] or 0.0),
@@ -207,12 +210,8 @@ def compute_transition_insights(
                 q25_forward_return_pct=float(row["q25_forward_return_pct"] or 0.0),
                 q75_forward_return_pct=float(row["q75_forward_return_pct"] or 0.0),
                 q90_forward_return_pct=float(row["q90_forward_return_pct"] or 0.0),
-                q25_forward_min_return_pct=float(
-                    row["q25_forward_min_return_pct"] or 0.0
-                ),
-                q75_forward_max_return_pct=float(
-                    row["q75_forward_max_return_pct"] or 0.0
-                ),
+                q25_forward_min_return_pct=float(row["q25_forward_min_return_pct"] or 0.0),
+                q75_forward_max_return_pct=float(row["q75_forward_max_return_pct"] or 0.0),
                 loss_stop_pct=float(row["loss_stop_pct"] or 0.0),
                 profit_stop_pct=float(row["profit_stop_pct"] or 0.0),
                 reward_risk=float(row["reward_risk"] or 0.0),
@@ -315,12 +314,8 @@ def _transition_work_frame(classified: pl.DataFrame, config: PotentialScanConfig
             )
             * 100.0
         ).alias("forward_return_pct"),
-        ((forward_max_high / pl.col("close") - 1.0) * 100.0).alias(
-            "forward_max_return_pct"
-        ),
-        ((forward_min_low / pl.col("close") - 1.0) * 100.0).alias(
-            "forward_min_return_pct"
-        ),
+        ((forward_max_high / pl.col("close") - 1.0) * 100.0).alias("forward_max_return_pct"),
+        ((forward_min_low / pl.col("close") - 1.0) * 100.0).alias("forward_min_return_pct"),
     )
 
 
@@ -355,12 +350,8 @@ def _pattern_frame(rows: pl.DataFrame, config: PotentialScanConfig) -> pl.DataFr
             pl.col("forward_return_pct").quantile(0.25).alias("q25_forward_return_pct"),
             pl.col("forward_return_pct").quantile(0.75).alias("q75_forward_return_pct"),
             pl.col("forward_return_pct").quantile(0.90).alias("q90_forward_return_pct"),
-            pl.col("forward_min_return_pct").quantile(0.25).alias(
-                "q25_forward_min_return_pct"
-            ),
-            pl.col("forward_max_return_pct").quantile(0.75).alias(
-                "q75_forward_max_return_pct"
-            ),
+            pl.col("forward_min_return_pct").quantile(0.25).alias("q25_forward_min_return_pct"),
+            pl.col("forward_max_return_pct").quantile(0.75).alias("q75_forward_max_return_pct"),
             pl.col("forward_return_pct")
             .filter(pl.col("forward_return_pct") > 0.0)
             .sum()

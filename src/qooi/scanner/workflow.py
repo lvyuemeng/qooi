@@ -13,17 +13,16 @@ from typing import Literal
 import polars as pl
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from qooi.exchange.context import BookMode
 from qooi.exchange.discovery import DiscoveryConfig, discover_candidates, empty_discovery_frame
 from qooi.exchange.store import AsyncCacheStore, HistoryCoverage, HistoryRefreshRequest
-from qooi.scanner.classifiers import KlineClassifier
-from qooi.scanner.contracts import (
+from qooi.scanner import (
     BarFetchResult,
     PotentialArtifacts,
     PotentialUniverse,
     ReportInputs,
     context_symbols,
 )
+from qooi.scanner.classifiers import KlineClassifier
 from qooi.scanner.decisions import (
     compute_kline_states,
     compute_source_states,
@@ -32,9 +31,19 @@ from qooi.scanner.decisions import (
 from qooi.scanner.diagnostics import write_diagnostics
 from qooi.scanner.report import render_report
 from qooi.scanner.transitions import compute_transition_insights
+from qooi.sources.collect import BookMode
 from qooi.sources.context import load_source_context
 
 RefreshMode = Literal["incremental", "cache_only", "force"]
+TailtreeLifecycle = Literal["train", "load_predict"]
+
+
+class TailtreeConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    lifecycle: TailtreeLifecycle = "train"
+    model_dir: Path = Path("data/output/potential/models")
+    model_tag: str = "tailtree-current"
 
 
 class PotentialConfig(BaseModel):
@@ -84,6 +93,7 @@ class PotentialConfig(BaseModel):
     tail_tree_learning_rate: float = 0.05
     tail_tree_num_iterations: int = 200
     tail_tree_early_stopping: int = 20
+    tailtree: TailtreeConfig = TailtreeConfig()
 
     @model_validator(mode="after")
     def normalize_paths_and_timeframes(self) -> PotentialConfig:
@@ -155,13 +165,22 @@ def run(config_path: Path | str) -> Path:
     log_path = config.output.parent / "scan.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(str(log_path), encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-5s | %(name)s | %(message)s"))
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)-5s | %(name)s | %(message)s")
+    )
     logger = logging.getLogger("qooi.scanner")
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
 
     inputs = ReportInputs(
-        config, artifacts, universe, bars, context, transitions, bundles, decisions,
+        config,
+        artifacts,
+        universe,
+        bars,
+        context,
+        transitions,
+        bundles,
+        decisions,
     )
     write_diagnostics(inputs)
     artifacts.report.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +312,4 @@ def _classify_kline_frames(
 
 
 def _classify_kline_frame(symbol: str, timeframe: str, frame: pl.DataFrame) -> pl.DataFrame:
-    return KlineClassifier(timeframe).classify(
-        frame.with_columns(pl.lit(symbol).alias("symbol"))
-    )
+    return KlineClassifier(timeframe).classify(frame.with_columns(pl.lit(symbol).alias("symbol")))

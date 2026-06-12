@@ -8,7 +8,34 @@ from typing import Literal
 import polars as pl
 
 from qooi.core.evaluate import format_table
-from qooi.strategies.semantics import ClassifierColumn, MarketStage, StructureState
+
+
+class StructureState:
+    UPTREND = "uptrend"
+    DOWNTREND = "downtrend"
+    RANGE = "range"
+    UNKNOWN = "unknown"
+
+
+class MarketStage:
+    WARMUP = "warmup"
+    DATA_ERROR = "data_error"
+    MARKUP = "markup"
+    MARKDOWN = "markdown"
+    ACCUMULATION = "accumulation"
+    DISTRIBUTION_OR_REVERSAL = "distribution_or_reversal"
+    RANGE = StructureState.RANGE
+    TREND_CONTINUATION = "trend_continuation"
+    WIDE_RANGE = "wide_range"
+    TRANSITION = "transition"
+    UNKNOWN = StructureState.UNKNOWN
+
+
+class ClassifierColumn:
+    STRUCTURE_TREND_STATE = "structure_trend_state"
+    MARKET_STAGE = "market_stage"
+    RANGE_WIDTH_ATR = "range_width_atr"
+
 
 StateDirection = Literal["bullish", "bearish", "neutral", "blocked", "missing"]
 KLINE_REQUIRED_COLUMNS = ("symbol", "timestamp", "open", "high", "low", "close", "volume")
@@ -70,8 +97,7 @@ class KlineClassifier:
                 symbol=symbol,
                 family="kline",
                 scale=self.scale,
-                reason=";".join(f"{column}_missing" for column in missing)
-                or "kline_rows_missing",
+                reason=";".join(f"{column}_missing" for column in missing) or "kline_rows_missing",
             )
             return validate_state_frame(state)
         state = _classify_kline_state_frame(frame, self.scale)
@@ -184,9 +210,9 @@ def _classify_kline_state_frame(frame: pl.DataFrame, scale: str) -> pl.DataFrame
     uptrend = (hh_count > 0) & (hl_count > 0) & (hh_count + hl_count >= lh_count + ll_count)
     downtrend = (lh_count > 0) & (ll_count > 0) & (lh_count + ll_count >= hh_count + hl_count)
     trend_conflict = (uptrend & downtrend).fill_null(False)
-    range_compression = (
-        range_ready & (pl.col(ClassifierColumn.RANGE_WIDTH_ATR) <= 8.0)
-    ).fill_null(False)
+    range_compression = (range_ready & (pl.col(ClassifierColumn.RANGE_WIDTH_ATR) <= 8.0)).fill_null(
+        False
+    )
     near_range_high = (
         range_ready & ((pl.col("range_high") - pl.col("close")).abs() <= safe_atr)
     ).fill_null(False)
@@ -194,13 +220,13 @@ def _classify_kline_state_frame(frame: pl.DataFrame, scale: str) -> pl.DataFrame
         range_ready & ((pl.col("close") - pl.col("range_low")).abs() <= safe_atr)
     ).fill_null(False)
     markup = ((pl.col("close") > pl.col("range_high")) & uptrend & ~trend_conflict).fill_null(False)
-    markdown = (
-        (pl.col("close") < pl.col("range_low")) & downtrend & ~trend_conflict
-    ).fill_null(False)
+    markdown = ((pl.col("close") < pl.col("range_low")) & downtrend & ~trend_conflict).fill_null(
+        False
+    )
     transition = (range_ready & trend_conflict).fill_null(False)
-    trend_continuation = (
-        (uptrend | downtrend) & ~markup & ~markdown & ~trend_conflict
-    ).fill_null(False)
+    trend_continuation = ((uptrend | downtrend) & ~markup & ~markdown & ~trend_conflict).fill_null(
+        False
+    )
     wide_range = (range_ready & ~range_compression & ~(uptrend | downtrend)).fill_null(False)
     swept_high = (
         pl.col("prior_liquidity_high").is_not_null()
@@ -355,6 +381,8 @@ def validate_state_frame(frame: pl.DataFrame) -> pl.DataFrame:
             for column, dtype in STATE_FRAME_SCHEMA.items()
         )
     ).select(STATE_FRAME_COLUMNS)
+
+
 def _state_frame_symbol(frame: pl.DataFrame) -> str:
     if frame.is_empty() or "symbol" not in frame.columns:
         return "*"
@@ -386,4 +414,3 @@ def _bucket_volatility_expr() -> pl.Expr:
         .then(pl.lit("vol_normal"))
         .otherwise(pl.lit("vol_high"))
     )
-

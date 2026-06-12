@@ -27,5 +27,3 @@ def test_no_legacy_classifier_builder_symbols_are_exported():
 
     assert not hasattr(classifiers, "ClassifierDiagnosticsBuilder")
     assert not hasattr(classifiers, "evaluate_classifier_frame")
-
-

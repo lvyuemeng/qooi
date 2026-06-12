@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,11 +16,12 @@ import numpy as np
 import polars as pl
 from pydantic import BaseModel, Field
 
-
 # ── pydantic models ──────────────────────────────────────────────────────────
+
 
 class TrainConfig(BaseModel):
     """Training hyperparameters. Validated on construction."""
+
     num_leaves: int = Field(default=64, ge=8, le=256)
     min_data_in_leaf: int = Field(default=30, ge=10, le=500)
     learning_rate: float = Field(default=0.05, gt=0, le=1.0)
@@ -32,6 +33,7 @@ class TrainConfig(BaseModel):
 
 class GPDParams(BaseModel):
     """Fitted GPD parameters for one leaf or the global baseline."""
+
     xi: float = Field(ge=-0.2, le=0.6)
     sigma: float = Field(gt=0)
     tail_rate: float = Field(ge=0, le=1.0)
@@ -39,6 +41,7 @@ class GPDParams(BaseModel):
 
 class TreeMetadata(BaseModel):
     """Serializable metadata stored alongside the LightGBM booster string."""
+
     direction: Literal["up", "down"]
     num_leaves_actual: int
     categorical_features: list[str]
@@ -59,6 +62,7 @@ class TailtreeTrainingFrame:
     `tail_observations` trains the LightGBM/GPD tree. `all_observations`
     supplies denominators for tail rate and lift diagnostics.
     """
+
     direction: Literal["up", "down"]
     all_observations: pl.DataFrame
     tail_observations: pl.DataFrame
@@ -79,13 +83,15 @@ class TailtreeTrainingFrame:
 
 # ── TailTreeModel ────────────────────────────────────────────────────────────
 
+
 @dataclass
 class TailTreeModel:
     """Trained tail-detection tree.
 
     Construct via TailTreeModel.train() or TailTreeModel.from_json().
     """
-    booster: Any                              # lightgbm.Booster
+
+    booster: Any  # lightgbm.Booster
     metadata: TreeMetadata
 
     # ── static factory: train ────────────────────────────────────────────────
@@ -101,7 +107,7 @@ class TailTreeModel:
         direction: Literal["up", "down"],
         global_tail_rate: float | None = None,
         train_n_observations: int | None = None,
-    ) -> "TailTreeModel":
+    ) -> TailTreeModel:
         """Train a LightGBM tree with GPD-based objective on tail exceedances.
 
         Args:
@@ -120,17 +126,23 @@ class TailTreeModel:
 
         if len(exceedance_values) != len(features):
             raise ValueError(
-                f"exceedance_values length {len(exceedance_values)} != features length {len(features)}"
+                "exceedance_values length "
+                f"{len(exceedance_values)} != features length {len(features)}"
             )
         if len(exceedance_values) < config.min_data_in_leaf:
             raise ValueError(
-                f"Not enough exceedances ({len(exceedance_values)}) for min_data_in_leaf={config.min_data_in_leaf}"
+                f"Not enough exceedances ({len(exceedance_values)}) for "
+                f"min_data_in_leaf={config.min_data_in_leaf}"
             )
 
         # 1. Global GPD fit over tail exceedance severity.
         xi_global, _, sigma_global = scipy.stats.genpareto.fit(exceedance_values, floc=0)
         train_n_observations = train_n_observations or len(features)
-        global_tail_rate = global_tail_rate if global_tail_rate is not None else len(exceedance_values) / len(features)
+        global_tail_rate = (
+            global_tail_rate
+            if global_tail_rate is not None
+            else len(exceedance_values) / len(features)
+        )
         global_baseline = GPDParams(
             xi=float(np.clip(xi_global, -0.2, 0.6)),
             sigma=float(max(sigma_global, 1e-6)),
@@ -140,7 +152,7 @@ class TailTreeModel:
         # 2. Build LightGBM datasets from numpy (no pandas dependency)
         all_cols = categorical_features + continuous_features
         present_cols = [c for c in all_cols if c in features.columns]
-        X = features.select(present_cols).to_numpy()
+        x = features.select(present_cols).to_numpy()
         # Map categorical columns to integer codes for LightGBM
         cat_indices = []
         for col in categorical_features:
@@ -151,18 +163,20 @@ class TailTreeModel:
                 if col_data.dtype == pl.String:
                     codes = col_data.cast(pl.Categorical).to_physical().to_numpy()
                     idx = present_cols.index(col)
-                    X[:, idx] = codes.astype(np.float64)
+                    x[:, idx] = codes.astype(np.float64)
 
-        n_valid = max(1, int(len(X) * config.validation_fraction))
-        X_train, X_valid = X[:-n_valid], X[-n_valid:]
+        n_valid = max(1, int(len(x) * config.validation_fraction))
+        x_train, x_valid = x[:-n_valid], x[-n_valid:]
         y_train, y_valid = exceedance_values[:-n_valid], exceedance_values[-n_valid:]
 
         train_data = lgb.Dataset(
-            X_train, label=y_train,
+            x_train,
+            label=y_train,
             categorical_feature=cat_indices if cat_indices else "auto",
         )
         valid_data = lgb.Dataset(
-            X_valid, label=y_valid,
+            x_valid,
+            label=y_valid,
             categorical_feature=cat_indices if cat_indices else "auto",
             reference=train_data,
         )
@@ -193,7 +207,7 @@ class TailTreeModel:
         )
 
         # 4. Per-leaf GPD fit
-        leaf_ids = booster.predict(X_train, pred_leaf=True).astype(int).ravel()
+        leaf_ids = booster.predict(x_train, pred_leaf=True).astype(int).ravel()
         leaf_params: dict[int, GPDParams] = {}
         for lid in np.unique(leaf_ids):
             mask = leaf_ids == lid
@@ -212,8 +226,12 @@ class TailTreeModel:
         # 5. Feature importance
         importance = booster.feature_importance(importance_type="gain")
         feature_importance = sorted(
-            [(present_cols[i], float(importance[i])) for i in range(min(len(present_cols), len(importance)))],
-            key=lambda x: x[1], reverse=True,
+            [
+                (present_cols[i], float(importance[i]))
+                for i in range(min(len(present_cols), len(importance)))
+            ],
+            key=lambda x: x[1],
+            reverse=True,
         )
         return TailTreeModel(
             booster=booster.model_to_string(),
@@ -226,7 +244,7 @@ class TailTreeModel:
                 leaf_params=leaf_params,
                 feature_importance=feature_importance,
                 train_config=config,
-                train_timestamp=datetime.now(timezone.utc).isoformat(),
+                train_timestamp=datetime.now(UTC).isoformat(),
                 train_n_observations=train_n_observations,
                 train_n_exceedances=len(exceedance_values),
             ),
@@ -238,19 +256,20 @@ class TailTreeModel:
     def _booster(self) -> Any:
         """Reconstruct lightgbm Booster from stored model string."""
         import lightgbm as lgb
+
         return lgb.Booster(model_str=self.booster)
 
     def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame:
         """Assign each row to a leaf. Returns features + 'leaf_id' (Int32)."""
         all_cols = self.metadata.categorical_features + self.metadata.continuous_features
         present = [c for c in all_cols if c in features.columns]
-        X = features.select(present).to_numpy()
+        x = features.select(present).to_numpy()
         for col in self.metadata.categorical_features:
             if col in features.columns and features[col].dtype == pl.String:
                 codes = features.get_column(col).cast(pl.Categorical).to_physical().to_numpy()
                 idx = present.index(col)
-                X[:, idx] = codes.astype(np.float64)
-        leaf_ids = self._booster.predict(X, pred_leaf=True).astype("int32").ravel()
+                x[:, idx] = codes.astype(np.float64)
+        leaf_ids = self._booster.predict(x, pred_leaf=True).astype("int32").ravel()
         return features.with_columns(pl.Series("leaf_id", leaf_ids))
 
     def predict_leaf_params(self, features: pl.DataFrame) -> pl.DataFrame:
@@ -260,10 +279,15 @@ class TailTreeModel:
             {"leaf_id": lid, "gpd_xi": p.xi, "gpd_sigma": p.sigma, "leaf_tail_rate": p.tail_rate}
             for lid, p in self.metadata.leaf_params.items()
         ]
-        leaf_df = pl.DataFrame(rows, schema={
-            "leaf_id": pl.Int32, "gpd_xi": pl.Float64,
-            "gpd_sigma": pl.Float64, "leaf_tail_rate": pl.Float64,
-        })
+        leaf_df = pl.DataFrame(
+            rows,
+            schema={
+                "leaf_id": pl.Int32,
+                "gpd_xi": pl.Float64,
+                "gpd_sigma": pl.Float64,
+                "leaf_tail_rate": pl.Float64,
+            },
+        )
         return with_leaf.join(leaf_df, on="leaf_id", how="left")
 
     # ── persistence ──────────────────────────────────────────────────────────
@@ -278,7 +302,7 @@ class TailTreeModel:
             json.dump(data, f, indent=2, default=str)
 
     @classmethod
-    def from_json(cls, path: str | Path) -> "TailTreeModel":
+    def from_json(cls, path: str | Path) -> TailTreeModel:
         """Load from JSON. pydantic validates metadata on construction."""
         with open(path) as f:
             data = json.load(f)
@@ -287,6 +311,7 @@ class TailTreeModel:
 
 
 # ── LightGBM custom objective ────────────────────────────────────────────────
+
 
 def _gpd_xi_objective(
     preds: np.ndarray,
@@ -308,7 +333,8 @@ def _gpd_xi_objective(
     # d(NLL)/dξ
     d_nll_d_xi = np.where(
         valid,
-        -y / (sigma * z) * (1.0 + 1.0 / np.maximum(np.abs(xi), 1e-8)) + np.log(np.maximum(z, 1e-8)) / np.maximum(xi * xi, 1e-8),
+        -y / (sigma * z) * (1.0 + 1.0 / np.maximum(np.abs(xi), 1e-8))
+        + np.log(np.maximum(z, 1e-8)) / np.maximum(xi * xi, 1e-8),
         0.0,
     )
     # dξ/dpreds (chain rule through scaled sigmoid)
@@ -334,11 +360,16 @@ def _gpd_nll_eval(
     z = 1.0 + xi * y / sigma
     valid = z > 0
 
-    nll = np.where(valid, np.log(sigma) + (1.0 + 1.0 / np.maximum(np.abs(xi), 1e-8)) * np.log(np.maximum(z, 1e-8)), 1e10)
+    nll = np.where(
+        valid,
+        np.log(sigma) + (1.0 + 1.0 / np.maximum(np.abs(xi), 1e-8)) * np.log(np.maximum(z, 1e-8)),
+        1e10,
+    )
     return ("gpd_nll", float(np.mean(nll)), False)
 
 
 # ── evidence functions ───────────────────────────────────────────────────────
+
 
 def label_tail_exceedances(
     outcome_frame: pl.DataFrame,
@@ -351,21 +382,29 @@ def label_tail_exceedances(
 
     exprs = []
     if has_max:
-        exprs.extend([
-            (pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct).alias("tail_up"),
-            pl.when(pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct)
-            .then(pl.col("forward_max_return_pct").cast(pl.Float64) - threshold_pct)
-            .otherwise(None)
-            .alias("tail_exceedance_value_up"),
-        ])
+        exprs.extend(
+            [
+                (pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct).alias(
+                    "tail_up"
+                ),
+                pl.when(pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct)
+                .then(pl.col("forward_max_return_pct").cast(pl.Float64) - threshold_pct)
+                .otherwise(None)
+                .alias("tail_exceedance_value_up"),
+            ]
+        )
     if has_min:
-        exprs.extend([
-            (pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct).alias("tail_down"),
-            pl.when(pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct)
-            .then(pl.col("forward_min_return_pct").cast(pl.Float64).abs() - threshold_pct)
-            .otherwise(None)
-            .alias("tail_exceedance_value_down"),
-        ])
+        exprs.extend(
+            [
+                (pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct).alias(
+                    "tail_down"
+                ),
+                pl.when(pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct)
+                .then(pl.col("forward_min_return_pct").cast(pl.Float64).abs() - threshold_pct)
+                .otherwise(None)
+                .alias("tail_exceedance_value_down"),
+            ]
+        )
 
     if not exprs:
         return outcome_frame
@@ -388,7 +427,11 @@ def tailtree_training_frame(
     empty_obs = observations.head(0)
     exceed_col = f"tail_exceedance_value_{direction}"
     tail_col = f"tail_{direction}"
-    if observations.is_empty() or labeled_outcomes.is_empty() or exceed_col not in labeled_outcomes.columns:
+    if (
+        observations.is_empty()
+        or labeled_outcomes.is_empty()
+        or exceed_col not in labeled_outcomes.columns
+    ):
         return TailtreeTrainingFrame(
             direction=direction,
             all_observations=empty_obs,
@@ -422,8 +465,14 @@ def tailtree_training_frame(
         on=["symbol", "decision_bar_close_ms"],
         how="inner",
     ).filter(pl.col(exceed_col).is_not_null())
-    exceedance_values = tail_observations.get_column(exceed_col).to_numpy() if not tail_observations.is_empty() else np.array([], dtype=float)
-    global_tail_rate = len(tail_observations) / len(all_observations) if not all_observations.is_empty() else 0.0
+    exceedance_values = (
+        tail_observations.get_column(exceed_col).to_numpy()
+        if not tail_observations.is_empty()
+        else np.array([], dtype=float)
+    )
+    global_tail_rate = (
+        len(tail_observations) / len(all_observations) if not all_observations.is_empty() else 0.0
+    )
     return TailtreeTrainingFrame(
         direction=direction,
         all_observations=all_observations,
@@ -475,13 +524,20 @@ def leaf_evidence_frame(
     has_tail = tail_col in outcomes.columns
 
     if not has_tail:
-        return pl.DataFrame(schema={
-            "leaf_id": pl.Int32, "tree_direction": pl.String,
-            "N_total": pl.UInt32, "N_tail_exceedances": pl.UInt32,
-            "gpd_shape_xi": pl.Float64, "gpd_scale_sigma": pl.Float64,
-            "tail_lift": pl.Float64, "tail_lift_stability": pl.Float64,
-            "leaf_tail_rate": pl.Float64, "global_tail_rate": pl.Float64,
-        })
+        return pl.DataFrame(
+            schema={
+                "leaf_id": pl.Int32,
+                "tree_direction": pl.String,
+                "N_total": pl.UInt32,
+                "N_tail_exceedances": pl.UInt32,
+                "gpd_shape_xi": pl.Float64,
+                "gpd_scale_sigma": pl.Float64,
+                "tail_lift": pl.Float64,
+                "tail_lift_stability": pl.Float64,
+                "leaf_tail_rate": pl.Float64,
+                "global_tail_rate": pl.Float64,
+            }
+        )
 
     outcome_by_decision = _tailtree_outcome_by_decision(outcomes)
     joined = with_leaf.join(
@@ -517,34 +573,61 @@ def leaf_evidence_frame(
             for lid, p in tree.metadata.leaf_params.items()
         ],
         schema={
-            "leaf_id": pl.Int32, "gpd_shape_xi": pl.Float64,
+            "leaf_id": pl.Int32,
+            "gpd_shape_xi": pl.Float64,
             "gpd_scale_sigma": pl.Float64,
         },
     )
 
-    result = leaf_stats.join(leaf_params_df, on="leaf_id", how="left").with_columns(
-        pl.lit(tree.metadata.direction).alias("tree_direction"),
-        (
-            pl.col("N_tail_exceedances").cast(pl.Float64)
-            / pl.when(pl.col("N_total") > 0).then(pl.col("N_total")).otherwise(None)
-        ).fill_null(0.0).alias("leaf_tail_rate"),
-        pl.lit(global_tr).alias("global_tail_rate"),
-    ).with_columns(
-        (
-            pl.col("leaf_tail_rate")
-            / pl.when(pl.col("global_tail_rate") > 0).then(pl.col("global_tail_rate")).otherwise(None)
-        ).fill_null(0.0).alias("tail_lift"),
-    ).with_columns(
-        (
-            (pl.col("N_tail_recent").cast(pl.Float64) / pl.when(pl.col("N_recent") > 0).then(pl.col("N_recent")).otherwise(None))
-            / pl.when(pl.col("leaf_tail_rate") > 0).then(pl.col("leaf_tail_rate")).otherwise(None)
-        ).clip(0, 2).fill_null(0.0).alias("tail_lift_stability"),
+    result = (
+        leaf_stats.join(leaf_params_df, on="leaf_id", how="left")
+        .with_columns(
+            pl.lit(tree.metadata.direction).alias("tree_direction"),
+            (
+                pl.col("N_tail_exceedances").cast(pl.Float64)
+                / pl.when(pl.col("N_total") > 0).then(pl.col("N_total")).otherwise(None)
+            )
+            .fill_null(0.0)
+            .alias("leaf_tail_rate"),
+            pl.lit(global_tr).alias("global_tail_rate"),
+        )
+        .with_columns(
+            (
+                pl.col("leaf_tail_rate")
+                / pl.when(pl.col("global_tail_rate") > 0)
+                .then(pl.col("global_tail_rate"))
+                .otherwise(None)
+            )
+            .fill_null(0.0)
+            .alias("tail_lift"),
+        )
+        .with_columns(
+            (
+                (
+                    pl.col("N_tail_recent").cast(pl.Float64)
+                    / pl.when(pl.col("N_recent") > 0).then(pl.col("N_recent")).otherwise(None)
+                )
+                / pl.when(pl.col("leaf_tail_rate") > 0)
+                .then(pl.col("leaf_tail_rate"))
+                .otherwise(None)
+            )
+            .clip(0, 2)
+            .fill_null(0.0)
+            .alias("tail_lift_stability"),
+        )
     )
 
     return result.select(
-        "leaf_id", "tree_direction", "N_total", "N_tail_exceedances",
-        "gpd_shape_xi", "gpd_scale_sigma", "tail_lift", "tail_lift_stability",
-        "leaf_tail_rate", "global_tail_rate",
+        "leaf_id",
+        "tree_direction",
+        "N_total",
+        "N_tail_exceedances",
+        "gpd_shape_xi",
+        "gpd_scale_sigma",
+        "tail_lift",
+        "tail_lift_stability",
+        "leaf_tail_rate",
+        "global_tail_rate",
     )
 
 
@@ -559,18 +642,36 @@ def leaf_context_frame(
     with_leaf = tree.predict_leaf(observations)
 
     if outcomes.is_empty():
-        return pl.DataFrame(schema={
-            "leaf_id": pl.Int32, "p_up": pl.Float64, "p_down": pl.Float64, "p_flat": pl.Float64,
-            "conditioned_entropy_bits": pl.Float64, "information_gain_bits": pl.Float64,
-            "tail_up_rate": pl.Float64, "tail_down_rate": pl.Float64,
-            "path_skew": pl.Float64, "returned_to_origin_rate": pl.Float64,
-            "statistical_direction": pl.String, "research_suggestion": pl.String,
-        })
+        return pl.DataFrame(
+            schema={
+                "leaf_id": pl.Int32,
+                "p_up": pl.Float64,
+                "p_down": pl.Float64,
+                "p_flat": pl.Float64,
+                "conditioned_entropy_bits": pl.Float64,
+                "information_gain_bits": pl.Float64,
+                "tail_up_rate": pl.Float64,
+                "tail_down_rate": pl.Float64,
+                "path_skew": pl.Float64,
+                "returned_to_origin_rate": pl.Float64,
+                "statistical_direction": pl.String,
+                "research_suggestion": pl.String,
+            }
+        )
 
     outcome_by_decision = _tailtree_outcome_by_decision(outcomes)
     joined = with_leaf.join(
-        outcome_by_decision.select(["symbol", "decision_bar_close_ms", "outcome_bucket",
-                          "tail_up", "tail_down", "direction_changed", "returned_to_origin"]),
+        outcome_by_decision.select(
+            [
+                "symbol",
+                "decision_bar_close_ms",
+                "outcome_bucket",
+                "tail_up",
+                "tail_down",
+                "direction_changed",
+                "returned_to_origin",
+            ]
+        ),
         on=["symbol", "decision_bar_close_ms"],
         how="left",
     )
@@ -590,20 +691,25 @@ def leaf_context_frame(
         )
         leaf_agg = leaf_agg.join(tail_agg, on="leaf_id", how="left")
 
-    path_agg = joined.group_by("leaf_id").agg(
-        (
-            pl.col("tail_up").cast(pl.Float64).mean().fill_null(0.0)
-            - pl.col("tail_down").cast(pl.Float64).mean().fill_null(0.0)
-        ).alias("path_skew"),
-        pl.col("returned_to_origin").cast(pl.Float64).mean().alias("returned_to_origin_rate"),
-    ) if "returned_to_origin" in joined.columns and has_tails else joined.group_by("leaf_id").agg(
-        pl.lit(0.0).alias("path_skew"),
-        pl.lit(0.0).alias("returned_to_origin_rate"),
+    path_agg = (
+        joined.group_by("leaf_id").agg(
+            (
+                pl.col("tail_up").cast(pl.Float64).mean().fill_null(0.0)
+                - pl.col("tail_down").cast(pl.Float64).mean().fill_null(0.0)
+            ).alias("path_skew"),
+            pl.col("returned_to_origin").cast(pl.Float64).mean().alias("returned_to_origin_rate"),
+        )
+        if "returned_to_origin" in joined.columns and has_tails
+        else joined.group_by("leaf_id").agg(
+            pl.lit(0.0).alias("path_skew"),
+            pl.lit(0.0).alias("returned_to_origin_rate"),
+        )
     )
     leaf_agg = leaf_agg.join(path_agg, on="leaf_id", how="left")
 
     # Entropy
     from qooi.scanner import entropy_expr
+
     leaf_agg = leaf_agg.with_columns(
         entropy_expr("p_up", "p_down", "p_flat").alias("conditioned_entropy_bits"),
         pl.lit(0.0).alias("information_gain_bits"),
@@ -628,15 +734,19 @@ def leaf_context_frame(
     )
 
     return leaf_agg.select(
-        "leaf_id", "p_up", "p_down", "p_flat",
-        "conditioned_entropy_bits", "information_gain_bits",
-        "tail_up_rate", "tail_down_rate",
-        "path_skew", "returned_to_origin_rate",
-        "statistical_direction", "research_suggestion",
+        "leaf_id",
+        "p_up",
+        "p_down",
+        "p_flat",
+        "conditioned_entropy_bits",
+        "information_gain_bits",
+        "tail_up_rate",
+        "tail_down_rate",
+        "path_skew",
+        "returned_to_origin_rate",
+        "statistical_direction",
+        "research_suggestion",
     )
-
-
-
 
 
 def select_tail_leaves(
@@ -660,8 +770,7 @@ def select_tail_leaves(
         (pl.col("N_tail_exceedances") >= min_tail_exceedances).alias("passes_tail_count_gate"),
         (pl.col("tail_lift") >= min_tail_lift).alias("passes_tail_lift_gate"),
         (
-            (pl.col("tail_lift_stability") >= min_tail_lift_stability)
-            | (pl.col("N_total") < 200)
+            (pl.col("tail_lift_stability") >= min_tail_lift_stability) | (pl.col("N_total") < 200)
         ).alias("passes_stability_gate"),
     ).with_columns(
         (

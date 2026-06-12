@@ -84,12 +84,14 @@ def _source_price_context_frame(bars: pl.DataFrame) -> pl.DataFrame:
             "timestamp",
             pct_change_expr("close", "previous_close").alias("price_return_pct"),
         )
-    return bars.sort("symbol", "timestamp").with_columns(
-        pl.col("close").shift(1).over("symbol").alias("previous_close")
-    ).select(
-        "symbol",
-        "timestamp",
-        pct_change_expr("close", "previous_close").alias("price_return_pct"),
+    return (
+        bars.sort("symbol", "timestamp")
+        .with_columns(pl.col("close").shift(1).over("symbol").alias("previous_close"))
+        .select(
+            "symbol",
+            "timestamp",
+            pct_change_expr("close", "previous_close").alias("price_return_pct"),
+        )
     )
 
 
@@ -386,43 +388,53 @@ def _source_outcomes_for_horizon(
     window_low = pl.concat_list(
         [pl.col("low").shift(-offset).over("symbol") for offset in range(1, horizon + 1)]
     )
-    bar_outcomes = bars.sort("symbol", "timestamp").with_columns(
-        pl.col("close").shift(-horizon).over("symbol").alias("future_close"),
-        window_high.list.max().alias("future_high"),
-        window_low.list.min().alias("future_low"),
-    ).select(
-        "symbol",
-        pl.col("timestamp").alias("bar_close_ms"),
-        pl.col("close").alias("close_at_event"),
-        "future_close",
-        pct_change_expr("future_close", "close").alias("forward_return_pct"),
-        pct_change_expr("future_low", "close").alias("forward_min_return_pct"),
-        pct_change_expr("future_high", "close").alias("forward_max_return_pct"),
-    ).with_columns(
-        (pl.col("forward_max_return_pct") - pl.col("forward_min_return_pct")).alias(
-            "path_range_pct"
-        ),
-        (pl.col("forward_max_return_pct") + pl.col("forward_min_return_pct")).alias(
-            "tail_asymmetry_pct"
-        ),
+    bar_outcomes = (
+        bars.sort("symbol", "timestamp")
+        .with_columns(
+            pl.col("close").shift(-horizon).over("symbol").alias("future_close"),
+            window_high.list.max().alias("future_high"),
+            window_low.list.min().alias("future_low"),
+        )
+        .select(
+            "symbol",
+            pl.col("timestamp").alias("bar_close_ms"),
+            pl.col("close").alias("close_at_event"),
+            "future_close",
+            pct_change_expr("future_close", "close").alias("forward_return_pct"),
+            pct_change_expr("future_low", "close").alias("forward_min_return_pct"),
+            pct_change_expr("future_high", "close").alias("forward_max_return_pct"),
+        )
+        .with_columns(
+            (pl.col("forward_max_return_pct") - pl.col("forward_min_return_pct")).alias(
+                "path_range_pct"
+            ),
+            (pl.col("forward_max_return_pct") + pl.col("forward_min_return_pct")).alias(
+                "tail_asymmetry_pct"
+            ),
+        )
     )
-    aligned = source_events.drop("aligned_bar_close_ms").sort("symbol", "known_at_ms").join_asof(
-        bar_outcomes,
-        left_on="known_at_ms",
-        right_on="bar_close_ms",
-        by="symbol",
-        strategy="forward",
-        check_sortedness=False,
-    ).with_columns(
-        pl.lit(horizon).alias("outcome_horizon"),
-        pl.col("bar_close_ms").alias("aligned_bar_close_ms"),
-        pl.col("forward_return_pct").is_not_null().alias("outcome_available"),
-        pl.when(pl.col("forward_return_pct").is_not_null())
-        .then(pl.lit("available"))
-        .when(pl.col("known_at_ms").is_null())
-        .then(pl.lit("event_not_time_serialized"))
-        .otherwise(pl.lit("future_bar_missing"))
-        .alias("outcome_reason"),
+    aligned = (
+        source_events.drop("aligned_bar_close_ms")
+        .sort("symbol", "known_at_ms")
+        .join_asof(
+            bar_outcomes,
+            left_on="known_at_ms",
+            right_on="bar_close_ms",
+            by="symbol",
+            strategy="forward",
+            check_sortedness=False,
+        )
+        .with_columns(
+            pl.lit(horizon).alias("outcome_horizon"),
+            pl.col("bar_close_ms").alias("aligned_bar_close_ms"),
+            pl.col("forward_return_pct").is_not_null().alias("outcome_available"),
+            pl.when(pl.col("forward_return_pct").is_not_null())
+            .then(pl.lit("available"))
+            .when(pl.col("known_at_ms").is_null())
+            .then(pl.lit("event_not_time_serialized"))
+            .otherwise(pl.lit("future_bar_missing"))
+            .alias("outcome_reason"),
+        )
     )
     return aligned.select(*SOURCE_OUTCOME_SCHEMA.keys())
 
@@ -443,23 +455,29 @@ def source_timeliness_frame(outcomes: pl.DataFrame) -> pl.DataFrame:
     }
     if outcomes.is_empty():
         return pl.DataFrame(schema=schema)
-    return outcomes.group_by("source_family", "outcome_horizon").agg(
-        pl.len().alias("rows"),
-        pl.col("outcome_available").sum().alias("available_rows"),
-        (pl.col("outcome_reason") == "future_bar_missing").sum().alias("future_missing_rows"),
-        pl.col("outcome_available").mean().alias("availability_rate"),
-        pl.col("known_at_ms").min().alias("min_known_at_ms"),
-        pl.col("known_at_ms").max().alias("max_known_at_ms"),
-        pl.col("aligned_bar_close_ms").min().alias("min_aligned_bar_close_ms"),
-        pl.col("aligned_bar_close_ms").max().alias("max_aligned_bar_close_ms"),
-    ).with_columns(
-        pl.when(pl.col("availability_rate") >= 0.80)
-        .then(pl.lit("usable_history"))
-        .when(pl.col("availability_rate") > 0.0)
-        .then(pl.lit("partial_history"))
-        .otherwise(pl.lit("snapshot_or_future_only"))
-        .alias("timeliness_status")
-    ).select(*schema.keys()).sort(["source_family", "outcome_horizon"])
+    return (
+        outcomes.group_by("source_family", "outcome_horizon")
+        .agg(
+            pl.len().alias("rows"),
+            pl.col("outcome_available").sum().alias("available_rows"),
+            (pl.col("outcome_reason") == "future_bar_missing").sum().alias("future_missing_rows"),
+            pl.col("outcome_available").mean().alias("availability_rate"),
+            pl.col("known_at_ms").min().alias("min_known_at_ms"),
+            pl.col("known_at_ms").max().alias("max_known_at_ms"),
+            pl.col("aligned_bar_close_ms").min().alias("min_aligned_bar_close_ms"),
+            pl.col("aligned_bar_close_ms").max().alias("max_aligned_bar_close_ms"),
+        )
+        .with_columns(
+            pl.when(pl.col("availability_rate") >= 0.80)
+            .then(pl.lit("usable_history"))
+            .when(pl.col("availability_rate") > 0.0)
+            .then(pl.lit("partial_history"))
+            .otherwise(pl.lit("snapshot_or_future_only"))
+            .alias("timeliness_status")
+        )
+        .select(*schema.keys())
+        .sort(["source_family", "outcome_horizon"])
+    )
 
 
 def source_state_predictability_frame(
@@ -497,65 +515,71 @@ def source_state_predictability_frame(
         return pl.DataFrame(schema=schema)
     scored = outcomes.filter(
         pl.col("outcome_available") & pl.col("source_state").is_not_null()
-    ).with_columns(
-        outcome_bucket_expr(return_threshold_pct).alias("outcome_bucket")
-    )
+    ).with_columns(outcome_bucket_expr(return_threshold_pct).alias("outcome_bucket"))
     if scored.is_empty():
         return pl.DataFrame(schema=schema)
-    baseline = scored.group_by("source_family", "outcome_horizon").agg(
-        (pl.col("outcome_bucket") == "up").mean().alias("baseline_p_up"),
-        (pl.col("outcome_bucket") == "down").mean().alias("baseline_p_down"),
-        (pl.col("outcome_bucket") == "flat").mean().alias("baseline_p_flat"),
-    ).with_columns(
-        entropy_expr("baseline_p_up", "baseline_p_down", "baseline_p_flat").alias(
-            "baseline_entropy_bits"
+    baseline = (
+        scored.group_by("source_family", "outcome_horizon")
+        .agg(
+            (pl.col("outcome_bucket") == "up").mean().alias("baseline_p_up"),
+            (pl.col("outcome_bucket") == "down").mean().alias("baseline_p_down"),
+            (pl.col("outcome_bucket") == "flat").mean().alias("baseline_p_flat"),
+        )
+        .with_columns(
+            entropy_expr("baseline_p_up", "baseline_p_down", "baseline_p_flat").alias(
+                "baseline_entropy_bits"
+            )
         )
     )
-    by_state = scored.group_by("source_family", "source_state", "outcome_horizon").agg(
-        pl.len().alias("observations"),
-        pl.col("symbol").n_unique().alias("symbol_count"),
-        (pl.col("outcome_bucket") == "up").mean().alias("p_up"),
-        (pl.col("outcome_bucket") == "down").mean().alias("p_down"),
-        (pl.col("outcome_bucket") == "flat").mean().alias("p_flat"),
-        pl.col("forward_return_pct").mean().alias("avg_forward_return_pct"),
-        pl.col("forward_return_pct").median().alias("median_forward_return_pct"),
-        pl.col("forward_return_pct").quantile(0.25).alias("q25_forward_return_pct"),
-        pl.col("forward_return_pct").quantile(0.75).alias("q75_forward_return_pct"),
-        pl.col("forward_min_return_pct").mean().alias("avg_forward_min_return_pct"),
-        pl.col("forward_max_return_pct").mean().alias("avg_forward_max_return_pct"),
-    ).with_columns(
-        entropy_expr("p_up", "p_down", "p_flat").alias("outcome_entropy_bits")
-    )
-    return by_state.join(
-        baseline, on=("source_family", "outcome_horizon"), how="left"
-    ).with_columns(
-        (pl.col("p_up") - pl.col("baseline_p_up")).alias("lift_up"),
-        (pl.col("p_down") - pl.col("baseline_p_down")).alias("lift_down"),
-        (pl.col("p_flat") - pl.col("baseline_p_flat")).alias("lift_flat"),
-        (pl.col("baseline_entropy_bits") - pl.col("outcome_entropy_bits")).alias(
-            "information_gain_bits"
-        ),
-        pl.when((pl.col("p_up") >= pl.col("p_down")) & (pl.col("p_up") >= pl.col("p_flat")))
-        .then(pl.lit("up"))
-        .when((pl.col("p_down") >= pl.col("p_up")) & (pl.col("p_down") >= pl.col("p_flat")))
-        .then(pl.lit("down"))
-        .otherwise(pl.lit("flat"))
-        .alias("dominant_outcome"),
-    ).with_columns(
-        pl.when(pl.col("dominant_outcome") == "up")
-        .then(pl.lit("bullish"))
-        .when(pl.col("dominant_outcome") == "down")
-        .then(pl.lit("bearish"))
-        .otherwise(pl.lit("neutral"))
-        .alias("statistical_direction"),
-        pl.when(
-            (pl.col("observations") >= 100)
-            & (pl.col("symbol_count") >= 20)
-            & (pl.col("information_gain_bits") > 0.0)
+    by_state = (
+        scored.group_by("source_family", "source_state", "outcome_horizon")
+        .agg(
+            pl.len().alias("observations"),
+            pl.col("symbol").n_unique().alias("symbol_count"),
+            (pl.col("outcome_bucket") == "up").mean().alias("p_up"),
+            (pl.col("outcome_bucket") == "down").mean().alias("p_down"),
+            (pl.col("outcome_bucket") == "flat").mean().alias("p_flat"),
+            pl.col("forward_return_pct").mean().alias("avg_forward_return_pct"),
+            pl.col("forward_return_pct").median().alias("median_forward_return_pct"),
+            pl.col("forward_return_pct").quantile(0.25).alias("q25_forward_return_pct"),
+            pl.col("forward_return_pct").quantile(0.75).alias("q75_forward_return_pct"),
+            pl.col("forward_min_return_pct").mean().alias("avg_forward_min_return_pct"),
+            pl.col("forward_max_return_pct").mean().alias("avg_forward_max_return_pct"),
         )
-        .then(pl.lit("usable_predictive_sample"))
-        .otherwise(pl.lit("insufficient_predictive_sample"))
-        .alias("predictability_status")
-    ).select(*schema.keys()).sort(
-        ["source_family", "source_state", "outcome_horizon"]
+        .with_columns(entropy_expr("p_up", "p_down", "p_flat").alias("outcome_entropy_bits"))
+    )
+    return (
+        by_state.join(baseline, on=("source_family", "outcome_horizon"), how="left")
+        .with_columns(
+            (pl.col("p_up") - pl.col("baseline_p_up")).alias("lift_up"),
+            (pl.col("p_down") - pl.col("baseline_p_down")).alias("lift_down"),
+            (pl.col("p_flat") - pl.col("baseline_p_flat")).alias("lift_flat"),
+            (pl.col("baseline_entropy_bits") - pl.col("outcome_entropy_bits")).alias(
+                "information_gain_bits"
+            ),
+            pl.when((pl.col("p_up") >= pl.col("p_down")) & (pl.col("p_up") >= pl.col("p_flat")))
+            .then(pl.lit("up"))
+            .when((pl.col("p_down") >= pl.col("p_up")) & (pl.col("p_down") >= pl.col("p_flat")))
+            .then(pl.lit("down"))
+            .otherwise(pl.lit("flat"))
+            .alias("dominant_outcome"),
+        )
+        .with_columns(
+            pl.when(pl.col("dominant_outcome") == "up")
+            .then(pl.lit("bullish"))
+            .when(pl.col("dominant_outcome") == "down")
+            .then(pl.lit("bearish"))
+            .otherwise(pl.lit("neutral"))
+            .alias("statistical_direction"),
+            pl.when(
+                (pl.col("observations") >= 100)
+                & (pl.col("symbol_count") >= 20)
+                & (pl.col("information_gain_bits") > 0.0)
+            )
+            .then(pl.lit("usable_predictive_sample"))
+            .otherwise(pl.lit("insufficient_predictive_sample"))
+            .alias("predictability_status"),
+        )
+        .select(*schema.keys())
+        .sort(["source_family", "source_state", "outcome_horizon"])
     )

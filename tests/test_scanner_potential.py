@@ -5,15 +5,16 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+import qooi.scanner as scan
 import qooi.scanner.workflow as potential
 from qooi.exchange.discovery import DiscoveryResult, empty_discovery_frame
-from qooi.scanner import candidates as potential_candidates
 from qooi.scanner import classifiers, decisions, features, source_events, transitions
-from qooi.scanner.tailtree import select_tail_leaves, _tailtree_outcome_by_decision
-from qooi.scanner import contracts as scan
-from qooi.scanner import evidence as potential_evidence
+from qooi.scanner import frames as potential_frames
 from qooi.scanner import history as potential_history
+from qooi.scanner import ladder as potential_ladder
+from qooi.scanner import rank as potential_rank
 from qooi.scanner.classifiers import STATE_FRAME_SCHEMA
+from qooi.scanner.tailtree import _tailtree_outcome_by_decision, select_tail_leaves
 from qooi.scanner.workflow import run
 
 
@@ -45,6 +46,7 @@ def _bullish_pattern() -> scan.TransitionPattern:
         suggestion="rapid_trend_watch",
     )
 
+
 def _state_row(
     family: str,
     direction: str,
@@ -66,6 +68,7 @@ def _state_row(
         reason,
         False,
     )
+
 
 def _decision_bundle(
     *,
@@ -99,6 +102,7 @@ def _decision_bundle(
         transition_patterns=patterns,
     )
 
+
 def _observation(symbol: str, index: int, *, changed: bool) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -131,6 +135,7 @@ def _observation(symbol: str, index: int, *, changed: bool) -> dict[str, object]
         "risk_context": "range_tight|vol_normal",
     }
 
+
 def _source_outcome(symbol: str, index: int, *, changed: bool) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -154,6 +159,7 @@ def _source_outcome(symbol: str, index: int, *, changed: bool) -> dict[str, obje
         "outcome_reason": "available",
     }
 
+
 def _realized_transition(symbol: str, index: int, *, changed: bool) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -175,6 +181,7 @@ def _realized_transition(symbol: str, index: int, *, changed: bool) -> dict[str,
         "time_to_core_change_bars": 1 if changed else None,
         "transition_count": 1 if changed else 0,
     }
+
 
 def _selected_evidence_for_test() -> pl.DataFrame:
     return pl.DataFrame(
@@ -215,16 +222,17 @@ def _selected_evidence_for_test() -> pl.DataFrame:
         }
     )
 
+
 def test_candidate_evidence_matches_latest_observation_to_selected_evidence() -> None:
     observations = pl.DataFrame(
         [
             _observation("BTC-USDT-SWAP", 1, changed=True),
             _observation("BTC-USDT-SWAP", 2, changed=True),
         ],
-        schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
     )
 
-    candidates = potential_candidates.candidate_evidence_frame(
+    candidates = potential_rank.candidate_evidence_frame(
         observations, _selected_evidence_for_test()
     )
 
@@ -236,16 +244,17 @@ def test_candidate_evidence_matches_latest_observation_to_selected_evidence() ->
     assert row["research_suggestion"] == "rapid_trend_watch"
     assert row["candidate_status"] == "matched_evidence"
 
+
 def test_candidate_evidence_combines_matched_and_unmatched_latest_observations() -> None:
     observations = pl.DataFrame(
         [
             _observation("BTC-USDT-SWAP", 1, changed=True),
             _observation("ETH-USDT-SWAP", 1, changed=False),
         ],
-        schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
     )
 
-    candidates = potential_candidates.candidate_evidence_frame(
+    candidates = potential_rank.candidate_evidence_frame(
         observations, _selected_evidence_for_test()
     )
 
@@ -254,14 +263,15 @@ def test_candidate_evidence_combines_matched_and_unmatched_latest_observations()
     assert rows["BTC-USDT-SWAP"]["candidate_status"] == "matched_evidence"
     assert rows["ETH-USDT-SWAP"]["candidate_status"] == "no_matching_evidence"
 
+
 def test_candidate_evidence_emits_unmatched_latest_observation_caveat() -> None:
     observations = pl.DataFrame(
         [_observation("BTC-USDT-SWAP", 1, changed=True)],
-        schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
     )
     evidence = pl.DataFrame(schema={"selected_evidence_level": pl.Boolean})
 
-    candidates = potential_candidates.candidate_evidence_frame(observations, evidence)
+    candidates = potential_rank.candidate_evidence_frame(observations, evidence)
 
     assert candidates.height == 1
     row = candidates.row(0, named=True)
@@ -269,16 +279,17 @@ def test_candidate_evidence_emits_unmatched_latest_observation_caveat() -> None:
     assert row["candidate_status"] == "no_selected_evidence"
     assert row["matched_evidence_level"] is None
 
+
 def test_rank_candidate_evidence_exposes_components_without_trading_signal() -> None:
     observations = pl.DataFrame(
         [_observation("BTC-USDT-SWAP", 1, changed=True)],
-        schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
     )
-    candidates = potential_candidates.candidate_evidence_frame(
+    candidates = potential_rank.candidate_evidence_frame(
         observations, _selected_evidence_for_test()
     )
 
-    ranked = potential_candidates.rank_candidate_evidence(candidates)
+    ranked = potential_rank.rank_candidate_evidence(candidates)
 
     assert "rank_score" in ranked.columns
     assert "rank_information_component" in ranked.columns
@@ -290,6 +301,7 @@ def test_rank_candidate_evidence_exposes_components_without_trading_signal() -> 
     assert "rank_penalty_component" in ranked.columns
     assert "entry_signal" not in ranked.columns
     assert "position_signal" not in ranked.columns
+
 
 def test_potential_run_writes_report_and_diagnostics_without_trading_artifacts(
     tmp_path: Path, monkeypatch
@@ -328,8 +340,9 @@ transition_context_limit = 0
     assert (diagnostics / "potential-observation-summary.csv").exists()
     assert (diagnostics / "potential-evidence-summary.csv").exists()
     assert (diagnostics / "potential-evidence-selected.csv").exists()
-    assert (diagnostics / "candidate-evidence.csv").exists()
+    assert (diagnostics / "candidate-inspection.csv").exists()
     assert (diagnostics / "candidate-rank.csv").exists()
+    assert not (diagnostics / "candidate-evidence.csv").exists()
     assert (states / "kline-state.csv").exists()
     assert not (diagnostics / "potential-observation.csv").exists()
     assert not (diagnostics / "potential-evidence.csv").exists()
@@ -355,6 +368,7 @@ transition_context_limit = 0
     assert not (diagnostics / "evidence-backtest.csv").exists()
     assert not (diagnostics / "evidence-baselines.csv").exists()
     assert not (report_path.parent / "research-board.csv").exists()
+
 
 def test_potential_config_rejects_legacy_aliases(
     tmp_path: Path,
@@ -432,6 +446,7 @@ disabled_symbols = ["BAD-USDT-SWAP"]
     assert current.disabled_sources == ("messages",)
     assert current.disabled_symbols == ("BAD-USDT-SWAP",)
 
+
 def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypatch) -> None:
     discovery = pl.DataFrame(
         {
@@ -465,6 +480,7 @@ def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypat
     assert scan.context_symbols(potential.PotentialConfig(), universe.symbols, no_patterns) == ()
     assert potential.target_min_bars(10, "15m") == 960
     assert potential.target_min_bars(10, "4H") == 120
+
 
 def test_source_events_are_known_at_close_and_exclude_availability_states() -> None:
     bars = pl.DataFrame(
@@ -513,6 +529,7 @@ def test_source_events_are_known_at_close_and_exclude_availability_states() -> N
     assert "crowded_longs_price_down" in states
     assert not any(str(state).endswith("_observed") for state in states)
     assert "message_observed" not in states
+
 
 def test_source_outcomes_predictability_and_timeliness_report_missing_futures() -> None:
     events = pl.DataFrame(
@@ -581,38 +598,43 @@ def test_source_outcomes_predictability_and_timeliness_report_missing_futures() 
     assert state["dominant_outcome"] == "down"
     assert state["statistical_direction"] == "bearish"
     assert state["predictability_status"] == "insufficient_predictive_sample"
-    assert timeliness.filter(pl.col("source_family") == "books").row(0, named=True)[
-        "timeliness_status"
-    ] == "snapshot_or_future_only"
-    assert timeliness.filter(pl.col("source_family") == "funding").row(0, named=True)[
-        "timeliness_status"
-    ] == "usable_history"
+    assert (
+        timeliness.filter(pl.col("source_family") == "books").row(0, named=True)[
+            "timeliness_status"
+        ]
+        == "snapshot_or_future_only"
+    )
+    assert (
+        timeliness.filter(pl.col("source_family") == "funding").row(0, named=True)[
+            "timeliness_status"
+        ]
+        == "usable_history"
+    )
+
 
 def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe() -> None:
     symbols = [f"SYM{i:03d}" for i in range(120)]
     observations = [
-        _observation(symbol, index, changed=index < 60)
-        for index, symbol in enumerate(symbols)
+        _observation(symbol, index, changed=index < 60) for index, symbol in enumerate(symbols)
     ]
     outcomes = [
-        _source_outcome(symbol, index, changed=index < 60)
-        for index, symbol in enumerate(symbols)
+        _source_outcome(symbol, index, changed=index < 60) for index, symbol in enumerate(symbols)
     ]
     realized = [
         _realized_transition(symbol, index, changed=index < 60)
         for index, symbol in enumerate(symbols)
     ]
-    evidence = potential_evidence.potential_evidence_frame(
-        pl.DataFrame(observations, schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA),
+    evidence = potential_ladder.potential_evidence_frame(
+        pl.DataFrame(observations, schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA),
         pl.DataFrame(outcomes, schema=source_events.SOURCE_OUTCOME_SCHEMA),
         pl.DataFrame(realized, schema=potential_history.REALIZED_TRANSITION_SCHEMA),
         return_threshold_pct=0.5,
     )
 
-    configured_timeframe = potential_evidence.potential_outcome_frame(
+    configured_timeframe = potential_frames.potential_outcome_frame(
         pl.DataFrame(
             [_observation("BTC-USDT-SWAP", 999, changed=True) | {"decision_timeframe": "4H"}],
-            schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA,
+            schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
         ),
         pl.DataFrame(schema=source_events.SOURCE_OUTCOME_SCHEMA),
         pl.DataFrame(
@@ -642,6 +664,7 @@ def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe(
     assert configured_timeframe.height == 1
     assert configured_timeframe.row(0, named=True)["terminal_direction"] == "bullish"
 
+
 def test_evidence_gate_excludes_market_background_and_requires_stable_information() -> None:
     symbols = [f"SYM{i:03d}" for i in range(40)]
     observations = [
@@ -656,8 +679,8 @@ def test_evidence_gate_excludes_market_background_and_requires_stable_informatio
         _realized_transition(symbol, index, changed=(index % 40) < 24)
         for index, symbol in enumerate(symbols * 200)
     ]
-    evidence = potential_evidence.potential_evidence_frame(
-        pl.DataFrame(observations, schema=potential_evidence.POTENTIAL_OBSERVATION_SCHEMA),
+    evidence = potential_ladder.potential_evidence_frame(
+        pl.DataFrame(observations, schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA),
         pl.DataFrame(outcomes, schema=source_events.SOURCE_OUTCOME_SCHEMA),
         pl.DataFrame(realized, schema=potential_history.REALIZED_TRANSITION_SCHEMA),
         return_threshold_pct=0.5,
@@ -666,6 +689,7 @@ def test_evidence_gate_excludes_market_background_and_requires_stable_informatio
     assert not (selected.get_column("evidence_level") == "market_background").any(), (
         "market_background must never be a selected evidence level"
     )
+
 
 def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> None:
     rows = pl.DataFrame(
@@ -710,6 +734,7 @@ def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> N
     assert "forward_return" not in classified.columns
     assert missing.select("missing_flag").item() is True
     assert missing.select("direction_hint").item() == "missing"
+
 
 @pytest.mark.parametrize(
     ("bundle", "config", "expected_group", "expected_direction", "expected_reason"),
@@ -775,6 +800,7 @@ def test_scan_review_decisions_require_transition_quality_and_source_confirmatio
     assert decision.group == expected_group
     assert decision.direction == expected_direction
     assert decision.block_reason == expected_reason
+
 
 def test_transition_matching_and_ngram_work_frame_do_not_use_unrelated_patterns() -> None:
     stages = ["accumulation", "markup", "trend_continuation"] * 8
@@ -894,6 +920,41 @@ def test_source_features_align_as_known_at_close_without_rewriting_source_time()
     assert rows[3000]["funding_age_ms"] == 500
 
 
+def test_stale_source_features_are_nulled_after_family_max_age() -> None:
+    bar_frame = pl.DataFrame(
+        {
+            "timestamp": [0, 60 * 60 * 1000, 17 * 60 * 60 * 1000],
+            "open": [1.0, 2.0, 3.0],
+            "high": [2.0, 3.0, 4.0],
+            "low": [0.5, 1.5, 2.5],
+            "close": [1.5, 2.5, 3.5],
+            "volume": [10.0, 20.0, 30.0],
+        }
+    )
+    state_frame = pl.DataFrame({"timestamp": [0, 60 * 60 * 1000, 17 * 60 * 60 * 1000]})
+    source_frames = {
+        "funding": pl.DataFrame(
+            {
+                "symbol": ["BTC-USDT-SWAP"],
+                "timestamp": [0],
+                "funding_rate": [0.01],
+            }
+        )
+    }
+
+    result = features.extract_continuous_features(
+        {("BTC-USDT-SWAP", "1H"): bar_frame},
+        {("BTC-USDT-SWAP", "1H"): state_frame},
+        source_frames,
+    ).sort("timestamp")
+
+    rows = {row["timestamp"]: row for row in result.iter_rows(named=True)}
+    assert rows[0]["funding_rate"] == pytest.approx(0.01)
+    assert rows[60 * 60 * 1000]["funding_rate"] == pytest.approx(0.01)
+    assert rows[17 * 60 * 60 * 1000]["funding_rate"] is None
+    assert rows[17 * 60 * 60 * 1000]["funding_age_ms"] == 17 * 60 * 60 * 1000
+
+
 def test_select_tail_leaves_returns_best_available_when_strict_gate_is_empty() -> None:
     leaf_evidence = pl.DataFrame(
         {
@@ -915,7 +976,9 @@ def test_select_tail_leaves_returns_best_available_when_strict_gate_is_empty() -
     assert selected.height == 2
     assert selected["selection_mode"].to_list() == ["best_available", "best_available"]
     assert selected["selected_evidence_level"].to_list() == [False, False]
-    assert selected["tail_evidence_score"].to_list()[0] >= selected["tail_evidence_score"].to_list()[1]
+    assert (
+        selected["tail_evidence_score"].to_list()[0] >= selected["tail_evidence_score"].to_list()[1]
+    )
 
 
 def test_tailtree_outcome_aggregation_preserves_source_tail_labels() -> None:

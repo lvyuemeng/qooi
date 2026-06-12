@@ -1,6 +1,8 @@
-"""Candidate and holdout evidence surfaces for scanner research."""
+"""Promoted scanner candidate ranking boundary."""
 
 from __future__ import annotations
+
+from typing import Any
 
 import polars as pl
 
@@ -117,6 +119,7 @@ CANDIDATE_EVIDENCE_SCHEMA = {
     "leaf_path": pl.String,
 }
 
+
 CANDIDATE_RANK_SCHEMA = CANDIDATE_EVIDENCE_SCHEMA | {
     "rank_information_component": pl.Float64,
     "rank_transition_component": pl.Float64,
@@ -129,6 +132,7 @@ CANDIDATE_RANK_SCHEMA = CANDIDATE_EVIDENCE_SCHEMA | {
     "rank_reason": pl.String,
 }
 
+
 def candidate_evidence_frame(
     observations: pl.DataFrame,
     evidence: pl.DataFrame,
@@ -137,25 +141,17 @@ def candidate_evidence_frame(
     tree_up: Any | None = None,
     tree_down: Any | None = None,
 ) -> pl.DataFrame:
-    """Match observation rows to selected evidence rows.
-
-    If tree_up/tree_down provided (tailtree path), traverses trees to assign
-    leaf_ids, then joins evidence on (leaf_id, tree_direction).
-    Otherwise uses the fixed ladder-level matching (evidence path).
-    """
+    """Match observation rows to selected evidence rows."""
     if observations.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
-
-    # Tree path: traverse trees → leaf_id → join evidence
     if tree_up is not None or tree_down is not None:
-        return _candidate_from_trees(observations, evidence, tree_up, tree_down, latest_only=latest_only)
-
-    # Ladder path: match by evidence level columns
+        return _candidate_from_trees(
+            observations, evidence, tree_up, tree_down, latest_only=latest_only
+        )
     base = _candidate_observations(observations, latest_only=latest_only)
     selected = _selected_evidence(evidence)
     if selected.is_empty():
         return _unmatched_candidates(base, "no_selected_evidence")
-
     frames = [
         _matches_for_level(base, selected, level, columns)
         for level, columns in EVIDENCE_LEVEL_COLUMNS
@@ -181,7 +177,6 @@ def _candidate_from_trees(
     *,
     latest_only: bool = True,
 ) -> pl.DataFrame:
-    """Match observations to tree evidence via leaf traversal."""
     base = _candidate_observations(observations, latest_only=latest_only)
     if base.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
@@ -194,7 +189,11 @@ def _candidate_from_trees(
             with_leaf = tree.predict_leaf(base)
         except Exception:
             continue
-        dir_evidence = evidence.filter(pl.col("tree_direction") == direction) if "tree_direction" in evidence.columns else evidence
+        dir_evidence = (
+            evidence.filter(pl.col("tree_direction") == direction)
+            if "tree_direction" in evidence.columns
+            else evidence
+        )
         if dir_evidence.is_empty():
             continue
         matched = with_leaf.join(
@@ -218,96 +217,6 @@ def _candidate_from_trees(
     return _select_schema(result, CANDIDATE_EVIDENCE_SCHEMA)
 
 
-def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
-    """Add transparent review-ordering components to candidate rows.
-
-    Detects tail_lift presence → uses tail-first scoring.
-    Falls back to entropy-first scoring for ladder path.
-    """
-    if candidates.is_empty():
-        return pl.DataFrame(schema=CANDIDATE_RANK_SCHEMA)
-
-    has_tail_lift = (
-        "tail_lift" in candidates.columns
-        and candidates["tail_lift"].drop_nulls().len() > 0
-    )
-
-    ranked = _select_schema(candidates, CANDIDATE_EVIDENCE_SCHEMA)
-
-    if has_tail_lift:
-        ranked = ranked.with_columns(
-            pl.col("tail_lift").fill_null(1.0).alias("rank_information_component"),
-            pl.lit(0.0).alias("rank_transition_component"),
-            pl.max_horizontal(
-                pl.col("tail_lift").fill_null(1.0), pl.lit(1.0)
-            ).alias("rank_tail_component"),
-            (pl.col("tail_lift_stability").fill_null(0.0)).alias("rank_stability_component"),
-            (pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log().alias("rank_path_component"),
-        )
-    else:
-        ranked = ranked.with_columns(
-            pl.max_horizontal(pl.col("information_gain_bits").fill_null(0.0), pl.lit(0.0)).alias(
-                "rank_information_component"
-            ),
-            pl.max_horizontal(
-                pl.col("transition_information_gain_bits").fill_null(0.0), pl.lit(0.0)
-            ).alias("rank_transition_component"),
-            pl.max_horizontal(
-                pl.col("tail_up_rate").fill_null(0.0), pl.col("tail_down_rate").fill_null(0.0)
-            ).alias("rank_tail_component"),
-            (pl.max_horizontal(pl.col("avg_path_range_pct").fill_null(0.0), pl.lit(0.0)) / 10.0).alias(
-                "rank_path_component"
-            ),
-            pl.min_horizontal(
-                pl.max_horizontal(
-                    pl.col("information_stability").fill_null(0.0),
-                    pl.col("transition_information_stability").fill_null(0.0),
-                ),
-                pl.lit(2.0),
-            ).alias("rank_stability_component"),
-        )
-
-    ranked = ranked.with_columns(
-        (pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0).log().alias("rank_quality_component") if not has_tail_lift
-        else pl.lit(0.0).alias("rank_quality_component"),
-    )
-
-    # Fix: need proper quality component for both paths
-    if has_tail_lift:
-        ranked = ranked.with_columns(
-            ((pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log() / 10.0).alias("rank_quality_component"),
-        )
-    else:
-        ranked = ranked.with_columns(
-            ((pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0).log()
-             + (pl.col("symbol_count").fill_null(0).cast(pl.Float64) + 1.0).log()).alias("rank_quality_component"),
-        )
-
-    ranked = ranked.with_columns(
-        (
-            pl.when(pl.col("source_freshness") == "stale").then(pl.lit(1.0)).otherwise(pl.lit(0.0))
-            + pl.when(pl.col("candidate_status") != "matched_evidence").then(pl.lit(2.0)).otherwise(pl.lit(0.0))
-        ).alias("rank_penalty_component"),
-    ).with_columns(
-        (
-            pl.col("rank_information_component")
-            + pl.col("rank_transition_component")
-            + pl.col("rank_tail_component")
-            + pl.col("rank_path_component")
-            + pl.col("rank_stability_component")
-            + pl.col("rank_quality_component")
-            - pl.col("rank_penalty_component")
-        ).alias("rank_score"),
-        pl.when(pl.col("candidate_status") == "matched_evidence")
-        .then(pl.lit("matched_selected_evidence"))
-        .otherwise(pl.col("candidate_status"))
-        .alias("rank_reason"),
-    )
-    ranked = _select_schema(ranked.sort("rank_score", descending=True), CANDIDATE_RANK_SCHEMA)
-    if has_tail_lift and "tree_direction" in ranked.columns:
-        ranked = ranked.unique(subset=["symbol", "tree_direction"], keep="first", maintain_order=True)
-    return ranked
-
 def _candidate_observations(observations: pl.DataFrame, *, latest_only: bool) -> pl.DataFrame:
     base = observations
     if latest_only:
@@ -317,10 +226,12 @@ def _candidate_observations(observations: pl.DataFrame, *, latest_only: bool) ->
         base = base.join(latest, on=("symbol", "decision_bar_close_ms"), how="inner")
     return base
 
+
 def _selected_evidence(evidence: pl.DataFrame) -> pl.DataFrame:
     if evidence.is_empty() or "selected_evidence_level" not in evidence.columns:
         return pl.DataFrame()
     return evidence.filter(pl.col("selected_evidence_level"))
+
 
 def _matches_for_level(
     observations: pl.DataFrame,
@@ -344,39 +255,51 @@ def _matches_for_level(
         pl.lit("matched_evidence").alias("candidate_status"),
     )
 
+
 def _best_candidate_per_observation(matched: pl.DataFrame) -> pl.DataFrame:
     if matched.is_empty():
         return matched
-    return matched.with_columns(
-        pl.when(pl.col("matched_evidence_level") == "market_background")
-        .then(0)
-        .when(pl.col("matched_evidence_level") == "market_swing")
-        .then(1)
-        .when(pl.col("matched_evidence_level") == "market_decision")
-        .then(2)
-        .when(pl.col("matched_evidence_level") == "market_decision_source")
-        .then(3)
-        .when(pl.col("matched_evidence_level") == "market_decision_source_risk")
-        .then(4)
-        .otherwise(5)
-        .alias("_level_rank"),
-        pl.col("information_gain_bits").fill_null(0.0).alias("_information_rank"),
-        pl.col("transition_information_gain_bits").fill_null(0.0).alias("_transition_rank"),
-    ).sort(
-        [
-            "symbol",
-            "decision_timeframe",
-            "decision_bar_close_ms",
-            "outcome_horizon",
-            "_level_rank",
-            "_information_rank",
-            "_transition_rank",
-        ],
-        descending=[False, False, False, False, True, True, True],
-    ).unique(
-        subset=("symbol", "decision_timeframe", "decision_bar_close_ms", "outcome_horizon"),
-        keep="first",
-    ).drop("_level_rank", "_information_rank", "_transition_rank")
+    return (
+        matched.with_columns(
+            pl.when(pl.col("matched_evidence_level") == "market_background")
+            .then(0)
+            .when(pl.col("matched_evidence_level") == "market_swing")
+            .then(1)
+            .when(pl.col("matched_evidence_level") == "market_decision")
+            .then(2)
+            .when(pl.col("matched_evidence_level") == "market_decision_source")
+            .then(3)
+            .when(pl.col("matched_evidence_level") == "market_decision_source_risk")
+            .then(4)
+            .otherwise(5)
+            .alias("_level_rank"),
+            pl.col("information_gain_bits").fill_null(0.0).alias("_information_rank"),
+            pl.col("transition_information_gain_bits").fill_null(0.0).alias("_transition_rank"),
+        )
+        .sort(
+            [
+                "symbol",
+                "decision_timeframe",
+                "decision_bar_close_ms",
+                "outcome_horizon",
+                "_level_rank",
+                "_information_rank",
+                "_transition_rank",
+            ],
+            descending=[False, False, False, False, True, True, True],
+        )
+        .unique(
+            subset=(
+                "symbol",
+                "decision_timeframe",
+                "decision_bar_close_ms",
+                "outcome_horizon",
+            ),
+            keep="first",
+        )
+        .drop("_level_rank", "_information_rank", "_transition_rank")
+    )
+
 
 def _unmatched_observations(observations: pl.DataFrame, matched: pl.DataFrame) -> pl.DataFrame:
     if observations.is_empty():
@@ -391,6 +314,7 @@ def _unmatched_observations(observations: pl.DataFrame, matched: pl.DataFrame) -
     )
     return _unmatched_candidates(missing, "no_matching_evidence")
 
+
 def _unmatched_candidates(observations: pl.DataFrame, status: str) -> pl.DataFrame:
     if observations.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
@@ -404,6 +328,109 @@ def _unmatched_candidates(observations: pl.DataFrame, status: str) -> pl.DataFra
     return _select_schema(frame, CANDIDATE_EVIDENCE_SCHEMA)
 
 
+def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
+    """Add transparent review-ordering components to candidate rows.
+
+    Detects tail_lift presence → uses tail-first scoring.
+    Falls back to entropy-first scoring for ladder path.
+    """
+    if candidates.is_empty():
+        return pl.DataFrame(schema=CANDIDATE_RANK_SCHEMA)
+
+    has_tail_lift = (
+        "tail_lift" in candidates.columns and candidates["tail_lift"].drop_nulls().len() > 0
+    )
+
+    ranked = _select_schema(candidates, CANDIDATE_EVIDENCE_SCHEMA)
+
+    if has_tail_lift:
+        ranked = ranked.with_columns(
+            pl.col("tail_lift").fill_null(1.0).alias("rank_information_component"),
+            pl.lit(0.0).alias("rank_transition_component"),
+            pl.max_horizontal(pl.col("tail_lift").fill_null(1.0), pl.lit(1.0)).alias(
+                "rank_tail_component"
+            ),
+            (pl.col("tail_lift_stability").fill_null(0.0)).alias("rank_stability_component"),
+            (pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0)
+            .log()
+            .alias("rank_path_component"),
+        )
+    else:
+        ranked = ranked.with_columns(
+            pl.max_horizontal(pl.col("information_gain_bits").fill_null(0.0), pl.lit(0.0)).alias(
+                "rank_information_component"
+            ),
+            pl.max_horizontal(
+                pl.col("transition_information_gain_bits").fill_null(0.0), pl.lit(0.0)
+            ).alias("rank_transition_component"),
+            pl.max_horizontal(
+                pl.col("tail_up_rate").fill_null(0.0), pl.col("tail_down_rate").fill_null(0.0)
+            ).alias("rank_tail_component"),
+            (
+                pl.max_horizontal(pl.col("avg_path_range_pct").fill_null(0.0), pl.lit(0.0)) / 10.0
+            ).alias("rank_path_component"),
+            pl.min_horizontal(
+                pl.max_horizontal(
+                    pl.col("information_stability").fill_null(0.0),
+                    pl.col("transition_information_stability").fill_null(0.0),
+                ),
+                pl.lit(2.0),
+            ).alias("rank_stability_component"),
+        )
+
+    ranked = ranked.with_columns(
+        (pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0)
+        .log()
+        .alias("rank_quality_component")
+        if not has_tail_lift
+        else pl.lit(0.0).alias("rank_quality_component"),
+    )
+
+    # Fix: need proper quality component for both paths
+    if has_tail_lift:
+        ranked = ranked.with_columns(
+            ((pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log() / 10.0).alias(
+                "rank_quality_component"
+            ),
+        )
+    else:
+        ranked = ranked.with_columns(
+            (
+                (pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0).log()
+                + (pl.col("symbol_count").fill_null(0).cast(pl.Float64) + 1.0).log()
+            ).alias("rank_quality_component"),
+        )
+
+    ranked = ranked.with_columns(
+        (
+            pl.when(pl.col("source_freshness") == "stale").then(pl.lit(1.0)).otherwise(pl.lit(0.0))
+            + pl.when(pl.col("candidate_status") != "matched_evidence")
+            .then(pl.lit(2.0))
+            .otherwise(pl.lit(0.0))
+        ).alias("rank_penalty_component"),
+    ).with_columns(
+        (
+            pl.col("rank_information_component")
+            + pl.col("rank_transition_component")
+            + pl.col("rank_tail_component")
+            + pl.col("rank_path_component")
+            + pl.col("rank_stability_component")
+            + pl.col("rank_quality_component")
+            - pl.col("rank_penalty_component")
+        ).alias("rank_score"),
+        pl.when(pl.col("candidate_status") == "matched_evidence")
+        .then(pl.lit("matched_selected_evidence"))
+        .otherwise(pl.col("candidate_status"))
+        .alias("rank_reason"),
+    )
+    ranked = _select_schema(ranked.sort("rank_score", descending=True), CANDIDATE_RANK_SCHEMA)
+    if has_tail_lift and "tree_direction" in ranked.columns:
+        ranked = ranked.unique(
+            subset=["symbol", "tree_direction"], keep="first", maintain_order=True
+        )
+    return ranked
+
+
 def _select_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
     if frame.is_empty() and not frame.columns:
         return pl.DataFrame(schema=schema)
@@ -415,3 +442,18 @@ def _select_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.Da
         ]
     )
     return filled.select(*(pl.col(column).cast(dtype) for column, dtype in schema.items()))
+
+
+def rank_candidates(candidates: pl.DataFrame) -> pl.DataFrame:
+    """Rank promoted candidate rows for review output."""
+
+    return rank_candidate_evidence(candidates)
+
+
+__all__ = [
+    "CANDIDATE_EVIDENCE_SCHEMA",
+    "CANDIDATE_RANK_SCHEMA",
+    "candidate_evidence_frame",
+    "rank_candidate_evidence",
+    "rank_candidates",
+]

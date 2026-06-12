@@ -36,3 +36,8 @@ transition_max_tail_loss_pct = 20.0
 transition_min_information_bits = 0.001
 require_context_for_review = false
 evidence = "tailtree"
+
+[potential.tailtree]
+lifecycle = "train"
+model_dir = "data/output/potential/tailtree-test/models"
+model_tag = "tailtree-1h-6h-test"

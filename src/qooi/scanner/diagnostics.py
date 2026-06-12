@@ -9,13 +9,7 @@ from pathlib import Path
 import polars as pl
 
 from qooi.exchange.store import HistoryCoverage
-from qooi.scanner import candidates as candidate_eval
-from qooi.scanner import evidence as evidence_eval
-from qooi.scanner import features as features_eval
-from qooi.scanner import history as history_eval
-from qooi.scanner import source_events as source_eval
-from qooi.scanner.classifiers import STATE_FRAME_SCHEMA, validate_state_frame
-from qooi.scanner.contracts import (
+from qooi.scanner import (
     PotentialUniverse,
     ReportInputs,
     ScanDecision,
@@ -25,35 +19,20 @@ from qooi.scanner.contracts import (
     TransitionEdge,
     UnsupportedTransitionPath,
 )
+from qooi.scanner import events as source_eval
+from qooi.scanner import features as features_eval
+from qooi.scanner import frames as frames_eval
+from qooi.scanner import history as history_eval
+from qooi.scanner import ladder as ladder_eval
+from qooi.scanner import rank as candidate_eval
+from qooi.scanner import rank as rank_eval
+from qooi.scanner import tailrun as tailrun_eval
+from qooi.scanner.classifiers import STATE_FRAME_SCHEMA, validate_state_frame
 from qooi.sources.context import SourceAvailability
 
-
-@dataclass(frozen=True)
-class LadderResult:
-    """Ladder path pipeline result. Every field has a concrete type."""
-    evidence: pl.DataFrame
-    candidates: pl.DataFrame
-    ranked: pl.DataFrame
-    sections: tuple
-
-
-@dataclass(frozen=True)
-class TailtreeResult:
-    """Tailtree path pipeline result. Every field has a concrete type."""
-    evidence: pl.DataFrame
-    candidates: pl.DataFrame
-    ranked: pl.DataFrame
-    tree_up: object | None
-    tree_down: object | None
-    sections: tuple
-
-
-@dataclass(frozen=True)
-class TailtreeEvidenceResult:
-    """Tailtree evidence/model build result before candidate matching."""
-    evidence: pl.DataFrame
-    tree_up: object | None
-    tree_down: object | None
+LadderResult = ladder_eval.LadderResult
+TailtreeResult = tailrun_eval.TailtreeResult
+TailtreeEvidenceResult = tailrun_eval.TailtreeEvidenceResult
 
 
 @dataclass(frozen=True)
@@ -91,6 +70,7 @@ def write_diagnostics(inputs: ReportInputs) -> None:
     diagnostic_frames = _build_diagnostic_frames(inputs)
 
     from qooi.scanner.report import report_sections_for
+
     inputs.report_sections = report_sections_for(inputs.config.evidence)
 
     state_frames = _build_state_frames(inputs)
@@ -108,6 +88,7 @@ def write_diagnostics(inputs: ReportInputs) -> None:
         "realized-transition.csv",
         "source-events.csv",
         "source-outcomes.csv",
+        "candidate-evidence.csv",
     }
     for directory in (diagnostics, states):
         for stale in directory.glob("*.parquet"):
@@ -148,7 +129,7 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         decision_timeframe=inputs.config.bar,
     )
 
-    potential_observations = evidence_eval.potential_observation_frame(
+    potential_observations = frames_eval.potential_observation_frame(
         kline_history,
         source_events,
         continuous_features,
@@ -162,10 +143,14 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         potential_observations, source_outcomes, realized_transitions, inputs
     )
     logger.info("evidence rows=%d", len(pipeline_result.evidence))
-    logger.info("candidates matched=%d ranked=%d",
-                pipeline_result.candidates.height, pipeline_result.ranked.height)
+    logger.info(
+        "candidates matched=%d ranked=%d",
+        pipeline_result.candidates.height,
+        pipeline_result.ranked.height,
+    )
     # Populate report sections for render_report
     from qooi.scanner.report import report_sections_for
+
     inputs.report_sections = report_sections_for(inputs.config.evidence)
 
     source_timeliness = source_eval.source_timeliness_frame(source_outcomes)
@@ -197,7 +182,6 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         source_timeliness=source_timeliness,
         source_state_predictability=source_state_predictability,
     )
-
 
 
 def _build_state_frames(inputs: ReportInputs) -> StateFrames:
@@ -235,8 +219,7 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
             frames.potential_observations.group_by(
                 ["source_family", "source_freshness", "market_alignment"],
                 maintain_order=True,
-            )
-            .len(name="row_count")
+            ).len(name="row_count")
             if not frames.potential_observations.is_empty()
             else pl.DataFrame(
                 schema={
@@ -249,7 +232,7 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         ),
         "potential-evidence-summary": _potential_evidence_summary(frames.potential_evidence),
         "potential-evidence-selected": _selected_potential_evidence(frames.potential_evidence),
-        "candidate-evidence": frames.candidate_evidence,
+        "candidate-inspection": frames.candidate_evidence,
         "candidate-rank": frames.candidate_rank,
         "source-timeliness": frames.source_timeliness,
         "source-state-predictability": frames.source_state_predictability,
@@ -291,7 +274,9 @@ def _potential_evidence_summary(evidence: pl.DataFrame) -> pl.DataFrame:
             pl.col("conditioned_observations").median().alias("median_conditioned_observations"),
             pl.col("symbol_count").median().alias("median_symbol_count"),
             pl.col("information_gain_bits").max().alias("max_information_gain_bits"),
-            pl.col("transition_information_gain_bits").max().alias("max_transition_information_gain_bits"),
+            pl.col("transition_information_gain_bits")
+            .max()
+            .alias("max_transition_information_gain_bits"),
         )
     return evidence.group_by(
         ["tree_direction", "statistical_direction", "research_suggestion"],
@@ -330,7 +315,6 @@ def _write_state_frames(frames: StateFrames, states: Path | str) -> None:
     }
     for name, frame in frame_groups.items():
         frame.write_csv(states / f"{name}.csv")
-
 
 
 def coverage_frame(coverage: tuple[HistoryCoverage, ...]) -> pl.DataFrame:
@@ -776,9 +760,9 @@ def _symbol_history_feasibility(frame: pl.DataFrame) -> pl.DataFrame:
             schema={"symbol": pl.String, "history_status": pl.String, "history_reason": pl.String}
         )
     status_rank = pl.when(pl.col("feasibility_status") == "missing_history").then(0)
-    status_rank = status_rank.when(
-        pl.col("feasibility_status") == "history_integrity_issue"
-    ).then(1)
+    status_rank = status_rank.when(pl.col("feasibility_status") == "history_integrity_issue").then(
+        1
+    )
     status_rank = status_rank.when(pl.col("feasibility_status") == "fetch_limited").then(2)
     status_rank = status_rank.when(pl.col("feasibility_status") == "cache_incomplete").then(3)
     status_rank = status_rank.when(pl.col("feasibility_status") == "low_coverage").then(4)
@@ -839,10 +823,11 @@ def _symbol_source_feasibility(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-
-
 def _run_pipeline(
-    observations, source_outcomes, realized_transitions, inputs,
+    observations,
+    source_outcomes,
+    realized_transitions,
+    inputs,
 ) -> LadderResult | TailtreeResult:
     """One dispatch. Returns concrete type — no downstream branching."""
     if inputs.config.evidence == "tailtree":
@@ -851,105 +836,82 @@ def _run_pipeline(
 
 
 def _run_ladder_pipeline(
-    observations, source_outcomes, realized_transitions, inputs,
+    observations,
+    source_outcomes,
+    realized_transitions,
+    inputs,
 ) -> LadderResult:
     """Self-contained ladder pipeline: evidence + candidates."""
-    evidence = evidence_eval.potential_evidence_frame(
-        observations, source_outcomes, realized_transitions,
+    evidence = ladder_eval.potential_evidence_frame(
+        observations,
+        source_outcomes,
+        realized_transitions,
         return_threshold_pct=inputs.config.transition_return_threshold_pct,
     )
     candidates = candidate_eval.candidate_evidence_frame(observations, evidence)
-    ranked = candidate_eval.rank_candidate_evidence(candidates)
+    ranked = rank_eval.rank_candidates(candidates)
     return LadderResult(evidence=evidence, candidates=candidates, ranked=ranked, sections=())
 
 
 def _run_tailtree_pipeline(
-    observations, source_outcomes, realized_transitions, inputs,
+    observations,
+    source_outcomes,
+    realized_transitions,
+    inputs,
 ) -> TailtreeResult:
     """Self-contained tailtree pipeline: evidence + candidates + trees."""
-    result = _build_tail_tree_evidence(
-        observations, source_outcomes, realized_transitions, inputs,
-    )
+    result = tailrun_eval.run(observations, source_outcomes, realized_transitions, inputs)
     candidates = candidate_eval.candidate_evidence_frame(
-        observations, result.evidence, tree_up=result.tree_up, tree_down=result.tree_down,
+        observations,
+        result.evidence,
+        tree_up=result.tree_up,
+        tree_down=result.tree_down,
     )
-    ranked = candidate_eval.rank_candidate_evidence(candidates)
+    ranked = rank_eval.rank_candidates(candidates)
     return TailtreeResult(
-        evidence=result.evidence, candidates=candidates, ranked=ranked,
-        tree_up=result.tree_up, tree_down=result.tree_down, sections=(),
+        evidence=result.evidence,
+        candidates=candidates,
+        ranked=ranked,
+        tree_up=result.tree_up,
+        tree_down=result.tree_down,
+        sections=(),
     )
+
+
+def _tailtree_model_root(inputs) -> Path:
+    return tailrun_eval._tailtree_model_root(inputs)
+
+
+def _tailtree_feature_schema_hash(
+    categorical_features: list[str], continuous_features: list[str]
+) -> str:
+    return tailrun_eval._tailtree_feature_schema_hash(categorical_features, continuous_features)
+
+
+def _tailtree_artifact_metadata(
+    inputs, tree_up: object | None, tree_down: object | None
+) -> dict[str, object]:
+    return tailrun_eval._tailtree_artifact_metadata(inputs, tree_up, tree_down)
+
+
+def _write_tailtree_artifacts(
+    inputs,
+    evidence_by_direction: dict[str, pl.DataFrame],
+    trees: dict[str, object],
+) -> None:
+    tailrun_eval._write_tailtree_artifacts(inputs, evidence_by_direction, trees)
+
+
+def _load_tail_tree_evidence(observations: pl.DataFrame, inputs):
+    return tailrun_eval._load_tail_tree_evidence(observations, inputs)
 
 
 def _build_tail_tree_evidence(
-    observations, source_outcomes, realized_transitions, inputs,
-) -> TailtreeEvidenceResult:
-    from qooi.scanner.tailtree import (
-        TrainConfig, label_tail_exceedances, leaf_context_frame,
-        leaf_evidence_frame, select_tail_leaves, tailtree_training_frame,
+    observations,
+    source_outcomes,
+    realized_transitions,
+    inputs,
+):
+    return tailrun_eval._build_tail_tree_evidence(
+        observations, source_outcomes, realized_transitions, inputs
     )
-    from qooi.scanner.tailtree import TailTreeModel as TTM
-
-    logger = logging.getLogger("qooi.scanner")
-    inputs.artifacts.diagnostics_dir.mkdir(parents=True, exist_ok=True)
-
-    outcome_frame = evidence_eval.potential_outcome_frame(
-        observations, source_outcomes, realized_transitions,
-        return_threshold_pct=inputs.config.transition_return_threshold_pct,
-    )
-    if outcome_frame.is_empty():
-        return TailtreeEvidenceResult(pl.DataFrame(), None, None)
-
-    outcome_frame = label_tail_exceedances(outcome_frame, threshold_pct=inputs.config.tail_threshold_pct)
-    logger.info("outcome rows=%d tail_up=%d tail_down=%d",
-                len(outcome_frame),
-                int(outcome_frame.get_column("tail_up").sum()) if "tail_up" in outcome_frame.columns else 0,
-                int(outcome_frame.get_column("tail_down").sum()) if "tail_down" in outcome_frame.columns else 0)
-    config = TrainConfig(
-        num_leaves=inputs.config.tail_tree_num_leaves,
-        min_data_in_leaf=inputs.config.tail_tree_min_data_in_leaf,
-        learning_rate=inputs.config.tail_tree_learning_rate,
-        num_iterations=inputs.config.tail_tree_num_iterations,
-        early_stopping_rounds=inputs.config.tail_tree_early_stopping,
-    )
-    cat = ["background_regime","swing_core","decision_core","decision_transition",
-           "decision_direction","source_family","source_state","risk_context","market_alignment"]
-    con = ["atr_percentile", "range_width_atr", "return_1bar", "return_4bar",
-           "return_24bar", "vol_anomaly", "close_to_range_high_ratio",
-           "imbalance_value", "spread_bps", "buy_sell_ratio", "funding_rate",
-           "oi_delta", "taker_buy_sell_ratio", "long_short_ratio",
-           "book_age_ms", "trade_age_ms", "funding_age_ms", "oi_age_ms",
-           "taker_age_ms", "lsr_age_ms"]
-    cat = [c for c in cat if c in observations.columns]
-    con = [c for c in con if c in observations.columns]
-
-    all_evidence = []
-    trees = {}
-    for direction in ("up", "down"):
-        training = tailtree_training_frame(observations, outcome_frame, direction=direction)
-        if not training.has_min_exceedances(config.min_data_in_leaf):
-            continue
-
-        tree = TTM.train(
-            training.tail_observations,
-            training.exceedance_values,
-            config=config,
-            categorical_features=cat,
-            continuous_features=con,
-            direction=direction,
-            global_tail_rate=training.global_tail_rate,
-            train_n_observations=training.train_n_observations,
-        )
-        tree.to_json(inputs.artifacts.diagnostics_dir / f"tail-tree-{direction}.json")
-        trees[direction] = tree
-
-        lev = leaf_evidence_frame(tree, observations, outcome_frame)
-        if lev.is_empty():
-            continue
-        lctx = leaf_context_frame(tree, observations, outcome_frame)
-        merged = lev.join(lctx, on="leaf_id", how="left")
-        selected = select_tail_leaves(merged)
-        selected.write_csv(inputs.artifacts.diagnostics_dir / f"potential-leaves-selected-{direction}.csv")
-        all_evidence.append(merged)
-
-    ev = pl.concat(all_evidence, how="diagonal_relaxed") if all_evidence else pl.DataFrame()
-    return TailtreeEvidenceResult(ev, trees.get("up"), trees.get("down"))

@@ -15,8 +15,7 @@ from typing import cast
 import polars as pl
 
 from qooi.exchange.store import HistoryCoverage
-from qooi.scanner.classifiers import StateDirection
-from qooi.scanner.contracts import (
+from qooi.scanner import (
     DERIVATIVE_FAMILIES,
     PotentialScanConfig,
     ScanDecision,
@@ -31,6 +30,7 @@ from qooi.scanner.contracts import (
     missing_state,
     transition_consensus_passes,
 )
+from qooi.scanner.classifiers import StateDirection
 from qooi.sources.context import SourceAvailability, SourceContextResult
 
 
@@ -355,14 +355,11 @@ def scan_review_decisions(
         no_consensus = transition_supported and not consensus_supported
         many_conflicts = len(contradictions) >= 2
         context_required = (
-            config.require_context_for_review
-            and bundle.context.direction == "missing"
+            config.require_context_for_review and bundle.context.direction == "missing"
         )
 
         source_families = (bundle.books, bundle.trades, bundle.derivatives, bundle.context)
-        confirming = [
-            row for row in source_families if row.direction == transition_state.direction
-        ]
+        confirming = [row for row in source_families if row.direction == transition_state.direction]
         fully_supported = (
             consensus_supported
             and transition_state.direction in {"bullish", "bearish"}
@@ -370,55 +367,99 @@ def scan_review_decisions(
         )
 
         rules = (
-            (kline_blocked, _D(
-                group="watch" if bundle.kline.direction == "missing" else "blocked",
-                direction="undecided" if bundle.kline.direction == "missing" else "blocked",
-                confidence="low" if bundle.kline.direction == "missing" else "blocked",
-                reason=bundle.kline.missing_reason or "kline_state_missing",
-            )),
+            (
+                kline_blocked,
+                _D(
+                    group="watch" if bundle.kline.direction == "missing" else "blocked",
+                    direction="undecided" if bundle.kline.direction == "missing" else "blocked",
+                    confidence="low" if bundle.kline.direction == "missing" else "blocked",
+                    reason=bundle.kline.missing_reason or "kline_state_missing",
+                ),
+            ),
             (transition_missing, _D(reason="transition_path_missing_or_neutral")),
-            (unsupported_dir, _D(
-                direction=bundle.transition.direction,
-                reason="transition_quality_below_threshold",
-            )),
-            (no_consensus, _D(
-                direction=bundle.transition.direction,
-                reason="transition_consensus_missing_or_contradicted",
-            )),
-            (many_conflicts, _D(
-                group="blocked", direction="blocked", confidence="blocked",
-                reason="contradictory_source_evidence",
-            )),
-            (bool(contradictions), _D(
-                direction=transition_state.direction,
-                reason="contradictory_source_evidence",
-            )),
-            (context_required, _D(
-                direction=transition_state.direction, reason="context_missing",
-            )),
-            (fully_supported, _D(
-                group=transition_state.direction, direction=transition_state.direction,
-                confidence=confidence(confirming, missing), reason="",
-            )),
-            (len(missing) >= len(families), _D(
-                group="blocked", direction="blocked", confidence="blocked",
-                reason="all_non_kline_sources_missing",
-            )),
-            (transition_state.direction in {"bullish", "bearish"}, _D(
-                direction=transition_state.direction,
-                reason="needs_source_confirmation",
-            )),
-            (True, _D(
-                direction="undecided",
-                reason="needs_directional_confirmation",
-            )),
+            (
+                unsupported_dir,
+                _D(
+                    direction=bundle.transition.direction,
+                    reason="transition_quality_below_threshold",
+                ),
+            ),
+            (
+                no_consensus,
+                _D(
+                    direction=bundle.transition.direction,
+                    reason="transition_consensus_missing_or_contradicted",
+                ),
+            ),
+            (
+                many_conflicts,
+                _D(
+                    group="blocked",
+                    direction="blocked",
+                    confidence="blocked",
+                    reason="contradictory_source_evidence",
+                ),
+            ),
+            (
+                bool(contradictions),
+                _D(
+                    direction=transition_state.direction,
+                    reason="contradictory_source_evidence",
+                ),
+            ),
+            (
+                context_required,
+                _D(
+                    direction=transition_state.direction,
+                    reason="context_missing",
+                ),
+            ),
+            (
+                fully_supported,
+                _D(
+                    group=transition_state.direction,
+                    direction=transition_state.direction,
+                    confidence=confidence(confirming, missing),
+                    reason="",
+                ),
+            ),
+            (
+                len(missing) >= len(families),
+                _D(
+                    group="blocked",
+                    direction="blocked",
+                    confidence="blocked",
+                    reason="all_non_kline_sources_missing",
+                ),
+            ),
+            (
+                transition_state.direction in {"bullish", "bearish"},
+                _D(
+                    direction=transition_state.direction,
+                    reason="needs_source_confirmation",
+                ),
+            ),
+            (
+                True,
+                _D(
+                    direction="undecided",
+                    reason="needs_directional_confirmation",
+                ),
+            ),
         )
         for condition, d in rules:
             if condition:
-                decisions.append(_decision(
-                    bundle, d.group, d.direction, d.confidence,
-                    missing, contradictions, d.reason,
-                ))
+                decisions.append(
+                    _decision(
+                        bundle,
+                        d.group,
+                        d.direction,
+                        d.confidence,
+                        missing,
+                        contradictions,
+                        d.reason,
+                    )
+                )
                 break
     return decisions
 

@@ -8,6 +8,16 @@ from __future__ import annotations
 
 import polars as pl
 
+HOUR_MS = 60 * 60 * 1000
+SOURCE_FEATURE_MAX_AGE_MS = {
+    "books": HOUR_MS,
+    "trades": HOUR_MS,
+    "funding": 16 * HOUR_MS,
+    "open_interest": 4 * HOUR_MS,
+    "taker_volume": 4 * HOUR_MS,
+    "long_short_ratios": 4 * HOUR_MS,
+}
+
 
 def extract_continuous_features(
     bars: dict[tuple[str, str], pl.DataFrame],
@@ -27,9 +37,7 @@ def extract_continuous_features(
     """
     kline_features = _kline_continuous_features(bars, state_frames, decision_timeframe)
     decision_keys = (
-        kline_features.select("symbol", "timestamp")
-        if not kline_features.is_empty()
-        else None
+        kline_features.select("symbol", "timestamp") if not kline_features.is_empty() else None
     )
     source_features = _source_continuous_features(source_frames, decision_keys=decision_keys)
 
@@ -38,9 +46,10 @@ def extract_continuous_features(
     if source_features.is_empty():
         return kline_features
 
-    return kline_features.join(
-        source_features, on=["symbol", "timestamp"], how="left"
-    ).select(kline_features.columns + [c for c in source_features.columns if c not in ("symbol", "timestamp")])
+    return kline_features.join(source_features, on=["symbol", "timestamp"], how="left").select(
+        kline_features.columns
+        + [c for c in source_features.columns if c not in ("symbol", "timestamp")]
+    )
 
 
 def _kline_continuous_features(
@@ -63,14 +72,14 @@ def _kline_continuous_features(
         if not required.issubset(frame.columns):
             continue
 
-        work = frame.select(
-            "timestamp", "open", "high", "low", "close", "volume"
-        ).sort("timestamp")
+        work = frame.select("timestamp", "open", "high", "low", "close", "volume").sort("timestamp")
 
         # ATR percentile from classifier state frame (already computed)
         atr_pct = None
         if "atr_percentile_100" in state.columns:
-            atr_pct = state.select("timestamp", pl.col("atr_percentile_100").alias("atr_percentile")).sort("timestamp")
+            atr_pct = state.select(
+                "timestamp", pl.col("atr_percentile_100").alias("atr_percentile")
+            ).sort("timestamp")
 
         # Range width from classifier state frame
         range_width = None
@@ -79,14 +88,22 @@ def _kline_continuous_features(
 
         # Returns
         work = work.with_columns(
-            ((pl.col("close") - pl.col("close").shift(1)) / pl.col("close").shift(1) * 100.0).alias("return_1bar"),
-            ((pl.col("close") - pl.col("close").shift(4)) / pl.col("close").shift(4) * 100.0).alias("return_4bar"),
-            ((pl.col("close") - pl.col("close").shift(24)) / pl.col("close").shift(24) * 100.0).alias("return_24bar"),
+            ((pl.col("close") - pl.col("close").shift(1)) / pl.col("close").shift(1) * 100.0).alias(
+                "return_1bar"
+            ),
+            ((pl.col("close") - pl.col("close").shift(4)) / pl.col("close").shift(4) * 100.0).alias(
+                "return_4bar"
+            ),
+            (
+                (pl.col("close") - pl.col("close").shift(24)) / pl.col("close").shift(24) * 100.0
+            ).alias("return_24bar"),
         )
 
         # Volume anomaly
         work = work.with_columns(
-            (pl.col("volume") / pl.col("volume").rolling_mean(20, min_samples=5)).alias("vol_anomaly"),
+            (pl.col("volume") / pl.col("volume").rolling_mean(20, min_samples=5)).alias(
+                "vol_anomaly"
+            ),
         )
 
         # Close-to-range ratio (from OHLCV directly: 48-bar range)
@@ -100,7 +117,15 @@ def _kline_continuous_features(
             ).alias("close_to_range_high_ratio"),
         )
 
-        cols = ["symbol", "timestamp", "return_1bar", "return_4bar", "return_24bar", "vol_anomaly", "close_to_range_high_ratio"]
+        cols = [
+            "symbol",
+            "timestamp",
+            "return_1bar",
+            "return_4bar",
+            "return_24bar",
+            "vol_anomaly",
+            "close_to_range_high_ratio",
+        ]
         out = work.select(pl.lit(symbol).alias("symbol"), *cols[1:])
 
         if atr_pct is not None:
@@ -116,12 +141,19 @@ def _kline_continuous_features(
         frames.append(out)
 
     if not frames:
-        return pl.DataFrame(schema={
-            "symbol": pl.String, "timestamp": pl.Int64,
-            "return_1bar": pl.Float64, "return_4bar": pl.Float64, "return_24bar": pl.Float64,
-            "vol_anomaly": pl.Float64, "close_to_range_high_ratio": pl.Float64,
-            "atr_percentile": pl.Float64, "range_width_atr": pl.Float64,
-        })
+        return pl.DataFrame(
+            schema={
+                "symbol": pl.String,
+                "timestamp": pl.Int64,
+                "return_1bar": pl.Float64,
+                "return_4bar": pl.Float64,
+                "return_24bar": pl.Float64,
+                "vol_anomaly": pl.Float64,
+                "close_to_range_high_ratio": pl.Float64,
+                "atr_percentile": pl.Float64,
+                "range_width_atr": pl.Float64,
+            }
+        )
     return pl.concat(frames, how="vertical_relaxed")
 
 
@@ -215,9 +247,19 @@ def _align_source_family_to_decision_keys(
     if aligned.is_empty():
         return aligned
 
-    return aligned.with_columns(
-        (pl.col("timestamp") - pl.col("source_timestamp_ms")).alias(f"{prefix}_age_ms")
-    ).drop("source_timestamp_ms")
+    age_col = f"{prefix}_age_ms"
+    aligned = aligned.with_columns(
+        (pl.col("timestamp") - pl.col("source_timestamp_ms")).alias(age_col)
+    )
+    max_age_ms = SOURCE_FEATURE_MAX_AGE_MS.get(family)
+    if max_age_ms is not None:
+        aligned = aligned.with_columns(
+            *[
+                pl.when(pl.col(age_col) <= max_age_ms).then(pl.col(col)).otherwise(None).alias(col)
+                for col in value_cols
+            ]
+        )
+    return aligned.drop("source_timestamp_ms")
 
 
 def _source_family_prefix(family: str) -> str:
@@ -239,7 +281,9 @@ def _first_float_col(frame: pl.DataFrame, candidates: tuple[str, ...]) -> str | 
 
 
 def _book_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
-    imbalance_col = _first_float_col(frame, ("ob_imbalance_25", "ob_imbalance_10", "ob_imbalance_5"))
+    imbalance_col = _first_float_col(
+        frame, ("ob_imbalance_25", "ob_imbalance_10", "ob_imbalance_5")
+    )
     bid_col = _first_float_col(frame, ("ob_bid_price",))
     ask_col = _first_float_col(frame, ("ob_ask_price",))
 
@@ -247,7 +291,9 @@ def _book_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
     if not needed:
         return work
 
-    work = work.join(frame.select(["symbol", "timestamp"] + needed), on=["symbol", "timestamp"], how="left")
+    work = work.join(
+        frame.select(["symbol", "timestamp"] + needed), on=["symbol", "timestamp"], how="left"
+    )
     exprs = []
 
     if imbalance_col:
@@ -256,7 +302,11 @@ def _book_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
         mid = (pl.col(bid_col).cast(pl.Float64) + pl.col(ask_col).cast(pl.Float64)) / 2.0
         exprs.append(((pl.col(ask_col) - pl.col(bid_col)) / mid * 10000.0).alias("spread_bps"))
         if "close" in frame.columns:
-            work = work.join(frame.select("symbol", "timestamp", pl.col("close").cast(pl.Float64)), on=["symbol", "timestamp"], how="left")
+            work = work.join(
+                frame.select("symbol", "timestamp", pl.col("close").cast(pl.Float64)),
+                on=["symbol", "timestamp"],
+                how="left",
+            )
             exprs.append(((pl.col("close") - mid) / mid * 100.0).alias("close_to_mid_pct"))
 
     work = work.with_columns(exprs)
@@ -280,17 +330,25 @@ def _trade_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
             pl.col(value_col).filter(pl.col("side") == "sell").sum().alias("sell_notional"),
         )
         .with_columns(
-            (pl.col("buy_notional") / pl.when(pl.col("sell_notional") > 0).then(pl.col("sell_notional")).otherwise(None)).alias("buy_sell_ratio")
+            (
+                pl.col("buy_notional")
+                / pl.when(pl.col("sell_notional") > 0).then(pl.col("sell_notional")).otherwise(None)
+            ).alias("buy_sell_ratio")
         )
     )
-    return work.join(agg.select("symbol", "timestamp", "buy_sell_ratio"), on=["symbol", "timestamp"], how="left")
+    return work.join(
+        agg.select("symbol", "timestamp", "buy_sell_ratio"), on=["symbol", "timestamp"], how="left"
+    )
 
 
 def _funding_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
     if "funding_rate" in frame.columns:
         return work.join(
-            frame.select("symbol", "timestamp", pl.col("funding_rate").cast(pl.Float64).alias("funding_rate")),
-            on=["symbol", "timestamp"], how="left"
+            frame.select(
+                "symbol", "timestamp", pl.col("funding_rate").cast(pl.Float64).alias("funding_rate")
+            ),
+            on=["symbol", "timestamp"],
+            how="left",
         )
     return work
 
@@ -300,11 +358,15 @@ def _oi_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
     if not value_col:
         return work
 
-    oi = frame.select("symbol", "timestamp", pl.col(value_col).cast(pl.Float64).alias("oi_value")).sort(["symbol", "timestamp"])
+    oi = frame.select(
+        "symbol", "timestamp", pl.col(value_col).cast(pl.Float64).alias("oi_value")
+    ).sort(["symbol", "timestamp"])
     oi = oi.with_columns(
         (pl.col("oi_value") - pl.col("oi_value").shift(1).over("symbol")).alias("oi_delta")
     )
-    return work.join(oi.select("symbol", "timestamp", "oi_delta"), on=["symbol", "timestamp"], how="left")
+    return work.join(
+        oi.select("symbol", "timestamp", "oi_delta"), on=["symbol", "timestamp"], how="left"
+    )
 
 
 def _taker_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
@@ -317,20 +379,35 @@ def _taker_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
         pl.col("taker_buy_volume").cast(pl.Float64),
         pl.col("taker_sell_volume").cast(pl.Float64),
     ).with_columns(
-        (pl.col("taker_buy_volume") / pl.when(pl.col("taker_sell_volume") > 0).then(pl.col("taker_sell_volume")).otherwise(None)).alias("taker_buy_sell_ratio")
+        (
+            pl.col("taker_buy_volume")
+            / pl.when(pl.col("taker_sell_volume") > 0)
+            .then(pl.col("taker_sell_volume"))
+            .otherwise(None)
+        ).alias("taker_buy_sell_ratio")
     )
-    return work.join(taker.select("symbol", "timestamp", "taker_buy_sell_ratio"), on=["symbol", "timestamp"], how="left")
+    return work.join(
+        taker.select("symbol", "timestamp", "taker_buy_sell_ratio"),
+        on=["symbol", "timestamp"],
+        how="left",
+    )
 
 
 def _lsr_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
-    ratio_col = _first_float_col(frame, (
-        "top_trader_long_short_position_ratio",
-        "top_trader_long_short_account_ratio",
-        "long_short_account_ratio",
-    ))
+    ratio_col = _first_float_col(
+        frame,
+        (
+            "top_trader_long_short_position_ratio",
+            "top_trader_long_short_account_ratio",
+            "long_short_account_ratio",
+        ),
+    )
     if ratio_col:
         return work.join(
-            frame.select("symbol", "timestamp", pl.col(ratio_col).cast(pl.Float64).alias("long_short_ratio")),
-            on=["symbol", "timestamp"], how="left"
+            frame.select(
+                "symbol", "timestamp", pl.col(ratio_col).cast(pl.Float64).alias("long_short_ratio")
+            ),
+            on=["symbol", "timestamp"],
+            how="left",
         )
     return work

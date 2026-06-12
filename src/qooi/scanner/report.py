@@ -10,17 +10,19 @@ from typing import Protocol
 
 import polars as pl
 
-from qooi.scanner.contracts import ReportInputs
-
+from qooi.scanner import ReportInputs
 
 # ── Protocol ─────────────────────────────────────────────────────────────────
 
+
 class ReportSection(Protocol):
     """A composable section of the scanner report."""
+
     def render(self, inputs: ReportInputs) -> str: ...
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
+
 
 def render_report(inputs: ReportInputs) -> str:
     """Compose report from pre-built sections. No dispatch. No branching."""
@@ -37,46 +39,56 @@ def report_sections_for(evidence: str) -> tuple:
     """Return path-specific report sections. One dispatch point for the report."""
     if evidence == "tailtree":
         return (
-            _TreeSummarySection(), _TreeImportanceSection(), _TreeLeafSection(),
-            _TreeReviewSection(), _TreeGateSection(),
+            _TreeSummarySection(),
+            _TreeImportanceSection(),
+            _TreeLeafSection(),
+            _TreeReviewSection(),
+            _TreeGateSection(),
         )
     return (
-        _LadderEvidenceSection(), _LadderReviewSection(), _LadderGateSection(),
+        _LadderEvidenceSection(),
+        _LadderReviewSection(),
+        _LadderGateSection(),
     )
 
 
 # ── Common sections ──────────────────────────────────────────────────────────
+
 
 class _ScanScopeSection:
     def render(self, inputs: ReportInputs) -> str:
         c = inputs.config
         watch = sum(1 for d in inputs.decisions if d.group == "watch")
         blocked = sum(1 for d in inputs.decisions if d.group == "blocked")
-        evidence_path = "tailtree (LightGBM + GPD)" if c.evidence == "tailtree" else "ladder (fixed 5-level)"
-        return "\n".join([
-            "# Potential Altcoin Diagnostics Report",
-            "",
-            "This is a research-only evidence report. It does not authorize live trading, "
-            "place orders, mutate baskets, or bypass executor risk and sizing controls.",
-            "",
-            "## Scan Scope",
-            "",
-            f"- Universe: `{c.universe}`",
-            f"- Bar: `{c.bar}`",
-            f"- Days: `{c.days}`",
-            f"- Transition history days: `{max(c.days, c.transition_history_days)}`",
-            f"- Transition n-gram length: `{c.transition_ngram_length}`",
-            f"- Evidence path: **{evidence_path}**",
-            f"- Selected symbols scanned: `{len(inputs.universe.symbols)}` of "
-            f"`{inputs.universe.eligible_count}` eligible symbols",
-            f"- Transition scan budget: `{c.transition_scan_budget}`",
-            f"- Refresh mode: `{c.refresh_mode}`",
-            f"- Source context scope: `{c.transition_context_scope}`",
-            f"- Transition watch rows: `{watch}`; blocked rows: `{blocked}`",
-            f"- Unsupported current transition paths: `{len(inputs.transitions.unsupported)}` "
-            f"in `{inputs.artifacts.diagnostics_dir / 'unsupported-current-paths.csv'}`",
-            f"- Diagnostics directory: `{inputs.artifacts.diagnostics_dir}`",
-        ])
+        evidence_path = (
+            "tailtree (LightGBM + GPD)" if c.evidence == "tailtree" else "ladder (fixed 5-level)"
+        )
+        return "\n".join(
+            [
+                "# Potential Altcoin Diagnostics Report",
+                "",
+                "This is a research-only evidence report. It does not authorize live trading, "
+                "place orders, mutate baskets, or bypass executor risk and sizing controls.",
+                "",
+                "## Scan Scope",
+                "",
+                f"- Universe: `{c.universe}`",
+                f"- Bar: `{c.bar}`",
+                f"- Days: `{c.days}`",
+                f"- Transition history days: `{max(c.days, c.transition_history_days)}`",
+                f"- Transition n-gram length: `{c.transition_ngram_length}`",
+                f"- Evidence path: **{evidence_path}**",
+                f"- Selected symbols scanned: `{len(inputs.universe.symbols)}` of "
+                f"`{inputs.universe.eligible_count}` eligible symbols",
+                f"- Transition scan budget: `{c.transition_scan_budget}`",
+                f"- Refresh mode: `{c.refresh_mode}`",
+                f"- Source context scope: `{c.transition_context_scope}`",
+                f"- Transition watch rows: `{watch}`; blocked rows: `{blocked}`",
+                f"- Unsupported current transition paths: `{len(inputs.transitions.unsupported)}` "
+                f"in `{inputs.artifacts.diagnostics_dir / 'unsupported-current-paths.csv'}`",
+                f"- Diagnostics directory: `{inputs.artifacts.diagnostics_dir}`",
+            ]
+        )
 
 
 class _SourceFreshnessSection:
@@ -88,15 +100,17 @@ class _SourceFreshnessSection:
         if obs.is_empty():
             return f"## Source Freshness\n\n- Observation summary empty: `{path}`"
         total = int(obs.get_column("row_count").sum())
-        return "\n".join([
-            "## Source Freshness",
-            "",
-            f"- Summary: `{path}`",
-            f"- Summarized observation rows: `{total}`; groups: `{obs.height}`",
-            "- Source freshness: " + _counts(obs, "source_freshness"),
-            "- Source families: " + _counts(obs, "source_family"),
-            "- Market alignment: " + _counts(obs, "market_alignment"),
-        ])
+        return "\n".join(
+            [
+                "## Source Freshness",
+                "",
+                f"- Summary: `{path}`",
+                f"- Summarized observation rows: `{total}`; groups: `{obs.height}`",
+                "- Source freshness: " + _counts(obs, "source_freshness"),
+                "- Source families: " + _counts(obs, "source_family"),
+                "- Market alignment: " + _counts(obs, "market_alignment"),
+            ]
+        )
 
 
 class _CoverageSection:
@@ -122,23 +136,27 @@ class _CoverageSection:
         if watch_path.exists():
             w = pl.read_csv(watch_path)
             if not w.is_empty():
-                lines.append("- Watchlist feasibility: " + _value_counts(w, "watchlist_feasibility"))
+                lines.append(
+                    "- Watchlist feasibility: " + _value_counts(w, "watchlist_feasibility")
+                )
                 limited = w.filter(
                     pl.col("watchlist_feasibility").is_in(
                         ["blocked_by_history", "coverage_limited_review", "source_blind_review"]
                     )
                 )
                 if not limited.is_empty():
-                    lines.extend([
-                        "",
-                        "| Symbol | Group | Feasibility | History | Sources | Reason |",
-                        "|---|---|---|---|---|---|",
-                    ])
+                    lines.extend(
+                        [
+                            "",
+                            "| Symbol | Group | Feasibility | History | Sources | Reason |",
+                            "|---|---|---|---|---|---|",
+                        ]
+                    )
                     for row in limited.head(8).iter_rows(named=True):
                         lines.append(
-                            f"| `{row['symbol']}` | {row.get('group','—')} | "
-                            f"{row['watchlist_feasibility']} | {row.get('history_status','—')} | "
-                            f"{row.get('source_status','—')} | {row.get('history_reason','—')} |"
+                            f"| `{row['symbol']}` | {row.get('group', '—')} | "
+                            f"{row['watchlist_feasibility']} | {row.get('history_status', '—')} | "
+                            f"{row.get('source_status', '—')} | {row.get('history_reason', '—')} |"
                         )
             else:
                 lines.append("- Watchlist feasibility: no decision rows produced.")
@@ -155,36 +173,46 @@ class _CaveatsSection:
             "",
             "- **Coverage gaps on short-lived symbols**: new or delisted contracts have shallow "
             "history, so 730-day targets cannot be met. This is data reality, not a scanner bug.",
-            "- **Context-blind by design**: we lack a full-fledged message/social source; ephemeral "
-            "signals (news, sentiment, events) are hard to transform into decisive quantitative data. "
-            "Missing context is surfaced explicitly rather than imputed.",
+            "- **Context-blind by design**: we lack a full-fledged message/social source; "
+            "ephemeral signals (news, sentiment, events) are hard to transform into "
+            "decisive quantitative data. Missing context is surfaced explicitly rather "
+            "than imputed.",
         ]
         if use_tree:
-            base.extend([
-                "- **GPD fits on 30+ exceedances have wider confidence intervals** than entropy on "
-                "400+ observations. This is the trade-off for targeting tail extremes rather than "
-                "average returns. Leaves with N_tail < 30 are excluded by the tail gate.",
-                "- **Two trees, directional separation**: Tree_UP identifies conditions for extreme-up "
-                "moves; Tree_DOWN identifies conditions for extreme-down moves. A single leaf can "
-                "only predict one tail direction. Leaves from both trees may coexist for the same "
-                "observation.",
-                "- **Feature importance is gain-based** from LightGBM leaf-wise splits. High-gain "
-                "features drive tail-heaviness separation. Low-gain features may still provide "
-                "context but don't materially shift the GPD shape parameter.",
-            ])
+            base.extend(
+                [
+                    "- **GPD fits on 30+ exceedances have wider confidence intervals** "
+                    "than entropy on 400+ observations. This is the trade-off for "
+                    "targeting tail extremes rather than average returns. Leaves with "
+                    "N_tail < 30 are excluded by the tail gate.",
+                    "- **Two trees, directional separation**: Tree_UP identifies "
+                    "conditions for extreme-up moves; Tree_DOWN identifies conditions "
+                    "for extreme-down moves. A single leaf can only predict one tail "
+                    "direction. Leaves from both trees may coexist for the same observation.",
+                    "- **Feature importance is gain-based** from LightGBM leaf-wise "
+                    "splits. High-gain features drive tail-heaviness separation. "
+                    "Low-gain features may still provide context but don't materially "
+                    "shift the GPD shape parameter.",
+                ]
+            )
         else:
-            base.extend([
-                "- **Evidence insufficiency is expected**: most state-vector observations do not "
-                "co-occur with enough outcome history to produce statistically stable evidence. "
-                "The scanner measures how much signal exists, not claiming signal exists everywhere.",
-                "- **Baseline hit rates near 50-57%** reflect inherent difficulty of predicting "
-                "short-horizon crypto returns. Higher-tail candidates (`market_swing`, `market_decision`) "
-                "tend to have cleaner tail vs adverse gaps.",
-            ])
+            base.extend(
+                [
+                    "- **Evidence insufficiency is expected**: most state-vector "
+                    "observations do not co-occur with enough outcome history to "
+                    "produce statistically stable evidence. The scanner measures how "
+                    "much signal exists, not claiming signal exists everywhere.",
+                    "- **Baseline hit rates near 50-57%** reflect inherent difficulty "
+                    "of predicting short-horizon crypto returns. Higher-tail candidates "
+                    "(`market_swing`, `market_decision`) tend to have cleaner tail vs "
+                    "adverse gaps.",
+                ]
+            )
         return "\n".join(base)
 
 
 # ── Ladder path sections ────────────────────────────────────────────────────
+
 
 class _LadderEvidenceSection:
     def render(self, inputs: ReportInputs) -> str:
@@ -221,14 +249,20 @@ class _LadderEvidenceSection:
         if selected.is_empty():
             return "\n".join(lines)
 
-        lines.extend([
-            "",
-            "| Level | Horizon | Suggestion | Direction | Obs | Symbols | Info | "
-            "Trans | TailUp | TailDown | MaxPath | MinPath | OriginRate | Skew |",
-            "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ])
+        lines.extend(
+            [
+                "",
+                "| Level | Horizon | Suggestion | Direction | Obs | Symbols | Info | "
+                "Trans | TailUp | TailDown | MaxPath | MinPath | OriginRate | Skew |",
+                "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
         top = selected.sort(
-            ["transition_information_gain_bits", "information_gain_bits", "conditioned_observations"],
+            [
+                "transition_information_gain_bits",
+                "information_gain_bits",
+                "conditioned_observations",
+            ],
             descending=[True, True, True],
         ).head(12)
         for row in top.iter_rows(named=True):
@@ -253,7 +287,7 @@ class _LadderReviewSection:
         lines = [
             "## Review Rows",
             "",
-            "Tiers: 1=top-decile Info,Sym≥15  |  2=top-quartile Info  |  3=ranked  |  —=no evidence",
+            "Tiers: 1=top-decile Info,Sym≥15  |  2=top-quartile Info  | 3=ranked  |  —=no evidence",
             "",
             "< evidence (cross-coin) | decision (coin-specific) >",
         ]
@@ -263,11 +297,13 @@ class _LadderReviewSection:
 
         rank_path = inputs.artifacts.diagnostics_dir / "candidate-rank.csv"
         rank_data = _read_rank_data(rank_path)
-        lines.extend([
-            "| T | Symbol | Info | Rank | Direction | Suggestion | Caveat |",
-            "|---|---:|---:|---:|---:|---:|---:|",
-            "| | | bits | score | | | |",
-        ])
+        lines.extend(
+            [
+                "| T | Symbol | Info | Rank | Direction | Suggestion | Caveat |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+                "| | | bits | score | | | |",
+            ]
+        )
         for d in decisions[:15]:
             rd = rank_data.get(d.symbol, {})
             tier = rd.get("tier", "—") if rd else "—"
@@ -295,17 +331,23 @@ class _LadderGateSection:
             evidence.filter(pl.col("selected_evidence_level")).get_column("row_count").sum()
         )
         if selected:
-            return "## Evidence Gate Summary\n\n- At least one parent-gated evidence row is reviewable."
-        return "\n".join([
-            "## Evidence Gate Summary",
-            "- No parent-gated evidence row is currently reviewable.",
-            f"- Evidence status: {_counts(evidence, 'evidence_status')}",
-            f"- Transition status: {_counts(evidence, 'transition_status')}",
-            "- This is an evidence-quality result, not a neutral trading signal.",
-        ])
+            return (
+                "## Evidence Gate Summary\n\n"
+                "- At least one parent-gated evidence row is reviewable."
+            )
+        return "\n".join(
+            [
+                "## Evidence Gate Summary",
+                "- No parent-gated evidence row is currently reviewable.",
+                f"- Evidence status: {_counts(evidence, 'evidence_status')}",
+                f"- Transition status: {_counts(evidence, 'transition_status')}",
+                "- This is an evidence-quality result, not a neutral trading signal.",
+            ]
+        )
 
 
 # ── Tree path sections ──────────────────────────────────────────────────────
+
 
 class _TreeSummarySection:
     def render(self, inputs: ReportInputs) -> str:
@@ -314,28 +356,34 @@ class _TreeSummarySection:
 
         for direction in ("up", "down"):
             tree_path = d / f"tail-tree-{direction}.json"
-            leaf_path = d / f"potential-leaf-evidence.csv"
+            leaf_path = d / "potential-leaf-evidence.csv"
             sel_path = d / f"potential-leaves-selected-{direction}.csv"
 
             if tree_path.exists():
                 lines.append(f"- Tree_{direction.upper()}: model saved to `{tree_path.name}`")
             else:
-                lines.append(f"- Tree_{direction.upper()}: not trained (insufficient tail exceedances)")
+                lines.append(
+                    f"- Tree_{direction.upper()}: not trained (insufficient tail exceedances)"
+                )
 
         if leaf_path.exists():
             evidence = pl.read_csv(leaf_path)
             if not evidence.is_empty():
                 total_leaves = evidence.get_column("leaf_id").n_unique()
-                dir_evidence = evidence.filter(pl.col("tree_direction").is_in(["up", "down"]))
                 lines.append(f"- Total leaves: `{total_leaves}` across both trees")
 
             for direction in ("up", "down"):
                 if sel_path.exists():
                     sel = pl.read_csv(sel_path) if sel_path.exists() else pl.DataFrame()
                     if not sel.is_empty():
-                        dir_sel = sel.filter(pl.col("tree_direction") == direction) if "tree_direction" in sel.columns else sel
+                        dir_sel = (
+                            sel.filter(pl.col("tree_direction") == direction)
+                            if "tree_direction" in sel.columns
+                            else sel
+                        )
                         lines.append(
-                            f"- Tree_{direction.upper()} leaves passing tail gate: `{dir_sel.height}`"
+                            f"- Tree_{direction.upper()} leaves passing tail gate: "
+                            f"`{dir_sel.height}`"
                         )
 
         # Global baseline from any tree JSON
@@ -343,6 +391,7 @@ class _TreeSummarySection:
             tree_path = d / f"tail-tree-{direction}.json"
             if tree_path.exists():
                 import json
+
                 with open(tree_path) as f:
                     data = json.load(f)
                 gb = data.get("metadata", {}).get("global_baseline", {})
@@ -350,7 +399,7 @@ class _TreeSummarySection:
                     lines.append(
                         f"- Global baseline (from Tree_{direction.upper()}): "
                         f"ξ={gb.get('xi', '?'):.3f}, σ={gb.get('sigma', '?'):.2f}, "
-                        f"tail_rate={gb.get('tail_rate', 0)*100:.1f}%"
+                        f"tail_rate={gb.get('tail_rate', 0) * 100:.1f}%"
                     )
                     break
 
@@ -364,6 +413,7 @@ class _TreeImportanceSection:
         if not imp_path.exists():
             # Try to extract from tree JSON
             import json
+
             rows = []
             for direction in ("up", "down"):
                 tree_path = d / f"tail-tree-{direction}.json"
@@ -387,7 +437,11 @@ class _TreeImportanceSection:
         if imp.is_empty():
             return ""
 
-        imp = imp.sort("gain_up", descending=True, nulls_last=True) if "gain_up" in imp.columns else imp
+        imp = (
+            imp.sort("gain_up", descending=True, nulls_last=True)
+            if "gain_up" in imp.columns
+            else imp
+        )
         lines = [
             "## Feature Importance",
             "",
@@ -435,7 +489,9 @@ class _TreeLeafSection:
             lpath = row.get("leaf_path", "—")
             if lpath and len(str(lpath)) > 80:
                 lpath = str(lpath)[:77] + "..."
-            lines.append(f"| {direction} | {leaf_id} | {lift} | {xi} | {sigma} | {n_tail} | {lpath} |")
+            lines.append(
+                f"| {direction} | {leaf_id} | {lift} | {xi} | {sigma} | {n_tail} | {lpath} |"
+            )
         return "\n".join(lines)
 
 
@@ -450,7 +506,7 @@ class _TreeReviewSection:
         lines = [
             "## Review Rows",
             "",
-            "Tiers: 1=tail_lift≥2.0,ξ>0.15,N≥50  |  2=lift≥1.5,N≥30  |  3=lift≥1.0  |  —=below gate",
+            "Tiers: 1=tail_lift≥2.0,ξ>0.15,N≥50  |  2=lift≥1.5,N≥30  | 3=lift≥1.0  |  —=below gate",
             "",
             "< evidence (cross-coin) | decision (coin-specific) >",
             "| T | Symbol | TailLift | ξ | Depth | Direction | Leaf | Caveat |",
@@ -466,7 +522,6 @@ class _TreeReviewSection:
             lpath = str(rd.get("leaf_path", "—")) if rd.get("leaf_path") else "—"
             if len(lpath) > 60:
                 lpath = lpath[:57] + "..."
-            suggestion = _suggestion_from_decision(d)
             lines.append(
                 f"| {tier} | `{d.symbol}` | {lift} | {xi} | {depth} | "
                 f"{d.direction} | {lpath} | {d.review_caveat} |"
@@ -496,13 +551,16 @@ class _TreeGateSection:
                 lines.append(f"- Tree_{direction.upper()}: no selected leaves artifact.")
 
         if total_passing == 0:
-            lines.append("- No leaves passed the tail gate. Review feature importance and "
-                          "consider lowering tail_threshold_pct or increasing history.")
+            lines.append(
+                "- No leaves passed the tail gate. Review feature importance and "
+                "consider lowering tail_threshold_pct or increasing history."
+            )
 
         return "\n".join(lines)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _read_rank_data(rank_path) -> dict[str, dict]:
     if not rank_path.exists():
@@ -516,11 +574,10 @@ def _read_rank_data(rank_path) -> dict[str, dict]:
                 (pl.col("tail_lift") >= 2.0)
                 & (pl.col("N_tail_exceedances").fill_null(0) >= 50)
                 & (pl.col("gpd_shape_xi").fill_null(0) > 0.15)
-            ).then(pl.lit("1"))
-            .when(
-                (pl.col("tail_lift") >= 1.5)
-                & (pl.col("N_tail_exceedances").fill_null(0) >= 30)
-            ).then(pl.lit("2"))
+            )
+            .then(pl.lit("1"))
+            .when((pl.col("tail_lift") >= 1.5) & (pl.col("N_tail_exceedances").fill_null(0) >= 30))
+            .then(pl.lit("2"))
             .when(pl.col("tail_lift") >= 1.0)
             .then(pl.lit("3"))
             .otherwise(pl.lit("—"))
@@ -533,7 +590,8 @@ def _read_rank_data(rank_path) -> dict[str, dict]:
             pl.when(
                 (pl.col("transition_information_gain_bits").fill_null(0) >= decile)
                 & (pl.col("symbol_count").fill_null(0) >= 15)
-            ).then(pl.lit("1"))
+            )
+            .then(pl.lit("1"))
             .when(pl.col("transition_information_gain_bits").fill_null(0) >= quartile)
             .then(pl.lit("2"))
             .when(pl.col("rank_score") > 0)
@@ -566,18 +624,24 @@ def _counts(frame: pl.DataFrame, column: str) -> str:
         .agg(pl.col("row_count").sum())
         .sort("row_count", descending=True)
     )
-    return ", ".join(
-        f"{row[column]}={row['row_count']}" for row in counts.head(8).iter_rows(named=True)
-    ) or "none"
+    return (
+        ", ".join(
+            f"{row[column]}={row['row_count']}" for row in counts.head(8).iter_rows(named=True)
+        )
+        or "none"
+    )
 
 
 def _value_counts(frame: pl.DataFrame, column: str) -> str:
     if column not in frame.columns:
         return "missing"
-    counts = frame.get_column(column).fill_null("missing").value_counts().sort("count", descending=True)
-    return ", ".join(
-        f"{row[column]}={row['count']}" for row in counts.head(8).iter_rows(named=True)
-    ) or "none"
+    counts = (
+        frame.get_column(column).fill_null("missing").value_counts().sort("count", descending=True)
+    )
+    return (
+        ", ".join(f"{row[column]}={row['count']}" for row in counts.head(8).iter_rows(named=True))
+        or "none"
+    )
 
 
 def _fmt(value: object) -> str:
