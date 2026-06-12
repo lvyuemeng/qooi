@@ -304,6 +304,61 @@ def test_rank_candidate_evidence_exposes_components_without_trading_signal() -> 
     assert "position_signal" not in ranked.columns
 
 
+def test_rank_candidate_evidence_penalizes_required_source_gaps_not_optional_absence() -> None:
+    candidates = pl.DataFrame(
+        [
+            {
+                "symbol": "BTC-USDT-SWAP",
+                "decision_timeframe": "1H",
+                "decision_bar_close_ms": 1,
+                "outcome_horizon": 12,
+                "matched_evidence_level": "market_decision_source",
+                "candidate_status": "matched_evidence",
+                "statistical_direction": "bullish",
+                "research_suggestion": "review",
+                "conditioned_observations": 100,
+                "symbol_count": 20,
+                "conditioned_p_up": 0.4,
+                "conditioned_p_down": 0.2,
+                "conditioned_p_flat": 0.4,
+                "lift_up": 1.4,
+                "lift_down": 0.7,
+                "lift_flat": 1.0,
+                "information_gain_bits": 0.5,
+                "transition_information_gain_bits": 0.2,
+                "tail_up_rate": 0.1,
+                "tail_down_rate": 0.05,
+                "avg_forward_max_return_pct": 4.0,
+                "avg_forward_min_return_pct": -2.0,
+                "avg_path_range_pct": 6.0,
+                "path_skew": 0.3,
+                "returned_to_origin_rate": 0.2,
+                "information_stability": 1.0,
+                "transition_information_stability": 1.0,
+                "evidence_status": "selected",
+                "transition_status": "supported",
+                "source_freshness": "fresh",
+                "source_age_ms": 0,
+                "market_alignment": "aligned",
+                "source_market_alignment": "source_aligned",
+                "required_missing_source_count": 1,
+                "required_stale_source_count": 2,
+                "provider_bounded_source_count": 3,
+                "optional_absent_source_count": 1,
+            }
+        ]
+    )
+
+    ranked = potential_rank.rank_candidate_evidence(candidates)
+    row = ranked.row(0, named=True)
+
+    assert "required_missing_source_count" in ranked.columns
+    assert "provider_bounded_source_count" in ranked.columns
+    assert "optional_absent_source_count" in ranked.columns
+    assert row["source_penalty_score"] == pytest.approx(2.6)
+    assert row["rank_penalty_component"] == pytest.approx(2.6)
+
+
 def test_potential_run_writes_report_and_diagnostics_without_trading_artifacts(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -338,6 +393,7 @@ transition_context_limit = 0
     assert "Tiers: 1=top-decile" in report
     assert (diagnostics / "coverage.csv").exists()
     assert (diagnostics / "source-freshness.csv").exists()
+    assert (diagnostics / "source-capability.csv").exists()
     assert (diagnostics / "potential-observation-summary.csv").exists()
     assert (diagnostics / "potential-evidence-summary.csv").exists()
     assert (diagnostics / "potential-evidence-selected.csv").exists()

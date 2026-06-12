@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 
 from qooi.scanner.config import PotentialConfig, SourceConfig, TransitionConfig
-from qooi.sources.artifacts import coerce_frame, source_manifest_family
+from qooi.sources.artifacts import coerce_frame, source_capability, source_manifest_family
 from qooi.sources.bundle import (
     SourceBundle,
     latest_timestamp,
@@ -28,6 +28,7 @@ from qooi.sources.collect import (
 from qooi.sources.context import (
     manifest_latest_maps,
     merge_context_frames,
+    source_availability,
 )
 from qooi.sources.coverage import (
     eligible_backfill_symbols,
@@ -133,6 +134,89 @@ def test_source_family_table_derives_manifest_aliases_and_merge_keys() -> None:
     assert funding.row_kind_col == "funding_source_kind"
     assert funding.history_kind == "history"
     assert funding.merge_keys == (("symbol", "funding_time"), ("symbol", "timestamp"))
+
+
+def test_source_capability_marks_rubik_contract_sources_provider_bounded() -> None:
+    capability = source_capability("long_short_ratio_contract", period="1H")
+
+    assert capability.family == "long_short_ratios"
+    assert capability.scope == "instrument"
+    assert capability.max_rows == 1440
+    assert capability.supports_latest_refresh_int == 1
+    assert capability.supports_backfill_int == 1
+    assert capability.required_for_review_int == 1
+    assert capability.required_for_evidence_int == 0
+    assert capability.optional_int == 0
+
+
+def test_source_availability_uses_frame_freshness_over_latest_missing_manifest() -> None:
+    current_ms = 2_000_000
+    config = PotentialConfig(
+        days=730,
+        transition=TransitionConfig(history_days=730),
+        source=SourceConfig(max_staleness_hours=24, rubik_period="1H"),
+    )
+    frames = {
+        "long_short_ratios": pl.DataFrame(
+            {
+                "symbol": ["ACT-USDT-SWAP", "ACT-USDT-SWAP"],
+                "timestamp": [current_ms - 3_600_000, current_ms - 1_800_000],
+                "long_short_ratio": [1.1, 1.2],
+            }
+        )
+    }
+    manifest = manifest_frame(
+        [
+            source_manifest_row(
+                symbol="ACT-USDT-SWAP",
+                source="long_short_ratio_contract",
+                phase="collect-source",
+                status="missing",
+                rows=0,
+                warning="long_short_ratio_contract_missing",
+            )
+        ]
+    )
+
+    rows = source_availability(
+        frames,
+        manifest,
+        ("ACT-USDT-SWAP",),
+        config,
+        current_ms=current_ms,
+    )
+    row = next(item for item in rows if item.family == "long_short_ratios")
+
+    assert row.rows == 2
+    assert row.latest_age_hours == 0.5
+    assert row.latest_fetch_status == "missing"
+    assert row.frame_fresh_int == 1
+    assert row.fetch_failed_frame_fresh_int == 1
+    assert row.frame_missing_int == 0
+    assert row.usable_int == 1
+    assert row.status == "provider_bounded"
+    assert row.provider_bounded_int == 1
+    assert row.coverage_capability_pct > row.coverage_target_pct
+
+
+def test_source_availability_treats_messages_as_optional_absent_without_penalty() -> None:
+    config = PotentialConfig(source=SourceConfig(max_staleness_hours=24))
+
+    rows = source_availability(
+        {},
+        pl.DataFrame(),
+        ("BTC-USDT-SWAP",),
+        config,
+        current_ms=2_000_000,
+    )
+    row = next(item for item in rows if item.family == "messages")
+
+    assert row.rows == 0
+    assert row.status == "optional_absent"
+    assert row.optional_absent_int == 1
+    assert row.frame_missing_int == 0
+    assert row.rank_penalty_weight == 0.0
+    assert row.source_penalty_component == 0.0
 
 
 def test_funding_history_normalizer_marks_history_rows() -> None:

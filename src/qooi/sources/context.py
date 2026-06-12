@@ -16,6 +16,9 @@ from qooi.sources import (
 )
 from qooi.sources.artifacts import (
     SOURCE_ARTIFACT_SPECS,
+    SourceCapability,
+    source_capability,
+    source_family,
     source_manifest_family,
     write_frame_artifact,
 )
@@ -39,23 +42,25 @@ CONTEXT_FAMILIES = (
 )
 
 
+class SourceSection(Protocol):
+    refresh_mode: Literal["inherit", "incremental", "cache_only", "force"]
+    book_mode: BookMode
+    book_depth: int
+    max_staleness_hours: int
+    trade_limit: int
+    funding_limit: int
+    rubik_period: str
+    rubik_limit: int
+    rubik_taker_unit: Literal["0", "1", "2"]
+    disabled_sources: tuple[str, ...]
+    disabled_symbols: tuple[str, ...]
+
+
+class TransitionSection(Protocol):
+    history_days: int
+
+
 class PotentialSourceConfig(Protocol):
-    class SourceSection(Protocol):
-        refresh_mode: Literal["inherit", "incremental", "cache_only", "force"]
-        book_mode: BookMode
-        book_depth: int
-        max_staleness_hours: int
-        trade_limit: int
-        funding_limit: int
-        rubik_period: str
-        rubik_limit: int
-        rubik_taker_unit: Literal["0", "1", "2"]
-        disabled_sources: tuple[str, ...]
-        disabled_symbols: tuple[str, ...]
-
-    class TransitionSection(Protocol):
-        history_days: int
-
     output: Path
     days: int
     fetch_concurrency: int
@@ -72,6 +77,25 @@ class SourceAvailability:
     latest_timestamp: int | None
     status: str
     warning: str
+    latest_age_hours: float | None = None
+    freshness_threshold_hours: float = 0.0
+    provider_cap_rows: int = 0
+    provider_cap_lookback_days: int | None = None
+    coverage_target_pct: float = 0.0
+    coverage_capability_pct: float = 0.0
+    frame_fresh_int: int = 0
+    frame_stale_int: int = 0
+    frame_missing_int: int = 0
+    provider_bounded_int: int = 0
+    optional_absent_int: int = 0
+    fetch_failed_frame_fresh_int: int = 0
+    usable_int: int = 0
+    required_for_review_int: int = 0
+    required_for_evidence_int: int = 0
+    rank_penalty_weight: float = 0.0
+    latest_fetch_status: str = ""
+    latest_fetch_warning: str = ""
+    source_penalty_component: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -218,19 +242,33 @@ def source_availability(
     manifest: pl.DataFrame,
     symbols: tuple[str, ...],
     config: PotentialSourceConfig,
+    *,
+    current_ms: int | None = None,
 ) -> list[SourceAvailability]:
     rows: list[SourceAvailability] = []
     symbol_frame = pl.DataFrame({"symbol": list(symbols)}, schema={"symbol": pl.String})
-    status_by_family_symbol, warning_by_family_symbol = manifest_latest_maps(manifest)
+    fetch_status_by_family_symbol, fetch_warning_by_family_symbol = manifest_latest_maps(manifest)
+    observed_ms = now_ms() if current_ms is None else current_ms
+    target_rows_by_family = _target_rows_by_family(config)
+    threshold_hours = float(config.source.max_staleness_hours)
     for family in CONTEXT_FAMILIES:
         frame = frames.get(family, pl.DataFrame())
+        family_spec = source_family(family)
+        capability = source_capability(family, period=config.source.rubik_period)
+        scanner_target_rows = target_rows_by_family.get(family, 0)
         if frame.is_empty() or "symbol" not in frame.columns:
             availability = symbol_frame.with_columns(
                 pl.lit(0, dtype=pl.Int64).alias("rows"),
                 pl.lit(None, dtype=pl.Int64).alias("latest_timestamp"),
             )
         else:
-            timestamp_col = "timestamp" if "timestamp" in frame.columns else "known_at_ms"
+            timestamp_col = (
+                family_spec.timestamp_col
+                if family_spec.timestamp_col in frame.columns
+                else "timestamp"
+            )
+            if timestamp_col not in frame.columns:
+                timestamp_col = "known_at_ms" if "known_at_ms" in frame.columns else "timestamp"
             grouped = frame.group_by("symbol").agg(
                 pl.len().cast(pl.Int64).alias("rows"),
                 pl.col(timestamp_col).max().cast(pl.Int64).alias("latest_timestamp")
@@ -245,25 +283,168 @@ def source_availability(
         )
         for current in availability_rows:
             symbol = str(current["symbol"])
-            if family in config.source.disabled_sources or symbol in config.source.disabled_symbols:
-                rows.append(SourceAvailability(family, symbol, 0, None, "disabled", "disabled"))
-                continue
             latest = current["latest_timestamp"]
-            status = status_by_family_symbol.get((family, symbol))
-            warning = warning_by_family_symbol.get((family, symbol), "")
-            if status is None:
-                status = "available" if int(current["rows"] or 0) else "missing"
+            observed_rows = int(current["rows"] or 0)
+            if family in config.source.disabled_sources or symbol in config.source.disabled_symbols:
+                rows.append(_disabled_availability(family, symbol, capability))
+                continue
+            latest_fetch_status = fetch_status_by_family_symbol.get((family, symbol), "")
+            latest_fetch_warning = fetch_warning_by_family_symbol.get((family, symbol), "")
+            latest_age_hours = (
+                round((observed_ms - int(latest)) / 3_600_000.0, 6) if latest is not None else None
+            )
+            frame_fresh_int = int(
+                observed_rows > 0
+                and latest_age_hours is not None
+                and latest_age_hours <= threshold_hours
+            )
+            frame_stale_int = int(
+                observed_rows > 0
+                and latest_age_hours is not None
+                and latest_age_hours > threshold_hours
+            )
+            optional_absent_int = int(capability.optional_int == 1 and observed_rows == 0)
+            frame_missing_int = int(
+                capability.required_for_review_int == 1
+                and observed_rows == 0
+                and not optional_absent_int
+            )
+            provider_bounded_int = int(
+                capability.max_rows > 0
+                and scanner_target_rows > capability.max_rows
+                and observed_rows > 0
+            )
+            coverage_target_pct = _coverage_pct(observed_rows, scanner_target_rows)
+            capability_rows = (
+                min(scanner_target_rows, capability.max_rows)
+                if scanner_target_rows
+                else capability.max_rows
+            )
+            coverage_capability_pct = _coverage_pct(observed_rows, capability_rows)
+            fetch_failed_frame_fresh_int = int(
+                latest_fetch_status in {"failed", "missing"} and frame_fresh_int == 1
+            )
+            usable_int = int(frame_fresh_int == 1 or fetch_failed_frame_fresh_int == 1)
+            status = _availability_status(
+                frame_fresh_int=frame_fresh_int,
+                frame_stale_int=frame_stale_int,
+                frame_missing_int=frame_missing_int,
+                provider_bounded_int=provider_bounded_int,
+                optional_absent_int=optional_absent_int,
+            )
+            source_penalty_component = _source_penalty_component(
+                frame_missing_int=frame_missing_int,
+                frame_stale_int=frame_stale_int,
+                provider_bounded_int=provider_bounded_int,
+                optional_absent_int=optional_absent_int,
+                fetch_failed_frame_fresh_int=fetch_failed_frame_fresh_int,
+                weight=capability.rank_penalty_weight,
+            )
             rows.append(
                 SourceAvailability(
-                    family,
-                    symbol,
-                    int(current["rows"] or 0),
-                    int(latest) if latest is not None else None,
-                    status,
-                    warning,
+                    family=family,
+                    symbol=symbol,
+                    rows=observed_rows,
+                    latest_timestamp=int(latest) if latest is not None else None,
+                    status=status,
+                    warning=latest_fetch_warning,
+                    latest_age_hours=latest_age_hours,
+                    freshness_threshold_hours=threshold_hours,
+                    provider_cap_rows=capability.max_rows,
+                    provider_cap_lookback_days=capability.max_lookback_days,
+                    coverage_target_pct=coverage_target_pct,
+                    coverage_capability_pct=coverage_capability_pct,
+                    frame_fresh_int=frame_fresh_int,
+                    frame_stale_int=frame_stale_int,
+                    frame_missing_int=frame_missing_int,
+                    provider_bounded_int=provider_bounded_int,
+                    optional_absent_int=optional_absent_int,
+                    fetch_failed_frame_fresh_int=fetch_failed_frame_fresh_int,
+                    usable_int=usable_int,
+                    required_for_review_int=capability.required_for_review_int,
+                    required_for_evidence_int=capability.required_for_evidence_int,
+                    rank_penalty_weight=capability.rank_penalty_weight,
+                    latest_fetch_status=latest_fetch_status,
+                    latest_fetch_warning=latest_fetch_warning,
+                    source_penalty_component=source_penalty_component,
                 )
             )
     return rows
+
+
+def _target_rows_by_family(config: PotentialSourceConfig) -> dict[str, int]:
+    target_days = max(config.days, config.transition.history_days)
+    return {
+        "books": 1,
+        "trades": max(1, config.source.trade_limit),
+        "funding": funding_min_rows(target_days),
+        "open_interest": period_min_rows(target_days, config.source.rubik_period),
+        "taker_volume": period_min_rows(target_days, config.source.rubik_period),
+        "long_short_ratios": period_min_rows(target_days, config.source.rubik_period),
+        "messages": 0,
+    }
+
+
+def _coverage_pct(rows: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(min(rows / denominator * 100.0, 100.0), 6)
+
+
+def _availability_status(
+    *,
+    frame_fresh_int: int,
+    frame_stale_int: int,
+    frame_missing_int: int,
+    provider_bounded_int: int,
+    optional_absent_int: int,
+) -> str:
+    if optional_absent_int:
+        return "optional_absent"
+    if frame_missing_int:
+        return "missing"
+    if frame_stale_int:
+        return "stale"
+    if frame_fresh_int and provider_bounded_int:
+        return "provider_bounded"
+    if frame_fresh_int:
+        return "fresh"
+    return "missing"
+
+
+def _source_penalty_component(
+    *,
+    frame_missing_int: int,
+    frame_stale_int: int,
+    provider_bounded_int: int,
+    optional_absent_int: int,
+    fetch_failed_frame_fresh_int: int,
+    weight: float,
+) -> float:
+    if optional_absent_int:
+        return 0.0
+    penalty = frame_missing_int * 2.0 + frame_stale_int * 0.8 + provider_bounded_int * 0.05
+    if fetch_failed_frame_fresh_int:
+        penalty += 0.05
+    return round(penalty * weight, 6)
+
+
+def _disabled_availability(
+    family: str, symbol: str, capability: SourceCapability
+) -> SourceAvailability:
+    return SourceAvailability(
+        family=family,
+        symbol=symbol,
+        rows=0,
+        latest_timestamp=None,
+        status="disabled",
+        warning="disabled",
+        frame_missing_int=capability.required_for_review_int,
+        required_for_review_int=capability.required_for_review_int,
+        required_for_evidence_int=capability.required_for_evidence_int,
+        rank_penalty_weight=capability.rank_penalty_weight,
+        source_penalty_component=0.0,
+    )
 
 
 def manifest_latest_maps(

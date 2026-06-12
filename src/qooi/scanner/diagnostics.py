@@ -40,6 +40,7 @@ class DiagnosticFrames:
     coverage: pl.DataFrame
     history_feasibility: pl.DataFrame
     source_freshness: pl.DataFrame
+    source_capability: pl.DataFrame
     universe: pl.DataFrame
     fetch_audit: pl.DataFrame
     transition_edges: pl.DataFrame
@@ -162,6 +163,7 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         coverage=coverage_frame(inputs.bars.coverage),
         history_feasibility=history_feasibility,
         source_freshness=source_freshness,
+        source_capability=_source_capability_frame(source_freshness),
         universe=_universe_frame(inputs.universe),
         fetch_audit=_fetch_audit_frame(inputs.bars.coverage, inputs.context.availability),
         transition_edges=_transition_edges_frame(inputs.transitions.edges),
@@ -206,6 +208,7 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         "coverage": frames.coverage,
         "history-feasibility": frames.history_feasibility,
         "source-freshness": frames.source_freshness,
+        "source-capability": frames.source_capability,
         "universe": frames.universe,
         "fetch-audit": frames.fetch_audit,
         "transition-edges": frames.transition_edges,
@@ -359,7 +362,28 @@ def _source_freshness_frame(availability: tuple[SourceAvailability, ...]) -> pl.
             "symbol": [row.symbol for row in availability],
             "rows": [row.rows for row in availability],
             "latest_timestamp": [row.latest_timestamp for row in availability],
+            "latest_age_hours": [row.latest_age_hours for row in availability],
+            "freshness_threshold_hours": [row.freshness_threshold_hours for row in availability],
+            "provider_cap_rows": [row.provider_cap_rows for row in availability],
+            "provider_cap_lookback_days": [row.provider_cap_lookback_days for row in availability],
+            "coverage_target_pct": [row.coverage_target_pct for row in availability],
+            "coverage_capability_pct": [row.coverage_capability_pct for row in availability],
             "status": [row.status for row in availability],
+            "frame_fresh_int": [row.frame_fresh_int for row in availability],
+            "frame_stale_int": [row.frame_stale_int for row in availability],
+            "frame_missing_int": [row.frame_missing_int for row in availability],
+            "provider_bounded_int": [row.provider_bounded_int for row in availability],
+            "optional_absent_int": [row.optional_absent_int for row in availability],
+            "fetch_failed_frame_fresh_int": [
+                row.fetch_failed_frame_fresh_int for row in availability
+            ],
+            "usable_int": [row.usable_int for row in availability],
+            "required_for_review_int": [row.required_for_review_int for row in availability],
+            "required_for_evidence_int": [row.required_for_evidence_int for row in availability],
+            "rank_penalty_weight": [row.rank_penalty_weight for row in availability],
+            "source_penalty_component": [row.source_penalty_component for row in availability],
+            "latest_fetch_status": [row.latest_fetch_status for row in availability],
+            "latest_fetch_warning": [row.latest_fetch_warning for row in availability],
             "warning": [row.warning for row in availability],
         },
         schema={
@@ -367,10 +391,55 @@ def _source_freshness_frame(availability: tuple[SourceAvailability, ...]) -> pl.
             "symbol": pl.String,
             "rows": pl.Int64,
             "latest_timestamp": pl.Int64,
+            "latest_age_hours": pl.Float64,
+            "freshness_threshold_hours": pl.Float64,
+            "provider_cap_rows": pl.Int64,
+            "provider_cap_lookback_days": pl.Int64,
+            "coverage_target_pct": pl.Float64,
+            "coverage_capability_pct": pl.Float64,
             "status": pl.String,
+            "frame_fresh_int": pl.Int64,
+            "frame_stale_int": pl.Int64,
+            "frame_missing_int": pl.Int64,
+            "provider_bounded_int": pl.Int64,
+            "optional_absent_int": pl.Int64,
+            "fetch_failed_frame_fresh_int": pl.Int64,
+            "usable_int": pl.Int64,
+            "required_for_review_int": pl.Int64,
+            "required_for_evidence_int": pl.Int64,
+            "rank_penalty_weight": pl.Float64,
+            "source_penalty_component": pl.Float64,
+            "latest_fetch_status": pl.String,
+            "latest_fetch_warning": pl.String,
             "warning": pl.String,
         },
     )
+
+
+def _source_capability_frame(source_freshness: pl.DataFrame) -> pl.DataFrame:
+    columns = [
+        "source_family",
+        "provider_cap_rows",
+        "provider_cap_lookback_days",
+        "freshness_threshold_hours",
+        "required_for_review_int",
+        "required_for_evidence_int",
+        "rank_penalty_weight",
+    ]
+    if source_freshness.is_empty():
+        return pl.DataFrame(
+            schema={
+                "source_family": pl.String,
+                "provider_cap_rows": pl.Int64,
+                "provider_cap_lookback_days": pl.Int64,
+                "freshness_threshold_hours": pl.Float64,
+                "required_for_review_int": pl.Int64,
+                "required_for_evidence_int": pl.Int64,
+                "rank_penalty_weight": pl.Float64,
+                "symbol_count": pl.UInt32,
+            }
+        )
+    return source_freshness.group_by(columns, maintain_order=True).len(name="symbol_count")
 
 
 def _universe_frame(universe: PotentialUniverse) -> pl.DataFrame:
@@ -745,8 +814,8 @@ def _watchlist_feasibility_frame(
         .then(pl.lit("blocked_by_evidence_gate"))
         .when(pl.col("history_status").is_in(["missing_history", "history_integrity_issue"]))
         .then(pl.lit("blocked_by_history"))
-        .when(pl.col("source_status") == "all_sources_missing_or_disabled")
-        .then(pl.lit("source_blind_review"))
+        .when(pl.col("source_status").is_in(["required_sources_missing", "required_sources_stale"]))
+        .then(pl.lit("source_limited_review"))
         .when(pl.col("history_status").is_in(["cache_incomplete", "fetch_limited", "low_coverage"]))
         .then(pl.lit("coverage_limited_review"))
         .otherwise(pl.lit("reviewable"))
@@ -790,25 +859,29 @@ def _symbol_source_feasibility(frame: pl.DataFrame) -> pl.DataFrame:
         frame.group_by("symbol")
         .agg(
             pl.len().alias("source_family_rows"),
-            pl.col("status")
-            .is_in(["available", "ok"])
-            .cast(pl.Int64)
-            .sum()
-            .alias("fresh_source_families"),
-            pl.col("status")
-            .is_in(["missing", "disabled"])
-            .cast(pl.Int64)
-            .sum()
-            .alias("missing_source_families"),
+            pl.col("usable_int").sum().alias("fresh_source_families"),
+            pl.col("frame_missing_int").sum().alias("missing_source_families"),
+            pl.col("frame_missing_int").sum().alias("required_missing_source_count"),
+            pl.col("frame_stale_int").sum().alias("required_stale_source_count"),
+            pl.col("provider_bounded_int").sum().alias("provider_bounded_source_count"),
+            pl.col("optional_absent_int").sum().alias("optional_absent_source_count"),
+            pl.when(pl.col("required_for_review_int") == 1)
+            .then(pl.col("coverage_capability_pct"))
+            .otherwise(None)
+            .min()
+            .alias("min_source_capability_coverage_pct"),
+            pl.sum("source_penalty_component").alias("source_penalty_score"),
             pl.concat_str("source_family", "status", separator="=")
-            .str.concat(";")
+            .str.join(";")
             .alias("source_reason"),
         )
         .with_columns(
-            pl.when(pl.col("fresh_source_families") > 0)
+            pl.when(pl.col("required_missing_source_count") > 0)
+            .then(pl.lit("required_sources_missing"))
+            .when(pl.col("required_stale_source_count") > 0)
+            .then(pl.lit("required_sources_stale"))
+            .when(pl.col("fresh_source_families") > 0)
             .then(pl.lit("source_context_available"))
-            .when(pl.col("missing_source_families") >= pl.col("source_family_rows"))
-            .then(pl.lit("all_sources_missing_or_disabled"))
             .otherwise(pl.lit("source_context_partial"))
             .alias("source_status")
         )
@@ -819,6 +892,12 @@ def _symbol_source_feasibility(frame: pl.DataFrame) -> pl.DataFrame:
             "source_family_rows",
             "fresh_source_families",
             "missing_source_families",
+            "required_missing_source_count",
+            "required_stale_source_count",
+            "provider_bounded_source_count",
+            "optional_absent_source_count",
+            "min_source_capability_coverage_pct",
+            "source_penalty_score",
         )
     )
 
@@ -849,6 +928,7 @@ def _run_ladder_pipeline(
         return_threshold_pct=inputs.config.transition.return_threshold_pct,
     )
     candidates = candidate_eval.candidate_evidence_frame(observations, evidence)
+    candidates = _join_candidate_source_constraints(candidates, inputs.context.availability)
     ranked = rank_eval.rank_candidates(candidates)
     return LadderResult(evidence=evidence, candidates=candidates, ranked=ranked, sections=())
 
@@ -867,6 +947,7 @@ def _run_tailtree_pipeline(
         tree_up=result.tree_up,
         tree_down=result.tree_down,
     )
+    candidates = _join_candidate_source_constraints(candidates, inputs.context.availability)
     ranked = rank_eval.rank_candidates(candidates)
     return TailtreeResult(
         evidence=result.evidence,
@@ -876,6 +957,47 @@ def _run_tailtree_pipeline(
         tree_down=result.tree_down,
         sections=(),
     )
+
+
+def _join_candidate_source_constraints(
+    candidates: pl.DataFrame, availability: tuple[SourceAvailability, ...]
+) -> pl.DataFrame:
+    if candidates.is_empty() or not availability:
+        return candidates
+    source_context = pl.DataFrame(
+        {
+            "symbol": [row.symbol for row in availability],
+            "required_missing_source_count": [row.frame_missing_int for row in availability],
+            "required_stale_source_count": [row.frame_stale_int for row in availability],
+            "provider_bounded_source_count": [row.provider_bounded_int for row in availability],
+            "optional_absent_source_count": [row.optional_absent_int for row in availability],
+            "source_penalty_score": [row.source_penalty_component for row in availability],
+        },
+        schema={
+            "symbol": pl.String,
+            "required_missing_source_count": pl.Int64,
+            "required_stale_source_count": pl.Int64,
+            "provider_bounded_source_count": pl.Int64,
+            "optional_absent_source_count": pl.Int64,
+            "source_penalty_score": pl.Float64,
+        },
+    )
+    if source_context.is_empty():
+        return candidates
+    by_symbol = source_context.group_by("symbol").agg(
+        pl.sum("required_missing_source_count"),
+        pl.sum("required_stale_source_count"),
+        pl.sum("provider_bounded_source_count"),
+        pl.sum("optional_absent_source_count"),
+        pl.sum("source_penalty_score"),
+    )
+    existing = [
+        column
+        for column in by_symbol.columns
+        if column in candidates.columns and column != "symbol"
+    ]
+    base = candidates.drop(existing) if existing else candidates
+    return base.join(by_symbol, on="symbol", how="left")
 
 
 def _tailtree_model_root(inputs) -> Path:
@@ -898,7 +1020,7 @@ def _tailtree_artifact_metadata(
 
 def _write_tailtree_artifacts(
     inputs,
-    evidence_by_direction: dict[tailrun_eval.TailtreeDirection, pl.DataFrame],
+    evidence_by_direction: dict[str, pl.DataFrame],
     trees: dict[tailrun_eval.TailtreeDirection, tailrun_eval.TailtreeArtifactTree],
 ) -> None:
     tailrun_eval._write_tailtree_artifacts(inputs, evidence_by_direction, trees)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 import polars as pl
+
+PolarsDtype: TypeAlias = type[pl.DataType] | pl.DataType
 
 
 class TailTreePredictor(Protocol):
@@ -79,7 +81,7 @@ EVIDENCE_VALUE_COLUMNS = (
     "research_suggestion",
 )
 
-CANDIDATE_EVIDENCE_SCHEMA = {
+CANDIDATE_EVIDENCE_SCHEMA: dict[str, PolarsDtype] = {
     "symbol": pl.String,
     "decision_timeframe": pl.String,
     "decision_bar_close_ms": pl.Int64,
@@ -113,6 +115,11 @@ CANDIDATE_EVIDENCE_SCHEMA = {
     "source_age_ms": pl.Int64,
     "market_alignment": pl.String,
     "source_market_alignment": pl.String,
+    "required_missing_source_count": pl.Int64,
+    "required_stale_source_count": pl.Int64,
+    "provider_bounded_source_count": pl.Int64,
+    "optional_absent_source_count": pl.Int64,
+    "source_penalty_score": pl.Float64,
     # Tree path columns (nullable — ladder path produces null)
     "tail_lift": pl.Float64,
     "gpd_shape_xi": pl.Float64,
@@ -125,7 +132,7 @@ CANDIDATE_EVIDENCE_SCHEMA = {
 }
 
 
-CANDIDATE_RANK_SCHEMA = CANDIDATE_EVIDENCE_SCHEMA | {
+CANDIDATE_RANK_SCHEMA: dict[str, PolarsDtype] = CANDIDATE_EVIDENCE_SCHEMA | {
     "rank_information_component": pl.Float64,
     "rank_transition_component": pl.Float64,
     "rank_tail_component": pl.Float64,
@@ -406,27 +413,40 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
             ).alias("rank_quality_component"),
         )
 
-    ranked = ranked.with_columns(
-        (
-            pl.when(pl.col("source_freshness") == "stale").then(pl.lit(1.0)).otherwise(pl.lit(0.0))
-            + pl.when(pl.col("candidate_status") != "matched_evidence")
-            .then(pl.lit(2.0))
-            .otherwise(pl.lit(0.0))
-        ).alias("rank_penalty_component"),
-    ).with_columns(
-        (
-            pl.col("rank_information_component")
-            + pl.col("rank_transition_component")
-            + pl.col("rank_tail_component")
-            + pl.col("rank_path_component")
-            + pl.col("rank_stability_component")
-            + pl.col("rank_quality_component")
-            - pl.col("rank_penalty_component")
-        ).alias("rank_score"),
-        pl.when(pl.col("candidate_status") == "matched_evidence")
-        .then(pl.lit("matched_selected_evidence"))
-        .otherwise(pl.col("candidate_status"))
-        .alias("rank_reason"),
+    ranked = (
+        ranked.with_columns(
+            (
+                pl.col("required_missing_source_count").fill_null(0).cast(pl.Float64) * 2.0
+                + pl.col("required_stale_source_count").fill_null(0).cast(pl.Float64) * 0.3
+                + pl.col("provider_bounded_source_count").fill_null(0).cast(pl.Float64) * 0.0
+            ).alias("source_penalty_score")
+        )
+        .with_columns(
+            (
+                pl.col("source_penalty_score")
+                + pl.when(pl.col("source_freshness") == "stale")
+                .then(pl.lit(1.0))
+                .otherwise(pl.lit(0.0))
+                + pl.when(pl.col("candidate_status") != "matched_evidence")
+                .then(pl.lit(2.0))
+                .otherwise(pl.lit(0.0))
+            ).alias("rank_penalty_component"),
+        )
+        .with_columns(
+            (
+                pl.col("rank_information_component")
+                + pl.col("rank_transition_component")
+                + pl.col("rank_tail_component")
+                + pl.col("rank_path_component")
+                + pl.col("rank_stability_component")
+                + pl.col("rank_quality_component")
+                - pl.col("rank_penalty_component")
+            ).alias("rank_score"),
+            pl.when(pl.col("candidate_status") == "matched_evidence")
+            .then(pl.lit("matched_selected_evidence"))
+            .otherwise(pl.col("candidate_status"))
+            .alias("rank_reason"),
+        )
     )
     ranked = _select_schema(ranked.sort("rank_score", descending=True), CANDIDATE_RANK_SCHEMA)
     if has_tail_lift and "tree_direction" in ranked.columns:
@@ -436,7 +456,7 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
     return ranked
 
 
-def _select_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+def _select_schema(frame: pl.DataFrame, schema: dict[str, PolarsDtype]) -> pl.DataFrame:
     if frame.is_empty() and not frame.columns:
         return pl.DataFrame(schema=schema)
     filled = frame.with_columns(

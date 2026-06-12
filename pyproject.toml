@@ -49,6 +49,18 @@ extend-safe-fixes = ["E402"]
 [tool.ruff.format]
 quote-style = "double"
 
+[tool.ty.environment]
+python-version = "3.11"
+root = ["./src"]
+
+[tool.ty.src]
+include = [
+    "src/qooi/sources/artifacts.py",
+    "src/qooi/sources/context.py",
+    "src/qooi/scanner/diagnostics.py",
+    "src/qooi/scanner/rank.py",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/qooi"]
 

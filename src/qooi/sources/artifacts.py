@@ -44,6 +44,23 @@ class SourceFamily:
     known_at_col: str | None = None
 
 
+@dataclass(frozen=True)
+class SourceCapability:
+    family: str
+    raw_source: str
+    scope: str
+    period: str
+    max_rows: int
+    max_lookback_days: int | None
+    earliest_provider_ms: int | None
+    supports_latest_refresh_int: int
+    supports_backfill_int: int
+    required_for_review_int: int
+    required_for_evidence_int: int
+    optional_int: int
+    rank_penalty_weight: float
+
+
 SOURCE_ARTIFACT_SPECS: dict[str, ArtifactSpec] = {
     "source_manifest": ArtifactSpec(
         "source_manifest", "source-manifest.csv", SOURCE_MANIFEST_SCHEMA
@@ -110,7 +127,7 @@ SOURCE_FAMILIES: dict[str, SourceFamily] = {
         "open_interest",
         "source_open_interest",
         "timestamp",
-        ("open_interest_history",),
+        ("open_interest_history", "open_interest"),
         (("symbol", "timestamp"),),
     ),
     "taker_volume": SourceFamily(
@@ -146,13 +163,217 @@ _RAW_SOURCE_FAMILIES = {
     for raw_source in family.raw_sources
 }
 
+_UNBOUNDED_ROWS = 1_000_000_000
+
+_SOURCE_CAPABILITY_BASE: dict[str, SourceCapability] = {
+    "books": SourceCapability(
+        "books", "books", "instrument", "snapshot", 1, None, None, 1, 0, 1, 0, 0, 1.0
+    ),
+    "trades": SourceCapability(
+        "trades", "trades", "instrument", "recent", 100, None, None, 1, 0, 1, 0, 0, 1.0
+    ),
+    "funding": SourceCapability(
+        "funding", "funding", "instrument", "8H", _UNBOUNDED_ROWS, None, None, 1, 1, 1, 0, 0, 1.0
+    ),
+    "funding_rate": SourceCapability(
+        "funding", "funding_rate", "instrument", "current", 1, None, None, 1, 0, 1, 0, 0, 1.0
+    ),
+    "open_interest": SourceCapability(
+        "open_interest", "open_interest", "instrument", "current", 1, None, None, 1, 0, 1, 0, 0, 1.0
+    ),
+    "open_interest_history": SourceCapability(
+        "open_interest",
+        "open_interest_history",
+        "instrument",
+        "1H",
+        1440,
+        60,
+        None,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0.2,
+    ),
+    "taker_volume_contract": SourceCapability(
+        "taker_volume",
+        "taker_volume_contract",
+        "instrument",
+        "1H",
+        1440,
+        60,
+        None,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0.2,
+    ),
+    "long_short_ratio_contract": SourceCapability(
+        "long_short_ratios",
+        "long_short_ratio_contract",
+        "instrument",
+        "1H",
+        1440,
+        60,
+        1704067200000,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0.2,
+    ),
+    "top_trader_long_short_account_ratio_contract": SourceCapability(
+        "long_short_ratios",
+        "top_trader_long_short_account_ratio_contract",
+        "instrument",
+        "1H",
+        1440,
+        60,
+        1711065600000,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0.2,
+    ),
+    "top_trader_long_short_position_ratio_contract": SourceCapability(
+        "long_short_ratios",
+        "top_trader_long_short_position_ratio_contract",
+        "instrument",
+        "1H",
+        1440,
+        60,
+        1711065600000,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0.2,
+    ),
+    "margin_loan_ratio": SourceCapability(
+        "ccy_rubik_context",
+        "margin_loan_ratio",
+        "currency",
+        "1H",
+        720,
+        30,
+        None,
+        1,
+        1,
+        0,
+        0,
+        1,
+        0.0,
+    ),
+    "ccy_long_short_account_ratio": SourceCapability(
+        "ccy_rubik_context",
+        "ccy_long_short_account_ratio",
+        "currency",
+        "1H",
+        720,
+        30,
+        None,
+        1,
+        1,
+        0,
+        0,
+        1,
+        0.0,
+    ),
+    "ccy_open_interest_volume": SourceCapability(
+        "ccy_rubik_context",
+        "ccy_open_interest_volume",
+        "currency",
+        "1H",
+        720,
+        30,
+        None,
+        1,
+        1,
+        0,
+        0,
+        1,
+        0.0,
+    ),
+    "messages": SourceCapability(
+        "messages", "messages", "external", "event", 0, None, None, 0, 0, 0, 0, 1, 0.0
+    ),
+}
+
+SOURCE_CAPABILITIES: dict[str, SourceCapability] = _SOURCE_CAPABILITY_BASE
+
 
 def source_family(name: str) -> SourceFamily:
     return SOURCE_FAMILIES[name]
 
 
+def source_capability(family_or_raw_source: str, *, period: str = "1H") -> SourceCapability:
+    raw_source = family_or_raw_source
+    if family_or_raw_source in SOURCE_FAMILIES:
+        raw_source = SOURCE_FAMILIES[family_or_raw_source].raw_sources[0]
+    base = SOURCE_CAPABILITIES[raw_source]
+    if raw_source in {
+        "open_interest_history",
+        "taker_volume_contract",
+        "long_short_ratio_contract",
+        "top_trader_long_short_account_ratio_contract",
+        "top_trader_long_short_position_ratio_contract",
+    }:
+        return SourceCapability(
+            base.family,
+            base.raw_source,
+            base.scope,
+            period,
+            base.max_rows,
+            base.max_lookback_days,
+            base.earliest_provider_ms,
+            base.supports_latest_refresh_int,
+            base.supports_backfill_int,
+            base.required_for_review_int,
+            base.required_for_evidence_int,
+            base.optional_int,
+            base.rank_penalty_weight,
+        )
+    if raw_source in {
+        "margin_loan_ratio",
+        "ccy_long_short_account_ratio",
+        "ccy_open_interest_volume",
+    }:
+        max_rows, lookback_days = _ccy_rubik_cap(period)
+        return SourceCapability(
+            base.family,
+            base.raw_source,
+            base.scope,
+            period,
+            max_rows,
+            lookback_days,
+            base.earliest_provider_ms,
+            base.supports_latest_refresh_int,
+            base.supports_backfill_int,
+            base.required_for_review_int,
+            base.required_for_evidence_int,
+            base.optional_int,
+            base.rank_penalty_weight,
+        )
+    return base
+
+
 def source_manifest_family(raw_source: str) -> str:
     return _RAW_SOURCE_FAMILIES.get(raw_source, raw_source if raw_source in SOURCE_FAMILIES else "")
+
+
+def _ccy_rubik_cap(period: str) -> tuple[int, int]:
+    if period == "1D":
+        return 180, 180
+    if period == "5m":
+        return 576, 2
+    return 720, 30
 
 
 _EXTRA_ARTIFACT_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
