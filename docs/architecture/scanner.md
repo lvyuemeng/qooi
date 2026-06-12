@@ -167,11 +167,12 @@ Key:
 
 Invariants:
 
-- source acquisition owns raw-source provenance, artifact schemas, and frame availability;
+- source acquisition owns raw-source provenance, artifact schemas, provider capabilities, and frame availability;
 - scanner may consume availability but must not infer provider fetch success from source feature nulls;
-- frame availability is numeric: rows, latest timestamp, latest age, freshness threshold, fresh bit, missing bit, usable bit;
+- frame availability is numeric: rows, latest timestamp, latest age, freshness threshold, provider cap rows, target coverage, capability coverage, fresh bit, stale bit, missing bit, provider-bounded bit, optional-absent bit, usable bit;
 - latest fetch status is provenance only and must not overwrite observed frame rows;
-- messages/context absence is an explicit source-family coverage count, not an implicit per-symbol model failure.
+- provider-bounded Rubik windows are acceptable for current review when recent rows are fresh and `coverage_capability_pct` is high;
+- messages/context absence is optional until a real provider is enabled and must not count as required market-data failure.
 
 ### `history_feasibility`
 
@@ -407,20 +408,37 @@ Candidate output has two different purposes and should remain separated:
 
 Current implementation ranks leaf-matched candidates. The desired architecture is stricter: promoted rank rows come only from selected evidence leaves, while all assignments remain available for inspection.
 
-Freshness and tradability should be numeric inputs, not manual labels only:
+Freshness, capability, and tradability should be numeric inputs, not manual labels only:
 
 ```text
 source_age_ms
 source_age_hours
 bar_age_bars
-fresh_source_count
-stale_source_count
+required_fresh_source_count
+required_stale_source_count
+required_missing_source_count
+provider_bounded_source_count
+optional_absent_source_count
+coverage_target_pct_min
+coverage_capability_pct_min
+market_data_fresh_rate
+source_penalty_score
 spread_bps
 spread_percentile_30d
 depth_percentile_30d
 estimated_slippage_bps_for_size
 expected_edge_bps
 cost_adjusted_score
+```
+
+Source penalty policy:
+
+```text
+missing required market family -> high penalty
+stale required market family -> medium penalty
+provider-bounded but fresh -> zero or low penalty
+optional absent context family -> zero main-rank penalty
+fetch failed but frame fresh -> zero or low penalty
 ```
 
 Static slippage thresholds are acceptable only as hard sanity guards. Promotion should prefer data-derived, symbol-relative, size-aware cost features and penalize cost against expected edge.

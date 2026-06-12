@@ -92,7 +92,7 @@ status
 warning
 ```
 
-Target availability columns for the source-availability fix:
+Target availability columns for the capability-aware source fix:
 
 ```text
 symbol
@@ -101,9 +101,20 @@ rows
 latest_timestamp
 latest_age_hours
 freshness_threshold_hours
+provider_cap_rows
+provider_cap_lookback_days
+coverage_target_pct
+coverage_capability_pct
 frame_fresh_int
+frame_stale_int
 frame_missing_int
+provider_bounded_int
+optional_absent_int
+fetch_failed_frame_fresh_int
 usable_int
+required_for_review_int
+required_for_evidence_int
+rank_penalty_weight
 latest_fetch_status
 latest_fetch_warning
 latest_fetch_status_code
@@ -150,11 +161,45 @@ diagnostics/source-freshness.csv
   columns from SourceAvailability
 ```
 
-These artifacts preserve two separate questions:
+Capability summary artifacts:
+
+```text
+diagnostics/source-capability.csv
+  key: source_family, raw_source, period
+  columns:
+    scope
+    max_rows
+    max_lookback_days
+    earliest_provider_ms
+    supports_latest_refresh_int
+    supports_backfill_int
+    required_for_review_int
+    required_for_evidence_int
+    optional_int
+    rank_penalty_weight
+
+diagnostics/source-availability.csv
+  key: symbol, source_family
+  columns:
+    rows
+    latest_age_hours
+    coverage_target_pct
+    coverage_capability_pct
+    frame_fresh_int
+    frame_stale_int
+    frame_missing_int
+    provider_bounded_int
+    optional_absent_int
+    usable_int
+    source_penalty_component
+```
+
+These artifacts preserve three separate questions:
 
 ```text
 Can evidence train/evaluate on the available cross-coin history?
-Can this current symbol row be reviewed with enough local history and fresh source context?
+Which source gaps are true missing/stale rows versus provider-bounded capability limits?
+Can this current symbol row be reviewed with enough local history and fresh required source context?
 ```
 
 ---
@@ -420,15 +465,27 @@ Ranking uses numeric columns that are present:
 - ladder: information gain, stability, support, path quality, data quality;
 - tailtree: tail lift, tail stability, support, path quality, data quality.
 
-Planned promoted-rank scoring should be explicit and cost-aware:
+Planned promoted-rank scoring should be explicit, capability-aware, and cost-aware:
 
 ```text
+source_gate = required_missing_source_count == 0
+              and required_stale_source_count <= stale_budget
+              and coverage_capability_pct_min >= capability_threshold
+
 promoted = selected_evidence_level
-           and freshness gate
+           and source_gate
            and bar recency gate
            and liquidity sanity gate
 
-cost_adjusted_score = raw_tail_score - cost_penalty
+source_penalty = missing_required_penalty
+               + stale_required_penalty
+               + provider_bounded_penalty
+               + optional_absent_penalty
+
+provider_bounded_penalty = 0 or low when frame_fresh_int=1 and coverage_capability_pct is high
+optional_absent_penalty  = 0 for messages until a real provider is enabled
+
+cost_adjusted_score = raw_tail_score - source_penalty - cost_penalty
 cost_penalty        = estimated_roundtrip_cost_bps / expected_edge_bps
 ```
 

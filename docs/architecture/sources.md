@@ -19,18 +19,22 @@ scanner config + symbols
 
 `SourceNeed` construction is pure. Provider calls and writes are side-effect boundaries.
 
-Availability is computed from materialized frames first, not from the latest fetch manifest alone:
+Availability is computed from materialized frames and source capability first, not from the latest fetch manifest alone:
 
 ```text
+provider capability + scanner demand
+  -> expected capability window
 frame rows + latest event/known-at timestamp + configured threshold
   -> frame_freshness
+frame rows + provider capability window
+  -> capability-adjusted coverage
 latest manifest row
   -> fetch provenance/status
-frame_freshness + fetch provenance
+frame_freshness + capability coverage + fetch provenance
   -> review usability diagnostics
 ```
 
-A latest empty or failed incremental provider fetch must not overwrite usable cached frame rows. The manifest explains the latest fetch attempt; the frame determines observed rows, age, and whether the family is currently usable.
+A latest empty or failed incremental provider fetch must not overwrite usable cached frame rows. A provider-bounded history window must not be treated as missing just because it cannot satisfy a longer scanner evidence horizon. The manifest explains the latest fetch attempt; provider capability defines the feasible expectation; the frame determines observed rows, age, and whether the family is currently usable.
 
 ## Module layout
 
@@ -56,6 +60,7 @@ Removed target: source collection must not live in `qooi.exchange.context`.
 | Abstraction | Owner | Meaning |
 |---|---|---|
 | `SourceNeed` | `sources.collect` | Scanner demand for family/symbol/time/depth/freshness. |
+| `SourceCapability` | `sources.artifacts` or `sources.coverage` | Provider/source-family capability: scope, period, max rows/lookback, earliest provider timestamp, latest-refresh support, backfill support, review/evidence role, and rank penalty weight. |
 | `SourceFetchPlan` | `sources.collect` | Value contract for one provider/raw-source fetch decision. |
 | `SourceCollectRequest` | `sources.collect` | Source collection execution inputs. |
 | `SourceCollectResult` | `sources.collect` | Provider-collected manifest and family frames. |
@@ -100,6 +105,44 @@ funding_source_kind=history -> settled historical funding rows; count for depth
 funding_source_kind=current -> current known-at snapshot; count for freshness
 ```
 
+## Capability and requirement policy
+
+Source status is capability-aware. Do not collapse provider limits, stale rows, missing rows, and optional absent sources into one `missing` bucket.
+
+```text
+fresh                  rows exist and latest age is inside the freshness threshold
+stale                  rows exist but latest age exceeds the freshness threshold
+missing                required source has no usable rows inside its provider capability
+provider_bounded       rows fill the provider capability window but the provider cannot satisfy the longer scanner target
+optional_absent        optional/unimplemented source has no rows and no main-rank penalty
+fetch_failed_frame_fresh latest fetch failed/empty but materialized frame rows remain fresh
+```
+
+Evaluation uses two coverage denominators:
+
+```text
+coverage_target_pct     = actual_rows / scanner_target_rows
+coverage_capability_pct = actual_rows / min(scanner_target_rows, provider_cap_rows)
+```
+
+Rank and current review should use `coverage_capability_pct`, latest age, and required-family role. `coverage_target_pct` remains visible for research/evidence context but does not create a full penalty when the provider cannot supply that depth.
+
+Family role policy:
+
+```text
+required market families: books, trades, funding, open_interest, taker_volume, long_short_ratios
+optional context families: messages until a real provider/source is enabled
+```
+
+Provider-bounded Rubik examples:
+
+```text
+contract long/short 1H: max 1,440 rows ~= 60 days
+ccy-level Rubik 1H: max 30 days; 1D: max 180 days
+```
+
+These sources are current/review context first. They must not be penalized as failed 730-day evidence sources when they are fresh and near their capability window.
+
 ## Dependency policy
 
 Target dependencies:
@@ -132,9 +175,11 @@ sources.context -> exchange.context
 - Fetch provider source rows through provider wrappers.
 - Normalize provider payloads into `SourceResult` frames and manifests.
 - Merge/write source artifacts by declared keys and schemas.
-- Derive frame-level source availability from persisted rows, latest timestamps, and configured staleness thresholds.
+- Derive frame-level source availability from persisted rows, latest timestamps, provider capabilities, and configured staleness thresholds.
 - Preserve latest fetch-attempt provenance separately from frame usability.
-- Emit explicit missing/stale/shallow availability for diagnostics.
+- Emit explicit fresh/stale/missing/provider-bounded/optional-absent availability for diagnostics and rank inputs.
+- Keep current-review refresh separate from historical backfill for provider-bounded Rubik-style sources.
+- Treat latest/current snapshots, such as current funding and current open interest, as freshness inputs distinct from historical-depth rows.
 
 ## Non-responsibilities
 

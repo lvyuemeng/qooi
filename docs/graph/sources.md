@@ -82,6 +82,22 @@ sources.collect.SourceNeed(
   mode,
 )
 
+sources.artifacts.SourceCapability(
+  family,
+  raw_source,
+  scope,
+  period,
+  max_rows,
+  max_lookback_days,
+  earliest_provider_ms,
+  supports_latest_refresh_int,
+  supports_backfill_int,
+  required_for_review_int,
+  required_for_evidence_int,
+  optional_int,
+  rank_penalty_weight,
+)
+
 sources.collect.SourceFetchPlan(
   family,
   raw_source,
@@ -117,9 +133,20 @@ sources.context.SourceAvailability(
   latest_timestamp,
   latest_age_hours,
   freshness_threshold_hours,
+  provider_cap_rows,
+  provider_cap_lookback_days,
+  coverage_target_pct,
+  coverage_capability_pct,
   frame_fresh_int,
+  frame_stale_int,
   frame_missing_int,
+  provider_bounded_int,
+  optional_absent_int,
+  fetch_failed_frame_fresh_int,
   usable_int,
+  required_for_review_int,
+  required_for_evidence_int,
+  rank_penalty_weight,
   latest_fetch_status,
   latest_fetch_warning,
 )
@@ -167,10 +194,23 @@ load_source_context
 Availability rule:
 
 ```text
-frame_missing_int = rows == 0
-frame_fresh_int   = rows > 0 and latest_age_hours <= freshness_threshold_hours
-usable_int        = frame_fresh_int for fresh-required source families
+frame_missing_int          = required_for_review_int and rows == 0
+frame_stale_int            = rows > 0 and latest_age_hours > freshness_threshold_hours
+frame_fresh_int            = rows > 0 and latest_age_hours <= freshness_threshold_hours
+provider_bounded_int       = scanner_target_rows > provider_cap_rows and coverage_capability_pct is high
+actionable_missing_int     = frame_missing_int and not optional_absent_int
+fetch_failed_frame_fresh_int = latest_fetch_status in {failed, missing} and frame_fresh_int
+usable_int                 = frame_fresh_int or fetch_failed_frame_fresh_int
 ```
+
+Coverage denominators:
+
+```text
+coverage_target_pct     = rows / scanner_target_rows
+coverage_capability_pct = rows / min(scanner_target_rows, provider_cap_rows)
+```
+
+Rank and current-review gates consume `coverage_capability_pct`, `frame_stale_int`, `actionable_missing_int`, and required-family role. Long-horizon `coverage_target_pct` remains visible for research but does not create a full penalty when `provider_bounded_int=1`.
 
 The latest manifest row can set `latest_fetch_status` and `latest_fetch_warning`; it must not set frame rows, latest timestamp, age, or usability by itself.
 
@@ -208,6 +248,32 @@ family freshness may use funding_rate/current rows
 current funding fetch is independent from history depth
 ```
 
+Capability-aware collection rules:
+
+```text
+collect_latest_context(request, families, symbols) -> SourceCollectResult
+collect_historical_backfill(request, families, symbols) -> SourceCollectResult
+```
+
+Current review freshness comes before deep backfill:
+
+```text
+books/trades snapshots
+funding current
+open_interest current/latest snapshot
+Rubik latest page for taker_volume and long_short_ratios
+```
+
+Historical backfill is separate and provider-bounded:
+
+```text
+funding history can page deeper through funding history
+Rubik contract long/short 1H is capped by provider rows/lookback
+ccy-level Rubik 1H is capped at 30 days; 1D at 180 days
+```
+
+An empty latest Rubik page records fetch provenance. It must not erase fresh cached rows or convert a provider-bounded source into missing.
+
 Snapshot planning rules:
 
 ```text
@@ -228,8 +294,10 @@ Artifact/family API:
 
 ```text
 SOURCE_FAMILIES
+SOURCE_CAPABILITIES
 SOURCE_ARTIFACT_SPECS
 source_family(name) -> SourceFamily
+source_capability(family_or_raw_source, *, period) -> SourceCapability
 source_manifest_family(raw_source) -> family
 artifact_path(output_dir, spec) -> Path
 coerce_frame(frame, schema) -> DataFrame
@@ -274,11 +342,19 @@ Pure observation/availability API:
 source_frame_observations(
     frames: dict[str, DataFrame],
     families: tuple[SourceFamily, ...],
+    capabilities: tuple[SourceCapability, ...],
     symbols: tuple[str, ...],
     *,
     now_ms: int,
+    scanner_target_rows_by_family: dict[str, int],
     freshness_ms_by_family: dict[str, int],
 ) -> tuple[SourceAvailability, ...]
+
+source_capability_windows(
+    capabilities: tuple[SourceCapability, ...],
+    *,
+    scanner_target_rows_by_family: dict[str, int],
+) -> DataFrame
 
 latest_fetch_observations(manifest: DataFrame) -> tuple[SourceFetchObservation, ...]
 
@@ -300,9 +376,18 @@ rows
 latest_timestamp
 latest_age_hours
 freshness_threshold_hours
+provider_cap_rows
+provider_cap_lookback_days
+coverage_target_pct
+coverage_capability_pct
 frame_fresh_int
+frame_stale_int
 frame_missing_int
+provider_bounded_int
+optional_absent_int
 usable_int
+required_for_review_int
+rank_penalty_weight
 ```
 
 Fetch observation owns provider provenance:
@@ -331,11 +416,15 @@ fetch_okx_book_snapshot(...)
 fetch_okx_recent_trades(...)
 fetch_okx_funding_history(...)
 fetch_okx_funding_rate(...)
+fetch_okx_open_interest(...)
 fetch_okx_open_interest_history(...)
 fetch_okx_taker_volume_contract(...)
 fetch_okx_long_short_account_ratio_contract(...)
 fetch_okx_top_trader_long_short_account_ratio_contract(...)
 fetch_okx_top_trader_long_short_position_ratio_contract(...)
+fetch_okx_margin_loan_ratio(...)
+fetch_okx_ccy_long_short_account_ratio(...)
+fetch_okx_ccy_open_interest_volume(...)
 ```
 
 Provider wrappers return:
@@ -417,28 +506,40 @@ funding
   mode: both
 
 open_interest
-  raw_sources: open_interest_history
+  raw_sources: open_interest_history, open_interest
   artifact: source_open_interest
   timestamp: timestamp
-  mode: history
+  mode: current + provider-bounded history
+  current: /api/v5/public/open-interest by instId
+  history: /api/v5/rubik/stat/contracts/open-interest-history by instId
 
 taker_volume
   raw_sources: taker_volume_contract
   artifact: source_taker_volume
   timestamp: timestamp
-  mode: history
+  mode: latest + provider-bounded history
 
 long_short_ratios
   raw_sources: long_short_ratio_contract, top_trader_long_short_account_ratio_contract, top_trader_long_short_position_ratio_contract
   artifact: source_long_short_ratios
   timestamp: timestamp
-  mode: history
+  mode: latest + provider-bounded history
+  contract_1h_cap: 1440 rows ~= 60 days
+
+ccy_rubik_context
+  raw_sources: margin_loan_ratio, ccy_long_short_account_ratio, ccy_open_interest_volume
+  artifact: source_ccy_rubik_context
+  timestamp: timestamp
+  mode: base-currency context, not instrument replacement
+  ccy_1h_cap: 30 days
+  ccy_1d_cap: 180 days
 
 messages
   raw_sources: local messages
   artifact: local message artifacts
   timestamp: timestamp
-  mode: local
+  mode: optional context until provider-enabled
+  rank_penalty_weight: 0 while optional_absent_int=1
 ```
 
 ## Target downstream callers
