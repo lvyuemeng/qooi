@@ -54,6 +54,7 @@ class DiagnosticFrames:
     potential_evidence: pl.DataFrame
     candidate_evidence: pl.DataFrame
     candidate_rank: pl.DataFrame
+    candidate_feasibility: pl.DataFrame
     source_timeliness: pl.DataFrame
     source_state_predictability: pl.DataFrame
 
@@ -159,6 +160,11 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         source_outcomes,
         return_threshold_pct=inputs.config.transition.return_threshold_pct,
     )
+    watchlist_feasibility = _watchlist_feasibility_frame(
+        inputs.decisions,
+        history_feasibility,
+        source_freshness,
+    )
     return DiagnosticFrames(
         coverage=coverage_frame(inputs.bars.coverage),
         history_feasibility=history_feasibility,
@@ -171,16 +177,16 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         unsupported_paths=_unsupported_paths_frame(inputs.transitions.unsupported),
         scan_funnel=_scan_funnel_frame(inputs),
         rejection=_rejection_frame(inputs.decisions),
-        watchlist_feasibility=_watchlist_feasibility_frame(
-            inputs.decisions,
-            history_feasibility,
-            source_freshness,
-        ),
+        watchlist_feasibility=watchlist_feasibility,
         source_state_health=_source_state_health_frame(inputs.bundles),
         potential_observations=potential_observations,
         potential_evidence=pipeline_result.evidence,
         candidate_evidence=pipeline_result.candidates,
         candidate_rank=pipeline_result.ranked,
+        candidate_feasibility=_candidate_feasibility_frame(
+            pipeline_result.ranked,
+            watchlist_feasibility,
+        ),
         source_timeliness=source_timeliness,
         source_state_predictability=source_state_predictability,
     )
@@ -237,11 +243,132 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         "potential-evidence-selected": _selected_potential_evidence(frames.potential_evidence),
         "candidate-inspection": frames.candidate_evidence,
         "candidate-rank": frames.candidate_rank,
+        "candidate-feasibility": frames.candidate_feasibility,
         "source-timeliness": frames.source_timeliness,
         "source-state-predictability": frames.source_state_predictability,
     }
     for name, frame in frame_groups.items():
         frame.write_csv(diagnostics / f"{name}.csv")
+
+
+def _candidate_feasibility_frame(
+    candidate_rank: pl.DataFrame, watchlist_feasibility: pl.DataFrame
+) -> pl.DataFrame:
+    columns = [
+        "symbol",
+        "watchlist_feasibility",
+        "rank_score",
+        "rank_tier",
+        "source_penalty_score",
+        "required_missing_source_count",
+        "required_stale_source_count",
+        "provider_bounded_source_count",
+        "optional_absent_source_count",
+        "min_history_coverage_pct",
+        "min_source_capability_coverage_pct",
+        "tree_direction",
+        "matched_evidence_level",
+        "tail_lift",
+        "gpd_shape_xi",
+        "N_tail_exceedances",
+        "source_status",
+        "history_status",
+        "candidate_reason",
+    ]
+    schema = {
+        "symbol": pl.String,
+        "watchlist_feasibility": pl.String,
+        "rank_score": pl.Float64,
+        "rank_tier": pl.String,
+        "source_penalty_score": pl.Float64,
+        "required_missing_source_count": pl.Int64,
+        "required_stale_source_count": pl.Int64,
+        "provider_bounded_source_count": pl.Int64,
+        "optional_absent_source_count": pl.Int64,
+        "min_history_coverage_pct": pl.Float64,
+        "min_source_capability_coverage_pct": pl.Float64,
+        "tree_direction": pl.String,
+        "matched_evidence_level": pl.String,
+        "tail_lift": pl.Float64,
+        "gpd_shape_xi": pl.Float64,
+        "N_tail_exceedances": pl.Int64,
+        "source_status": pl.String,
+        "history_status": pl.String,
+        "candidate_reason": pl.String,
+    }
+    if candidate_rank.is_empty():
+        return pl.DataFrame(schema=schema)
+
+    best = (
+        candidate_rank.sort("rank_score", descending=True)
+        .unique(subset=["symbol"], keep="first", maintain_order=True)
+        .with_columns(
+            _rank_tier_expr().alias("rank_tier"),
+        )
+    )
+    selected = best.select(
+        [
+            "symbol",
+            "rank_score",
+            "rank_tier",
+            "source_penalty_score",
+            "required_missing_source_count",
+            "required_stale_source_count",
+            "provider_bounded_source_count",
+            "optional_absent_source_count",
+            "tree_direction",
+            "matched_evidence_level",
+            "tail_lift",
+            "gpd_shape_xi",
+            "N_tail_exceedances",
+            pl.col("rank_reason").alias("candidate_reason"),
+        ]
+    )
+    if watchlist_feasibility.is_empty():
+        return selected.with_columns(
+            pl.lit("unclassified").alias("watchlist_feasibility"),
+            pl.lit(None, dtype=pl.Float64).alias("min_history_coverage_pct"),
+            pl.lit(None, dtype=pl.Float64).alias("min_source_capability_coverage_pct"),
+            pl.lit("missing").alias("source_status"),
+            pl.lit("missing").alias("history_status"),
+        ).select(columns)
+
+    watch_columns = [
+        "symbol",
+        "watchlist_feasibility",
+        "min_history_coverage_pct",
+        "min_source_capability_coverage_pct",
+        "source_status",
+        "history_status",
+    ]
+    return (
+        selected.join(watchlist_feasibility.select(watch_columns), on="symbol", how="left")
+        .with_columns(
+            pl.col("watchlist_feasibility").fill_null("unclassified"),
+            pl.col("source_status").fill_null("missing"),
+            pl.col("history_status").fill_null("missing"),
+        )
+        .select(columns)
+    )
+
+
+def _rank_tier_expr() -> pl.Expr:
+    return (
+        pl.when(
+            (pl.col("tail_lift").fill_null(0.0) >= 2.0)
+            & (pl.col("N_tail_exceedances").fill_null(0) >= 50)
+            & (pl.col("gpd_shape_xi").fill_null(0.0) > 0.15)
+        )
+        .then(pl.lit("1"))
+        .when(
+            (pl.col("tail_lift").fill_null(0.0) >= 1.5)
+            & (pl.col("N_tail_exceedances").fill_null(0) >= 30)
+        )
+        .then(pl.lit("2"))
+        .when(pl.col("tail_lift").fill_null(0.0) >= 1.0)
+        .then(pl.lit("3"))
+        .otherwise(pl.lit("—"))
+    )
 
 
 def _potential_evidence_summary(evidence: pl.DataFrame) -> pl.DataFrame:

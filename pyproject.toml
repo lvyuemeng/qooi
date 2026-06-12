@@ -59,6 +59,7 @@ include = [
     "src/qooi/sources/context.py",
     "src/qooi/scanner/diagnostics.py",
     "src/qooi/scanner/rank.py",
+    "src/qooi/scanner/report.py",
 ]
 
 [tool.hatch.build.targets.wheel]

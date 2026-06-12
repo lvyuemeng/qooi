@@ -391,6 +391,11 @@ transition_context_limit = 0
     assert "## Unified Evidence Surface" in report
     assert "## Review Rows" in report
     assert "Tiers: 1=top-decile" in report
+    assert "## Candidate Feasibility" in report
+    assert (
+        "| Symbol | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
+        "Hist% | Cap% | Tree | TailLift | ξ | Reason |" in report
+    )
     assert (diagnostics / "coverage.csv").exists()
     assert (diagnostics / "source-freshness.csv").exists()
     assert (diagnostics / "source-capability.csv").exists()
@@ -399,6 +404,7 @@ transition_context_limit = 0
     assert (diagnostics / "potential-evidence-selected.csv").exists()
     assert (diagnostics / "candidate-inspection.csv").exists()
     assert (diagnostics / "candidate-rank.csv").exists()
+    assert (diagnostics / "candidate-feasibility.csv").exists()
     assert not (diagnostics / "candidate-evidence.csv").exists()
     assert (states / "kline-state.csv").exists()
     assert not (diagnostics / "potential-observation.csv").exists()

@@ -27,7 +27,12 @@ class ReportSection(Protocol):
 def render_report(inputs: ReportInputs) -> str:
     """Compose report from pre-built sections. No dispatch. No branching."""
     sections = (
-        [_ScanScopeSection(), _SourceFreshnessSection(), _CoverageSection()]
+        [
+            _ScanScopeSection(),
+            _SourceFreshnessSection(),
+            _CoverageSection(),
+            _CandidateFeasibilitySection(),
+        ]
         + list(inputs.report_sections)
         + [_CaveatsSection()]
     )
@@ -164,6 +169,73 @@ class _CoverageSection:
                 lines.append("- Watchlist feasibility: no decision rows produced.")
         else:
             lines.append("- Watchlist feasibility artifact is missing.")
+        return "\n".join(lines)
+
+
+class _CandidateFeasibilitySection:
+    def render(self, inputs: ReportInputs) -> str:
+        path = inputs.artifacts.diagnostics_dir / "candidate-feasibility.csv"
+        lines = [
+            "## Candidate Feasibility",
+            "",
+            f"- Candidate feasibility: `{path}`",
+            (
+                "- Tiers: 1=tail_lift≥2.0,ξ>0.15,N≥50 | "
+                "2=tail_lift≥1.5,N≥30 | 3=tail_lift≥1.0 | —=below tail gate"
+            ),
+            (
+                "- Units: Rank=rank_score, SrcPen=source_penalty_score, "
+                "Miss/Stale/Bound/Opt=source-family counts, "
+                "Hist%/Cap%=minimum coverage percentages."
+            ),
+        ]
+        if not path.exists():
+            lines.append("- Candidate feasibility artifact is missing.")
+            return "\n".join(lines)
+        lines.extend(
+            [
+                "",
+                (
+                    "| Symbol | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
+                    "Hist% | Cap% | Tree | TailLift | ξ | Reason |"
+                ),
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
+                (
+                    "| | status | score | penalty | count | count | count | count | "
+                    "pct | pct | direction | x baseline | shape | blocker |"
+                ),
+            ]
+        )
+        frame = pl.read_csv(path)
+        if frame.is_empty():
+            lines.append("- No ranked candidates produced.")
+            return "\n".join(lines)
+        lines.insert(5, "- Feasibility: " + _value_counts(frame, "watchlist_feasibility"))
+        ordered = frame.sort(
+            [
+                "rank_score",
+                "source_penalty_score",
+                "min_history_coverage_pct",
+                "min_source_capability_coverage_pct",
+            ],
+            descending=[True, False, True, True],
+        ).head(15)
+        for row in ordered.iter_rows(named=True):
+            reason = _candidate_feasibility_reason(row)
+            lines.append(
+                f"| `{row['symbol']}` | {row.get('watchlist_feasibility', '—')} | "
+                f"{_fmt(row.get('rank_score'))} | {_fmt(row.get('source_penalty_score'))} | "
+                f"{_int_fmt(row.get('required_missing_source_count'))} | "
+                f"{_int_fmt(row.get('required_stale_source_count'))} | "
+                f"{_int_fmt(row.get('provider_bounded_source_count'))} | "
+                f"{_int_fmt(row.get('optional_absent_source_count'))} | "
+                f"{_fmt(row.get('min_history_coverage_pct'))} | "
+                f"{_fmt(row.get('min_source_capability_coverage_pct'))} | "
+                f"{row.get('tree_direction', '—')} | {_fmt(row.get('tail_lift'))} | "
+                f"{_fmt(row.get('gpd_shape_xi'))} | {reason} |"
+            )
+        if frame.height > 15:
+            lines.append(f"- {frame.height - 15} additional candidate feasibility rows omitted.")
         return "\n".join(lines)
 
 
@@ -604,7 +676,7 @@ def _read_rank_data(rank_path) -> dict[str, dict]:
 
     result = {}
     for row in df.iter_rows(named=True):
-        result[row["symbol"]] = row
+        result.setdefault(row["symbol"], row)
     return result
 
 
@@ -646,10 +718,38 @@ def _value_counts(frame: pl.DataFrame, column: str) -> str:
     )
 
 
+def _candidate_feasibility_reason(row: dict) -> str:
+    missing = int(float(row.get("required_missing_source_count") or 0))
+    stale = int(float(row.get("required_stale_source_count") or 0))
+    feasibility = str(row.get("watchlist_feasibility") or "unclassified")
+    history = str(row.get("history_status") or "missing")
+    source = str(row.get("source_status") or "missing")
+    if missing > 0:
+        return f"missing_required_sources={missing}"
+    if stale > 0:
+        return f"stale_required_sources={stale}"
+    if feasibility == "coverage_limited_review":
+        return f"history={history}"
+    if feasibility == "blocked_by_evidence_gate":
+        return "evidence_gate_blocked"
+    if feasibility == "reviewable":
+        return "reviewable"
+    return f"source={source};history={history}"
+
+
+def _int_fmt(value: object) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return str(int(float(str(value))))
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 def _fmt(value: object) -> str:
     if value is None:
         return "n/a"
     try:
-        return f"{float(value):.4f}"
+        return f"{float(str(value)):.4f}"
     except (TypeError, ValueError):
         return "n/a"
