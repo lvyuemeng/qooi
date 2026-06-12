@@ -7,7 +7,7 @@ import fnmatch
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, TypedDict
 
 import httpx
 import polars as pl
@@ -60,8 +60,30 @@ class SourceFetchPlan:
     reason: str
 
 
+class SourceDemandSection(Protocol):
+    disabled_sources: tuple[str, ...]
+    max_staleness_hours: int
+    rubik_period: str
+
+
+class TransitionDemandSection(Protocol):
+    history_days: int
+
+
+class SourceDemandConfig(Protocol):
+    days: int
+    source: SourceDemandSection
+    transition: TransitionDemandSection
+
+
+class DiscoveryContractMetadata(TypedDict):
+    ct_val: float | None
+    ct_val_ccy: str | None
+    base_ccy: str | None
+
+
 def source_needs_from_config(
-    config: object,
+    config: SourceDemandConfig,
     *,
     symbols: tuple[str, ...],
     context_symbols: tuple[str, ...],
@@ -69,13 +91,10 @@ def source_needs_from_config(
     end_ms: int | None,
 ) -> tuple[SourceNeed, ...]:
     target_symbols = context_symbols or symbols
-    disabled = set(getattr(config, "disabled_sources", ()))
-    freshness_ms = int(getattr(config, "max_source_staleness_hours", 0)) * HOUR_MS
-    days = max(
-        int(getattr(config, "days", 0)),
-        int(getattr(config, "transition_history_days", 0)),
-    )
-    rubik_rows = period_min_rows(days, str(getattr(config, "rubik_period", "1H")))
+    disabled = set(config.source.disabled_sources)
+    freshness_ms = config.source.max_staleness_hours * HOUR_MS
+    days = max(config.days, config.transition.history_days)
+    rubik_rows = period_min_rows(days, config.source.rubik_period)
     candidates = (
         SourceNeed("books", target_symbols, None, end_ms, 1, freshness_ms, "snapshot"),
         SourceNeed("trades", target_symbols, None, end_ms, 1, freshness_ms, "snapshot"),
@@ -792,14 +811,14 @@ def _symbol_latest_timestamp(frame: pl.DataFrame, symbol: str) -> int | None:
     return _source_symbol_summary(frame).get(symbol, (0, None, None))[2]
 
 
-def _discovery_contract_metadata(discovery: pl.DataFrame) -> dict[str, dict[str, object]]:
+def _discovery_contract_metadata(discovery: pl.DataFrame) -> dict[str, DiscoveryContractMetadata]:
     required = {"symbol", "ct_val", "ct_val_ccy", "base_ccy"}
     if discovery.is_empty() or "symbol" not in discovery.columns:
         return {}
     for column in required - set(discovery.columns):
         discovery = discovery.with_columns(pl.lit(None).alias(column))
     rows = discovery.select("symbol", "ct_val", "ct_val_ccy", "base_ccy").iter_rows(named=True)
-    metadata: dict[str, dict[str, object]] = {}
+    metadata: dict[str, DiscoveryContractMetadata] = {}
     for row in rows:
         ct_val = row["ct_val"]
         metadata[str(row["symbol"])] = {

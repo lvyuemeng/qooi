@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import importlib
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import polars as pl
 import pytest
 
+from qooi.scanner.config import PotentialConfig, SourceConfig, TransitionConfig
 from qooi.sources.artifacts import coerce_frame, source_manifest_family
 from qooi.sources.bundle import (
     SourceBundle,
@@ -86,17 +86,19 @@ def test_collect_module_exposes_demand_first_contracts() -> None:
 
 def test_source_needs_from_config_derives_quantitative_family_demand() -> None:
     collect = importlib.import_module("qooi.sources.collect")
-    config = SimpleNamespace(
+    config = PotentialConfig(
         days=2,
-        transition_history_days=3,
-        max_source_staleness_hours=6,
-        book_depth=20,
-        trade_limit=50,
-        funding_limit=400,
-        rubik_limit=144,
-        book_mode="snapshot",
-        rubik_period="1H",
-        disabled_sources=("trades",),
+        transition=TransitionConfig(history_days=3),
+        source=SourceConfig(
+            max_staleness_hours=6,
+            book_depth=20,
+            trade_limit=50,
+            funding_limit=400,
+            rubik_limit=144,
+            book_mode="snapshot",
+            rubik_period="1H",
+            disabled_sources=("trades",),
+        ),
     )
 
     needs = collect.source_needs_from_config(

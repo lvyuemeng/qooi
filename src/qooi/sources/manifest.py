@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import TypedDict
 
 import polars as pl
 
 from qooi.sources.schema import SOURCE_MANIFEST_SCHEMA
+
+
+class SourceManifestRow(TypedDict):
+    timestamp: int
+    symbol: str
+    source: str
+    phase: str
+    status: str
+    backend: str
+    endpoint: str
+    rows: int
+    range_start: int | None
+    range_end: int | None
+    coverage_pct: float | None
+    warning: str
+    stop_reason: str
 
 
 def now_ms() -> int:
@@ -18,7 +34,7 @@ def empty_source_manifest_frame() -> pl.DataFrame:
     return pl.DataFrame(schema=SOURCE_MANIFEST_SCHEMA)
 
 
-def manifest_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
+def manifest_frame(rows: list[SourceManifestRow]) -> pl.DataFrame:
     if not rows:
         return empty_source_manifest_frame()
     frame = pl.DataFrame(rows)
@@ -43,7 +59,7 @@ def source_manifest_row(
     warning: str = "",
     stop_reason: str = "",
     timestamp: int | None = None,
-) -> dict[str, Any]:
+) -> SourceManifestRow:
     return {
         "timestamp": timestamp if timestamp is not None else now_ms(),
         "symbol": symbol,

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Protocol
 
 import polars as pl
 
-from qooi.sources.manifest import manifest_frame, now_ms, source_manifest_row
+from qooi.sources.manifest import SourceManifestRow, manifest_frame, now_ms, source_manifest_row
 
 __all__ = [
     "compute_source_coverage_score",
@@ -40,7 +40,7 @@ def manifest_row_from_history_coverage(
     phase: str = "collect-market",
     status: str | None = None,
     error: str | None = None,
-) -> dict[str, Any]:
+) -> SourceManifestRow:
     warning = ";".join(coverage.notes)
     row_status = status or ("ok" if coverage.actual_bars else "missing")
     if error:

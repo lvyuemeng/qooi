@@ -40,22 +40,28 @@ CONTEXT_FAMILIES = (
 
 
 class PotentialSourceConfig(Protocol):
+    class SourceSection(Protocol):
+        refresh_mode: Literal["inherit", "incremental", "cache_only", "force"]
+        book_mode: BookMode
+        book_depth: int
+        max_staleness_hours: int
+        trade_limit: int
+        funding_limit: int
+        rubik_period: str
+        rubik_limit: int
+        rubik_taker_unit: Literal["0", "1", "2"]
+        disabled_sources: tuple[str, ...]
+        disabled_symbols: tuple[str, ...]
+
+    class TransitionSection(Protocol):
+        history_days: int
+
     output: Path
     days: int
-    transition_history_days: int
     fetch_concurrency: int
-    source_refresh_mode: Literal["inherit", "incremental", "cache_only", "force"]
-    book_mode: BookMode
     refresh_mode: Literal["incremental", "cache_only", "force"]
-    book_depth: int
-    max_source_staleness_hours: int
-    trade_limit: int
-    funding_limit: int
-    rubik_period: str
-    rubik_limit: int
-    rubik_taker_unit: Literal["0", "1", "2"]
-    disabled_sources: tuple[str, ...]
-    disabled_symbols: tuple[str, ...]
+    source: SourceSection
+    transition: TransitionSection
 
 
 @dataclass(frozen=True)
@@ -85,8 +91,8 @@ async def load_source_context(
     bundle = read_source_bundle(config.output.parent, SOURCE_ARTIFACT_SPECS)
     refresh_mode = (
         config.refresh_mode
-        if config.source_refresh_mode == "inherit"
-        else config.source_refresh_mode
+        if config.source.refresh_mode == "inherit"
+        else config.source.refresh_mode
     )
     if refresh_mode == "cache_only":
         frames = context_frames(bundle, {})
@@ -98,29 +104,29 @@ async def load_source_context(
     if context_symbols:
         force_refresh = refresh_mode == "force"
         target_end_ms = now_ms()
-        target_days = max(config.days, config.transition_history_days)
+        target_days = max(config.days, config.transition.history_days)
         target_start_ms = target_end_ms - target_days * DAY_MS
         request = SourceCollectRequest(
             output_dir=config.output.parent,
             symbols=context_symbols,
             discovery=discovery,
             concurrency=config.fetch_concurrency,
-            book_mode=config.book_mode,
-            book_depth=config.book_depth,
-            max_source_staleness_hours=config.max_source_staleness_hours,
-            trade_limit=config.trade_limit,
-            funding_limit=config.funding_limit,
-            rubik_period=config.rubik_period,
-            rubik_limit=config.rubik_limit,
-            rubik_taker_unit=config.rubik_taker_unit,
-            disabled_sources=config.disabled_sources,
-            disabled_symbols=config.disabled_symbols,
+            book_mode=config.source.book_mode,
+            book_depth=config.source.book_depth,
+            max_source_staleness_hours=config.source.max_staleness_hours,
+            trade_limit=config.source.trade_limit,
+            funding_limit=config.source.funding_limit,
+            rubik_period=config.source.rubik_period,
+            rubik_limit=config.source.rubik_limit,
+            rubik_taker_unit=config.source.rubik_taker_unit,
+            disabled_sources=config.source.disabled_sources,
+            disabled_symbols=config.source.disabled_symbols,
             refresh_trades=force_refresh,
             refresh_context=force_refresh,
             target_source_start_ms=target_start_ms,
             target_source_end_ms=target_end_ms,
             funding_min_rows=funding_min_rows(target_days),
-            rubik_min_rows=period_min_rows(target_days, config.rubik_period),
+            rubik_min_rows=period_min_rows(target_days, config.source.rubik_period),
             existing_frames=context_frames(bundle, {}),
         )
         try:
@@ -239,7 +245,7 @@ def source_availability(
         )
         for current in availability_rows:
             symbol = str(current["symbol"])
-            if family in config.disabled_sources or symbol in config.disabled_symbols:
+            if family in config.source.disabled_sources or symbol in config.source.disabled_symbols:
                 rows.append(SourceAvailability(family, symbol, 0, None, "disabled", "disabled"))
                 continue
             latest = current["latest_timestamp"]
