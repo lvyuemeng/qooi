@@ -149,7 +149,7 @@ qooi.scanner.frames.potential_observation_frame(
     continuous_features: pl.DataFrame | None,
     *,
     decision_timeframe: str,
-    max_source_staleness_hours: int,
+    max_source_staleness_hours: int,  # from PotentialConfig.source.max_staleness_hours
 ) -> pl.DataFrame
 ```
 
@@ -218,7 +218,7 @@ qooi.scanner.diagnostics._run_pipeline(
 One dispatch point:
 
 ```text
-if inputs.config.evidence == "tailtree":
+if inputs.config.evidence.kind == "tailtree":
     return _run_tailtree_pipeline(...)
 return _run_ladder_pipeline(...)
 ```
@@ -226,7 +226,7 @@ return _run_ladder_pipeline(...)
 Implemented tailtree lifecycle dispatch is nested inside the tailtree path, not spread across consumers:
 
 ```text
-if inputs.config.tailtree.lifecycle == "load_predict":
+if inputs.config.evidence.tailtree.lifecycle == "load_predict":
     result = _load_tail_tree_evidence(...)
 else:
     result = _build_tail_tree_evidence(...)

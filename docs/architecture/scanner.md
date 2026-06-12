@@ -214,8 +214,8 @@ Invariants:
 Current tail labels use path extremes over the configured horizon:
 
 ```text
-up tail:   max(high over next N bars) / close_now - 1 > tail_threshold_pct
-down tail: min(low  over next N bars) / close_now - 1 < -tail_threshold_pct
+up tail:   max(high over next N bars) / close_now - 1 > threshold_pct
+down tail: min(low  over next N bars) / close_now - 1 < -threshold_pct
 ```
 
 This is an **excursion/touch** label. It detects whether price touched an extreme inside the horizon. It does not by itself prove trend persistence, tradability after latency, or close-to-close continuation. Architecture therefore distinguishes three outcome families:
@@ -300,7 +300,7 @@ It is not a whole-return distribution model, not a classifier, and not a candida
 
 ### Horizon semantics
 
-The configured bar/horizon pair defines what the tree can learn. With `bar = "1H"` and `transition_mae_mfe_horizon = 12`, the implemented tail label means a 12-hour path-extreme touch. Changing the horizon changes the research question:
+The configured bar/horizon pair defines what the tree can learn. With `bar = "1H"` and `transition.mae_mfe_horizon = 12`, the implemented tail label means a 12-hour path-extreme touch. Changing the horizon changes the research question:
 
 | Horizon pattern | Interpretation risk |
 |---|---|
@@ -320,10 +320,13 @@ Tailtree has two distinct lifecycle modes and they should be explicit in config:
 | `train` | yes | yes | yes | research/evidence refresh |
 | `load_predict` | no, except optional diagnostics | no | no | current candidate review from a frozen model |
 
-`evidence = "tailtree"` chooses the evidence path. A separate lifecycle field chooses whether this run trains or loads a frozen model:
+`[potential.evidence] kind = "tailtree"` chooses the evidence path. A nested tailtree lifecycle section chooses whether this run trains or loads a frozen model:
 
 ```toml
-[potential.tailtree]
+[potential.evidence]
+kind = "tailtree"
+
+[potential.evidence.tailtree]
 lifecycle = "train"          # "train" or "load_predict"
 model_dir = "data/output/potential/daily-deep/models"
 model_tag = "tailtree-1h-12h-v1"

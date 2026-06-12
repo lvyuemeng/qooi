@@ -1,17 +1,11 @@
 [potential]
-universe = "research"
 output = "data/output/potential/report.md"
+universe = "research"
 bar = "1H"
-days = 120
+
+[potential.source]
 book_mode = "snapshot"
 book_depth = 25
-timeframes = ["1H", "4H", "1D"]
-refresh_mode = "incremental"
-transition_scan_budget = 80
-transition_history_days = 730
-transition_context_scope = "all_scanned"
-transition_context_limit = 80
-max_source_staleness_hours = 24
 trade_limit = 100
 funding_limit = 100
 rubik_period = "1H"
@@ -19,17 +13,28 @@ rubik_limit = 100
 rubik_taker_unit = "2"
 disabled_sources = []
 disabled_symbols = []
-transition_ngram_length = 4
-transition_horizon = 12
-transition_mae_mfe_horizon = 12
-transition_min_count = 30
-transition_recent_window = 720
-transition_long_window = 4320
-transition_return_threshold_pct = 0.0
-transition_min_probability = 0.05
-transition_min_directional_probability = 0.55
-transition_min_probability_delta = -0.10
-transition_min_reward_risk = 1.0
-transition_max_tail_loss_pct = 20.0
-transition_min_information_bits = 0.001
-require_context_for_review = false
+max_staleness_hours = 24
+
+[potential.transition]
+scan_budget = 80
+history_days = 730
+context_scope = "all_scanned"
+context_limit = 80
+ngram_length = 4
+horizon = 12
+mae_mfe_horizon = 12
+min_count = 30
+recent_window = 720
+long_window = 4320
+return_threshold_pct = 0.0
+min_probability = 0.05
+min_directional_probability = 0.55
+min_probability_delta = -0.1
+min_reward_risk = 1.0
+max_tail_loss_pct = 20.0
+min_information_bits = 0.001
+
+[potential.review]
+require_context = false
+
+[potential.evidence]

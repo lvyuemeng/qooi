@@ -59,7 +59,7 @@ outcome_horizon = N bars
 label time scale = N * bar duration
 ```
 
-For the daily-deep config, `bar = "1H"` and `transition_mae_mfe_horizon = 12`, so the implemented label is a 12-hour path-extreme touch. This label can count burst-then-fade paths as successful excursions. Continuation/exhaustion semantics require additional path-shape diagnostics, not a different interpretation of `tail_up`/`tail_down`.
+For the daily-deep config, `bar = "1H"` and `transition.mae_mfe_horizon = 12`, so the implemented label is a 12-hour path-extreme touch. This label can count burst-then-fade paths as successful excursions. Continuation/exhaustion semantics require additional path-shape diagnostics, not a different interpretation of `tail_up`/`tail_down`.
 
 ---
 
@@ -232,7 +232,10 @@ Training and current prediction are different scanner modes. The tailtree path e
 Implemented config shape:
 
 ```toml
-[potential.tailtree]
+[potential.evidence]
+kind = "tailtree"
+
+[potential.evidence.tailtree]
 lifecycle = "train"        # "train" or "load_predict"
 model_dir = "data/output/potential/daily-deep/models"
 model_tag = "tailtree-1h-12h-v1"
@@ -242,14 +245,14 @@ Implemented lifecycle calls:
 
 ```text
 qooi.scanner.tailrun.run(...)
-    if config.tailtree.lifecycle == "train":
+    if config.evidence.tailtree.lifecycle == "train":
         → qooi.scanner.tailrun.train_evaluate_predict(...)
         → write model_dir/model_tag/tail-tree-up.json
         → write model_dir/model_tag/tail-tree-down.json
         → write model_dir/model_tag/potential-leaf-evidence-up.csv
         → write model_dir/model_tag/potential-leaf-evidence-down.csv
         → write model_dir/model_tag/tailtree-artifact.json
-    if config.tailtree.lifecycle == "load_predict":
+    if config.evidence.tailtree.lifecycle == "load_predict":
         → qooi.scanner.tailrun.load_predict(...)
         → load frozen models/evidence
         → validate artifact metadata against config
@@ -263,10 +266,6 @@ qooi.scanner.tailrun
     → lifecycle code: artifact root, metadata hash, save/load, validation,
       train-vs-load dispatch
 ```
-
-Compatibility note: `qooi.scanner.diagnostics._build_tail_tree_evidence`,
-`_load_tail_tree_evidence`, and `_write_tailtree_artifacts` remain thin wrappers
-for existing tests and internal callers; implementation ownership is `tailrun`.
 
 Do not move lifecycle dispatch into report, candidate, or ranking modules.
 
