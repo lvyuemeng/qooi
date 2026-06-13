@@ -10,15 +10,13 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from qooi.sources.collect import BookMode
 
 RefreshMode = Literal["incremental", "cache_only", "force"]
-SourceRefreshMode = Literal["inherit", "incremental", "cache_only", "force"]
 EvidenceKind = Literal["ladder", "tailtree"]
 TailtreeLifecycle = Literal["train", "load_predict"]
 
 
 class SourceConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    refresh_mode: SourceRefreshMode = "inherit"
     disabled_sources: tuple[str, ...] = ()
     disabled_symbols: tuple[str, ...] = ()
     book_mode: BookMode = "snapshot"

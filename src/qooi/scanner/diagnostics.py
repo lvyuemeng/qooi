@@ -10,6 +10,7 @@ import polars as pl
 
 from qooi.exchange.store import HistoryCoverage
 from qooi.scanner import (
+    PotentialArtifacts,
     PotentialUniverse,
     ReportInputs,
     ScanDecision,
@@ -69,7 +70,7 @@ class StateFrames:
 
 
 def write_diagnostics(inputs: ReportInputs) -> None:
-    diagnostic_frames = _build_diagnostic_frames(inputs)
+    diagnostic_frames = build_diagnostic_frames(inputs)
 
     from qooi.scanner.report import report_sections_for
 
@@ -100,8 +101,19 @@ def write_diagnostics(inputs: ReportInputs) -> None:
         if stale.exists():
             stale.unlink()
 
-    _write_diagnostic_frames(diagnostic_frames, diagnostics)
+    write_diagnostic_frames(diagnostic_frames, inputs.artifacts)
     _write_state_frames(state_frames, states)
+
+
+def build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
+    return _build_diagnostic_frames(inputs)
+
+
+def write_diagnostic_frames(
+    frames: DiagnosticFrames,
+    artifacts: PotentialArtifacts,
+) -> None:
+    _write_diagnostic_frames(frames, artifacts.diagnostics_dir)
 
 
 def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:

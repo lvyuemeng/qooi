@@ -57,7 +57,7 @@ refresh_mode="incremental"  -> refresh stale/missing cache incrementally
 refresh_mode="force"        -> rebuild requested cache window
 ```
 
-`[potential.source].refresh_mode` must not affect `exchange.store` bar requests. Source collection may inherit the top-level mode, but that inheritance is resolved in `qooi.sources.context`, not in exchange.
+`[potential.source]` has no refresh mode and must not affect `exchange.store` bar requests. The scanner workflow copies the single root `PotentialConfig.refresh_mode` into both bar and source-context requests.
 
 ## Demand boundary
 

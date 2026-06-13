@@ -130,7 +130,7 @@ def test_source_context_request_resolves_refresh_without_scanner_root_config() -
         refresh_mode="force",
         fetch_concurrency=7,
         transition=TransitionConfig(history_days=5),
-        source=SourceConfig(refresh_mode="cache_only", book_depth=20),
+        source=SourceConfig(book_depth=20),
     )
 
     request = workflow.source_context_request(
@@ -144,10 +144,15 @@ def test_source_context_request_resolves_refresh_without_scanner_root_config() -
     assert request.output_dir == Path("data/output/potential")
     assert request.target_days == 5
     assert request.concurrency == 7
-    assert request.refresh_mode == "cache_only"
+    assert request.refresh_mode == "force"
     assert request.source.book_depth == 20
     assert request.symbols == ("BTC-USDT-SWAP",)
     assert request.context_symbols == ("ETH-USDT-SWAP",)
+
+
+def test_source_config_rejects_nested_refresh_mode() -> None:
+    with pytest.raises(ValueError, match="refresh_mode"):
+        SourceConfig.model_validate({"refresh_mode": "cache_only"})
 
 
 def test_source_context_module_does_not_accept_potential_config_boundary() -> None:

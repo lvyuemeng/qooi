@@ -42,6 +42,13 @@ def test_frames_and_ladder_own_public_functions() -> None:
     assert ladder.select_potential_evidence_level.__module__ == "qooi.scanner.ladder"
 
 
+def test_diagnostics_exposes_build_write_boundary_apis() -> None:
+    diagnostics = importlib.import_module("qooi.scanner.diagnostics")
+
+    assert diagnostics.build_diagnostic_frames.__module__ == "qooi.scanner.diagnostics"
+    assert diagnostics.write_diagnostic_frames.__module__ == "qooi.scanner.diagnostics"
+
+
 def test_rank_module_owns_candidate_ranking_entrypoint() -> None:
     rank = importlib.import_module("qooi.scanner.rank")
     frame = pl.DataFrame(

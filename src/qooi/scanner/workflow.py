@@ -21,7 +21,7 @@ from qooi.scanner import (
     context_symbols,
 )
 from qooi.scanner.classifiers import KlineClassifier
-from qooi.scanner.config import PotentialConfig, RefreshMode, SourceRefreshMode
+from qooi.scanner.config import PotentialConfig
 from qooi.scanner.decisions import (
     compute_kline_states,
     compute_source_states,
@@ -125,17 +125,9 @@ def source_context_request(
         discovery=discovery,
         target_days=max(config.days, config.transition.history_days),
         concurrency=config.fetch_concurrency,
-        refresh_mode=_source_refresh_mode(config.refresh_mode, config.source.refresh_mode),
+        refresh_mode=config.refresh_mode,
         source=config.source,
     )
-
-
-def _source_refresh_mode(
-    top_level: RefreshMode, source_mode: SourceRefreshMode
-) -> RefreshMode:
-    if source_mode == "inherit":
-        return top_level
-    return source_mode
 
 
 def target_min_bars(days: int, timeframe: str) -> int:

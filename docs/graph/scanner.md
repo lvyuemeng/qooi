@@ -671,23 +671,23 @@ qooi.scanner.report.render_report(
 ) -> str
 ```
 
-Current implementation still exposes underscored/internal names in places:
+Current implementation has the public build/write boundary, while report rendering still reads some CSV artifacts during the same run:
 
 ```text
-_build_diagnostic_frames(inputs) -> DiagnosticFrames
-_write_diagnostic_frames(frames, diagnostics_dir) -> None
-render_report(inputs) -> str  # reads some CSV artifacts during same run
+build_diagnostic_frames(inputs) -> DiagnosticFrames
+write_diagnostic_frames(frames, artifacts) -> None
+render_report(inputs) -> str  # still reads some CSV artifacts during same run
 ```
 
 Target API removes same-run CSV read-back and separates expensive compute from cheap IO.
 Measured cache-only hotpath:
 
 ```text
-qooi.scanner.history.realized_transition_frame(...)       ~11.0s
-qooi.scanner.history.kline_path_history_frame(...)         ~5.0s
-qooi.scanner.diagnostics._run_pipeline(...)                ~3.8s
-qooi.scanner.frames.potential_observation_frame(...)       ~1.8s
-qooi.scanner.diagnostics.write_diagnostic_frames(...)      ~0.2s
+qooi.scanner.history.realized_transition_frame(...)        ~4.9s
+qooi.scanner.history.kline_path_history_frame(...)         ~1.8s
+qooi.scanner.diagnostics._run_pipeline(...)                ~0.7s
+qooi.scanner.frames.potential_observation_frame(...)       ~0.5s
+qooi.scanner.diagnostics.write_diagnostic_frames(...)      ~0.1s
 qooi.scanner.report.render_report(...)                     ~0.1s
 ```
 

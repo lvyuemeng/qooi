@@ -2,10 +2,10 @@
 output = "data/output/potential/daily-deep/report.md"
 universe = "research"
 bar = "1H"
+refresh_mode = "incremental"
 fetch_concurrency = 8
 
 [potential.source]
-refresh_mode = "incremental"
 book_mode = "snapshot"
 book_depth = 25
 trade_limit = 100

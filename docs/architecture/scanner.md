@@ -532,8 +532,8 @@ Static slippage thresholds are acceptable only as hard sanity guards. Promotion 
 Measured cache-only deep scan shows that Markdown rendering is not the slow stage:
 
 ```text
-build_diagnostic_frames     ~22.6s
-write_diagnostic_frames      ~0.2s
+build_diagnostic_frames      ~8.2s
+write_diagnostic_frames      ~0.1s
 render_report                ~0.1s
 ```
 
@@ -541,10 +541,10 @@ Therefore "report construction" means diagnostic-frame construction, not Markdow
 rendering. The dominant current hotpath is:
 
 ```text
-history.realized_transition_frame     ~11.0s
-history.kline_path_history_frame       ~5.0s
-tailtree/evidence pipeline             ~3.8s
-frames.potential_observation_frame     ~1.8s
+history.realized_transition_frame      ~4.9s
+history.kline_path_history_frame       ~1.8s
+tailtree/evidence pipeline             ~0.7s
+frames.potential_observation_frame     ~0.5s
 ```
 
 Optimization must target these frame builders before Markdown table helpers or CSV

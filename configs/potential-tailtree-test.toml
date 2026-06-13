@@ -2,10 +2,10 @@
 output = "data/output/potential/tailtree-test/report.md"
 universe = "research"
 bar = "1H"
+refresh_mode = "incremental"
 fetch_concurrency = 4
 
 [potential.source]
-refresh_mode = "incremental"
 book_mode = "snapshot"
 book_depth = 5
 trade_limit = 50
