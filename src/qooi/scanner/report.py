@@ -789,6 +789,19 @@ def _read_rank_data(rank_path) -> dict[str, dict]:
     if not rank_path.exists():
         return {}
     df = pl.read_csv(rank_path).sort("rank_score", descending=True)
+    numeric_cols = (
+        "rank_score",
+        "transition_information_gain_bits",
+        "symbol_count",
+        "tail_lift",
+        "N_tail_exceedances",
+        "gpd_shape_xi",
+    )
+    df = df.with_columns(
+        pl.col(col).cast(pl.Float64, strict=False).alias(col)
+        for col in numeric_cols
+        if col in df.columns
+    )
 
     has_tail = "tail_lift" in df.columns and df["tail_lift"].drop_nulls().len() > 0
     if has_tail:

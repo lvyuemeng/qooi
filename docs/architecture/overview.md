@@ -92,28 +92,32 @@ Do not preserve backward-compatible aliases when current callers can be updated.
 
 | Config section | Owner | Decision owned | Forbidden repetition |
 |---|---|---|---|
-| `[potential]` | `qooi.scanner.workflow` | scanner run identity, output, universe, OHLCV bar cache refresh, concurrency | source-provider knobs, evidence lifecycle, report audit flags |
-| `[potential.source]` | source request constructed by `workflow.py` | source-family refresh override, source limits, source staleness, disabled source/symbol demand | OHLCV bar refresh, candidate/rank/report policy |
+| `[potential]` | `qooi.scanner.workflow` | scanner run identity, output, universe, one scan refresh mode for materialized inputs, concurrency | source-provider knobs, evidence lifecycle, report audit flags |
+| `[potential.source]` | source request constructed by `workflow.py` | source limits, source staleness, disabled source/symbol demand | refresh mode, OHLCV bar refresh, candidate/rank/report policy |
 | `[potential.transition]` | `qooi.scanner.transitions` | transition/history windows and probability thresholds | source freshness, model lifecycle |
 | `[potential.evidence]` | `qooi.scanner.diagnostics` dispatch | evidence path name | booleans such as `use_tail_tree`, provider menus |
 | `[potential.evidence.tailtree]` | `qooi.scanner.tailrun` | train/load-predict lifecycle and model artifact identity | source refresh, report rendering |
 | `[potential.review]` | `qooi.scanner.decisions` | current review requirements only | candidate ranking, source acquisition |
 
-Refresh semantics must be explicit:
+Refresh semantics must be singular:
 
 ```text
-PotentialConfig.refresh_mode         -> OHLCV/bar cache refresh in exchange.store
-SourceConfig.refresh_mode="inherit" -> use PotentialConfig.refresh_mode for sources
-SourceConfig.refresh_mode=<mode>     -> override source-family collection only
+PotentialConfig.refresh_mode -> materialized input refresh for bars and source context
 ```
 
-This avoids a repeated `refresh_mode` role where `[potential.source]` appears to control bar cache refresh. If a config shape changes, update callers directly and remove old aliases rather than accepting both shapes.
+Nested source refresh overrides are forbidden by default. The old two-field shape made
+`[potential.source].refresh_mode` look like it controlled the whole scan while bar
+refresh still used `[potential].refresh_mode`; that violates scanner config ergonomics.
+If source and bar materialization ever need different cadence, use separate workflow
+commands/config files such as materialize-bars, materialize-sources, and evaluate-report
+rather than repeating a `refresh_mode` field in nested sections. If a config shape changes,
+update callers directly and remove old aliases rather than accepting both shapes.
 
 Boundary rule:
 
 ```text
 GOOD: workflow builds SourceContextRequest(output_dir, target_days, concurrency,
-      refresh_mode, source=PotentialConfig.source, ...)
+      refresh_mode=PotentialConfig.refresh_mode, source=PotentialConfig.source, ...)
 BAD:  qooi.sources.context.load_source_context(PotentialConfig, ...)
 ```
 

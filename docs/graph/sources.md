@@ -174,11 +174,6 @@ Keep these contracts small. Add fields only when a current source decision requi
 Scanner-facing API:
 
 ```text
-resolve_source_refresh_mode(
-    top_level_refresh_mode: RefreshMode,
-    source_refresh_mode: SourceRefreshMode,
-) -> RefreshMode
-
 SourceContextRequest(
   output_dir,
   symbols,
@@ -186,24 +181,31 @@ SourceContextRequest(
   discovery,
   target_days,
   concurrency,
-  refresh_mode,
+  refresh_mode,  # copied from PotentialConfig.refresh_mode by workflow.py
   source,
 )
 
 load_source_context(request: SourceContextRequest) -> SourceContextResult
 ```
 
-Refresh resolution:
+Refresh rule:
 
 ```text
-source.refresh_mode="inherit" -> top_level_refresh_mode
-source.refresh_mode=<mode>    -> <mode>
+sources.context never resolves refresh inheritance
+workflow.py passes the already-decided scan refresh mode
 ```
 
-No source API should inspect both scanner root and source section locations.
-`workflow.py` resolves refresh inheritance before constructing
-`SourceContextRequest`. There is no compatibility alias where
-`[potential.source].refresh_mode` controls bar cache refresh.
+Forbidden target APIs:
+
+```text
+SourceConfig.refresh_mode
+SourceRefreshMode
+resolve_source_refresh_mode(...)
+```
+
+There is no compatibility alias where `[potential.source].refresh_mode` controls source
+or bar refresh. The source section owns provider limits and staleness thresholds only;
+the root scan owns materialization refresh.
 
 Flow:
 

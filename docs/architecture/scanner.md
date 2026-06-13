@@ -116,7 +116,7 @@ PotentialConfig                                  # scanner TOML/root parse bound
   ├─ output/universe/bar/timeframes/days/refresh_mode/fetch_concurrency
   │    -> workflow/load_bars and exchange.store requests
   ├─ source: SourceConfig
-  │    -> workflow builds sources.context.SourceContextRequest
+  │    -> workflow builds sources.context.SourceContextRequest using root refresh_mode
   ├─ transition: TransitionConfig
   │    -> transitions/history/evidence target windows
   ├─ evidence: EvidenceConfig
@@ -126,15 +126,20 @@ PotentialConfig                                  # scanner TOML/root parse bound
        -> decisions only
 ```
 
-Refresh-mode ownership is decisive:
+Refresh-mode ownership is singular:
 
 ```text
-config.refresh_mode                 # OHLCV bar cache refresh only
-config.source.refresh_mode=inherit  # source collection uses config.refresh_mode
-config.source.refresh_mode=<mode>   # source collection override only
+config.refresh_mode  # bars and source context materialization for this scan
 ```
 
-No module should infer refresh behavior by checking several locations. No compatibility aliases should preserve old config shapes once callers are updated.
+`SourceConfig` must not define another `refresh_mode`. A repeated nested refresh field is
+ergonomic debt because `[potential.source].refresh_mode = "cache_only"` reads like a
+whole-scan cache-only request while bars still refresh from the root mode. If bars and
+source context need different cadences, split workflow commands or use distinct config
+files rather than repeating the same field name under multiple sections.
+
+No module should infer refresh behavior by checking several locations. No compatibility
+aliases should preserve old config shapes once callers are updated.
 
 Boundary target:
 
@@ -156,7 +161,8 @@ pure product has independent tests/callers and extraction removes real lines.
 | Surface | Owns | Does not own |
 |---|---|---|
 | `workflow.py` | staged run orchestration and boundary request construction | frame schema logic, report table construction |
-| `diagnostics.py` pure projections | candidate-selection frame, data-health frame, diagnostic artifacts | Markdown formatting, provider fetches |
+| `diagnostics.py` build phase | kline path history, realized transitions, source outcomes, evidence pipeline, candidate/data-health projections | Markdown formatting, provider fetches |
+| `diagnostics.py` write phase | persist already-built diagnostic/state frames | recompute evidence or report semantics |
 | `report.py` | render in-memory report frames to Markdown | CSV reading, type recovery, candidate/source/history business rules |
 
 Later split rule:
@@ -520,6 +526,34 @@ fetch failed but frame fresh -> zero or low penalty
 ```
 
 Static slippage thresholds are acceptable only as hard sanity guards. Promotion should prefer data-derived, symbol-relative, size-aware cost features and penalize cost against expected edge.
+
+## Diagnostics and report runtime boundary
+
+Measured cache-only deep scan shows that Markdown rendering is not the slow stage:
+
+```text
+build_diagnostic_frames     ~22.6s
+write_diagnostic_frames      ~0.2s
+render_report                ~0.1s
+```
+
+Therefore "report construction" means diagnostic-frame construction, not Markdown
+rendering. The dominant current hotpath is:
+
+```text
+history.realized_transition_frame     ~11.0s
+history.kline_path_history_frame       ~5.0s
+tailtree/evidence pipeline             ~3.8s
+frames.potential_observation_frame     ~1.8s
+```
+
+Optimization must target these frame builders before Markdown table helpers or CSV
+writers. `write_diagnostics(inputs)` should be treated as two products:
+
+```text
+build_diagnostic_frames(inputs) -> DiagnosticFrames  # expensive computation
+write_diagnostic_frames(frames, artifacts) -> None   # cheap artifact IO
+```
 
 ## Report projection boundary
 

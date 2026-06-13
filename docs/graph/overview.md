@@ -40,10 +40,12 @@ Composable config graph:
 PotentialConfig.refresh_mode
   -> scanner.workflow.load_bars
   -> exchange.store.HistoryRefreshRequest
-
-PotentialConfig.source.refresh_mode
-  -> sources.context.resolve_source_refresh_mode(...)
+  -> scanner.workflow.source_context_request
+  -> sources.context.SourceContextRequest
   -> sources.collect.SourceCollectRequest
+
+PotentialConfig.source
+  -> sources provider limits, staleness, disabled demand
 
 PotentialConfig.evidence.kind
   -> scanner.diagnostics evidence dispatch

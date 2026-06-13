@@ -27,6 +27,7 @@ qooi.scanner.workflow.run(config_path: Path) -> Path
        # internally builds exchange.store.HistoryRefreshRequest
   4. qooi.scanner.transitions.compute_transition_insights(...)
   5. qooi.scanner.workflow.source_context_request(config, ...) -> SourceContextRequest
+       # request.refresh_mode = config.refresh_mode; no nested source refresh override
   6. qooi.sources.context.load_source_context(request) -> SourceContextResult
   7. qooi.scanner.decisions.compute_source_states(...)
   8. qooi.scanner.decisions.scan_review_decisions(...)       # audit lens/artifact
@@ -41,8 +42,8 @@ the package boundary, not another scanner-wide abstraction.
 
 ```text
 PotentialConfig                      # root scanner config, owned by workflow
-  -> HistoryRefreshRequest           # exchange-owned cache request
-  -> SourceContextRequest            # sources-owned demand request
+  -> HistoryRefreshRequest           # exchange-owned cache request using config.refresh_mode
+  -> SourceContextRequest            # sources-owned demand request using config.refresh_mode
   -> evidence/transition/review calls # scanner-local section consumers
 ```
 
@@ -83,6 +84,27 @@ helpers. There are no `qooi.scanner.contracts`, `qooi.scanner.evidence`, or
 `qooi.scanner.candidates` compatibility modules in the resolved graph.
 
 ---
+
+## Refresh and source context boundary
+
+One scan refresh field feeds both materialized input families:
+
+```text
+PotentialConfig.refresh_mode: "incremental" | "cache_only" | "force"
+  -> qooi.exchange.store.HistoryRefreshRequest(refresh, incremental, cache_only)
+  -> qooi.sources.context.SourceContextRequest(refresh_mode)
+```
+
+Forbidden target APIs:
+
+```text
+SourceConfig.refresh_mode
+SourceRefreshMode
+resolve_source_refresh_mode(...)
+```
+
+If bars and sources need independent cadence, add explicit workflow commands/config
+profiles rather than another nested `refresh_mode` field.
 
 ## Source context + feasibility inputs
 
@@ -635,15 +657,51 @@ no symbol-level candidate rows in data-health report section
 no candidate ranking or source collection
 ```
 
-## Diagnostics and report
+## Diagnostics build/write and report render
 
 ```text
 qooi.scanner.diagnostics.build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames
-qooi.scanner.diagnostics.write_diagnostic_frames(frames: DiagnosticFrames, artifacts: PotentialArtifacts) -> None
-qooi.scanner.report.render_report(inputs: ReportInputs, frames: DiagnosticFrames) -> str
+qooi.scanner.diagnostics.write_diagnostic_frames(
+    frames: DiagnosticFrames,
+    artifacts: PotentialArtifacts,
+) -> None
+qooi.scanner.report.render_report(
+    inputs: ReportInputs,
+    frames: DiagnosticFrames,
+) -> str
 ```
 
-Diagnostics writes path-specific artifacts after the one dispatch. It does not own candidate-selection or health semantics; it orchestrates and persists those products.
+Current implementation still exposes underscored/internal names in places:
+
+```text
+_build_diagnostic_frames(inputs) -> DiagnosticFrames
+_write_diagnostic_frames(frames, diagnostics_dir) -> None
+render_report(inputs) -> str  # reads some CSV artifacts during same run
+```
+
+Target API removes same-run CSV read-back and separates expensive compute from cheap IO.
+Measured cache-only hotpath:
+
+```text
+qooi.scanner.history.realized_transition_frame(...)       ~11.0s
+qooi.scanner.history.kline_path_history_frame(...)         ~5.0s
+qooi.scanner.diagnostics._run_pipeline(...)                ~3.8s
+qooi.scanner.frames.potential_observation_frame(...)       ~1.8s
+qooi.scanner.diagnostics.write_diagnostic_frames(...)      ~0.2s
+qooi.scanner.report.render_report(...)                     ~0.1s
+```
+
+Optimization order:
+
+```text
+1. realized_transition_frame
+2. kline_path_history_frame
+3. tailtree/evidence pipeline
+4. potential_observation_frame
+5. in-memory report frames to remove CSV type recovery
+```
+
+Do not optimize Markdown table formatting before these frame builders.
 
 Report rendering graph:
 

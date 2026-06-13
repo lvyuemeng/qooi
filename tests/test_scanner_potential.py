@@ -14,6 +14,7 @@ from qooi.scanner import frames as potential_frames
 from qooi.scanner import history as potential_history
 from qooi.scanner import ladder as potential_ladder
 from qooi.scanner import rank as potential_rank
+from qooi.scanner import report as potential_report
 from qooi.scanner.classifiers import STATE_FRAME_SCHEMA
 from qooi.scanner.config import TransitionConfig
 from qooi.scanner.tailtree import _tailtree_outcome_by_decision, select_tail_leaves
@@ -627,6 +628,21 @@ def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypat
     assert scan.context_symbols(potential.PotentialConfig(), universe.symbols, no_patterns) == ()
     assert potential.target_min_bars(10, "15m") == 960
     assert potential.target_min_bars(10, "4H") == 120
+
+
+def test_rank_report_reader_casts_csv_numeric_columns(tmp_path: Path) -> None:
+    path = tmp_path / "candidate-rank.csv"
+    path.write_text(
+        "symbol,rank_score,transition_information_gain_bits,symbol_count\n"
+        "AAA-USDT-SWAP,1.0,not_available,20\n"
+        "BBB-USDT-SWAP,2.0,3.0,30\n",
+        encoding="utf-8",
+    )
+
+    rows = potential_report._read_rank_data(path)
+
+    assert rows["BBB-USDT-SWAP"]["tier"] == "1"
+    assert rows["AAA-USDT-SWAP"]["tier"] == "3"
 
 
 def test_source_events_are_known_at_close_and_exclude_availability_states() -> None:

@@ -61,14 +61,15 @@ Removed target: source collection must not live in `qooi.exchange.context`.
 
 ```text
 PotentialConfig.refresh_mode
-  -> default refresh mode for both bar cache and source collection
+  -> the single scan materialization refresh mode for bar cache and source collection
 
-SourceConfig.refresh_mode="inherit"
-  -> source collection uses PotentialConfig.refresh_mode
-
-SourceConfig.refresh_mode in {"incremental", "cache_only", "force"}
-  -> source collection override only
+SourceConfig.refresh_mode
+  -> forbidden target API; source sections do not override refresh
 ```
+
+A nested source refresh override is intentionally not part of the target contract. If
+source and bar materialization need different cadence, use distinct workflow commands or
+config profiles rather than repeating a `refresh_mode` role inside `SourceConfig`.
 
 `SourceConfig` owns provider-family limits and freshness:
 
@@ -90,7 +91,7 @@ sources.context.SourceContextRequest
   discovery
   target_days
   concurrency
-  refresh_mode
+  refresh_mode  # copied from PotentialConfig.refresh_mode
   source: SourceConfig-like provider limits
 ```
 
