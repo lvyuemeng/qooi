@@ -206,58 +206,72 @@ def realized_transition_frame(
     frames = []
     base = kline_history.sort("symbol", "timeframe", "bar_close_ms")
     for horizon in sorted({int(horizon) for horizon in horizons if int(horizon) > 0}):
+        future_direction = [f"_future_direction_{offset}" for offset in range(1, horizon + 1)]
+        future_core = [f"_future_core_{offset}" for offset in range(1, horizon + 1)]
+        future_event = [f"_future_event_{offset}" for offset in range(1, horizon + 1)]
+        with_future = base.with_columns(
+            *[
+                pl.col("direction_hint")
+                .shift(-offset)
+                .over("symbol", "timeframe")
+                .alias(future_direction[offset - 1])
+                for offset in range(1, horizon + 1)
+            ],
+            *[
+                pl.col("core_context")
+                .shift(-offset)
+                .over("symbol", "timeframe")
+                .alias(future_core[offset - 1])
+                for offset in range(1, horizon + 1)
+            ],
+            *[
+                pl.col("event_state")
+                .shift(-offset)
+                .over("symbol", "timeframe")
+                .alias(future_event[offset - 1])
+                for offset in range(1, horizon + 1)
+            ],
+            pl.col("regime_state")
+            .shift(-horizon)
+            .over("symbol", "timeframe")
+            .alias("terminal_regime_state"),
+            pl.col("structure_state")
+            .shift(-horizon)
+            .over("symbol", "timeframe")
+            .alias("terminal_structure_state"),
+            pl.col("transition_kind")
+            .shift(-horizon)
+            .over("symbol", "timeframe")
+            .alias("terminal_transition_kind"),
+        )
         direction_change_time = pl.min_horizontal(
             *(
-                pl.when(
-                    pl.col("direction_hint").shift(-offset).over("symbol", "timeframe")
-                    != pl.col("direction_hint")
-                )
-                .then(offset)
+                pl.when(pl.col(column) != pl.col("direction_hint"))
+                .then(pl.lit(offset))
                 .otherwise(None)
-                for offset in range(1, horizon + 1)
+                for offset, column in enumerate(future_direction, start=1)
             )
         )
         core_change_time = pl.min_horizontal(
             *(
-                pl.when(
-                    pl.col("core_context").shift(-offset).over("symbol", "timeframe")
-                    != pl.col("core_context")
-                )
-                .then(offset)
+                pl.when(pl.col(column) != pl.col("core_context"))
+                .then(pl.lit(offset))
                 .otherwise(None)
-                for offset in range(1, horizon + 1)
+                for offset, column in enumerate(future_core, start=1)
             )
         )
         transition_count = sum(
             (
-                pl.col("core_context").shift(-offset).over("symbol", "timeframe")
-                != pl.col("core_context").shift(-(offset - 1)).over("symbol", "timeframe")
+                pl.col(column)
+                != (pl.col("core_context") if offset == 1 else pl.col(future_core[offset - 2]))
             ).cast(pl.Int64)
-            for offset in range(1, horizon + 1)
+            for offset, column in enumerate(future_core, start=1)
         )
         frames.append(
-            base.with_columns(
+            with_future.with_columns(
                 pl.lit(horizon).alias("outcome_horizon"),
-                pl.col("direction_hint")
-                .shift(-horizon)
-                .over("symbol", "timeframe")
-                .alias("terminal_direction"),
-                pl.col("regime_state")
-                .shift(-horizon)
-                .over("symbol", "timeframe")
-                .alias("terminal_regime_state"),
-                pl.col("structure_state")
-                .shift(-horizon)
-                .over("symbol", "timeframe")
-                .alias("terminal_structure_state"),
-                pl.col("core_context")
-                .shift(-horizon)
-                .over("symbol", "timeframe")
-                .alias("terminal_core_context"),
-                pl.col("transition_kind")
-                .shift(-horizon)
-                .over("symbol", "timeframe")
-                .alias("terminal_transition_kind"),
+                pl.col(future_direction[-1]).alias("terminal_direction"),
+                pl.col(future_core[-1]).alias("terminal_core_context"),
                 direction_change_time.alias("time_to_direction_change_bars"),
                 core_change_time.alias("time_to_core_change_bars"),
                 transition_count.alias("transition_count"),
@@ -274,13 +288,7 @@ def realized_transition_frame(
                     "core_context_changed"
                 ),
                 pl.concat_list(
-                    [
-                        ~pl.col("event_state")
-                        .shift(-offset)
-                        .over("symbol", "timeframe")
-                        .str.starts_with("none")
-                        for offset in range(1, horizon + 1)
-                    ]
+                    [~pl.col(column).str.starts_with("none") for column in future_event]
                 )
                 .list.any()
                 .alias("event_fired"),

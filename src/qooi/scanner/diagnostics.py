@@ -130,7 +130,7 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
     kline_history = history_eval.kline_path_history_frame(inputs.config, inputs.bars.state_frames)
     source_outcomes = source_eval.source_outcomes_frame(source_events, bars)
     realized_transitions = history_eval.realized_transition_frame(
-        kline_history,
+        kline_history.filter(pl.col("timeframe") == inputs.config.bar),
         tuple(source_outcomes.get_column("outcome_horizon").unique().to_list())
         if not source_outcomes.is_empty()
         else (inputs.config.transition.horizon,),

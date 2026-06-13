@@ -186,6 +186,61 @@ def _realized_transition(symbol: str, index: int, *, changed: bool) -> dict[str,
     }
 
 
+def test_realized_transition_frame_preserves_future_path_metrics() -> None:
+    history = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC", "BTC", "BTC", "ETH", "ETH"],
+            "timeframe": ["1H", "1H", "1H", "1H", "4H", "4H"],
+            "bar_close_ms": [1, 2, 3, 4, 1, 2],
+            "direction_hint": ["flat", "flat", "up", "flat", "down", "up"],
+            "regime_state": ["range", "range", "trend", "range", "bear", "bull"],
+            "structure_state": ["coil", "coil", "break", "coil", "drop", "rise"],
+            "core_context": [
+                "range|coil",
+                "range|coil",
+                "trend|break",
+                "range|coil",
+                "bear|drop",
+                "bull|rise",
+            ],
+            "transition_kind": ["same", "same", "state", "state", "same", "state"],
+            "event_state": [
+                "none_event",
+                "shock",
+                "none_event",
+                "none_event",
+                "none_event",
+                "none_event",
+            ],
+        }
+    )
+
+    rows = potential_history.realized_transition_frame(history, (1, 2)).sort(
+        "symbol", "timeframe", "bar_close_ms", "outcome_horizon"
+    )
+
+    btc_h2 = rows.filter(
+        (pl.col("symbol") == "BTC")
+        & (pl.col("bar_close_ms") == 1)
+        & (pl.col("outcome_horizon") == 2)
+    ).row(0, named=True)
+    eth_h1 = rows.filter(
+        (pl.col("symbol") == "ETH")
+        & (pl.col("bar_close_ms") == 1)
+        & (pl.col("outcome_horizon") == 1)
+    ).row(0, named=True)
+
+    assert rows.height == 12
+    assert btc_h2["terminal_core_context"] == "trend|break"
+    assert btc_h2["time_to_direction_change_bars"] == 2
+    assert btc_h2["time_to_core_change_bars"] == 2
+    assert btc_h2["transition_count"] == 1
+    assert btc_h2["event_fired"] is True
+    assert btc_h2["returned_to_origin"] is False
+    assert eth_h1["direction_changed"] is True
+    assert eth_h1["core_context_changed"] is True
+
+
 def _selected_evidence_for_test() -> pl.DataFrame:
     return pl.DataFrame(
         {
