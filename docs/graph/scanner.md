@@ -22,11 +22,12 @@ scripts/potential_scan.py
 qooi.scanner.workflow.run(config_path: Path) -> Path
 
   1. qooi.scanner.workflow.load_config(config_path) -> PotentialConfig
-  2. qooi.scanner.workflow.resolve_workflow_plan(config) -> ScannerWorkflowPlan
-  3. qooi.scanner.workflow.resolve_universe(config) -> PotentialUniverse
-  4. qooi.scanner.workflow.load_bars(plan.bars, symbols) -> BarFetchResult
-  5. qooi.scanner.transitions.compute_transition_insights(...)
-  6. qooi.sources.context.load_source_context(plan.sources, ...)
+  2. qooi.scanner.workflow.resolve_universe(config) -> PotentialUniverse
+  3. qooi.scanner.workflow.load_bars(config, symbols) -> BarFetchResult
+       # internally builds exchange.store.HistoryRefreshRequest
+  4. qooi.scanner.transitions.compute_transition_insights(...)
+  5. qooi.scanner.workflow.source_context_request(config, ...) -> SourceContextRequest
+  6. qooi.sources.context.load_source_context(request) -> SourceContextResult
   7. qooi.scanner.decisions.compute_source_states(...)
   8. qooi.scanner.decisions.scan_review_decisions(...)       # audit lens/artifact
   9. qooi.scanner.diagnostics.build_diagnostic_frames(inputs) -> DiagnosticFrames
@@ -34,18 +35,18 @@ qooi.scanner.workflow.run(config_path: Path) -> Path
  11. qooi.scanner.report.render_report(inputs, frames) -> str
 ```
 
-`ScannerWorkflowPlan` is config-derived and contains section-owned run decisions; it is not a global materialized dataframe bag.
+No separate `ScannerWorkflowPlan` is required unless a future caller needs to
+inspect a complete dry-run plan. The lean boundary is a small request object at
+the package boundary, not another scanner-wide abstraction.
 
 ```text
-ScannerWorkflowPlan
-  bars.refresh_mode: RefreshMode             # from PotentialConfig.refresh_mode
-  bars.fetch_concurrency: int
-  sources.refresh_mode: RefreshMode          # SourceConfig override or inherited top-level mode
-  evidence.kind: "ladder" | "tailtree"
-  tailtree.lifecycle: "train" | "load_predict"
+PotentialConfig                      # root scanner config, owned by workflow
+  -> HistoryRefreshRequest           # exchange-owned cache request
+  -> SourceContextRequest            # sources-owned demand request
+  -> evidence/transition/review calls # scanner-local section consumers
 ```
 
-`workflow.py` passes named data products between modules. It must not grow a global materialized-data bag that every downstream consumer accepts. It also must not let modules discover refresh/lifecycle behavior by checking several config locations.
+`workflow.py` passes named data products between modules. It must not grow a global materialized-data bag that every downstream consumer accepts. It also must not pass the whole root config into packages that only need a source/exchange request.
 
 ---
 
@@ -72,8 +73,8 @@ observations/outcomes
 result.evidence/latest_observations
   → qooi.scanner.rank.candidate_evidence_frame(...)
   → qooi.scanner.rank.rank_candidate_evidence(...)
-  → qooi.scanner.selection.candidate_selection_frame(...)
-  → qooi.scanner.health.data_health_frame(...)
+  → qooi.scanner.diagnostics.candidate_feasibility_frame(...)
+  → qooi.scanner.diagnostics.data_health_frame(...)
   → candidate-inspection.csv + candidate-rank.csv + candidate-feasibility.csv + report
 ```
 
@@ -481,16 +482,16 @@ Ranking uses numeric columns that are present:
 - ladder: information gain, stability, support, path quality, data quality;
 - tailtree: tail lift, tail stability, support, path quality, data quality.
 
-Candidate selection projection belongs to `selection.py`, not `report.py` or the artifact writer:
+Candidate selection projection currently belongs to `diagnostics.py`, not `report.py`:
 
 ```text
-qooi.scanner.selection.candidate_selection_frame(
+qooi.scanner.diagnostics.candidate_feasibility_frame(
     candidate_rank: pl.DataFrame,
     watchlist_feasibility: pl.DataFrame,
 ) -> pl.DataFrame
 ```
 
-Compatibility rule: `qooi.scanner.diagnostics.candidate_feasibility_frame(...)` is a temporary landed API and should be moved, not wrapped indefinitely. After callers are updated, remove the old name.
+Split to `selection.py` only if it removes real module pressure after CSV read-back and default audit rendering are removed; do not create a forwarding wrapper.
 
 Output contract:
 
@@ -519,7 +520,7 @@ columns:
   candidate_reason: String
 ```
 
-This projection is semantic, not presentational. It may derive `rank_tier`, select the best row per symbol, and derive stable blocker/reason codes. It must not emit display-formatted strings for numeric values. The landed `diagnostics.candidate_feasibility_frame` should be moved to `selection.candidate_selection_frame`; do not leave a wrapper alias after callers migrate.
+This projection is semantic, not presentational. It may derive `rank_tier`, select the best row per symbol, and derive stable blocker/reason codes. It must not emit display-formatted strings for numeric values.
 
 Promoted-rank scoring should be explicit, capability-aware, and cost-aware:
 
@@ -551,16 +552,18 @@ Manual slippage thresholds are allowed only as extreme sanity guards. Normal rev
 
 ## Selection and health projections
 
-### `qooi.scanner.selection`
+### Candidate-selection projection
 
 Canonical candidate-selection projection:
 
 ```text
-qooi.scanner.selection.candidate_selection_frame(
+qooi.scanner.diagnostics.candidate_feasibility_frame(
     candidate_rank: pl.DataFrame,
     watchlist_feasibility: pl.DataFrame,
 ) -> pl.DataFrame
 ```
+
+This function may later move to `qooi.scanner.selection.candidate_selection_frame(...)` only if that removes real module pressure without becoming a wrapper alias.
 
 Schema:
 
@@ -596,17 +599,19 @@ candidate_reason: semantic blocker code, not display prose
 no Markdown strings or report formatting
 ```
 
-### `qooi.scanner.health`
+### Data-health projection
 
 Aggregate report-health projection:
 
 ```text
-qooi.scanner.health.data_health_frame(
+qooi.scanner.diagnostics.data_health_frame(
     history_feasibility: pl.DataFrame,
     source_availability: pl.DataFrame,
     candidate_selection: pl.DataFrame,
 ) -> pl.DataFrame
 ```
+
+This function can stay in `diagnostics.py` while it only feeds diagnostics/report. Split to `health.py` only if it gains independent callers or materially reduces `diagnostics.py` after CSV read-back is removed.
 
 Schema:
 
@@ -657,8 +662,8 @@ DiagnosticFrames.path_evidence
 Target frame contracts:
 
 ```text
-qooi.scanner.selection.CANDIDATE_SELECTION_SCHEMA
-qooi.scanner.health.DATA_HEALTH_SCHEMA
+qooi.scanner.diagnostics.CANDIDATE_SELECTION_SCHEMA
+qooi.scanner.diagnostics.DATA_HEALTH_SCHEMA
 ```
 
 `report.py` should not read `diagnostics/*.csv` during the same run. CSV artifacts are an output boundary for users/tests, not an internal type transport.

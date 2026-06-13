@@ -5,9 +5,10 @@ Target API graph for demand-first source modules.
 ## Pipeline
 
 ```text
-scanner config + symbols
-  -> sources.context.load_source_context
-  -> sources.collect.source_needs_from_config
+scanner workflow + symbols
+  -> workflow.source_context_request(...)
+  -> sources.context.load_source_context(request)
+  -> sources.collect.source_needs_from_request
   -> sources.collect.collect_source_context
   -> sources.bundle.merge_source_frames
   -> SourceContextResult
@@ -178,7 +179,18 @@ resolve_source_refresh_mode(
     source_refresh_mode: SourceRefreshMode,
 ) -> RefreshMode
 
-load_source_context(config, *, symbols, context_symbols, discovery) -> SourceContextResult
+SourceContextRequest(
+  output_dir,
+  symbols,
+  context_symbols,
+  discovery,
+  target_days,
+  concurrency,
+  refresh_mode,
+  source,
+)
+
+load_source_context(request: SourceContextRequest) -> SourceContextResult
 ```
 
 Refresh resolution:
@@ -188,14 +200,17 @@ source.refresh_mode="inherit" -> top_level_refresh_mode
 source.refresh_mode=<mode>    -> <mode>
 ```
 
-No other source API should inspect both config locations. There is no compatibility alias where `[potential.source].refresh_mode` controls bar cache refresh.
+No source API should inspect both scanner root and source section locations.
+`workflow.py` resolves refresh inheritance before constructing
+`SourceContextRequest`. There is no compatibility alias where
+`[potential.source].refresh_mode` controls bar cache refresh.
 
 Flow:
 
 ```text
-load_source_context
+load_source_context(request)
   -> read_source_bundle
-  -> source_needs_from_config
+  -> source_needs_from_request
   -> collect_source_context
   -> merge/write source artifacts
   -> source_availability
@@ -243,14 +258,14 @@ No provider endpoint logic here.
 Demand and collection API:
 
 ```text
-source_needs_from_config(config, *, symbols, context_symbols, start_ms, end_ms) -> tuple[SourceNeed, ...]
+source_needs_from_request(request: SourceContextRequest, *, start_ms, end_ms) -> tuple[SourceNeed, ...]
 collect_source_context(request: SourceCollectRequest) -> SourceCollectResult
 ```
 
 Rules:
 
 ```text
-source_needs_from_config: pure
+source_needs_from_request: pure
 collect_source_context: side effects allowed
 ```
 

@@ -21,9 +21,7 @@ src/qooi/scanner/
 ├── tailtree.py       # LightGBM + GPD tail evidence path; optional deps
 ├── tailrun.py        # tailtree train/load_predict lifecycle and model artifacts
 ├── rank.py           # candidate-inspection and candidate-rank rows
-├── selection.py      # target: canonical candidate-selection projection
-├── health.py         # target: data-health aggregate projection
-├── diagnostics.py    # artifact writer/orchestrator over computed frames
+├── diagnostics.py    # artifact writer + pure report projection functions
 └── report.py         # markdown renderer from in-memory report frames
 ```
 
@@ -109,16 +107,23 @@ Forbidden:
 
 ## Scanner config workflow
 
-Scanner config is composable by section. `workflow.py` resolves the run plan once, then passes section-owned config to the module that owns the decision.
+Scanner config is composable by section, but `PotentialConfig` remains the single
+root config model. `workflow.py` should pass module-owned request views at package
+boundaries instead of handing the whole root config to every package.
 
 ```text
-PotentialConfig
-  ├─ output/universe/bar/timeframes/days/refresh_mode/fetch_concurrency -> workflow/load_bars
-  ├─ source: SourceConfig                                           -> sources.context
-  ├─ transition: TransitionConfig                                   -> transitions/history
-  ├─ evidence: EvidenceConfig                                       -> diagnostics evidence dispatch
-  │    └─ tailtree: TailtreeConfig                                  -> tailrun lifecycle
-  └─ review: ReviewConfig                                           -> decisions only
+PotentialConfig                                  # scanner TOML/root parse boundary
+  ├─ output/universe/bar/timeframes/days/refresh_mode/fetch_concurrency
+  │    -> workflow/load_bars and exchange.store requests
+  ├─ source: SourceConfig
+  │    -> workflow builds sources.context.SourceContextRequest
+  ├─ transition: TransitionConfig
+  │    -> transitions/history/evidence target windows
+  ├─ evidence: EvidenceConfig
+  │    -> diagnostics evidence dispatch
+  │       └─ tailtree: TailtreeConfig -> tailrun lifecycle
+  └─ review: ReviewConfig
+       -> decisions only
 ```
 
 Refresh-mode ownership is decisive:
@@ -131,17 +136,36 @@ config.source.refresh_mode=<mode>   # source collection override only
 
 No module should infer refresh behavior by checking several locations. No compatibility aliases should preserve old config shapes once callers are updated.
 
+Boundary target:
+
+```text
+workflow.py owns PotentialConfig.
+sources.context owns SourceContextRequest.
+exchange.store owns HistoryRefreshRequest.
+```
+
+This separates the monolith at call boundaries without creating parallel config
+models for every nested section.
+
 ## Lean reduction target
 
-The current scanner has grown large report and diagnostics modules. The target is not another helper layer; it is fewer ownership surfaces:
+The current scanner has grown large report and diagnostics modules. The first
+target is fewer conversion layers, not more files. Split a module only after a
+pure product has independent tests/callers and extraction removes real lines.
 
-| Target module | Owns | Does not own |
+| Surface | Owns | Does not own |
 |---|---|---|
-| `workflow.py` | staged run orchestration and config-section routing | frame schema logic, report table construction |
-| `selection.py` | `candidate_selection_frame(candidate_rank, watchlist_feasibility)` and promotion/reason semantics | Markdown formatting, artifact writes |
-| `health.py` | aggregate data-health rows from history/source/candidate frames | candidate ranking, source collection |
-| `diagnostics.py` | build/write diagnostic artifacts from already-owned frame products | evidence model internals, report CSV read-back |
+| `workflow.py` | staged run orchestration and boundary request construction | frame schema logic, report table construction |
+| `diagnostics.py` pure projections | candidate-selection frame, data-health frame, diagnostic artifacts | Markdown formatting, provider fetches |
 | `report.py` | render in-memory report frames to Markdown | CSV reading, type recovery, candidate/source/history business rules |
+
+Later split rule:
+
+```text
+Move diagnostics.candidate_selection_frame -> selection.py only if it gains
+independent callers/tests or if diagnostics.py remains too large after removing
+CSV read-back and default audit rendering. Same for data-health.
+```
 
 Default report surface:
 
@@ -460,7 +484,7 @@ Candidate output has three different grains. The report must not present all thr
 
 The top-level report should have one candidate-selection table sourced from `candidate-feasibility.csv` or its in-memory frame. `Review Rows`/decision-rule output is an audit lens and should be demoted to artifact/appendix, not a rank-ordered candidate list. `Data Coverage And Feasibility` should become an aggregate data-health summary, not another symbol table competing with candidate selection.
 
-Candidate-selection semantics belong to `selection.py`: best-row selection, promotion gates, source/history blocker codes, and stable numeric schema. Report rendering belongs to `report.py`; artifact writing belongs to `diagnostics.py`.
+Candidate-selection semantics belong to diagnostics/report projections: best-row selection, promotion gates, source/history blocker codes, and stable numeric schema. Report rendering belongs to `report.py`; artifact writing belongs to `diagnostics.py`. Extract a separate `selection.py` only when the code split removes real duplication rather than creating a new forwarding layer.
 
 Freshness, capability, and tradability are numeric inputs, not manual labels:
 
@@ -534,8 +558,8 @@ rank/feasibility joins
 Report sections should receive decisive frame schemas, for example:
 
 ```text
-selection.CANDIDATE_SELECTION_SCHEMA
-health.DATA_HEALTH_SCHEMA
+diagnostics.CANDIDATE_SELECTION_SCHEMA
+diagnostics.DATA_HEALTH_SCHEMA
 ```
 
 The renderer should fail fast when projection schemas are wrong; it should not infer missing semantics with attribute checks, opaque row dictionaries, or CSV read-back conversions inside the same run.

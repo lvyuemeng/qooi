@@ -83,12 +83,17 @@ configs/potential*.toml
 
 ## Composable configuration policy
 
-Configuration is a composition of package-owned sections, not repeated role flags. Each section owns one workflow decision and consumers read that section directly. Do not preserve backward-compatible aliases when current callers can be updated.
+`PotentialConfig` remains the single scanner TOML/root parse boundary. Do not split
+the user-facing config into independent top-level files or duplicate package config
+trees. Composition happens at module call boundaries: `workflow.py` passes the
+small request/config view that a module needs, not the whole root config.
+
+Do not preserve backward-compatible aliases when current callers can be updated.
 
 | Config section | Owner | Decision owned | Forbidden repetition |
 |---|---|---|---|
 | `[potential]` | `qooi.scanner.workflow` | scanner run identity, output, universe, OHLCV bar cache refresh, concurrency | source-provider knobs, evidence lifecycle, report audit flags |
-| `[potential.source]` | `qooi.sources.context` | source-family refresh override, source limits, source staleness, disabled source/symbol demand | OHLCV bar refresh, candidate/rank/report policy |
+| `[potential.source]` | source request constructed by `workflow.py` | source-family refresh override, source limits, source staleness, disabled source/symbol demand | OHLCV bar refresh, candidate/rank/report policy |
 | `[potential.transition]` | `qooi.scanner.transitions` | transition/history windows and probability thresholds | source freshness, model lifecycle |
 | `[potential.evidence]` | `qooi.scanner.diagnostics` dispatch | evidence path name | booleans such as `use_tail_tree`, provider menus |
 | `[potential.evidence.tailtree]` | `qooi.scanner.tailrun` | train/load-predict lifecycle and model artifact identity | source refresh, report rendering |
@@ -104,6 +109,18 @@ SourceConfig.refresh_mode=<mode>     -> override source-family collection only
 
 This avoids a repeated `refresh_mode` role where `[potential.source]` appears to control bar cache refresh. If a config shape changes, update callers directly and remove old aliases rather than accepting both shapes.
 
+Boundary rule:
+
+```text
+GOOD: workflow builds SourceContextRequest(output_dir, target_days, concurrency,
+      refresh_mode, source=PotentialConfig.source, ...)
+BAD:  qooi.sources.context.load_source_context(PotentialConfig, ...)
+```
+
+The source package is indifferent to scanner config shape; it needs a demand
+request. It may define the request contract, but it should not know about the
+whole `PotentialConfig` object or scanner transition/evidence/review sections.
+
 ## Lean-module policy
 
 Large modules are not automatically wrong, but repeated helper surfaces and read-back/conversion layers violate the project context. Reduction should follow ownership, not create `_utils.py` grab bags.
@@ -112,7 +129,7 @@ Current high-pressure modules to reduce:
 
 | Package | Module | Current pressure | Reduction direction |
 |---|---|---:|---|
-| scanner | `diagnostics.py` | artifact assembly, evidence dispatch, report projections, frame writers | split semantic products into one-word owners such as `selection.py` and `health.py`; keep `diagnostics.py` as writer/orchestrator |
+| scanner | `diagnostics.py` | artifact assembly, evidence dispatch, report projections, frame writers | first extract pure functions inside the module; split only when a product has independent callers/tests |
 | scanner | `report.py` | section logic plus CSV read-back plus type recovery | render in-memory report frames; remove default decision audit; delete conversion helpers |
 | sources | `collect.py` | demand planning plus provider execution | keep pure demand planning separate from side-effect collection within named APIs; no compatibility wrappers |
 | exchange | `store.py` | cache request, refresh, validation, coverage rows | keep cache/coverage contracts decisive; no source-context policy |

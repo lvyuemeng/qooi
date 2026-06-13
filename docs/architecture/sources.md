@@ -57,7 +57,7 @@ Removed target: source collection must not live in `qooi.exchange.context`.
 
 ## Source config workflow
 
-`SourceConfig` is a source-family demand override, not a second scanner run config.
+`SourceConfig` is a nested scanner config section, not a second scanner run config. `qooi.sources` should receive a source-owned demand request, not the full `PotentialConfig` root.
 
 ```text
 PotentialConfig.refresh_mode
@@ -79,6 +79,22 @@ disabled_sources, disabled_symbols
 ```
 
 It must not own OHLCV bar cache refresh, evidence path, tailtree lifecycle, candidate ranking, or report section selection. Old aliases that blur these roles should be removed, not preserved.
+
+Source package boundary:
+
+```text
+sources.context.SourceContextRequest
+  output_dir
+  symbols
+  context_symbols
+  discovery
+  target_days
+  concurrency
+  refresh_mode
+  source: SourceConfig-like provider limits
+```
+
+`workflow.py` builds this request from `PotentialConfig`; `sources.context` consumes the request. The source package may define the request contract and a minimal `SourceSection` protocol, but it should not know about scanner transition/evidence/review config objects.
 
 ## Core abstractions
 
