@@ -183,7 +183,7 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
         potential_evidence=pipeline_result.evidence,
         candidate_evidence=pipeline_result.candidates,
         candidate_rank=pipeline_result.ranked,
-        candidate_feasibility=_candidate_feasibility_frame(
+        candidate_feasibility=candidate_feasibility_frame(
             pipeline_result.ranked,
             watchlist_feasibility,
         ),
@@ -251,7 +251,7 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         frame.write_csv(diagnostics / f"{name}.csv")
 
 
-def _candidate_feasibility_frame(
+def candidate_feasibility_frame(
     candidate_rank: pl.DataFrame, watchlist_feasibility: pl.DataFrame
 ) -> pl.DataFrame:
     columns = [
@@ -321,7 +321,7 @@ def _candidate_feasibility_frame(
             "tail_lift",
             "gpd_shape_xi",
             "N_tail_exceedances",
-            pl.col("rank_reason").alias("candidate_reason"),
+            "rank_reason",
         ]
     )
     if watchlist_feasibility.is_empty():
@@ -331,6 +331,7 @@ def _candidate_feasibility_frame(
             pl.lit(None, dtype=pl.Float64).alias("min_source_capability_coverage_pct"),
             pl.lit("missing").alias("source_status"),
             pl.lit("missing").alias("history_status"),
+            pl.col("rank_reason").alias("candidate_reason"),
         ).select(columns)
 
     watch_columns = [
@@ -348,7 +349,30 @@ def _candidate_feasibility_frame(
             pl.col("source_status").fill_null("missing"),
             pl.col("history_status").fill_null("missing"),
         )
+        .with_columns(_candidate_reason_expr().alias("candidate_reason"))
         .select(columns)
+    )
+
+
+def _candidate_reason_expr() -> pl.Expr:
+    return (
+        pl.when(pl.col("required_missing_source_count") > 0)
+        .then(
+            pl.lit("missing_required_sources=")
+            + pl.col("required_missing_source_count").cast(pl.String)
+        )
+        .when(pl.col("required_stale_source_count") > 0)
+        .then(
+            pl.lit("stale_required_sources=")
+            + pl.col("required_stale_source_count").cast(pl.String)
+        )
+        .when(pl.col("watchlist_feasibility") == "coverage_limited_review")
+        .then(pl.lit("history=") + pl.col("history_status"))
+        .when(pl.col("watchlist_feasibility") == "blocked_by_evidence_gate")
+        .then(pl.lit("evidence_gate_blocked"))
+        .when(pl.col("watchlist_feasibility") == "reviewable")
+        .then(pl.lit("reviewable"))
+        .otherwise(pl.col("rank_reason"))
     )
 
 

@@ -6,6 +6,8 @@ No evidence-path branching inside any section.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import polars as pl
@@ -30,8 +32,8 @@ def render_report(inputs: ReportInputs) -> str:
         [
             _ScanScopeSection(),
             _SourceFreshnessSection(),
-            _CoverageSection(),
-            _CandidateFeasibilitySection(),
+            DataHealthSection(),
+            CandidateSelectionSection(),
         ]
         + list(inputs.report_sections)
         + [_CaveatsSection()]
@@ -120,63 +122,230 @@ class _SourceFreshnessSection:
         )
 
 
-class _CoverageSection:
+@dataclass(frozen=True)
+class DataHealthRow:
+    scope: str
+    row_count: int
+    required_missing_source_count: int | None
+    required_stale_source_count: int | None
+    provider_bounded_source_count: int | None
+    optional_absent_source_count: int | None
+    reviewable_count: int | None
+    limited_count: int | None
+
+    def markdown_row(self) -> str:
+        return (
+            f"| {self.scope} | {self.row_count} | "
+            f"{_fmt_optional_int(self.required_missing_source_count)} | "
+            f"{_fmt_optional_int(self.required_stale_source_count)} | "
+            f"{_fmt_optional_int(self.provider_bounded_source_count)} | "
+            f"{_fmt_optional_int(self.optional_absent_source_count)} | "
+            f"{_fmt_optional_int(self.reviewable_count)} | "
+            f"{_fmt_optional_int(self.limited_count)} |"
+        )
+
+
+class DataHealthSection:
+    def rows(self, diagnostics_dir: Path) -> tuple[DataHealthRow, ...]:
+        rows: list[DataHealthRow] = []
+        source_path = diagnostics_dir / "source-freshness.csv"
+        if source_path.exists():
+            source = pl.read_csv(source_path)
+            rows.append(
+                DataHealthRow(
+                    scope="sources",
+                    row_count=source.height,
+                    required_missing_source_count=_sum_int_column(source, "frame_missing_int"),
+                    required_stale_source_count=_sum_int_column(source, "frame_stale_int"),
+                    provider_bounded_source_count=_sum_int_column(source, "provider_bounded_int"),
+                    optional_absent_source_count=_sum_int_column(source, "optional_absent_int"),
+                    reviewable_count=_sum_int_column(source, "usable_int"),
+                    limited_count=_sum_int_column(source, "frame_stale_int")
+                    + _sum_int_column(source, "frame_missing_int"),
+                )
+            )
+        history_path = diagnostics_dir / "history-feasibility.csv"
+        if history_path.exists():
+            history = pl.read_csv(history_path)
+            reviewable = _count_value(history, "feasibility_status", "reviewable_history")
+            rows.append(
+                DataHealthRow(
+                    scope="history",
+                    row_count=history.height,
+                    required_missing_source_count=None,
+                    required_stale_source_count=None,
+                    provider_bounded_source_count=None,
+                    optional_absent_source_count=None,
+                    reviewable_count=reviewable,
+                    limited_count=history.height - reviewable,
+                )
+            )
+        candidate_path = diagnostics_dir / "candidate-feasibility.csv"
+        if candidate_path.exists():
+            candidates = pl.read_csv(candidate_path)
+            reviewable = _count_value(candidates, "watchlist_feasibility", "reviewable")
+            rows.append(
+                DataHealthRow(
+                    scope="candidates",
+                    row_count=candidates.height,
+                    required_missing_source_count=_sum_int_column(
+                        candidates, "required_missing_source_count"
+                    ),
+                    required_stale_source_count=_sum_int_column(
+                        candidates, "required_stale_source_count"
+                    ),
+                    provider_bounded_source_count=_sum_int_column(
+                        candidates, "provider_bounded_source_count"
+                    ),
+                    optional_absent_source_count=_sum_int_column(
+                        candidates, "optional_absent_source_count"
+                    ),
+                    reviewable_count=reviewable,
+                    limited_count=candidates.height - reviewable,
+                )
+            )
+        return tuple(rows)
+
     def render(self, inputs: ReportInputs) -> str:
         d = inputs.artifacts.diagnostics_dir
         hist_path = d / "history-feasibility.csv"
         watch_path = d / "watchlist-feasibility.csv"
+        rows = self.rows(d)
         lines = [
-            "## Data Coverage And Feasibility",
+            "## Data Health Summary",
             "",
             f"- History feasibility: `{hist_path}`",
             f"- Watchlist feasibility: `{watch_path}`",
+            (
+                "- Units: rows=count, Miss/Stale/Bound/Opt=source-family counts, "
+                "Review/Limited=symbol or source-row counts."
+            ),
+            "",
+            "| Scope | Rows | Miss | Stale | Bound | Opt | Review | Limited |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| | count | count | count | count | count | count | count |",
         ]
-        if hist_path.exists():
-            hist = pl.read_csv(hist_path)
-            if not hist.is_empty():
-                lines.append("- History feasibility: " + _value_counts(hist, "feasibility_status"))
-            else:
-                lines.append("- History feasibility: no rows produced.")
-        else:
-            lines.append("- History feasibility artifact is missing.")
-
-        if watch_path.exists():
-            w = pl.read_csv(watch_path)
-            if not w.is_empty():
-                lines.append(
-                    "- Watchlist feasibility: " + _value_counts(w, "watchlist_feasibility")
-                )
-                limited = w.filter(
-                    pl.col("watchlist_feasibility").is_in(
-                        ["blocked_by_history", "coverage_limited_review", "source_blind_review"]
-                    )
-                )
-                if not limited.is_empty():
-                    lines.extend(
-                        [
-                            "",
-                            "| Symbol | Group | Feasibility | History | Sources | Reason |",
-                            "|---|---|---|---|---|---|",
-                        ]
-                    )
-                    for row in limited.head(8).iter_rows(named=True):
-                        lines.append(
-                            f"| `{row['symbol']}` | {row.get('group', '—')} | "
-                            f"{row['watchlist_feasibility']} | {row.get('history_status', '—')} | "
-                            f"{row.get('source_status', '—')} | {row.get('history_reason', '—')} |"
-                        )
-            else:
-                lines.append("- Watchlist feasibility: no decision rows produced.")
-        else:
-            lines.append("- Watchlist feasibility artifact is missing.")
+        if not rows:
+            lines.append("- No data health artifacts produced.")
+            return "\n".join(lines)
+        lines.extend(row.markdown_row() for row in rows)
         return "\n".join(lines)
 
 
-class _CandidateFeasibilitySection:
+@dataclass(frozen=True)
+class CandidateSelectionRow:
+    symbol: str
+    feasibility: str
+    rank_score: float | None
+    rank_tier: str
+    source_penalty_score: float | None
+    required_missing_source_count: int
+    required_stale_source_count: int
+    provider_bounded_source_count: int
+    optional_absent_source_count: int
+    min_history_coverage_pct: float | None
+    min_source_capability_coverage_pct: float | None
+    tree_direction: str
+    tail_lift: float | None
+    gpd_shape_xi: float | None
+    n_tail_exceedances: int | None
+    reason: str
+
+    @classmethod
+    def from_frame_row(cls, row: tuple[object, ...]) -> CandidateSelectionRow:
+        (
+            symbol,
+            feasibility,
+            rank_score,
+            rank_tier,
+            source_penalty_score,
+            missing,
+            stale,
+            bounded,
+            optional,
+            history_pct,
+            capability_pct,
+            tree_direction,
+            tail_lift,
+            gpd_shape_xi,
+            n_tail,
+            reason,
+        ) = row
+        return cls(
+            symbol=str(symbol),
+            feasibility=str(feasibility),
+            rank_score=_float_value(rank_score),
+            rank_tier=str(rank_tier),
+            source_penalty_score=_float_value(source_penalty_score),
+            required_missing_source_count=_int_value(missing),
+            required_stale_source_count=_int_value(stale),
+            provider_bounded_source_count=_int_value(bounded),
+            optional_absent_source_count=_int_value(optional),
+            min_history_coverage_pct=_float_value(history_pct),
+            min_source_capability_coverage_pct=_float_value(capability_pct),
+            tree_direction=str(tree_direction),
+            tail_lift=_float_value(tail_lift),
+            gpd_shape_xi=_float_value(gpd_shape_xi),
+            n_tail_exceedances=_optional_int_value(n_tail),
+            reason=str(reason),
+        )
+
+    def markdown_row(self) -> str:
+        return (
+            f"| `{self.symbol}` | {self.feasibility} | "
+            f"{_fmt_float(self.rank_score)} | {_fmt_float(self.source_penalty_score)} | "
+            f"{self.required_missing_source_count} | {self.required_stale_source_count} | "
+            f"{self.provider_bounded_source_count} | {self.optional_absent_source_count} | "
+            f"{_fmt_float(self.min_history_coverage_pct)} | "
+            f"{_fmt_float(self.min_source_capability_coverage_pct)} | "
+            f"{self.tree_direction} | {_fmt_float(self.tail_lift)} | "
+            f"{_fmt_float(self.gpd_shape_xi)} | {self.reason} |"
+        )
+
+
+class CandidateSelectionSection:
+    columns = [
+        "symbol",
+        "watchlist_feasibility",
+        "rank_score",
+        "rank_tier",
+        "source_penalty_score",
+        "required_missing_source_count",
+        "required_stale_source_count",
+        "provider_bounded_source_count",
+        "optional_absent_source_count",
+        "min_history_coverage_pct",
+        "min_source_capability_coverage_pct",
+        "tree_direction",
+        "tail_lift",
+        "gpd_shape_xi",
+        "N_tail_exceedances",
+        "candidate_reason",
+    ]
+
+    def rows(self, diagnostics_dir: Path) -> tuple[CandidateSelectionRow, ...]:
+        path = diagnostics_dir / "candidate-feasibility.csv"
+        if not path.exists():
+            return ()
+        frame = pl.read_csv(path)
+        if frame.is_empty():
+            return ()
+        ordered = frame.sort(
+            [
+                "rank_score",
+                "source_penalty_score",
+                "min_history_coverage_pct",
+                "min_source_capability_coverage_pct",
+            ],
+            descending=[True, False, True, True],
+        ).select(self.columns)
+        return tuple(CandidateSelectionRow.from_frame_row(row) for row in ordered.iter_rows())
+
     def render(self, inputs: ReportInputs) -> str:
         path = inputs.artifacts.diagnostics_dir / "candidate-feasibility.csv"
+        rows = self.rows(inputs.artifacts.diagnostics_dir)
         lines = [
-            "## Candidate Feasibility",
+            "## Candidate Selection",
             "",
             f"- Candidate feasibility: `{path}`",
             (
@@ -189,9 +358,12 @@ class _CandidateFeasibilitySection:
                 "Hist%/Cap%=minimum coverage percentages."
             ),
         ]
-        if not path.exists():
+        if path.exists():
+            frame = pl.read_csv(path)
+            if not frame.is_empty():
+                lines.append("- Feasibility: " + _value_counts(frame, "watchlist_feasibility"))
+        else:
             lines.append("- Candidate feasibility artifact is missing.")
-            return "\n".join(lines)
         lines.extend(
             [
                 "",
@@ -206,36 +378,13 @@ class _CandidateFeasibilitySection:
                 ),
             ]
         )
-        frame = pl.read_csv(path)
-        if frame.is_empty():
+        if not rows:
             lines.append("- No ranked candidates produced.")
             return "\n".join(lines)
-        lines.insert(5, "- Feasibility: " + _value_counts(frame, "watchlist_feasibility"))
-        ordered = frame.sort(
-            [
-                "rank_score",
-                "source_penalty_score",
-                "min_history_coverage_pct",
-                "min_source_capability_coverage_pct",
-            ],
-            descending=[True, False, True, True],
-        ).head(15)
-        for row in ordered.iter_rows(named=True):
-            reason = _candidate_feasibility_reason(row)
-            lines.append(
-                f"| `{row['symbol']}` | {row.get('watchlist_feasibility', '—')} | "
-                f"{_fmt(row.get('rank_score'))} | {_fmt(row.get('source_penalty_score'))} | "
-                f"{_int_fmt(row.get('required_missing_source_count'))} | "
-                f"{_int_fmt(row.get('required_stale_source_count'))} | "
-                f"{_int_fmt(row.get('provider_bounded_source_count'))} | "
-                f"{_int_fmt(row.get('optional_absent_source_count'))} | "
-                f"{_fmt(row.get('min_history_coverage_pct'))} | "
-                f"{_fmt(row.get('min_source_capability_coverage_pct'))} | "
-                f"{row.get('tree_direction', '—')} | {_fmt(row.get('tail_lift'))} | "
-                f"{_fmt(row.get('gpd_shape_xi'))} | {reason} |"
-            )
-        if frame.height > 15:
-            lines.append(f"- {frame.height - 15} additional candidate feasibility rows omitted.")
+        for row in rows[:15]:
+            lines.append(row.markdown_row())
+        if len(rows) > 15:
+            lines.append(f"- {len(rows) - 15} additional candidate feasibility rows omitted.")
         return "\n".join(lines)
 
 
@@ -359,7 +508,7 @@ class _LadderReviewSection:
     def render(self, inputs: ReportInputs) -> str:
         decisions = [d for d in inputs.decisions if d.group == "watch"]
         lines = [
-            "## Review Rows",
+            "## Decision Rule Audit",
             "",
             "Tiers: 1=top-decile Info,Sym≥15  |  2=top-quartile Info  | 3=ranked  |  —=no evidence",
             "",
@@ -578,7 +727,7 @@ class _TreeReviewSection:
         rank_path = inputs.artifacts.diagnostics_dir / "candidate-rank.csv"
         rank_data = _read_rank_data(rank_path)
         lines = [
-            "## Review Rows",
+            "## Decision Rule Audit",
             "",
             "Tiers: 1=tail_lift≥2.0,ξ>0.15,N≥50  |  2=lift≥1.5,N≥30  | 3=lift≥1.0  |  —=below gate",
             "",
@@ -718,23 +867,47 @@ def _value_counts(frame: pl.DataFrame, column: str) -> str:
     )
 
 
-def _candidate_feasibility_reason(row: dict) -> str:
-    missing = int(float(row.get("required_missing_source_count") or 0))
-    stale = int(float(row.get("required_stale_source_count") or 0))
-    feasibility = str(row.get("watchlist_feasibility") or "unclassified")
-    history = str(row.get("history_status") or "missing")
-    source = str(row.get("source_status") or "missing")
-    if missing > 0:
-        return f"missing_required_sources={missing}"
-    if stale > 0:
-        return f"stale_required_sources={stale}"
-    if feasibility == "coverage_limited_review":
-        return f"history={history}"
-    if feasibility == "blocked_by_evidence_gate":
-        return "evidence_gate_blocked"
-    if feasibility == "reviewable":
-        return "reviewable"
-    return f"source={source};history={history}"
+def _sum_int_column(frame: pl.DataFrame, column: str) -> int:
+    if column not in frame.columns or frame.is_empty():
+        return 0
+    value = frame.get_column(column).fill_null(0).sum()
+    return 0 if value is None else int(value)
+
+
+def _count_value(frame: pl.DataFrame, column: str, value: str) -> int:
+    if column not in frame.columns or frame.is_empty():
+        return 0
+    return frame.filter(pl.col(column) == value).height
+
+
+def _fmt_optional_int(value: int | None) -> str:
+    return "—" if value is None else str(value)
+
+
+def _float_value(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    raise TypeError(f"expected numeric value, got {type(value).__name__}")
+
+
+def _int_value(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    raise TypeError(f"expected integer-compatible value, got {type(value).__name__}")
+
+
+def _optional_int_value(value: object) -> int | None:
+    if value is None:
+        return None
+    return _int_value(value)
+
+
+def _fmt_float(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.4f}"
 
 
 def _int_fmt(value: object) -> str:

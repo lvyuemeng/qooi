@@ -9,6 +9,7 @@ import qooi.scanner as scan
 import qooi.scanner.workflow as potential
 from qooi.exchange.discovery import DiscoveryResult, empty_discovery_frame
 from qooi.scanner import classifiers, decisions, features, source_events, transitions
+from qooi.scanner import diagnostics as potential_diagnostics
 from qooi.scanner import frames as potential_frames
 from qooi.scanner import history as potential_history
 from qooi.scanner import ladder as potential_ladder
@@ -359,6 +360,78 @@ def test_rank_candidate_evidence_penalizes_required_source_gaps_not_optional_abs
     assert row["rank_penalty_component"] == pytest.approx(2.6)
 
 
+def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> None:
+    candidate_rank = pl.DataFrame(
+        [
+            {
+                "symbol": "AAA-USDT-SWAP",
+                "rank_score": 10.0,
+                "source_penalty_score": 0.3,
+                "required_missing_source_count": 0,
+                "required_stale_source_count": 1,
+                "provider_bounded_source_count": 3,
+                "optional_absent_source_count": 1,
+                "tree_direction": "up",
+                "matched_evidence_level": "tree_up",
+                "tail_lift": 1.4,
+                "gpd_shape_xi": 0.10,
+                "N_tail_exceedances": 40,
+                "rank_reason": "weaker",
+            },
+            {
+                "symbol": "AAA-USDT-SWAP",
+                "rank_score": 20.0,
+                "source_penalty_score": 0.1,
+                "required_missing_source_count": 0,
+                "required_stale_source_count": 0,
+                "provider_bounded_source_count": 3,
+                "optional_absent_source_count": 1,
+                "tree_direction": "down",
+                "matched_evidence_level": "tree_down",
+                "tail_lift": 2.5,
+                "gpd_shape_xi": 0.20,
+                "N_tail_exceedances": 60,
+                "rank_reason": "best",
+            },
+        ]
+    )
+    watchlist = pl.DataFrame(
+        [
+            {
+                "symbol": "AAA-USDT-SWAP",
+                "watchlist_feasibility": "reviewable",
+                "min_history_coverage_pct": 100.0,
+                "min_source_capability_coverage_pct": 99.0,
+                "source_status": "source_context_available",
+                "history_status": "reviewable_history",
+            }
+        ]
+    )
+
+    frame = potential_diagnostics.candidate_feasibility_frame(candidate_rank, watchlist)
+
+    assert frame.height == 1
+    row = frame.row(0, named=True)
+    assert row["symbol"] == "AAA-USDT-SWAP"
+    assert row["rank_score"] == pytest.approx(20.0)
+    assert row["tree_direction"] == "down"
+    assert row["rank_tier"] == "1"
+    assert row["candidate_reason"] == "reviewable"
+    assert row["watchlist_feasibility"] == "reviewable"
+
+
+def test_report_candidate_selection_uses_typed_rows_not_opaque_dicts() -> None:
+    source = Path("src/qooi/scanner/report.py").read_text(encoding="utf-8")
+    assert "class CandidateSelectionRow" in source
+    assert "class CandidateSelectionSection" in source
+    candidate_section = source.split("class CandidateSelectionSection", 1)[1].split(
+        "class _CaveatsSection", 1
+    )[0]
+    assert "row.get(" not in candidate_section
+    assert "float(str(" not in candidate_section
+    assert "dict[str, object]" not in candidate_section
+
+
 def test_potential_run_writes_report_and_diagnostics_without_trading_artifacts(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -389,9 +462,10 @@ transition_context_limit = 0
     assert "place orders" in report
     assert "mutate baskets" in report
     assert "## Unified Evidence Surface" in report
-    assert "## Review Rows" in report
+    assert "## Data Health Summary" in report
+    assert "## Candidate Selection" in report
+    assert "## Decision Rule Audit" in report
     assert "Tiers: 1=top-decile" in report
-    assert "## Candidate Feasibility" in report
     assert (
         "| Symbol | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
         "Hist% | Cap% | Tree | TailLift | ξ | Reason |" in report
