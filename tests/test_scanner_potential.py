@@ -965,6 +965,34 @@ def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> N
     assert missing.select("direction_hint").item() == "missing"
 
 
+def test_kline_path_rows_keep_state_runs_separate_by_timeframe() -> None:
+    rows = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC", "BTC", "BTC"],
+            "timestamp": [1, 1, 2, 2],
+            "source_family": ["kline", "kline", "kline", "kline"],
+            "scale": ["1H", "4H", "1H", "4H"],
+            "state_key": ["range|coil", "markup|trend", "range|coil", "markup|trend"],
+            "context_event": ["none", "impulse", "none", "impulse"],
+            "direction_hint": ["neutral", "bullish", "neutral", "bullish"],
+            "quality_weight": [0.5, 0.8, 0.5, 0.8],
+            "missing_flag": [False, False, False, False],
+            "stale_flag": [False, False, False, False],
+        }
+    )
+
+    history = potential_history.kline_path_rows(rows, 2).sort("timeframe", "bar_close_ms")
+
+    one_h = history.filter(pl.col("timeframe") == "1H").to_dicts()
+    four_h = history.filter(pl.col("timeframe") == "4H").to_dicts()
+    assert [row["state_age_bars"] for row in one_h] == [1, 2]
+    assert [row["event_age_bars"] for row in one_h] == [1, 2]
+    assert [row["state_age_bars"] for row in four_h] == [1, 2]
+    assert [row["event_age_bars"] for row in four_h] == [1, 2]
+    assert one_h[1]["transition_path"] == "range|coil -> range|coil"
+    assert four_h[1]["transition_path"] == "markup|trend -> markup|trend"
+
+
 @pytest.mark.parametrize(
     ("bundle", "config", "expected_group", "expected_direction", "expected_reason"),
     [

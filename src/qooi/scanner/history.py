@@ -56,7 +56,7 @@ REALIZED_TRANSITION_SCHEMA = {
 def kline_path_history_frame(config, frames: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFrame:
     histories = []
     for timeframe in config.timeframes:
-        for (symbol, frame_timeframe), frame in frames.items():
+        for (_symbol, frame_timeframe), frame in frames.items():
             if frame_timeframe != timeframe or frame.is_empty():
                 continue
             rows = frame
@@ -70,11 +70,12 @@ def kline_path_history_frame(config, frames: dict[tuple[str, str], pl.DataFrame]
 
 def kline_path_rows(rows: pl.DataFrame, ngram_length: int) -> pl.DataFrame:
     ngram_length = max(2, ngram_length)
-    state_changed = (pl.col("state_key") != pl.col("state_key").shift(1).over("symbol")).fill_null(
-        True
-    )
+    group_keys = ("symbol", "scale") if rows.get_column("scale").n_unique() > 1 else ("symbol",)
+    state_changed = (
+        pl.col("state_key") != pl.col("state_key").shift(1).over(*group_keys)
+    ).fill_null(True)
     event_changed = (
-        pl.col("context_event") != pl.col("context_event").shift(1).over("symbol")
+        pl.col("context_event") != pl.col("context_event").shift(1).over(*group_keys)
     ).fill_null(True)
     return (
         rows.sort("symbol", "timestamp")
@@ -89,7 +90,7 @@ def kline_path_rows(rows: pl.DataFrame, ngram_length: int) -> pl.DataFrame:
             pl.concat_str("state_key", "context_event", separator="|").alias("full_context"),
             pl.concat_str(
                 [
-                    pl.col("state_key").shift(offset).over("symbol")
+                    pl.col("state_key").shift(offset).over(*group_keys)
                     for offset in range(ngram_length - 1, 0, -1)
                 ]
                 + [pl.col("state_key")],
@@ -97,8 +98,8 @@ def kline_path_rows(rows: pl.DataFrame, ngram_length: int) -> pl.DataFrame:
             ).alias("transition_path"),
             state_changed.alias("state_changed"),
             event_changed.alias("event_changed"),
-            state_changed.cast(pl.Int64).cum_sum().over("symbol").alias("state_run"),
-            event_changed.cast(pl.Int64).cum_sum().over("symbol").alias("event_run"),
+            state_changed.cast(pl.Int64).cum_sum().over(*group_keys).alias("state_run"),
+            event_changed.cast(pl.Int64).cum_sum().over(*group_keys).alias("event_run"),
         )
         .with_columns(
             pl.col("direction_hint").fill_null("unknown_direction"),
@@ -144,11 +145,11 @@ def kline_path_rows(rows: pl.DataFrame, ngram_length: int) -> pl.DataFrame:
         )
         .with_columns(
             pl.cum_count("state_key")
-            .over("symbol", "state_run")
+            .over("symbol", "scale", "state_run")
             .cast(pl.UInt32)
             .alias("state_age_bars"),
             pl.cum_count("context_event")
-            .over("symbol", "event_run")
+            .over("symbol", "scale", "event_run")
             .cast(pl.UInt32)
             .alias("event_age_bars"),
         )
