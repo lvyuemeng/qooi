@@ -107,23 +107,27 @@ Forbidden:
 
 ## Scanner config workflow
 
-Scanner config is composable by section, but `PotentialConfig` remains the single
-root config model. `workflow.py` should pass module-owned request views at package
-boundaries instead of handing the whole root config to every package.
+`PotentialConfig` is the potential workflow's single config entry: one TOML parse
+object for one scanner run. It is allowed to embed every section needed by this
+workflow, but it must not become a runtime god-object. Section semantics belong
+to the behavior/module that interprets them; `workflow.py` composes sections into
+small request/context objects at call boundaries.
 
 ```text
-PotentialConfig                                  # scanner TOML/root parse boundary
+PotentialConfig                                  # scanner config entry
   ├─ output/universe/bar/timeframes/days/refresh_mode/fetch_concurrency
   │    -> workflow/load_bars and exchange.store requests
-  ├─ source: SourceConfig
+  ├─ source: SourceConfig                         # source-owned shape target
   │    -> workflow builds sources.context.SourceContextRequest using root refresh_mode
-  ├─ transition: TransitionConfig
+  ├─ transition: TransitionConfig                 # transition-owned behavior
   │    -> transitions/history/evidence target windows
-  ├─ evidence: EvidenceConfig
+  ├─ evidence: EvidenceConfig                     # evidence dispatch behavior
   │    -> diagnostics evidence dispatch
   │       └─ tailtree: TailtreeConfig -> tailrun lifecycle
-  └─ review: ReviewConfig
-       -> decisions only
+  ├─ review: ReviewConfig                         # decision-review behavior
+  │    -> decisions only
+  └─ profile: ProfileConfig                       # qooi.profiling context
+       -> injected diagnostics context
 ```
 
 Refresh-mode ownership is singular:
@@ -144,13 +148,14 @@ aliases should preserve old config shapes once callers are updated.
 Boundary target:
 
 ```text
-workflow.py owns PotentialConfig.
+workflow.py owns config composition, not section semantics.
 sources.context owns SourceContextRequest.
 exchange.store owns HistoryRefreshRequest.
+qooi.profiling owns ProfileContext.
 ```
 
-This separates the monolith at call boundaries without creating parallel config
-models for every nested section.
+This keeps the ergonomic monolithic config entry while avoiding full-root config
+leakage into packages.
 
 ## Lean reduction target
 

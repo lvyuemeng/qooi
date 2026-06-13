@@ -20,6 +20,7 @@ AI/learned-state work is isolated in `qooi.dynamic` because it is not the active
 | Core / Execution | `qooi.core` | Basket lifecycle, executor/backtests, recovery policies, evaluation, metrics, soft/live state. |
 | Research | `qooi.research` | Deterministic known-at-close research tables, pattern/outcome/metric/promotion artifacts. |
 | Scanner | `qooi.scanner` | Potential trading-change scanner, observation/outcome/evidence computation, research-review reports. |
+| Profiling | `qooi.profiling` | Cross-cutting native profiling context, stage/frame records, and profile artifacts. |
 | Dynamic | `qooi.dynamic` | Isolated optional learned-state / AI research sandbox. |
 | Scripts | `scripts/` | Thin command entrypoints only; orchestration lives in packages. |
 
@@ -55,6 +56,10 @@ sources
   -> provider APIs, source normalization, manifests, artifact bundles
   -> no strategy/scanner/research/core policy
 
+profiling
+  -> stdlib profiling + Polars profile adapters + profile artifact records
+  -> no domain workflow ownership
+
 dynamic
   -> prepared frames / sequence contracts / optional ML
   -> no exchange, sources, scanner, executor, basket, or strategy ownership
@@ -83,21 +88,27 @@ configs/potential*.toml
 
 ## Composable configuration policy
 
-`PotentialConfig` remains the single scanner TOML/root parse boundary. Do not split
-the user-facing config into independent top-level files or duplicate package config
-trees. Composition happens at module call boundaries: `workflow.py` passes the
-small request/config view that a module needs, not the whole root config.
+`PotentialConfig` is the single potential-workflow config entry. That root
+object is reasonable: one TOML document validates one run. The boundary is
+semantic, not syntactic: nested sections are embedded component configs, while
+`workflow.py` composes them into package-owned requests/contexts before calling
+other modules.
+
+Do not split the user surface into many independent files just to avoid a root
+object. Avoid repetition by reusing component config types and by preventing the
+root config from leaking past workflow composition.
 
 Do not preserve backward-compatible aliases when current callers can be updated.
 
-| Config section | Owner | Decision owned | Forbidden repetition |
+| Config section | Type owner | Workflow role | Forbidden repetition |
 |---|---|---|---|
-| `[potential]` | `qooi.scanner.workflow` | scanner run identity, output, universe, one scan refresh mode for materialized inputs, concurrency | source-provider knobs, evidence lifecycle, report audit flags |
-| `[potential.source]` | source request constructed by `workflow.py` | source limits, source staleness, disabled source/symbol demand | refresh mode, OHLCV bar refresh, candidate/rank/report policy |
-| `[potential.transition]` | `qooi.scanner.transitions` | transition/history windows and probability thresholds | source freshness, model lifecycle |
-| `[potential.evidence]` | `qooi.scanner.diagnostics` dispatch | evidence path name | booleans such as `use_tail_tree`, provider menus |
-| `[potential.evidence.tailtree]` | `qooi.scanner.tailrun` | train/load-predict lifecycle and model artifact identity | source refresh, report rendering |
-| `[potential.review]` | `qooi.scanner.decisions` | current review requirements only | candidate ranking, source acquisition |
+| `[potential]` | `qooi.scanner.workflow` | config entry, run identity, output, universe, bar, scan refresh, concurrency | provider/model/report internals |
+| `[potential.source]` | `qooi.sources` request/config type | source demand and freshness input | refresh mode, rank/report policy |
+| `[potential.transition]` | `qooi.scanner.transitions` | transition windows and thresholds | source/provider fields |
+| `[potential.evidence]` | `qooi.scanner.diagnostics` dispatch type | evidence path selection | booleans such as `use_tail_tree` |
+| `[potential.evidence.tailtree]` | `qooi.scanner.tailrun` | model lifecycle and artifact identity | source refresh, report rendering |
+| `[potential.review]` | `qooi.scanner.decisions` | current review requirements | candidate ranking, source acquisition |
+| `[potential.profile]` | `qooi.profiling` | injected profile context mode | scanner/source-specific behavior |
 
 Refresh semantics must be singular:
 
@@ -124,6 +135,13 @@ BAD:  qooi.sources.context.load_source_context(PotentialConfig, ...)
 The source package is indifferent to scanner config shape; it needs a demand
 request. It may define the request contract, but it should not know about the
 whole `PotentialConfig` object or scanner transition/evidence/review sections.
+
+Same rule for profiling:
+
+```text
+GOOD: workflow embeds ProfileConfig and injects ProfileContext
+BAD:  scanner/source modules implement their own profile sinks
+```
 
 ## Lean-module policy
 

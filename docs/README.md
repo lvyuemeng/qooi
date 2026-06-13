@@ -27,6 +27,7 @@ Durable design boundaries live under `docs/architecture/`.
 | `architecture/core.md` | Basket lifecycle, recovery, executor, accounting, and evaluation boundaries. |
 | `architecture/research.md` | Deterministic manual-classifier research and shared table pipe. |
 | `architecture/scanner.md` | Potential trading-change scanner architecture. |
+| `architecture/profiling.md` | Cross-cutting native profiling context and profile artifact contracts. |
 | `architecture/dynamic.md` | Isolated AI/learned-state research sandbox. |
 | `architecture/testing.md` | Test ownership map and reduction rules. |
 
@@ -44,6 +45,7 @@ Concrete implementation-facing module graphs live under `docs/graph/`.
 | `graph/core.md` | Core basket/executor/evaluation module graph. |
 | `graph/research.md` | Research table/report module graph. |
 | `graph/scanner.md` | Potential scanner module graph. |
+| `graph/profiling.md` | Cross-cutting profile context API and artifact graph. |
 | `graph/dynamic.md` | Dynamic/AI module graph and forbidden edges. |
 
 Each isolated module family owns its own graph. Cross-cutting graph appendices, such as `graph/classifier.md`, must not create new architecture parts unless the code also gains a matching package boundary.

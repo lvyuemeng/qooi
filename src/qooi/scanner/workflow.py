@@ -13,6 +13,7 @@ import polars as pl
 
 from qooi.exchange.discovery import DiscoveryConfig, discover_candidates, empty_discovery_frame
 from qooi.exchange.store import AsyncCacheStore, HistoryCoverage, HistoryRefreshRequest
+from qooi.profiling import ProfileContext
 from qooi.scanner import (
     BarFetchResult,
     PotentialArtifacts,
@@ -45,35 +46,43 @@ def run(config_path: Path | str) -> Path:
         diagnostics_dir=config.output.parent / "diagnostics",
         states_dir=config.output.parent / "states",
     )
-    universe = resolve_universe(config)
-    bars = asyncio.run(load_bars(config, universe.symbols))
-    kline_states = compute_kline_states(
-        config, universe.symbols, bars.state_frames, bars.frames, bars.coverage
-    )
-    transitions = compute_transition_insights(
-        config, universe.symbols, bars.frames, bars.state_frames
-    )
+    profile = ProfileContext.from_config(config.profile, config.output.parent / "profile")
+    with profile.stage("scanner", "workflow", "resolve_universe"):
+        universe = resolve_universe(config)
+    with profile.stage("scanner", "workflow", "load_bars"):
+        bars = asyncio.run(load_bars(config, universe.symbols))
+    with profile.stage("scanner", "workflow", "compute_kline_states"):
+        kline_states = compute_kline_states(
+            config, universe.symbols, bars.state_frames, bars.frames, bars.coverage
+        )
+    with profile.stage("scanner", "workflow", "compute_transition_insights"):
+        transitions = compute_transition_insights(
+            config, universe.symbols, bars.frames, bars.state_frames
+        )
     symbols_with_decision_bars = tuple(
         symbol
         for symbol in universe.symbols
         if not bars.frames.get((symbol, config.bar), pl.DataFrame()).is_empty()
     )
-    context = asyncio.run(
-        load_source_context(
-            source_context_request(
-                config,
-                symbols=universe.symbols,
-                context_symbols=context_symbols(
-                    config, symbols_with_decision_bars, transitions.insights
-                ),
-                discovery=universe.discovery,
+    with profile.stage("scanner", "workflow", "load_source_context"):
+        context = asyncio.run(
+            load_source_context(
+                source_context_request(
+                    config,
+                    symbols=universe.symbols,
+                    context_symbols=context_symbols(
+                        config, symbols_with_decision_bars, transitions.insights
+                    ),
+                    discovery=universe.discovery,
+                )
             )
         )
-    )
-    bundles = compute_source_states(
-        config, universe.symbols, kline_states, transitions.insights, bars.coverage, context
-    )
-    decisions = tuple(scan_review_decisions(config, bundles))
+    with profile.stage("scanner", "workflow", "compute_source_states"):
+        bundles = compute_source_states(
+            config, universe.symbols, kline_states, transitions.insights, bars.coverage, context
+        )
+    with profile.stage("scanner", "workflow", "scan_review_decisions"):
+        decisions = tuple(scan_review_decisions(config, bundles))
 
     log_path = config.output.parent / "scan.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,9 +104,15 @@ def run(config_path: Path | str) -> Path:
         bundles,
         decisions,
     )
-    write_diagnostics(inputs)
+    with profile.stage("scanner", "workflow", "write_diagnostics"):
+        profile.native(
+            "scanner.workflow.write_diagnostics",
+            lambda: write_diagnostics(inputs, profile),
+        )
     artifacts.report.parent.mkdir(parents=True, exist_ok=True)
-    artifacts.report.write_text(render_report(inputs), encoding="utf-8")
+    with profile.stage("scanner", "workflow", "render_report"):
+        artifacts.report.write_text(render_report(inputs), encoding="utf-8")
+    profile.write()
 
     logger.removeHandler(handler)
     handler.close()

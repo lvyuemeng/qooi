@@ -15,6 +15,8 @@ qooi.sources
   -> provider/source artifacts
 qooi.scanner
   -> deterministic potential scanner reports
+qooi.profiling
+  -> injected native stage/frame profiling context
 qooi.research
   -> deterministic research artifacts
 qooi.strategies
@@ -52,6 +54,10 @@ PotentialConfig.evidence.kind
 
 PotentialConfig.evidence.tailtree.lifecycle
   -> scanner.tailrun train/load_predict lifecycle
+
+PotentialConfig.profile
+  -> qooi.profiling.ProfileConfig
+  -> qooi.profiling.ProfileContext injected into workflow/module calls
 ```
 
 No compatibility graph:

@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from qooi.profiling import ProfileConfig
 from qooi.sources.collect import BookMode
 
 RefreshMode = Literal["incremental", "cache_only", "force"]
@@ -101,6 +102,7 @@ class PotentialConfig(BaseModel):
     transition: TransitionConfig = TransitionConfig()
     review: ReviewConfig = ReviewConfig()
     evidence: EvidenceConfig = EvidenceConfig()
+    profile: ProfileConfig = ProfileConfig()
 
     @model_validator(mode="after")
     def normalize_paths_and_timeframes(self) -> PotentialConfig:

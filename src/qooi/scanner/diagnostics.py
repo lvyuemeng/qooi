@@ -9,6 +9,7 @@ from pathlib import Path
 import polars as pl
 
 from qooi.exchange.store import HistoryCoverage
+from qooi.profiling import ProfileContext
 from qooi.scanner import (
     PotentialArtifacts,
     PotentialUniverse,
@@ -69,8 +70,9 @@ class StateFrames:
     context: pl.DataFrame
 
 
-def write_diagnostics(inputs: ReportInputs) -> None:
-    diagnostic_frames = build_diagnostic_frames(inputs)
+def write_diagnostics(inputs: ReportInputs, profile: ProfileContext | None = None) -> None:
+    profile = ProfileContext.disabled_if_none(profile)
+    diagnostic_frames = build_diagnostic_frames(inputs, profile)
 
     from qooi.scanner.report import report_sections_for
 
@@ -105,8 +107,11 @@ def write_diagnostics(inputs: ReportInputs) -> None:
     _write_state_frames(state_frames, states)
 
 
-def build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
-    return _build_diagnostic_frames(inputs)
+def build_diagnostic_frames(
+    inputs: ReportInputs,
+    profile: ProfileContext | None = None,
+) -> DiagnosticFrames:
+    return _build_diagnostic_frames(inputs, ProfileContext.disabled_if_none(profile))
 
 
 def write_diagnostic_frames(
@@ -116,46 +121,69 @@ def write_diagnostic_frames(
     _write_diagnostic_frames(frames, artifacts.diagnostics_dir)
 
 
-def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
+def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> DiagnosticFrames:
     logger = logging.getLogger("qooi.scanner")
     logger.info("features begin")
-    history_feasibility = _history_feasibility_frame(inputs.bars.coverage)
-    source_freshness = _source_freshness_frame(inputs.context.availability)
+    with profile.stage("scanner", "diagnostics", "history_feasibility"):
+        history_feasibility = _history_feasibility_frame(inputs.bars.coverage)
+    profile.frame("scanner", "diagnostics", "history_feasibility", history_feasibility)
+    with profile.stage("scanner", "diagnostics", "source_freshness"):
+        source_freshness = _source_freshness_frame(inputs.context.availability)
+    profile.frame("scanner", "diagnostics", "source_freshness", source_freshness)
     bars = _bars_with_symbol(inputs.bars.frames, inputs.config.bar)
-    source_events = source_eval.source_events_frame(
-        inputs.context.frames,
-        bars,
-        inputs.config.bar,
-    )
-    kline_history = history_eval.kline_path_history_frame(inputs.config, inputs.bars.state_frames)
-    source_outcomes = source_eval.source_outcomes_frame(source_events, bars)
-    realized_transitions = history_eval.realized_transition_frame(
-        kline_history.filter(pl.col("timeframe") == inputs.config.bar),
-        tuple(source_outcomes.get_column("outcome_horizon").unique().to_list())
-        if not source_outcomes.is_empty()
-        else (inputs.config.transition.horizon,),
-    )
+    profile.frame("scanner", "diagnostics", "decision_bars", bars)
+    with profile.stage("scanner", "events", "source_events_frame"):
+        source_events = source_eval.source_events_frame(
+            inputs.context.frames,
+            bars,
+            inputs.config.bar,
+        )
+    profile.frame("scanner", "events", "source_events", source_events)
+    with profile.stage("scanner", "history", "kline_path_history_frame"):
+        kline_history = history_eval.kline_path_history_frame(
+            inputs.config, inputs.bars.state_frames
+        )
+    profile.frame("scanner", "history", "kline_history", kline_history)
+    with profile.stage("scanner", "events", "source_outcomes_frame"):
+        source_outcomes = source_eval.source_outcomes_frame(source_events, bars)
+    profile.frame("scanner", "events", "source_outcomes", source_outcomes)
+    with profile.stage("scanner", "history", "realized_transition_frame"):
+        realized_transitions = history_eval.realized_transition_frame(
+            kline_history.filter(pl.col("timeframe") == inputs.config.bar),
+            tuple(source_outcomes.get_column("outcome_horizon").unique().to_list())
+            if not source_outcomes.is_empty()
+            else (inputs.config.transition.horizon,),
+        )
+    profile.frame("scanner", "history", "realized_transitions", realized_transitions)
 
-    continuous_features = features_eval.extract_continuous_features(
-        inputs.bars.frames,
-        inputs.bars.state_frames,
-        inputs.context.frames,
-        decision_timeframe=inputs.config.bar,
-    )
+    with profile.stage("scanner", "features", "extract_continuous_features"):
+        continuous_features = features_eval.extract_continuous_features(
+            inputs.bars.frames,
+            inputs.bars.state_frames,
+            inputs.context.frames,
+            decision_timeframe=inputs.config.bar,
+        )
+    profile.frame("scanner", "features", "continuous_features", continuous_features)
 
-    potential_observations = frames_eval.potential_observation_frame(
-        kline_history,
-        source_events,
-        continuous_features,
-        decision_timeframe=inputs.config.bar,
-        max_source_staleness_hours=inputs.config.source.max_staleness_hours,
-    )
+    with profile.stage("scanner", "frames", "potential_observation_frame"):
+        potential_observations = frames_eval.potential_observation_frame(
+            kline_history,
+            source_events,
+            continuous_features,
+            decision_timeframe=inputs.config.bar,
+            max_source_staleness_hours=inputs.config.source.max_staleness_hours,
+        )
+    profile.frame("scanner", "frames", "potential_observations", potential_observations)
     logger.info("observation rows=%d", len(potential_observations))
 
     logger.info("evidence begin path=%s", inputs.config.evidence.kind)
-    pipeline_result = _run_pipeline(
-        potential_observations, source_outcomes, realized_transitions, inputs
-    )
+    with profile.stage("scanner", "diagnostics", "run_pipeline"):
+        pipeline_result = _run_pipeline(
+            potential_observations, source_outcomes, realized_transitions, inputs
+        )
+    profile.frame("scanner", "diagnostics", "potential_evidence", pipeline_result.evidence)
+    profile.frame("scanner", "diagnostics", "candidate_evidence", pipeline_result.candidates)
+    profile.frame("scanner", "diagnostics", "candidate_rank", pipeline_result.ranked)
     logger.info("evidence rows=%d", len(pipeline_result.evidence))
     logger.info(
         "candidates matched=%d ranked=%d",
@@ -167,16 +195,20 @@ def _build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames:
 
     inputs.report_sections = report_sections_for(inputs.config.evidence.kind)
 
-    source_timeliness = source_eval.source_timeliness_frame(source_outcomes)
-    source_state_predictability = source_eval.source_state_predictability_frame(
-        source_outcomes,
-        return_threshold_pct=inputs.config.transition.return_threshold_pct,
-    )
-    watchlist_feasibility = _watchlist_feasibility_frame(
-        inputs.decisions,
-        history_feasibility,
-        source_freshness,
-    )
+    with profile.stage("scanner", "events", "source_timeliness_frame"):
+        source_timeliness = source_eval.source_timeliness_frame(source_outcomes)
+    with profile.stage("scanner", "events", "source_state_predictability_frame"):
+        source_state_predictability = source_eval.source_state_predictability_frame(
+            source_outcomes,
+            return_threshold_pct=inputs.config.transition.return_threshold_pct,
+        )
+    with profile.stage("scanner", "diagnostics", "watchlist_feasibility_frame"):
+        watchlist_feasibility = _watchlist_feasibility_frame(
+            inputs.decisions,
+            history_feasibility,
+            source_freshness,
+        )
+    profile.frame("scanner", "diagnostics", "watchlist_feasibility", watchlist_feasibility)
     return DiagnosticFrames(
         coverage=coverage_frame(inputs.bars.coverage),
         history_feasibility=history_feasibility,

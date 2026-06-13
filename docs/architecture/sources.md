@@ -57,7 +57,10 @@ Removed target: source collection must not live in `qooi.exchange.context`.
 
 ## Source config workflow
 
-`SourceConfig` is a nested scanner config section, not a second scanner run config. `qooi.sources` should receive a source-owned demand request, not the full `PotentialConfig` root.
+`SourceConfig` is the source-demand section shape embedded in scanner workflows,
+not a second scanner run config and not semantically owned by `PotentialConfig`.
+`qooi.sources` should receive a source-owned demand request, not the full scanner
+root.
 
 ```text
 PotentialConfig.refresh_mode
@@ -95,7 +98,10 @@ sources.context.SourceContextRequest
   source: SourceConfig-like provider limits
 ```
 
-`workflow.py` builds this request from `PotentialConfig`; `sources.context` consumes the request. The source package may define the request contract and a minimal `SourceSection` protocol, but it should not know about scanner transition/evidence/review config objects.
+`workflow.py` composes this request from the scanner workflow envelope;
+`sources.context` consumes the request. The source package may define the request
+contract and a minimal `SourceSection` protocol, but it should not know about
+scanner transition/evidence/review config objects.
 
 ## Core abstractions
 

@@ -18,22 +18,29 @@ scripts/potential_scan.py
 
 ## Orchestrator: `qooi.scanner.workflow`
 
+Implemented flow with injected profiling context:
+
 ```text
 qooi.scanner.workflow.run(config_path: Path) -> Path
 
   1. qooi.scanner.workflow.load_config(config_path) -> PotentialConfig
-  2. qooi.scanner.workflow.resolve_universe(config) -> PotentialUniverse
-  3. qooi.scanner.workflow.load_bars(config, symbols) -> BarFetchResult
+  2. qooi.profiling.ProfileContext.from_config(config.profile, artifacts.profile_dir)
+  3. profile.stage("scanner", "workflow", "resolve_universe")
+       -> qooi.scanner.workflow.resolve_universe(config) -> PotentialUniverse
+  4. profile.stage("scanner", "workflow", "load_bars")
+       -> qooi.scanner.workflow.load_bars(config, symbols) -> BarFetchResult
        # internally builds exchange.store.HistoryRefreshRequest
-  4. qooi.scanner.transitions.compute_transition_insights(...)
-  5. qooi.scanner.workflow.source_context_request(config, ...) -> SourceContextRequest
+  5. qooi.scanner.transitions.compute_transition_insights(...)
+  6. qooi.scanner.workflow.source_context_request(config, ...) -> SourceContextRequest
        # request.refresh_mode = config.refresh_mode; no nested source refresh override
-  6. qooi.sources.context.load_source_context(request) -> SourceContextResult
-  7. qooi.scanner.decisions.compute_source_states(...)
-  8. qooi.scanner.decisions.scan_review_decisions(...)       # audit lens/artifact
-  9. qooi.scanner.diagnostics.build_diagnostic_frames(inputs) -> DiagnosticFrames
- 10. qooi.scanner.diagnostics.write_diagnostic_frames(frames, artifacts) -> None
- 11. qooi.scanner.report.render_report(inputs, frames) -> str
+  7. profile.stage("scanner", "workflow", "load_source_context")
+       -> qooi.sources.context.load_source_context(request) -> SourceContextResult
+  8. qooi.scanner.decisions.compute_source_states(...)
+  9. qooi.scanner.decisions.scan_review_decisions(...)       # audit lens/artifact
+ 10. qooi.scanner.diagnostics.build_diagnostic_frames(inputs, profile) -> DiagnosticFrames
+ 11. qooi.scanner.diagnostics.write_diagnostic_frames(frames, artifacts) -> None
+ 12. qooi.scanner.report.render_report(inputs, frames) -> str
+ 13. profile.write()
 ```
 
 No separate `ScannerWorkflowPlan` is required unless a future caller needs to
@@ -41,9 +48,10 @@ inspect a complete dry-run plan. The lean boundary is a small request object at
 the package boundary, not another scanner-wide abstraction.
 
 ```text
-PotentialConfig                      # root scanner config, owned by workflow
+PotentialConfig                      # single scanner config entry, not runtime god-object
   -> HistoryRefreshRequest           # exchange-owned cache request using config.refresh_mode
   -> SourceContextRequest            # sources-owned demand request using config.refresh_mode
+  -> ProfileContext                  # qooi.profiling-owned diagnostics context
   -> evidence/transition/review calls # scanner-local section consumers
 ```
 

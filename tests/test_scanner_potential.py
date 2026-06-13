@@ -498,6 +498,9 @@ def test_potential_run_writes_report_and_diagnostics_without_trading_artifacts(
 [potential]
 output = "{report_path.as_posix()}"
 transition_context_limit = 0
+
+[potential.profile]
+mode = "stage"
 ''',
         encoding="utf-8",
     )
@@ -535,6 +538,14 @@ transition_context_limit = 0
     assert (diagnostics / "candidate-inspection.csv").exists()
     assert (diagnostics / "candidate-rank.csv").exists()
     assert (diagnostics / "candidate-feasibility.csv").exists()
+    profile = report_path.parent / "profile"
+    assert (profile / "stages.csv").exists()
+    assert (profile / "frames.csv").exists()
+    assert (profile / "summary.md").exists()
+    profile_stages = pl.read_csv(profile / "stages.csv")
+    profile_frames = pl.read_csv(profile / "frames.csv")
+    assert "write_diagnostics" in profile_stages.get_column("stage").to_list()
+    assert "realized_transitions" in profile_frames.get_column("frame").to_list()
     assert not (diagnostics / "candidate-evidence.csv").exists()
     assert (states / "kline-state.csv").exists()
     assert not (diagnostics / "potential-observation.csv").exists()
