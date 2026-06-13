@@ -21,7 +21,7 @@ from qooi.scanner import (
     context_symbols,
 )
 from qooi.scanner.classifiers import KlineClassifier
-from qooi.scanner.config import PotentialConfig
+from qooi.scanner.config import PotentialConfig, RefreshMode, SourceRefreshMode
 from qooi.scanner.decisions import (
     compute_kline_states,
     compute_source_states,
@@ -30,7 +30,7 @@ from qooi.scanner.decisions import (
 from qooi.scanner.diagnostics import write_diagnostics
 from qooi.scanner.report import render_report
 from qooi.scanner.transitions import compute_transition_insights
-from qooi.sources.context import load_source_context
+from qooi.sources.context import SourceContextRequest, load_source_context
 
 
 @dataclass(frozen=True)
@@ -60,12 +60,14 @@ def run(config_path: Path | str) -> Path:
     )
     context = asyncio.run(
         load_source_context(
-            config,
-            symbols=universe.symbols,
-            context_symbols=context_symbols(
-                config, symbols_with_decision_bars, transitions.insights
-            ),
-            discovery=universe.discovery,
+            source_context_request(
+                config,
+                symbols=universe.symbols,
+                context_symbols=context_symbols(
+                    config, symbols_with_decision_bars, transitions.insights
+                ),
+                discovery=universe.discovery,
+            )
         )
     )
     bundles = compute_source_states(
@@ -107,6 +109,33 @@ def load_config(path: Path) -> PotentialConfig:
         return PotentialConfig()
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     return PotentialConfig.model_validate(data.get("potential", data))
+
+
+def source_context_request(
+    config: PotentialConfig,
+    *,
+    symbols: tuple[str, ...],
+    context_symbols: tuple[str, ...],
+    discovery: pl.DataFrame,
+) -> SourceContextRequest:
+    return SourceContextRequest(
+        output_dir=config.output.parent,
+        symbols=symbols,
+        context_symbols=context_symbols,
+        discovery=discovery,
+        target_days=max(config.days, config.transition.history_days),
+        concurrency=config.fetch_concurrency,
+        refresh_mode=_source_refresh_mode(config.refresh_mode, config.source.refresh_mode),
+        source=config.source,
+    )
+
+
+def _source_refresh_mode(
+    top_level: RefreshMode, source_mode: SourceRefreshMode
+) -> RefreshMode:
+    if source_mode == "inherit":
+        return top_level
+    return source_mode
 
 
 def target_min_bars(days: int, timeframe: str) -> int:

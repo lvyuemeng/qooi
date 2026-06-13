@@ -66,14 +66,11 @@ class SourceDemandSection(Protocol):
     rubik_period: str
 
 
-class TransitionDemandSection(Protocol):
-    history_days: int
-
-
-class SourceDemandConfig(Protocol):
-    days: int
+class SourceDemandRequest(Protocol):
+    symbols: tuple[str, ...]
+    context_symbols: tuple[str, ...]
+    target_days: int
     source: SourceDemandSection
-    transition: TransitionDemandSection
 
 
 class DiscoveryContractMetadata(TypedDict):
@@ -82,19 +79,16 @@ class DiscoveryContractMetadata(TypedDict):
     base_ccy: str | None
 
 
-def source_needs_from_config(
-    config: SourceDemandConfig,
+def source_needs_from_request(
+    request: SourceDemandRequest,
     *,
-    symbols: tuple[str, ...],
-    context_symbols: tuple[str, ...],
     start_ms: int | None,
     end_ms: int | None,
 ) -> tuple[SourceNeed, ...]:
-    target_symbols = context_symbols or symbols
-    disabled = set(config.source.disabled_sources)
-    freshness_ms = config.source.max_staleness_hours * HOUR_MS
-    days = max(config.days, config.transition.history_days)
-    rubik_rows = period_min_rows(days, config.source.rubik_period)
+    target_symbols = request.context_symbols or request.symbols
+    disabled = set(request.source.disabled_sources)
+    freshness_ms = request.source.max_staleness_hours * HOUR_MS
+    rubik_rows = period_min_rows(request.target_days, request.source.rubik_period)
     candidates = (
         SourceNeed("books", target_symbols, None, end_ms, 1, freshness_ms, "snapshot"),
         SourceNeed("trades", target_symbols, None, end_ms, 1, freshness_ms, "snapshot"),
@@ -103,7 +97,7 @@ def source_needs_from_config(
             target_symbols,
             start_ms,
             end_ms,
-            funding_min_rows(days),
+            funding_min_rows(request.target_days),
             freshness_ms,
             "both",
         ),

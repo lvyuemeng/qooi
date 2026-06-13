@@ -26,6 +26,7 @@ from qooi.sources.collect import (
     _incremental_rubik_window,
 )
 from qooi.sources.context import (
+    SourceContextRequest,
     manifest_latest_maps,
     merge_context_frames,
     source_availability,
@@ -85,11 +86,16 @@ def test_collect_module_exposes_demand_first_contracts() -> None:
     assert plan.raw_source == "funding_rate"
 
 
-def test_source_needs_from_config_derives_quantitative_family_demand() -> None:
+def test_source_needs_from_request_derives_quantitative_family_demand() -> None:
     collect = importlib.import_module("qooi.sources.collect")
-    config = PotentialConfig(
-        days=2,
-        transition=TransitionConfig(history_days=3),
+    request = SourceContextRequest(
+        output_dir=Path("data/output/potential"),
+        symbols=("BTC-USDT-SWAP",),
+        context_symbols=("ETH-USDT-SWAP",),
+        discovery=pl.DataFrame(),
+        target_days=3,
+        concurrency=3,
+        refresh_mode="incremental",
         source=SourceConfig(
             max_staleness_hours=6,
             book_depth=20,
@@ -102,13 +108,7 @@ def test_source_needs_from_config_derives_quantitative_family_demand() -> None:
         ),
     )
 
-    needs = collect.source_needs_from_config(
-        config,
-        symbols=("BTC-USDT-SWAP",),
-        context_symbols=("ETH-USDT-SWAP",),
-        start_ms=1_000,
-        end_ms=2_000,
-    )
+    needs = collect.source_needs_from_request(request, start_ms=1_000, end_ms=2_000)
     by_family = {need.family: need for need in needs}
 
     assert "trades" not in by_family
@@ -120,6 +120,63 @@ def test_source_needs_from_config_derives_quantitative_family_demand() -> None:
     assert by_family["funding"].min_rows == 9
     assert by_family["open_interest"].mode == "history"
     assert by_family["open_interest"].min_rows == 72
+
+
+def test_source_context_request_resolves_refresh_without_scanner_root_config() -> None:
+    workflow = importlib.import_module("qooi.scanner.workflow")
+    config = PotentialConfig(
+        output=Path("data/output/potential/report.md"),
+        days=2,
+        refresh_mode="force",
+        fetch_concurrency=7,
+        transition=TransitionConfig(history_days=5),
+        source=SourceConfig(refresh_mode="cache_only", book_depth=20),
+    )
+
+    request = workflow.source_context_request(
+        config,
+        symbols=("BTC-USDT-SWAP",),
+        context_symbols=("ETH-USDT-SWAP",),
+        discovery=pl.DataFrame({"symbol": ["ETH-USDT-SWAP"]}),
+    )
+
+    assert isinstance(request, SourceContextRequest)
+    assert request.output_dir == Path("data/output/potential")
+    assert request.target_days == 5
+    assert request.concurrency == 7
+    assert request.refresh_mode == "cache_only"
+    assert request.source.book_depth == 20
+    assert request.symbols == ("BTC-USDT-SWAP",)
+    assert request.context_symbols == ("ETH-USDT-SWAP",)
+
+
+def test_source_context_module_does_not_accept_potential_config_boundary() -> None:
+    import inspect
+
+    import qooi.sources.context as context
+
+    signature = inspect.signature(context.load_source_context)
+
+    assert tuple(signature.parameters) == ("request",)
+    assert not hasattr(context, "PotentialSourceConfig")
+
+
+def _source_request(
+    *,
+    symbols: tuple[str, ...] = ("BTC-USDT-SWAP",),
+    source: SourceConfig | None = None,
+    target_days: int = 60,
+) -> SourceContextRequest:
+    return SourceContextRequest(
+        output_dir=Path("data/output/potential"),
+        symbols=symbols,
+        context_symbols=symbols,
+        discovery=pl.DataFrame(),
+        target_days=target_days,
+        concurrency=1,
+        refresh_mode="cache_only",
+        source=source or SourceConfig(),
+    )
 
 
 def test_source_family_table_derives_manifest_aliases_and_merge_keys() -> None:
@@ -151,9 +208,9 @@ def test_source_capability_marks_rubik_contract_sources_provider_bounded() -> No
 
 def test_source_availability_uses_frame_freshness_over_latest_missing_manifest() -> None:
     current_ms = 2_000_000
-    config = PotentialConfig(
-        days=730,
-        transition=TransitionConfig(history_days=730),
+    request = _source_request(
+        symbols=("ACT-USDT-SWAP",),
+        target_days=730,
         source=SourceConfig(max_staleness_hours=24, rubik_period="1H"),
     )
     frames = {
@@ -181,8 +238,7 @@ def test_source_availability_uses_frame_freshness_over_latest_missing_manifest()
     rows = source_availability(
         frames,
         manifest,
-        ("ACT-USDT-SWAP",),
-        config,
+        request,
         current_ms=current_ms,
     )
     row = next(item for item in rows if item.family == "long_short_ratios")
@@ -200,13 +256,12 @@ def test_source_availability_uses_frame_freshness_over_latest_missing_manifest()
 
 
 def test_source_availability_treats_messages_as_optional_absent_without_penalty() -> None:
-    config = PotentialConfig(source=SourceConfig(max_staleness_hours=24))
+    request = _source_request(source=SourceConfig(max_staleness_hours=24))
 
     rows = source_availability(
         {},
         pl.DataFrame(),
-        ("BTC-USDT-SWAP",),
-        config,
+        request,
         current_ms=2_000_000,
     )
     row = next(item for item in rows if item.family == "messages")

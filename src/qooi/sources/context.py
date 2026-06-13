@@ -56,17 +56,16 @@ class SourceSection(Protocol):
     disabled_symbols: tuple[str, ...]
 
 
-class TransitionSection(Protocol):
-    history_days: int
-
-
-class PotentialSourceConfig(Protocol):
-    output: Path
-    days: int
-    fetch_concurrency: int
+@dataclass(frozen=True)
+class SourceContextRequest:
+    output_dir: Path
+    symbols: tuple[str, ...]
+    context_symbols: tuple[str, ...]
+    discovery: pl.DataFrame
+    target_days: int
+    concurrency: int
     refresh_mode: Literal["incremental", "cache_only", "force"]
     source: SourceSection
-    transition: TransitionSection
 
 
 @dataclass(frozen=True)
@@ -106,68 +105,60 @@ class SourceContextResult:
 
 
 async def load_source_context(
-    config: PotentialSourceConfig,
-    *,
-    symbols: tuple[str, ...],
-    context_symbols: tuple[str, ...],
-    discovery: pl.DataFrame,
+    request: SourceContextRequest,
 ) -> SourceContextResult:
-    bundle = read_source_bundle(config.output.parent, SOURCE_ARTIFACT_SPECS)
-    refresh_mode = (
-        config.refresh_mode
-        if config.source.refresh_mode == "inherit"
-        else config.source.refresh_mode
-    )
-    if refresh_mode == "cache_only":
+    bundle = read_source_bundle(request.output_dir, SOURCE_ARTIFACT_SPECS)
+    if request.refresh_mode == "cache_only":
         frames = context_frames(bundle, {})
         return SourceContextResult(
             bundle.manifest,
             frames,
-            tuple(source_availability(frames, bundle.manifest, symbols, config)),
+            tuple(source_availability(frames, bundle.manifest, request)),
         )
-    if context_symbols:
-        force_refresh = refresh_mode == "force"
+    if request.context_symbols:
+        force_refresh = request.refresh_mode == "force"
         target_end_ms = now_ms()
-        target_days = max(config.days, config.transition.history_days)
-        target_start_ms = target_end_ms - target_days * DAY_MS
-        request = SourceCollectRequest(
-            output_dir=config.output.parent,
-            symbols=context_symbols,
-            discovery=discovery,
-            concurrency=config.fetch_concurrency,
-            book_mode=config.source.book_mode,
-            book_depth=config.source.book_depth,
-            max_source_staleness_hours=config.source.max_staleness_hours,
-            trade_limit=config.source.trade_limit,
-            funding_limit=config.source.funding_limit,
-            rubik_period=config.source.rubik_period,
-            rubik_limit=config.source.rubik_limit,
-            rubik_taker_unit=config.source.rubik_taker_unit,
-            disabled_sources=config.source.disabled_sources,
-            disabled_symbols=config.source.disabled_symbols,
+        target_start_ms = target_end_ms - request.target_days * DAY_MS
+        collect_request = SourceCollectRequest(
+            output_dir=request.output_dir,
+            symbols=request.context_symbols,
+            discovery=request.discovery,
+            concurrency=request.concurrency,
+            book_mode=request.source.book_mode,
+            book_depth=request.source.book_depth,
+            max_source_staleness_hours=request.source.max_staleness_hours,
+            trade_limit=request.source.trade_limit,
+            funding_limit=request.source.funding_limit,
+            rubik_period=request.source.rubik_period,
+            rubik_limit=request.source.rubik_limit,
+            rubik_taker_unit=request.source.rubik_taker_unit,
+            disabled_sources=request.source.disabled_sources,
+            disabled_symbols=request.source.disabled_symbols,
             refresh_trades=force_refresh,
             refresh_context=force_refresh,
             target_source_start_ms=target_start_ms,
             target_source_end_ms=target_end_ms,
-            funding_min_rows=funding_min_rows(target_days),
-            rubik_min_rows=period_min_rows(target_days, config.source.rubik_period),
+            funding_min_rows=funding_min_rows(request.target_days),
+            rubik_min_rows=period_min_rows(
+                request.target_days, request.source.rubik_period
+            ),
             existing_frames=context_frames(bundle, {}),
         )
         try:
-            result = await collect_source_context(request)
+            result = await collect_source_context(collect_request)
             frames = merge_context_frames(bundle, result.frames)
-            write_context_frames(config.output.parent, frames)
+            write_context_frames(request.output_dir, frames)
             write_frame_artifact(
-                config.output.parent,
+                request.output_dir,
                 SOURCE_ARTIFACT_SPECS["source_manifest"],
                 concat_manifest(bundle.manifest, result.manifest),
             )
             manifest = concat_manifest(bundle.manifest, result.manifest)
-            availability = tuple(source_availability(frames, manifest, symbols, config))
+            availability = tuple(source_availability(frames, manifest, request))
             return SourceContextResult(manifest, frames, availability)
         except Exception as exc:
             frames = context_frames(bundle, {})
-            availability = tuple(source_availability(frames, bundle.manifest, symbols, config))
+            availability = tuple(source_availability(frames, bundle.manifest, request))
             failed = SourceAvailability(
                 "context", "*", 0, None, "failed", f"{type(exc).__name__}: {exc}"
             )
@@ -176,7 +167,7 @@ async def load_source_context(
     return SourceContextResult(
         bundle.manifest,
         frames,
-        tuple(source_availability(frames, bundle.manifest, symbols, config)),
+        tuple(source_availability(frames, bundle.manifest, request)),
     )
 
 
@@ -240,21 +231,20 @@ def concat_manifest(left: pl.DataFrame, right: pl.DataFrame) -> pl.DataFrame:
 def source_availability(
     frames: dict[str, pl.DataFrame],
     manifest: pl.DataFrame,
-    symbols: tuple[str, ...],
-    config: PotentialSourceConfig,
+    request: SourceContextRequest,
     *,
     current_ms: int | None = None,
 ) -> list[SourceAvailability]:
     rows: list[SourceAvailability] = []
-    symbol_frame = pl.DataFrame({"symbol": list(symbols)}, schema={"symbol": pl.String})
+    symbol_frame = pl.DataFrame({"symbol": list(request.symbols)}, schema={"symbol": pl.String})
     fetch_status_by_family_symbol, fetch_warning_by_family_symbol = manifest_latest_maps(manifest)
     observed_ms = now_ms() if current_ms is None else current_ms
-    target_rows_by_family = _target_rows_by_family(config)
-    threshold_hours = float(config.source.max_staleness_hours)
+    target_rows_by_family = _target_rows_by_family(request)
+    threshold_hours = float(request.source.max_staleness_hours)
     for family in CONTEXT_FAMILIES:
         frame = frames.get(family, pl.DataFrame())
         family_spec = source_family(family)
-        capability = source_capability(family, period=config.source.rubik_period)
+        capability = source_capability(family, period=request.source.rubik_period)
         scanner_target_rows = target_rows_by_family.get(family, 0)
         if frame.is_empty() or "symbol" not in frame.columns:
             availability = symbol_frame.with_columns(
@@ -285,7 +275,11 @@ def source_availability(
             symbol = str(current["symbol"])
             latest = current["latest_timestamp"]
             observed_rows = int(current["rows"] or 0)
-            if family in config.source.disabled_sources or symbol in config.source.disabled_symbols:
+            disabled = (
+                family in request.source.disabled_sources
+                or symbol in request.source.disabled_symbols
+            )
+            if disabled:
                 rows.append(_disabled_availability(family, symbol, capability))
                 continue
             latest_fetch_status = fetch_status_by_family_symbol.get((family, symbol), "")
@@ -372,15 +366,16 @@ def source_availability(
     return rows
 
 
-def _target_rows_by_family(config: PotentialSourceConfig) -> dict[str, int]:
-    target_days = max(config.days, config.transition.history_days)
+def _target_rows_by_family(request: SourceContextRequest) -> dict[str, int]:
     return {
         "books": 1,
-        "trades": max(1, config.source.trade_limit),
-        "funding": funding_min_rows(target_days),
-        "open_interest": period_min_rows(target_days, config.source.rubik_period),
-        "taker_volume": period_min_rows(target_days, config.source.rubik_period),
-        "long_short_ratios": period_min_rows(target_days, config.source.rubik_period),
+        "trades": max(1, request.source.trade_limit),
+        "funding": funding_min_rows(request.target_days),
+        "open_interest": period_min_rows(request.target_days, request.source.rubik_period),
+        "taker_volume": period_min_rows(request.target_days, request.source.rubik_period),
+        "long_short_ratios": period_min_rows(
+            request.target_days, request.source.rubik_period
+        ),
         "messages": 0,
     }
 
