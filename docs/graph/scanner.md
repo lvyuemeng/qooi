@@ -19,20 +19,33 @@ scripts/potential_scan.py
 ## Orchestrator: `qooi.scanner.workflow`
 
 ```text
-qooi.scanner.workflow.run(config_path: Path) -> None
+qooi.scanner.workflow.run(config_path: Path) -> Path
 
   1. qooi.scanner.workflow.load_config(config_path) -> PotentialConfig
-  2. qooi.scanner.workflow.resolve_universe(config) -> PotentialUniverse
-  3. qooi.scanner.workflow.load_bars(config, symbols) -> BarFetchResult
-  4. qooi.scanner.transitions.compute_transition_insights(...)
-  5. qooi.sources.context.load_source_context(...)
-  6. qooi.scanner.decisions.compute_source_states(...)
-  7. qooi.scanner.decisions.scan_review_decisions(...)       # decision lens
-  8. qooi.scanner.diagnostics.write_diagnostics(inputs)       # evidence lens
-  9. qooi.scanner.report.render_report(inputs) -> str
+  2. qooi.scanner.workflow.resolve_workflow_plan(config) -> ScannerWorkflowPlan
+  3. qooi.scanner.workflow.resolve_universe(config) -> PotentialUniverse
+  4. qooi.scanner.workflow.load_bars(plan.bars, symbols) -> BarFetchResult
+  5. qooi.scanner.transitions.compute_transition_insights(...)
+  6. qooi.sources.context.load_source_context(plan.sources, ...)
+  7. qooi.scanner.decisions.compute_source_states(...)
+  8. qooi.scanner.decisions.scan_review_decisions(...)       # audit lens/artifact
+  9. qooi.scanner.diagnostics.build_diagnostic_frames(inputs) -> DiagnosticFrames
+ 10. qooi.scanner.diagnostics.write_diagnostic_frames(frames, artifacts) -> None
+ 11. qooi.scanner.report.render_report(inputs, frames) -> str
 ```
 
-`workflow.py` passes named data products between modules. It must not grow a global materialized-data bag that every downstream consumer accepts.
+`ScannerWorkflowPlan` is config-derived and contains section-owned run decisions; it is not a global materialized dataframe bag.
+
+```text
+ScannerWorkflowPlan
+  bars.refresh_mode: RefreshMode             # from PotentialConfig.refresh_mode
+  bars.fetch_concurrency: int
+  sources.refresh_mode: RefreshMode          # SourceConfig override or inherited top-level mode
+  evidence.kind: "ladder" | "tailtree"
+  tailtree.lifecycle: "train" | "load_predict"
+```
+
+`workflow.py` passes named data products between modules. It must not grow a global materialized-data bag that every downstream consumer accepts. It also must not let modules discover refresh/lifecycle behavior by checking several config locations.
 
 ---
 
@@ -59,7 +72,8 @@ observations/outcomes
 result.evidence/latest_observations
   → qooi.scanner.rank.candidate_evidence_frame(...)
   → qooi.scanner.rank.rank_candidate_evidence(...)
-  → qooi.scanner.diagnostics.candidate_feasibility_frame(...)
+  → qooi.scanner.selection.candidate_selection_frame(...)
+  → qooi.scanner.health.data_health_frame(...)
   → candidate-inspection.csv + candidate-rank.csv + candidate-feasibility.csv + report
 ```
 
@@ -467,14 +481,16 @@ Ranking uses numeric columns that are present:
 - ladder: information gain, stability, support, path quality, data quality;
 - tailtree: tail lift, tail stability, support, path quality, data quality.
 
-Candidate selection projection belongs to `diagnostics.py`, not `report.py`. Target public contract:
+Candidate selection projection belongs to `selection.py`, not `report.py` or the artifact writer:
 
 ```text
-qooi.scanner.diagnostics.candidate_feasibility_frame(
+qooi.scanner.selection.candidate_selection_frame(
     candidate_rank: pl.DataFrame,
     watchlist_feasibility: pl.DataFrame,
 ) -> pl.DataFrame
 ```
+
+Compatibility rule: `qooi.scanner.diagnostics.candidate_feasibility_frame(...)` is a temporary landed API and should be moved, not wrapped indefinitely. After callers are updated, remove the old name.
 
 Output contract:
 
@@ -503,7 +519,7 @@ columns:
   candidate_reason: String
 ```
 
-This projection is semantic, not presentational. It may derive `rank_tier`, select the best row per symbol, and derive stable blocker/reason codes. It must not emit display-formatted strings for numeric values. Current code writes this artifact through a private helper; the next code refactor should promote that helper to this public contract and test it directly.
+This projection is semantic, not presentational. It may derive `rank_tier`, select the best row per symbol, and derive stable blocker/reason codes. It must not emit display-formatted strings for numeric values. The landed `diagnostics.candidate_feasibility_frame` should be moved to `selection.candidate_selection_frame`; do not leave a wrapper alias after callers migrate.
 
 Promoted-rank scoring should be explicit, capability-aware, and cost-aware:
 
@@ -533,62 +549,119 @@ Manual slippage thresholds are allowed only as extreme sanity guards. Normal rev
 
 ---
 
+## Selection and health projections
+
+### `qooi.scanner.selection`
+
+Canonical candidate-selection projection:
+
+```text
+qooi.scanner.selection.candidate_selection_frame(
+    candidate_rank: pl.DataFrame,
+    watchlist_feasibility: pl.DataFrame,
+) -> pl.DataFrame
+```
+
+Schema:
+
+```text
+CANDIDATE_SELECTION_SCHEMA
+  symbol: String
+  feasibility: String
+  rank_score: Float64
+  rank_tier: String
+  source_penalty_score: Float64
+  required_missing_source_count: Int64
+  required_stale_source_count: Int64
+  provider_bounded_source_count: Int64
+  optional_absent_source_count: Int64
+  min_history_coverage_pct: Float64
+  min_source_capability_coverage_pct: Float64
+  tree_direction: String
+  matched_evidence_level: String
+  tail_lift: Float64
+  gpd_shape_xi: Float64
+  n_tail_exceedances: Int64
+  source_status: String
+  history_status: String
+  candidate_reason: String
+```
+
+Rules:
+
+```text
+key: symbol
+selection: highest rank_score per symbol after deterministic tie sort
+candidate_reason: semantic blocker code, not display prose
+no Markdown strings or report formatting
+```
+
+### `qooi.scanner.health`
+
+Aggregate report-health projection:
+
+```text
+qooi.scanner.health.data_health_frame(
+    history_feasibility: pl.DataFrame,
+    source_availability: pl.DataFrame,
+    candidate_selection: pl.DataFrame,
+) -> pl.DataFrame
+```
+
+Schema:
+
+```text
+DATA_HEALTH_SCHEMA
+  scope: String
+  row_count: Int64
+  required_missing_source_count: Int64
+  required_stale_source_count: Int64
+  provider_bounded_source_count: Int64
+  optional_absent_source_count: Int64
+  reviewable_count: Int64
+  limited_count: Int64
+```
+
+Rules:
+
+```text
+source/history/candidate health are aggregate counts
+no symbol-level candidate rows in data-health report section
+no candidate ranking or source collection
+```
+
 ## Diagnostics and report
 
 ```text
-qooi.scanner.diagnostics.write_diagnostics(inputs: ReportInputs) -> DiagnosticFrames
-qooi.scanner.report.render_report(inputs: ReportInputs) -> str
+qooi.scanner.diagnostics.build_diagnostic_frames(inputs: ReportInputs) -> DiagnosticFrames
+qooi.scanner.diagnostics.write_diagnostic_frames(frames: DiagnosticFrames, artifacts: PotentialArtifacts) -> None
+qooi.scanner.report.render_report(inputs: ReportInputs, frames: DiagnosticFrames) -> str
 ```
 
-Diagnostics writes path-specific artifacts after the one dispatch. It also owns report-ready semantic projections such as `candidate-feasibility.csv`.
+Diagnostics writes path-specific artifacts after the one dispatch. It does not own candidate-selection or health semantics; it orchestrates and persists those products.
 
 Report rendering graph:
 
 ```text
-diagnostics/candidate-feasibility.csv
-  → qooi.scanner.report.CandidateSelectionSection.rows(...) -> tuple[CandidateSelectionRow, ...]
-  → qooi.scanner.report.CandidateSelectionSection.render(...) -> str
+DiagnosticFrames.candidate_selection
+  → qooi.scanner.report.CandidateSelectionSection.render(frame) -> str
 
-history-feasibility.csv + source-freshness.csv + candidate-feasibility.csv
-  → qooi.scanner.report.DataHealthSection.rows(...) -> tuple[DataHealthRow, ...]
-  → qooi.scanner.report.DataHealthSection.render(...) -> str
+DiagnosticFrames.data_health
+  → qooi.scanner.report.DataHealthSection.render(frame) -> str
 
-path-specific evidence artifacts
+DiagnosticFrames.path_evidence
   → report_sections_for(evidence)
-  → ReportSection.render(inputs)
+  → ReportSection.render(inputs, frames)
 ```
 
-Typed report row contracts:
+Target frame contracts:
 
 ```text
-CandidateSelectionRow
-  symbol: str
-  feasibility: str
-  rank_score: float | None
-  rank_tier: str
-  source_penalty_score: float | None
-  required_missing_source_count: int
-  required_stale_source_count: int
-  provider_bounded_source_count: int
-  optional_absent_source_count: int
-  min_history_coverage_pct: float | None
-  min_source_capability_coverage_pct: float | None
-  tree_direction: str
-  tail_lift: float | None
-  gpd_shape_xi: float | None
-  n_tail_exceedances: int | None
-  reason: str
-
-DataHealthRow
-  scope: str
-  row_count: int
-  required_missing_source_count: int | None
-  required_stale_source_count: int | None
-  provider_bounded_source_count: int | None
-  optional_absent_source_count: int | None
-  reviewable_count: int | None
-  limited_count: int | None
+qooi.scanner.selection.CANDIDATE_SELECTION_SCHEMA
+qooi.scanner.health.DATA_HEALTH_SCHEMA
 ```
+
+`report.py` should not read `diagnostics/*.csv` during the same run. CSV artifacts are an output boundary for users/tests, not an internal type transport.
 
 `report.py` is a renderer, not a schema inference engine. Forbidden report code patterns:
 
@@ -600,7 +673,7 @@ Any/object plus float(str(value)) recovery
 business-rule joins between rank and feasibility
 ```
 
-Path-specific report sections are composed before rendering, not by branching inside every section. The renderer formats typed values; it does not decide source, history, or candidate semantics.
+Path-specific report sections are composed before rendering, not by branching inside every section. The renderer formats typed frame columns; it does not decide source, history, or candidate semantics. Default report excludes `Decision Rule Audit`; audit rows remain diagnostics unless an explicit appendix mode is added.
 
 ---
 

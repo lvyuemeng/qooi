@@ -81,6 +81,52 @@ configs/potential*.toml
   -> Markdown research report and CSV diagnostics
 ```
 
+## Composable configuration policy
+
+Configuration is a composition of package-owned sections, not repeated role flags. Each section owns one workflow decision and consumers read that section directly. Do not preserve backward-compatible aliases when current callers can be updated.
+
+| Config section | Owner | Decision owned | Forbidden repetition |
+|---|---|---|---|
+| `[potential]` | `qooi.scanner.workflow` | scanner run identity, output, universe, OHLCV bar cache refresh, concurrency | source-provider knobs, evidence lifecycle, report audit flags |
+| `[potential.source]` | `qooi.sources.context` | source-family refresh override, source limits, source staleness, disabled source/symbol demand | OHLCV bar refresh, candidate/rank/report policy |
+| `[potential.transition]` | `qooi.scanner.transitions` | transition/history windows and probability thresholds | source freshness, model lifecycle |
+| `[potential.evidence]` | `qooi.scanner.diagnostics` dispatch | evidence path name | booleans such as `use_tail_tree`, provider menus |
+| `[potential.evidence.tailtree]` | `qooi.scanner.tailrun` | train/load-predict lifecycle and model artifact identity | source refresh, report rendering |
+| `[potential.review]` | `qooi.scanner.decisions` | current review requirements only | candidate ranking, source acquisition |
+
+Refresh semantics must be explicit:
+
+```text
+PotentialConfig.refresh_mode         -> OHLCV/bar cache refresh in exchange.store
+SourceConfig.refresh_mode="inherit" -> use PotentialConfig.refresh_mode for sources
+SourceConfig.refresh_mode=<mode>     -> override source-family collection only
+```
+
+This avoids a repeated `refresh_mode` role where `[potential.source]` appears to control bar cache refresh. If a config shape changes, update callers directly and remove old aliases rather than accepting both shapes.
+
+## Lean-module policy
+
+Large modules are not automatically wrong, but repeated helper surfaces and read-back/conversion layers violate the project context. Reduction should follow ownership, not create `_utils.py` grab bags.
+
+Current high-pressure modules to reduce:
+
+| Package | Module | Current pressure | Reduction direction |
+|---|---|---:|---|
+| scanner | `diagnostics.py` | artifact assembly, evidence dispatch, report projections, frame writers | split semantic products into one-word owners such as `selection.py` and `health.py`; keep `diagnostics.py` as writer/orchestrator |
+| scanner | `report.py` | section logic plus CSV read-back plus type recovery | render in-memory report frames; remove default decision audit; delete conversion helpers |
+| sources | `collect.py` | demand planning plus provider execution | keep pure demand planning separate from side-effect collection within named APIs; no compatibility wrappers |
+| exchange | `store.py` | cache request, refresh, validation, coverage rows | keep cache/coverage contracts decisive; no source-context policy |
+| research | `reports.py` / `data.py` | wide report/data transforms | keep research artifacts consuming package outputs, not scanner internals |
+
+Reduction rule:
+
+```text
+If two helpers differ only by family/source/report table, replace them with a
+small typed table or dataclass method owned by the module's data product.
+If a helper exists only to recover type after CSV read-back, remove the read-back.
+If a module only forwards old names, delete it and update callers.
+```
+
 ## Promotion boundary
 
 Scanner and research outputs are review surfaces. They become strategy candidates only after they are converted into explicit strategy signal columns and pass execution-aware backtests through `qooi.core`.

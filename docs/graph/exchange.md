@@ -85,13 +85,32 @@ CacheRefreshEvent
 API:
 
 ```text
-plan_history(requests) -> HistoryTarget rows
-validate_history(...) -> HistoryCoverage rows
-history_coverage_frame(...) -> DataFrame
-history_coverage_row(...) -> dict
-history_coverage_error_row(...) -> dict
-bar_freshness_threshold_hours(timeframe) -> int
+bar_refresh_request(
+    symbol: str,
+    timeframe: str,
+    *,
+    days: int,
+    history_days: int,
+    refresh_mode: RefreshMode,
+) -> HistoryRefreshRequest
+
+plan_history(request: HistoryRequest) -> HistoryTarget
+validate_history(frame, target) -> HistoryCoverage
+history_coverage_frame(coverages) -> DataFrame
+history_coverage_row(coverage) -> dict
+history_coverage_error_row(request, error) -> dict
+bar_freshness_threshold_hours(timeframe) -> float
 ```
+
+Refresh mapping:
+
+```text
+refresh_mode="cache_only"  -> HistoryRefreshRequest(refresh=False, cache_only=True)
+refresh_mode="incremental" -> HistoryRefreshRequest(refresh=True, incremental=True)
+refresh_mode="force"       -> HistoryRefreshRequest(refresh=True, incremental=False)
+```
+
+No exchange API accepts or reads `SourceConfig`.
 
 Flow:
 

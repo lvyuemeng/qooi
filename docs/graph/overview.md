@@ -10,7 +10,7 @@ scripts/
     -> qooi.dynamic + qooi.research prepared frames
 
 qooi.exchange
-  -> market/cache/universe/context/trading IO
+  -> market/cache/universe/trading IO
 qooi.sources
   -> provider/source artifacts
 qooi.scanner
@@ -32,4 +32,28 @@ configs/potential*.toml
   -> scripts/potential_scan.py
   -> qooi.scanner.workflow.run()
   -> docs/report-style Markdown + CSV diagnostics
+```
+
+Composable config graph:
+
+```text
+PotentialConfig.refresh_mode
+  -> scanner.workflow.load_bars
+  -> exchange.store.HistoryRefreshRequest
+
+PotentialConfig.source.refresh_mode
+  -> sources.context.resolve_source_refresh_mode(...)
+  -> sources.collect.SourceCollectRequest
+
+PotentialConfig.evidence.kind
+  -> scanner.diagnostics evidence dispatch
+
+PotentialConfig.evidence.tailtree.lifecycle
+  -> scanner.tailrun train/load_predict lifecycle
+```
+
+No compatibility graph:
+
+```text
+removed aliases/wrappers -> update callers -> delete old names
 ```

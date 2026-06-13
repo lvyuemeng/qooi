@@ -173,8 +173,22 @@ Keep these contracts small. Add fields only when a current source decision requi
 Scanner-facing API:
 
 ```text
+resolve_source_refresh_mode(
+    top_level_refresh_mode: RefreshMode,
+    source_refresh_mode: SourceRefreshMode,
+) -> RefreshMode
+
 load_source_context(config, *, symbols, context_symbols, discovery) -> SourceContextResult
 ```
+
+Refresh resolution:
+
+```text
+source.refresh_mode="inherit" -> top_level_refresh_mode
+source.refresh_mode=<mode>    -> <mode>
+```
+
+No other source API should inspect both config locations. There is no compatibility alias where `[potential.source].refresh_mode` controls bar cache refresh.
 
 Flow:
 

@@ -21,8 +21,10 @@ src/qooi/scanner/
 ├── tailtree.py       # LightGBM + GPD tail evidence path; optional deps
 ├── tailrun.py        # tailtree train/load_predict lifecycle and model artifacts
 ├── rank.py           # candidate-inspection and candidate-rank rows
-├── diagnostics.py    # artifact writing, report-ready projections, one evidence dispatch
-└── report.py         # markdown renderer from typed report projection rows
+├── selection.py      # target: canonical candidate-selection projection
+├── health.py         # target: data-health aggregate projection
+├── diagnostics.py    # artifact writer/orchestrator over computed frames
+└── report.py         # markdown renderer from in-memory report frames
 ```
 
 `contracts.py` is intentionally absent. Scanner-local contracts such as `ReportInputs`,
@@ -104,6 +106,54 @@ Forbidden:
 - `features.py` must not use future return/outcome columns.
 - `ladder.py` and `tailtree.py` must not cross-import each other as evidence paths.
 - Timestamp-only joins are forbidden in source-derived feature construction.
+
+## Scanner config workflow
+
+Scanner config is composable by section. `workflow.py` resolves the run plan once, then passes section-owned config to the module that owns the decision.
+
+```text
+PotentialConfig
+  ├─ output/universe/bar/timeframes/days/refresh_mode/fetch_concurrency -> workflow/load_bars
+  ├─ source: SourceConfig                                           -> sources.context
+  ├─ transition: TransitionConfig                                   -> transitions/history
+  ├─ evidence: EvidenceConfig                                       -> diagnostics evidence dispatch
+  │    └─ tailtree: TailtreeConfig                                  -> tailrun lifecycle
+  └─ review: ReviewConfig                                           -> decisions only
+```
+
+Refresh-mode ownership is decisive:
+
+```text
+config.refresh_mode                 # OHLCV bar cache refresh only
+config.source.refresh_mode=inherit  # source collection uses config.refresh_mode
+config.source.refresh_mode=<mode>   # source collection override only
+```
+
+No module should infer refresh behavior by checking several locations. No compatibility aliases should preserve old config shapes once callers are updated.
+
+## Lean reduction target
+
+The current scanner has grown large report and diagnostics modules. The target is not another helper layer; it is fewer ownership surfaces:
+
+| Target module | Owns | Does not own |
+|---|---|---|
+| `workflow.py` | staged run orchestration and config-section routing | frame schema logic, report table construction |
+| `selection.py` | `candidate_selection_frame(candidate_rank, watchlist_feasibility)` and promotion/reason semantics | Markdown formatting, artifact writes |
+| `health.py` | aggregate data-health rows from history/source/candidate frames | candidate ranking, source collection |
+| `diagnostics.py` | build/write diagnostic artifacts from already-owned frame products | evidence model internals, report CSV read-back |
+| `report.py` | render in-memory report frames to Markdown | CSV reading, type recovery, candidate/source/history business rules |
+
+Default report surface:
+
+```text
+Scan Scope
+Data Health Summary
+Candidate Selection
+Path-specific Evidence Summary
+Caveats
+```
+
+`Decision Rule Audit` is not a default peer section. It may remain as a CSV artifact or explicit appendix mode, because it is a rule-order trace rather than the canonical ranked candidate answer.
 
 ## Cross-package boundaries
 
@@ -408,7 +458,9 @@ Candidate output has three different grains. The report must not present all thr
 | `candidate-feasibility.csv` | one best row per symbol | rank joined to current review feasibility | canonical report candidate-selection table |
 | `watchlist-feasibility.csv` | one row per symbol | history/source reviewability diagnostics | data-health input, not a candidate table |
 
-The top-level report should have one candidate-selection table sourced from `candidate-feasibility.csv`. `Review Rows`/decision-rule output is an audit lens and should be demoted or clearly labeled as rule-order audit, not a rank-ordered candidate list. `Data Coverage And Feasibility` should become an aggregate data-health summary, not another symbol table competing with candidate selection.
+The top-level report should have one candidate-selection table sourced from `candidate-feasibility.csv` or its in-memory frame. `Review Rows`/decision-rule output is an audit lens and should be demoted to artifact/appendix, not a rank-ordered candidate list. `Data Coverage And Feasibility` should become an aggregate data-health summary, not another symbol table competing with candidate selection.
+
+Candidate-selection semantics belong to `selection.py`: best-row selection, promotion gates, source/history blocker codes, and stable numeric schema. Report rendering belongs to `report.py`; artifact writing belongs to `diagnostics.py`.
 
 Freshness, capability, and tradability are numeric inputs, not manual labels:
 
@@ -479,30 +531,14 @@ business rules for source/history blocker semantics
 rank/feasibility joins
 ```
 
-Report sections should receive decisive row contracts, for example:
+Report sections should receive decisive frame schemas, for example:
 
 ```text
-CandidateSelectionRow(
-  symbol: str,
-  feasibility: str,
-  rank_score: float | None,
-  rank_tier: str,
-  source_penalty_score: float | None,
-  required_missing_source_count: int,
-  required_stale_source_count: int,
-  provider_bounded_source_count: int,
-  optional_absent_source_count: int,
-  min_history_coverage_pct: float | None,
-  min_source_capability_coverage_pct: float | None,
-  tree_direction: str,
-  tail_lift: float | None,
-  gpd_shape_xi: float | None,
-  n_tail_exceedances: int | None,
-  reason: str,
-)
+selection.CANDIDATE_SELECTION_SCHEMA
+health.DATA_HEALTH_SCHEMA
 ```
 
-The renderer should fail fast when projection schemas are wrong; it should not infer missing semantics with attribute checks or opaque row dictionaries.
+The renderer should fail fast when projection schemas are wrong; it should not infer missing semantics with attribute checks, opaque row dictionaries, or CSV read-back conversions inside the same run.
 
 ## Artifact boundaries
 

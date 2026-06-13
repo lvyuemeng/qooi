@@ -55,6 +55,31 @@ A latest empty or failed incremental provider fetch must not overwrite usable ca
 
 Removed target: source collection must not live in `qooi.exchange.context`.
 
+## Source config workflow
+
+`SourceConfig` is a source-family demand override, not a second scanner run config.
+
+```text
+PotentialConfig.refresh_mode
+  -> default refresh mode for both bar cache and source collection
+
+SourceConfig.refresh_mode="inherit"
+  -> source collection uses PotentialConfig.refresh_mode
+
+SourceConfig.refresh_mode in {"incremental", "cache_only", "force"}
+  -> source collection override only
+```
+
+`SourceConfig` owns provider-family limits and freshness:
+
+```text
+book_mode, book_depth, trade_limit, funding_limit, rubik_period,
+rubik_limit, rubik_taker_unit, max_staleness_hours,
+disabled_sources, disabled_symbols
+```
+
+It must not own OHLCV bar cache refresh, evidence path, tailtree lifecycle, candidate ranking, or report section selection. Old aliases that blur these roles should be removed, not preserved.
+
 ## Core abstractions
 
 | Abstraction | Owner | Meaning |

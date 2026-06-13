@@ -47,6 +47,18 @@ exchange -> dynamic/learned-state modules
 exchange -> sources.context / source collection orchestration
 ```
 
+## Bar cache refresh ownership
+
+`qooi.exchange.store` executes OHLCV/cache refresh requests, but it does not decide scanner source policy. Scanner workflow supplies a decisive `HistoryRefreshRequest` from top-level `PotentialConfig.refresh_mode`:
+
+```text
+refresh_mode="cache_only"   -> read cache, report coverage, no exchange fetch
+refresh_mode="incremental"  -> refresh stale/missing cache incrementally
+refresh_mode="force"        -> rebuild requested cache window
+```
+
+`[potential.source].refresh_mode` must not affect `exchange.store` bar requests. Source collection may inherit the top-level mode, but that inheritance is resolved in `qooi.sources.context`, not in exchange.
+
 ## Demand boundary
 
 Exchange answers:
