@@ -59,7 +59,8 @@ observations/outcomes
 result.evidence/latest_observations
   → qooi.scanner.rank.candidate_evidence_frame(...)
   → qooi.scanner.rank.rank_candidate_evidence(...)
-  → candidate-inspection.csv + candidate-rank.csv + report
+  → qooi.scanner.diagnostics.candidate_feasibility_frame(...)
+  → candidate-inspection.csv + candidate-rank.csv + candidate-feasibility.csv + report
 ```
 
 `qooi.scanner.__init__` owns scanner-local contracts/protocols and shared expression
@@ -454,18 +455,57 @@ The only caller that supplies tree models is the tailtree pipeline. Candidate in
 Current output:
 
 ```text
-candidate-inspection.csv # latest rows matched to evidence/leaf metrics
-candidate-rank.csv       # ranked current candidates
+candidate-inspection.csv  # latest rows matched to evidence/leaf metrics
+candidate-rank.csv        # symbol × selected direction ranked evidence matches
+candidate-feasibility.csv # one best ranked row per symbol joined to review feasibility
 ```
 
-`candidate-inspection.csv` is the diagnostic surface; `candidate-rank.csv` is the promoted review surface. Do not add promotion-only fields to inspection rows; add those to `rank.py`/`candidate-rank.csv`.
+`candidate-inspection.csv` is the diagnostic surface. `candidate-rank.csv` is rank detail and may contain multiple rows per symbol. `candidate-feasibility.csv` is the report-facing candidate-selection surface.
 
 Ranking uses numeric columns that are present:
 
 - ladder: information gain, stability, support, path quality, data quality;
 - tailtree: tail lift, tail stability, support, path quality, data quality.
 
-Planned promoted-rank scoring should be explicit, capability-aware, and cost-aware:
+Candidate selection projection belongs to `diagnostics.py`, not `report.py`. Target public contract:
+
+```text
+qooi.scanner.diagnostics.candidate_feasibility_frame(
+    candidate_rank: pl.DataFrame,
+    watchlist_feasibility: pl.DataFrame,
+) -> pl.DataFrame
+```
+
+Output contract:
+
+```text
+key: symbol
+selection: highest rank_score per symbol
+columns:
+  symbol: String
+  watchlist_feasibility: String
+  rank_score: Float64
+  rank_tier: String
+  source_penalty_score: Float64
+  required_missing_source_count: Int64
+  required_stale_source_count: Int64
+  provider_bounded_source_count: Int64
+  optional_absent_source_count: Int64
+  min_history_coverage_pct: Float64
+  min_source_capability_coverage_pct: Float64
+  tree_direction: String
+  matched_evidence_level: String
+  tail_lift: Float64
+  gpd_shape_xi: Float64
+  N_tail_exceedances: Int64
+  source_status: String
+  history_status: String
+  candidate_reason: String
+```
+
+This projection is semantic, not presentational. It may derive `rank_tier`, select the best row per symbol, and derive stable blocker/reason codes. It must not emit display-formatted strings for numeric values. Current code writes this artifact through a private helper; the next code refactor should promote that helper to this public contract and test it directly.
+
+Promoted-rank scoring should be explicit, capability-aware, and cost-aware:
 
 ```text
 source_gate = required_missing_source_count == 0
@@ -500,7 +540,67 @@ qooi.scanner.diagnostics.write_diagnostics(inputs: ReportInputs) -> DiagnosticFr
 qooi.scanner.report.render_report(inputs: ReportInputs) -> str
 ```
 
-Diagnostics writes path-specific artifacts after the one dispatch. Report renders the frames it receives; path-specific sections are composed before rendering, not by branching inside every section.
+Diagnostics writes path-specific artifacts after the one dispatch. It also owns report-ready semantic projections such as `candidate-feasibility.csv`.
+
+Report rendering graph:
+
+```text
+diagnostics/candidate-feasibility.csv
+  → qooi.scanner.report.CandidateSelectionSection.rows(...) -> tuple[CandidateSelectionRow, ...]
+  → qooi.scanner.report.CandidateSelectionSection.render(...) -> str
+
+history-feasibility.csv + source-freshness.csv + candidate-feasibility.csv
+  → qooi.scanner.report.DataHealthSection.rows(...) -> tuple[DataHealthRow, ...]
+  → qooi.scanner.report.DataHealthSection.render(...) -> str
+
+path-specific evidence artifacts
+  → report_sections_for(evidence)
+  → ReportSection.render(inputs)
+```
+
+Typed report row contracts:
+
+```text
+CandidateSelectionRow
+  symbol: str
+  feasibility: str
+  rank_score: float | None
+  rank_tier: str
+  source_penalty_score: float | None
+  required_missing_source_count: int
+  required_stale_source_count: int
+  provider_bounded_source_count: int
+  optional_absent_source_count: int
+  min_history_coverage_pct: float | None
+  min_source_capability_coverage_pct: float | None
+  tree_direction: str
+  tail_lift: float | None
+  gpd_shape_xi: float | None
+  n_tail_exceedances: int | None
+  reason: str
+
+DataHealthRow
+  scope: str
+  row_count: int
+  required_missing_source_count: int | None
+  required_stale_source_count: int | None
+  provider_bounded_source_count: int | None
+  optional_absent_source_count: int | None
+  reviewable_count: int | None
+  limited_count: int | None
+```
+
+`report.py` is a renderer, not a schema inference engine. Forbidden report code patterns:
+
+```text
+dict[str, object] row contracts
+row.get(...) as normal data access
+getattr(...) probing
+Any/object plus float(str(value)) recovery
+business-rule joins between rank and feasibility
+```
+
+Path-specific report sections are composed before rendering, not by branching inside every section. The renderer formats typed values; it does not decide source, history, or candidate semantics.
 
 ---
 

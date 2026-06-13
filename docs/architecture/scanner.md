@@ -21,8 +21,8 @@ src/qooi/scanner/
 ├── tailtree.py       # LightGBM + GPD tail evidence path; optional deps
 ├── tailrun.py        # tailtree train/load_predict lifecycle and model artifacts
 ├── rank.py           # candidate-inspection and candidate-rank rows
-├── diagnostics.py    # artifact writing and one evidence-path dispatch
-└── report.py         # markdown renderer from computed artifacts
+├── diagnostics.py    # artifact writing, report-ready projections, one evidence dispatch
+└── report.py         # markdown renderer from typed report projection rows
 ```
 
 `contracts.py` is intentionally absent. Scanner-local contracts such as `ReportInputs`,
@@ -399,16 +399,18 @@ A leaf should be promoted only when its lift, count, and path-shape quality surv
 
 ## Candidate review semantics
 
-Candidate output has two different purposes and should remain separated:
+Candidate output has three different grains. The report must not present all three as competing candidate lists:
 
-| Artifact | Meaning | Promotion role |
-|---|---|---|
-| `candidate-inspection.csv` | every latest symbol assigned to a leaf with evidence metrics | debugging/research surface |
-| `candidate-rank.csv` | selected-leaf-only rows passing evidence/freshness/cost gates | promoted review list |
+| Artifact | Grain | Meaning | Report role |
+|---|---:|---|---|
+| `candidate-inspection.csv` | symbol × evidence row | every latest symbol assigned to evidence/leaf metrics | debugging/research appendix only |
+| `candidate-rank.csv` | symbol × selected direction | ranked evidence matches with source penalties | machine-readable rank detail |
+| `candidate-feasibility.csv` | one best row per symbol | rank joined to current review feasibility | canonical report candidate-selection table |
+| `watchlist-feasibility.csv` | one row per symbol | history/source reviewability diagnostics | data-health input, not a candidate table |
 
-Current implementation ranks leaf-matched candidates. The desired architecture is stricter: promoted rank rows come only from selected evidence leaves, while all assignments remain available for inspection.
+The top-level report should have one candidate-selection table sourced from `candidate-feasibility.csv`. `Review Rows`/decision-rule output is an audit lens and should be demoted or clearly labeled as rule-order audit, not a rank-ordered candidate list. `Data Coverage And Feasibility` should become an aggregate data-health summary, not another symbol table competing with candidate selection.
 
-Freshness, capability, and tradability should be numeric inputs, not manual labels only:
+Freshness, capability, and tradability are numeric inputs, not manual labels:
 
 ```text
 source_age_ms
@@ -443,6 +445,65 @@ fetch failed but frame fresh -> zero or low penalty
 
 Static slippage thresholds are acceptable only as hard sanity guards. Promotion should prefer data-derived, symbol-relative, size-aware cost features and penalize cost against expected edge.
 
+## Report projection boundary
+
+`diagnostics.py` owns semantic projection. `report.py` owns presentation only.
+
+Allowed in `diagnostics.py`:
+
+```text
+rank + feasibility joins
+best row per symbol selection
+candidate blocker/reason derivation
+numeric schema validation
+empty-frame schema construction
+```
+
+Allowed in `report.py`:
+
+```text
+section composition
+column ordering
+formatting float | int | str | None values from typed rows
+Markdown table rendering
+```
+
+Forbidden in `report.py`:
+
+```text
+row.get(...) over dict[str, object]
+getattr(...) probing
+Any/object recovery paths
+float(str(value)) as type inference
+business rules for source/history blocker semantics
+rank/feasibility joins
+```
+
+Report sections should receive decisive row contracts, for example:
+
+```text
+CandidateSelectionRow(
+  symbol: str,
+  feasibility: str,
+  rank_score: float | None,
+  rank_tier: str,
+  source_penalty_score: float | None,
+  required_missing_source_count: int,
+  required_stale_source_count: int,
+  provider_bounded_source_count: int,
+  optional_absent_source_count: int,
+  min_history_coverage_pct: float | None,
+  min_source_capability_coverage_pct: float | None,
+  tree_direction: str,
+  tail_lift: float | None,
+  gpd_shape_xi: float | None,
+  n_tail_exceedances: int | None,
+  reason: str,
+)
+```
+
+The renderer should fail fast when projection schemas are wrong; it should not infer missing semantics with attribute checks or opaque row dictionaries.
+
 ## Artifact boundaries
 
 Materialization artifacts:
@@ -464,9 +525,12 @@ tailtree: tail-tree-up.json, tail-tree-down.json,
 Review artifacts:
 
 ```text
-candidate-inspection.csv   # all latest evidence/leaf assignments, diagnostic surface
-candidate-rank.csv         # one row per promoted symbol-direction after gates
-report.md
+candidate-inspection.csv    # all latest evidence/leaf assignments, diagnostic surface
+candidate-rank.csv          # symbol × selected direction rank detail
+candidate-feasibility.csv   # one best ranked row per symbol joined to feasibility
+report.md                   # candidate selection + data health + evidence/model diagnostics
 ```
+
+`candidate-feasibility.csv` is the only top-level candidate table source for the report. `candidate-rank.csv` remains available for per-direction detail, and `watchlist-feasibility.csv` remains available for source/history audit joins.
 
 A model iteration should be able to reuse materialized artifacts; code should not skip stages ad hoc to finish a scan. Reduce config when necessary, or split materialization from evidence/review in a later workflow command.
