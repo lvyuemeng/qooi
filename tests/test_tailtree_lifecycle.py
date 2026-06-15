@@ -701,6 +701,7 @@ def test_tailtree_selection_efficiency_frame_replays_equal_topk_budgets() -> Non
             "outcome_horizon": [12, 12, 12],
             "tree_direction": ["up", "up", "up"],
             "rank_score": [9.0, 5.0, 1.0],
+            "N_total": [10, 20, 30],
             "tail_lift": [3.0, 2.0, 1.2],
             "N_tail_exceedances": [4, 2, 1],
             "tail_utility_mean": [1.5, 0.5, 0.1],
@@ -742,12 +743,56 @@ def test_tailtree_selection_efficiency_frame_replays_equal_topk_budgets() -> Non
     assert top_one["model_tag"] == "tailtree-fixture"
     assert top_one["training_profile"] == "balanced_baseline"
     assert top_one["selected_symbol_count"] == 1
-    assert top_one["selected_observation_count"] == 1
+    assert top_one["selected_observation_count"] == 10
     assert top_one["selected_tail_count"] == 4
+    assert top_one["selected_tail_rate"] == pytest.approx(0.4)
+    assert top_one["valid_tail_lift"] == pytest.approx(4.0)
     assert top_one["selected_profit_proxy_mean"] == 1.5
     assert top_one["profit_proxy_per_selected_obs"] == 1.5
     assert top_one["hpo_score"] > 0.0
     assert top_one["promotion_threshold_pass_int"] == 1
+
+
+def test_tailtree_selection_budget_winners_use_normalized_opportunity_score() -> None:
+    efficiency = pl.DataFrame(
+        {
+            "universe_snapshot_id": ["u", "u", "u"],
+            "model_tag": ["tag", "tag", "tag"],
+            "objective": [
+                "tail_utility_quantile",
+                "tail_utility_quantile",
+                "tail_utility_quantile",
+            ],
+            "training_profile": ["balanced_baseline", "balanced_baseline", "balanced_baseline"],
+            "outcome_horizon": [12, 12, 12],
+            "tree_direction": ["up", "up", "up"],
+            "budget_family": ["top_k", "top_k", "top_pct"],
+            "budget_value": [1.0, 3.0, 0.2],
+            "selected_symbol_count": [1, 3, 8],
+            "selected_observation_count": [1, 3, 8],
+            "selected_observation_rate": [0.01, 0.03, 0.08],
+            "selected_tail_count": [4, 6, 20],
+            "selected_tail_per_1k_obs": [900.0, 120.0, 60.0],
+            "valid_tail_lift": [1.2, 2.6, 1.1],
+            "selected_profit_proxy_mean": [0.3, 1.0, 0.2],
+            "selected_profit_proxy_p90": [0.4, 1.4, 0.3],
+            "selected_utility_mean": [0.3, 1.0, 0.2],
+            "selected_utility_p90": [0.4, 1.4, 0.3],
+            "profit_proxy_per_selected_obs": [0.3, 1.0, 0.2],
+            "profit_proxy_per_1k_observed": [0.03, 0.30, 0.16],
+            "hpo_score": [9999.0, 20.0, 10.0],
+            "promotion_threshold_pass_int": [1, 1, 1],
+        }
+    )
+
+    winners = tailrun.select_tailtree_budget_winners(efficiency)
+
+    assert winners.height == 1
+    winner = winners.row(0, named=True)
+    assert winner["budget_family"] == "top_k"
+    assert winner["budget_value"] == 3.0
+    assert winner["winner_rank"] == 1
+    assert winner["winner_score"] > 0.0
 
 
 def test_tailtree_selection_efficiency_writer_replaces_canonical_artifact(

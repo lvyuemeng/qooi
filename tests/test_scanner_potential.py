@@ -417,6 +417,7 @@ def test_candidate_evidence_matches_tailtree_score_bucket_models() -> None:
             "score_max": [1.0],
             "selected_evidence_level": [True],
             "tail_lift": [2.7],
+            "N_total": [100],
             "N_tail_exceedances": [50],
         }
     )
@@ -432,6 +433,7 @@ def test_candidate_evidence_matches_tailtree_score_bucket_models() -> None:
     assert row["score_bucket"] == "top_5pct"
     assert row["matched_evidence_level"] == "tree_up"
     assert row["tail_lift"] == pytest.approx(2.7)
+    assert row["N_total"] == 100
     assert row["candidate_status"] == "matched_evidence"
 
 
@@ -875,6 +877,46 @@ def test_tailtree_report_summary_uses_horizon_run_summary(tmp_path: Path) -> Non
         "0.8000 | 1.1000 | 4 | 4 |" in rendered
     )
     assert "Tree_UP: not trained" not in rendered
+
+
+def test_tailtree_selection_efficiency_report_projects_budget_winners() -> None:
+    class _Frames:
+        tailtree_selection_efficiency = pl.DataFrame(
+            {
+                "universe_snapshot_id": ["u", "u"],
+                "model_tag": ["tag", "tag"],
+                "objective": ["tail_utility_quantile", "tail_utility_quantile"],
+                "training_profile": ["balanced_baseline", "balanced_baseline"],
+                "outcome_horizon": [12, 12],
+                "tree_direction": ["up", "up"],
+                "budget_family": ["top_k", "top_k"],
+                "budget_value": [1.0, 3.0],
+                "selected_symbol_count": [1, 3],
+                "selected_observation_count": [1, 3],
+                "selected_observation_rate": [0.01, 0.03],
+                "selected_tail_count": [4, 6],
+                "selected_tail_per_1k_obs": [900.0, 120.0],
+                "valid_tail_lift": [1.2, 2.6],
+                "selected_profit_proxy_mean": [0.3, 1.0],
+                "selected_profit_proxy_p90": [0.4, 1.4],
+                "selected_utility_mean": [0.3, 1.0],
+                "selected_utility_p90": [0.4, 1.4],
+                "profit_proxy_per_selected_obs": [0.3, 1.0],
+                "profit_proxy_per_1k_observed": [0.03, 0.30],
+                "hpo_score": [9999.0, 20.0],
+                "promotion_threshold_pass_int": [1, 1],
+            }
+        )
+
+    rendered = potential_report._TreeSelectionEfficiencySection().render(object(), _Frames())
+
+    assert "## Tail Tree Selection Efficiency" in rendered
+    assert "Winner=normalized opportunity score" in rendered
+    assert (
+        "| H | Dir | Obj | Profile | Budget | Win | Proxy/Obs | Proxy/1k | "
+        "Lift | Sel | Tail |" in rendered
+    )
+    assert "| 12 | up | tail_utility_quantile | balanced_baseline | top_k=3.0000 |" in rendered
 
 
 def test_report_candidate_selection_uses_typed_rows_not_opaque_dicts() -> None:

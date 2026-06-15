@@ -568,6 +568,15 @@ fit_seconds
 score_seconds
 ```
 
+Budget-winner projection is an in-memory view over the canonical artifact, not a second
+artifact family. `qooi.scanner.tailrun.select_tailtree_budget_winners(...)` selects one
+winner per `model_tag × objective × training_profile × outcome_horizon × tree_direction`.
+The winner score is a normalized opportunity score over proxy-per-selected-observation,
+proxy-per-1k-valid-observations, lift, selected-tail count, and narrowness. It deliberately
+does not sort by raw `hpo_score`, because that column can contain unbounded components, and
+it does not include liquidity, cost, slippage, funding, sizing, or execution penalties.
+The report may render this projection as a compact Tail Tree Selection Efficiency table.
+
 Acceptance rule:
 
 ```text

@@ -130,6 +130,7 @@ CANDIDATE_EVIDENCE_SCHEMA: dict[str, PolarsDtype] = {
     "gpd_shape_xi": pl.Float64,
     "gpd_scale_sigma": pl.Float64,
     "tail_lift_stability": pl.Float64,
+    "N_total": pl.UInt32,
     "N_tail_exceedances": pl.UInt32,
     "tail_utility_mean": pl.Float64,
     "tail_utility_p90": pl.Float64,

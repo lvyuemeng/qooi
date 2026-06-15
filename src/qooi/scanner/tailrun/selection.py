@@ -165,7 +165,8 @@ class TailtreeCandidateReplay:
 
     def row_for_budget(self, family: str, value: float) -> dict[str, object]:
         selected = self.selected_for_budget(family, value)
-        selected_count = len(selected)
+        selected_count = self.observation_count(selected)
+        selected_symbol_count = self.symbol_count(selected)
         selected_tail_count = self.tail_count(selected)
         profit_values = self.profit_values(selected)
         utility_p90_values = self.utility_p90_values(selected)
@@ -186,7 +187,7 @@ class TailtreeCandidateReplay:
         selected_rate = selected_count / valid_count if valid_count else 0.0
         selected_tail_rate = selected_tail_count / selected_count if selected_count else 0.0
         lift = selected_tail_rate / valid_tail_rate if valid_tail_rate > 0.0 else 0.0
-        profit_per_selected = profit_sum / selected_count if selected_count else 0.0
+        profit_per_selected = profit_mean
         profit_per_1k = profit_sum / valid_count * 1000.0 if valid_count else 0.0
         hpo_score = profit_per_selected + lift + log1p(max(selected_tail_count, 0)) - selected_rate
         return {
@@ -199,7 +200,7 @@ class TailtreeCandidateReplay:
             "budget_family": family,
             "budget_value": float(value),
             "eligible_symbol_count": self.symbol_count(self.eligible),
-            "selected_symbol_count": self.symbol_count(selected),
+            "selected_symbol_count": selected_symbol_count,
             "observation_row_count": self.summary.observation_row_count,
             "feature_count": self.summary.integer("feature_count"),
             "train_exceedance_count": self.summary.integer("train_exceedance_count"),
@@ -272,6 +273,13 @@ class TailtreeCandidateReplay:
             return 0
         return int(selected.get_column("N_tail_exceedances").fill_null(0).sum())
 
+    def observation_count(self, selected: pl.DataFrame) -> int:
+        if selected.is_empty():
+            return 0
+        if "N_total" in selected.columns:
+            return int(selected.get_column("N_total").fill_null(0).sum())
+        return len(selected)
+
     def symbol_count(self, frame: pl.DataFrame) -> int:
         return int(frame.get_column("symbol").n_unique()) if "symbol" in frame.columns else 0
 
@@ -321,6 +329,89 @@ def tailtree_selection_efficiency_frame(
     return pl.DataFrame(rows, schema=TAILTREE_SELECTION_EFFICIENCY_SCHEMA)
 
 
+def _normalized_component(column: str) -> pl.Expr:
+    value = pl.col(column).fill_null(0.0).fill_nan(0.0)
+    maximum = value.max().over(
+        ["model_tag", "objective", "training_profile", "outcome_horizon", "tree_direction"]
+    )
+    return pl.when(maximum > 0.0).then(value / maximum).otherwise(0.0)
+
+
+def select_tailtree_budget_winners(selection_efficiency: pl.DataFrame) -> pl.DataFrame:
+    """Select one normalized opportunity-efficiency budget winner per model grain.
+
+    The selector deliberately ignores raw ``hpo_score`` so one unbounded component cannot
+    dominate winner choice. It compares only scanner opportunity metrics; execution,
+    liquidity, cost, funding, and sizing are not part of this surface.
+    """
+    group_cols = [
+        "model_tag",
+        "objective",
+        "training_profile",
+        "outcome_horizon",
+        "tree_direction",
+    ]
+    required = {
+        *group_cols,
+        "budget_family",
+        "budget_value",
+        "selected_observation_rate",
+        "selected_tail_count",
+        "valid_tail_lift",
+        "profit_proxy_per_selected_obs",
+        "profit_proxy_per_1k_observed",
+        "promotion_threshold_pass_int",
+    }
+    if selection_efficiency.is_empty() or not required.issubset(selection_efficiency.columns):
+        return selection_efficiency.head(0).with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("winner_score"),
+            pl.lit(None, dtype=pl.Int64).alias("winner_rank"),
+        )
+
+    scored = selection_efficiency.with_columns(
+        (
+            pl.col("promotion_threshold_pass_int").fill_null(0).cast(pl.Float64)
+            + _normalized_component("profit_proxy_per_selected_obs")
+            + _normalized_component("profit_proxy_per_1k_observed")
+            + _normalized_component("valid_tail_lift")
+            + _normalized_component("selected_tail_count")
+            - pl.col("selected_observation_rate").fill_null(0.0).fill_nan(0.0)
+        ).alias("winner_score")
+    )
+    return (
+        scored.sort(
+            [
+                *group_cols,
+                "winner_score",
+                "profit_proxy_per_selected_obs",
+                "profit_proxy_per_1k_observed",
+                "valid_tail_lift",
+                "selected_observation_rate",
+                "selected_symbol_count",
+                "budget_family",
+                "budget_value",
+            ],
+            descending=[
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+                True,
+                True,
+                False,
+                False,
+                False,
+                False,
+            ],
+        )
+        .unique(subset=group_cols, keep="first", maintain_order=True)
+        .with_columns(pl.lit(1, dtype=pl.Int64).alias("winner_rank"))
+    )
+
+
 def write_tailtree_selection_efficiency(
     frame: pl.DataFrame,
     diagnostics_dir: Path | str,
@@ -345,6 +436,7 @@ __all__ = [
     "TailtreeTrainingProfile",
     "TailtreeModelTag",
     "UniverseSnapshotId",
+    "select_tailtree_budget_winners",
     "tailtree_selection_efficiency_frame",
     "write_tailtree_selection_efficiency",
 ]

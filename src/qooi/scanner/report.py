@@ -12,6 +12,7 @@ from typing import Protocol
 import polars as pl
 
 from qooi.scanner import ReportInputs
+from qooi.scanner.tailrun import select_tailtree_budget_winners
 
 # ── Protocol ─────────────────────────────────────────────────────────────────
 
@@ -30,6 +31,7 @@ class DiagnosticFrameSet(Protocol):
     candidate_rank: pl.DataFrame
     candidate_horizon_consistency: pl.DataFrame
     candidate_feasibility: pl.DataFrame
+    tailtree_selection_efficiency: pl.DataFrame
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -57,6 +59,7 @@ def report_sections_for(evidence: str) -> tuple:
     if evidence == "tailtree":
         return (
             _TreeSummarySection(),
+            _TreeSelectionEfficiencySection(),
             _TreeImportanceSection(),
             _TreeLeafSection(),
             _TreeGateSection(),
@@ -658,6 +661,44 @@ class _TreeSummarySection:
             return "\n".join(lines)
 
         lines.append("- Tailtree run summary artifact is missing.")
+        return "\n".join(lines)
+
+
+class _TreeSelectionEfficiencySection:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
+        efficiency = frames.tailtree_selection_efficiency
+        if efficiency.is_empty():
+            return ""
+        winners = select_tailtree_budget_winners(efficiency)
+        if winners.is_empty():
+            return ""
+        lines = [
+            "## Tail Tree Selection Efficiency",
+            "",
+            "- Source: canonical `tailtree-selection-efficiency.csv` frame.",
+            "- Winner=normalized opportunity score; ignores raw unbounded hpo_score "
+            "and uses no liquidity/cost/execution penalties.",
+            "- Units: Win=winner_score, Proxy/Obs=profit_proxy_per_selected_obs, "
+            "Proxy/1k=profit_proxy_per_1k_observed, Lift=valid_tail_lift, "
+            "Sel=selected_symbol_count, Tail=selected_tail_count.",
+            "",
+            "| H | Dir | Obj | Profile | Budget | Win | Proxy/Obs | Proxy/1k | Lift | Sel | Tail |",
+            "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for row in winners.sort(["outcome_horizon", "tree_direction", "objective"]).iter_rows(
+            named=True
+        ):
+            budget = f"{row['budget_family']}={_fmt(row.get('budget_value'))}"
+            lines.append(
+                f"| {_int_value(row.get('outcome_horizon'))} | {row.get('tree_direction')} | "
+                f"{row.get('objective')} | {row.get('training_profile')} | {budget} | "
+                f"{_fmt(row.get('winner_score'))} | "
+                f"{_fmt(row.get('profit_proxy_per_selected_obs'))} | "
+                f"{_fmt(row.get('profit_proxy_per_1k_observed'))} | "
+                f"{_fmt(row.get('valid_tail_lift'))} | "
+                f"{_int_value(row.get('selected_symbol_count'))} | "
+                f"{_int_value(row.get('selected_tail_count'))} |"
+            )
         return "\n".join(lines)
 
 
