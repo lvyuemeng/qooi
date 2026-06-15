@@ -570,11 +570,10 @@ are decoupled:
 [potential.evidence.tailtree.selection]       # replay budgets and feasibility gates
 ```
 
-The currently implemented `[[potential.evidence.tailtree.hpo_settings]]` shape is a fixed
-trial-list slice and should be treated as transitional naming. It must not grow search,
-walkforward, or selection fields. The next migration should rename/reshape it toward
-`trials` and move evaluation/search ownership into their own typed sections without changing
-the canonical artifact. Replay budgets and feasibility gates remain under
+The implemented `[[potential.evidence.tailtree.trials]]` shape is the fixed trial-list
+slice. It must not grow search, walkforward, or selection fields. Search ownership belongs
+under `search`, evaluation ownership belongs under `evaluation`, and neither changes the
+canonical artifact. Replay budgets and feasibility gates remain under
 `[potential.evidence.tailtree.selection]`; they are shared across every trial and every fold
 so feedback compares like with like.
 

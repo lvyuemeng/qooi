@@ -883,6 +883,10 @@ def test_tailtree_selection_efficiency_report_projects_budget_winners() -> None:
     class _Frames:
         tailtree_selection_efficiency = pl.DataFrame(
             {
+                "trial_id": ["primary", "primary"],
+                "trial_source": ["primary", "primary"],
+                "fold_id": [0, 0],
+                "evaluation_protocol": ["single_split", "single_split"],
                 "universe_snapshot_id": ["u", "u"],
                 "model_tag": ["tag", "tag"],
                 "objective": ["tail_utility_quantile", "tail_utility_quantile"],
@@ -917,16 +921,20 @@ def test_tailtree_selection_efficiency_report_projects_budget_winners() -> None:
     assert "## Tail Tree Selection Efficiency" in rendered
     assert "Winner=normalized opportunity score" in rendered
     assert (
-        "| H | Dir | Obj | Profile | Budget | Feas | Win | Proxy/Obs | Proxy/1k | "
-        "Lift | Obs | Sel | Tail |" in rendered
+        "| Trial | H | Dir | Obj | Profile | Budget | Feas | Win | Proxy/Obs | "
+        "Proxy/1k | Lift | Obs | Sel | Tail |" in rendered
     )
     assert (
-        "| 12 | up | tail_utility_quantile | balanced_baseline | top_k=3.0000 | 1 |"
+        "| primary/0 | 12 | up | tail_utility_quantile | balanced_baseline | "
+        "top_k=3.0000 | 1 |"
         in rendered
     )
     assert "## Tail Tree HPO Feedback" in rendered
-    assert "| Rank | H | Dir | Obj | Profile | Budget | Feas | Score | Margin |" in rendered
-    assert "| 1 | 12 | up | tail_utility_quantile | balanced_baseline | top_k=3.0000 |" in rendered
+    assert "| Rank | Trial | H | Dir | Obj | Profile | Budget | Feas | Score | Margin |" in rendered
+    assert (
+        "| 1 | primary/0 | 12 | up | tail_utility_quantile | balanced_baseline | "
+        "top_k=3.0000 |" in rendered
+    )
 
 
 def test_report_candidate_selection_uses_typed_rows_not_opaque_dicts() -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 import polars as pl
 
@@ -41,6 +41,18 @@ TailtreeEvidenceResult = tailrun_eval.TailtreeEvidenceResult
 class _TailtreeSettingInputs:
     config: object
     artifacts: PotentialArtifacts
+
+
+class _TailtreeRuntimeConfig(Protocol):
+    objective: str
+    training_profile: str
+
+
+@dataclass(frozen=True)
+class _TailtreeTrialRun:
+    trial_id: str
+    trial_source: str
+    tailtree: _TailtreeRuntimeConfig
 
 
 @dataclass(frozen=True)
@@ -797,33 +809,37 @@ def _run_ladder_pipeline(
     )
 
 
-def _tailtree_setting_configs(config):
+def _tailtree_trial_configs(config):
     base = config.evidence.tailtree
-    settings = [base]
-    for setting in base.hpo_settings:
-        settings.append(
-            base.model_copy(
-                update={
-                    "objective": setting.objective,
-                    "training_profile": setting.training_profile,
-                    "model_tag": setting.model_tag,
-                    "num_leaves": setting.num_leaves,
-                    "min_data_in_leaf": setting.min_data_in_leaf,
-                    "learning_rate": setting.learning_rate,
-                    "num_iterations": setting.num_iterations,
-                    "early_stopping_rounds": setting.early_stopping_rounds,
-                    "hpo_settings": (),
-                }
+    trials = [_TailtreeTrialRun("primary", "primary", base)]
+    for trial in base.trials:
+        trials.append(
+            _TailtreeTrialRun(
+                trial.trial_id,
+                "fixed",
+                base.model_copy(
+                    update={
+                        "objective": trial.objective,
+                        "training_profile": trial.training_profile,
+                        "model_tag": trial.model_tag,
+                        "num_leaves": trial.num_leaves,
+                        "min_data_in_leaf": trial.min_data_in_leaf,
+                        "learning_rate": trial.learning_rate,
+                        "num_iterations": trial.num_iterations,
+                        "early_stopping_rounds": trial.early_stopping_rounds,
+                        "trials": (),
+                    }
+                ),
             )
         )
     unique = []
     seen = set()
-    for tailtree in settings:
-        key = (tailtree.objective, tailtree.training_profile, tailtree.model_tag)
+    for trial in trials:
+        key = (trial.trial_id, trial.tailtree.objective, trial.tailtree.training_profile)
         if key in seen:
             continue
         seen.add(key)
-        unique.append(tailtree)
+        unique.append(trial)
     return tuple(unique)
 
 
@@ -875,8 +891,9 @@ def _run_tailtree_pipeline(
     primary_result = None
     primary_candidates = pl.DataFrame()
     primary_ranked = pl.DataFrame()
-    setting_configs = _tailtree_setting_configs(inputs.config)
-    for index, tailtree in enumerate(setting_configs):
+    trial_configs = _tailtree_trial_configs(inputs.config)
+    for index, trial_config in enumerate(trial_configs):
+        tailtree = trial_config.tailtree
         setting_config = _config_for_tailtree_setting(inputs.config, tailtree)
         setting_inputs = cast(
             ReportInputs,
@@ -902,6 +919,15 @@ def _run_tailtree_pipeline(
         summary = pl.read_csv(summary_path) if summary_path.exists() else pl.DataFrame()
         if not summary.is_empty():
             summary = summary.with_columns(
+                pl.lit(trial_config.trial_id).alias("trial_id"),
+                pl.lit(trial_config.trial_source).alias("trial_source"),
+                pl.lit(0).alias("fold_id"),
+                pl.lit("single_split").alias("evaluation_protocol"),
+                pl.lit(None, dtype=pl.Int64).alias("train_start_ms"),
+                pl.lit(None, dtype=pl.Int64).alias("train_end_ms"),
+                pl.lit(None, dtype=pl.Int64).alias("valid_start_ms"),
+                pl.lit(None, dtype=pl.Int64).alias("valid_end_ms"),
+                pl.lit(0).alias("embargo_bars"),
                 pl.lit(tailtree.model_tag).alias("model_tag"),
                 pl.lit(tailtree.training_profile).alias("training_profile"),
                 pl.lit(tailtree.objective).alias("objective"),
@@ -910,6 +936,10 @@ def _run_tailtree_pipeline(
         selection_frames.append(
             tailrun_eval.tailtree_selection_efficiency_frame(
                 ranked,
+                trial_id=trial_config.trial_id,
+                trial_source=trial_config.trial_source,
+                fold_id=0,
+                evaluation_protocol="single_split",
                 run_summary=summary,
                 universe_snapshot_id=_tailtree_universe_snapshot_id(inputs),
                 model_tag=tailtree.model_tag,

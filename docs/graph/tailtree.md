@@ -350,7 +350,7 @@ Coding guidance:
 
 ```text
 1. Keep fixed trials, sampler/search, walkforward evaluation, and selection replay separate.
-2. Treat current [[potential.evidence.tailtree.hpo_settings]] as transitional fixed trials.
+2. Keep `[[potential.evidence.tailtree.trials]]` as fixed trial specs only.
 3. Do not put Optuna state, fold settings, or selection gates into the fixed-trial shape.
 4. Walkforward must be available to one fixed parameter set without HPO search.
 5. Optuna, if added, is an optional trial source only; it emits TailtreeTrialSpec rows.

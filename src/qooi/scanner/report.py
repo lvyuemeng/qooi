@@ -678,21 +678,24 @@ class _TreeSelectionEfficiencySection:
             "- Source: canonical `tailtree-selection-efficiency.csv` frame.",
             "- Winner=normalized opportunity score; ignores raw unbounded hpo_score "
             "and uses no liquidity/cost/execution penalties.",
-            "- Units: Win=winner_score, Proxy/Obs=profit_proxy_per_selected_obs, "
+            "- Units: Trial=trial_id/fold_id, Win=winner_score, "
+            "Proxy/Obs=profit_proxy_per_selected_obs, "
             "Proxy/1k=profit_proxy_per_1k_observed, Lift=valid_tail_lift, "
             "Feas=feasibility_pass_int, Obs=selected_observation_count, "
             "Sel=selected_symbol_count, Tail=selected_tail_count.",
             "",
-            "| H | Dir | Obj | Profile | Budget | Feas | Win | Proxy/Obs | "
+            "| Trial | H | Dir | Obj | Profile | Budget | Feas | Win | Proxy/Obs | "
             "Proxy/1k | Lift | Obs | Sel | Tail |",
-            "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "|---|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for row in winners.sort(["outcome_horizon", "tree_direction", "objective"]).iter_rows(
             named=True
         ):
             budget = f"{row['budget_family']}={_fmt(row.get('budget_value'))}"
+            trial = f"{row.get('trial_id', 'primary')}/{_int_value(row.get('fold_id'))}"
             lines.append(
-                f"| {_int_value(row.get('outcome_horizon'))} | {row.get('tree_direction')} | "
+                f"| {trial} | {_int_value(row.get('outcome_horizon'))} | "
+                f"{row.get('tree_direction')} | "
                 f"{row.get('objective')} | {row.get('training_profile')} | {budget} | "
                 f"{_int_value(row.get('feasibility_pass_int'))} | "
                 f"{_fmt(row.get('winner_score'))} | "
@@ -715,15 +718,17 @@ class _TreeSelectionEfficiencySection:
                     "- Score ignores raw hpo_score and objective-native units; "
                     "Margin is best-score minus row-score within horizon/direction.",
                     "",
-                    "| Rank | H | Dir | Obj | Profile | Budget | Feas | Score | Margin | "
+                    "| Rank | Trial | H | Dir | Obj | Profile | Budget | Feas | Score | Margin | "
                     "Proxy/Obs | Proxy/1k | Lift | Obs | Tail |",
-                    "|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                    "|---:|---|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
                 ]
             )
             for row in feedback.head(12).iter_rows(named=True):
                 budget = f"{row['budget_family']}={_fmt(row.get('budget_value'))}"
+                trial = f"{row.get('trial_id', 'primary')}/{_int_value(row.get('fold_id'))}"
                 lines.append(
                     f"| {_int_value(row.get('hpo_feedback_rank'))} | "
+                    f"{trial} | "
                     f"{_int_value(row.get('outcome_horizon'))} | "
                     f"{row.get('tree_direction')} | {row.get('objective')} | "
                     f"{row.get('training_profile')} | {budget} | "

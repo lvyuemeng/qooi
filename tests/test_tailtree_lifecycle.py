@@ -125,7 +125,7 @@ def test_tailtree_config_normalizes_outcome_horizon() -> None:
     assert int_config.outcome_horizon == (12,)
 
 
-def test_tailtree_config_loads_hpo_setting_grid(tmp_path: Path) -> None:
+def test_tailtree_config_loads_fixed_trial_grid(tmp_path: Path) -> None:
     config_path = tmp_path / "potential.toml"
     config_path.write_text(
         """
@@ -146,7 +146,8 @@ min_selected_tail_count = 3
 min_valid_tail_lift = 1.2
 min_profit_proxy_per_selected_obs = 0.1
 
-[[potential.evidence.tailtree.hpo_settings]]
+[[potential.evidence.tailtree.trials]]
+trial_id = "quantile-sparse"
 objective = "tail_utility_quantile"
 training_profile = "sparse_interpretable"
 model_tag = "tailtree-grid-quantile-sparse"
@@ -160,7 +161,7 @@ early_stopping_rounds = 10
     )
 
     config = potential.load_config(config_path)
-    setting = config.evidence.tailtree.hpo_settings[0]
+    setting = config.evidence.tailtree.trials[0]
 
     assert config.evidence.tailtree.training_profile == "balanced_baseline"
     assert config.evidence.tailtree.selection.top_k == (1, 2)
@@ -172,6 +173,7 @@ early_stopping_rounds = 10
     assert config.evidence.tailtree.selection.min_profit_proxy_per_selected_obs == pytest.approx(
         0.1
     )
+    assert setting.trial_id == "quantile-sparse"
     assert setting.objective == "tail_utility_quantile"
     assert setting.training_profile == "sparse_interpretable"
     assert setting.model_tag == "tailtree-grid-quantile-sparse"
@@ -180,6 +182,16 @@ early_stopping_rounds = 10
     assert setting.learning_rate == pytest.approx(0.03)
     assert setting.num_iterations == 80
     assert setting.early_stopping_rounds == 10
+
+
+def test_tailtree_config_rejects_duplicate_fixed_trial_ids() -> None:
+    with pytest.raises(ValueError, match="trial_id values must be unique"):
+        TailtreeConfig(
+            trials=(
+                {"trial_id": "quantile", "model_tag": "tailtree-quantile-a"},
+                {"trial_id": "quantile", "model_tag": "tailtree-quantile-b"},
+            )
+        )
 
 
 def test_tailtree_config_loads_tail_utility_objective(tmp_path: Path) -> None:
@@ -407,7 +419,7 @@ def test_tailtree_load_predict_loads_every_configured_horizon(
     assert (tmp_path / "diagnostics" / "tailtree-run-summary.csv").exists()
 
 
-def test_tailtree_pipeline_appends_hpo_setting_feedback_rows(
+def test_tailtree_pipeline_appends_fixed_trial_feedback_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = potential.PotentialConfig(
@@ -418,8 +430,9 @@ def test_tailtree_pipeline_appends_hpo_setting_feedback_rows(
                 model_tag="tailtree-base",
                 objective="tail_severity_gpd",
                 training_profile="balanced_baseline",
-                hpo_settings=(
+                trials=(
                     {
+                        "trial_id": "quantile-sparse",
                         "objective": "tail_utility_quantile",
                         "training_profile": "sparse_interpretable",
                         "model_tag": "tailtree-quantile-sparse",
@@ -522,6 +535,12 @@ def test_tailtree_pipeline_appends_hpo_setting_feedback_rows(
         "tail_severity_gpd",
         "tail_utility_quantile",
     }
+    assert result.selection_efficiency.select("trial_id", "trial_source", "fold_id").unique().sort(
+        "trial_id"
+    ).to_dicts() == [
+        {"trial_id": "primary", "trial_source": "primary", "fold_id": 0},
+        {"trial_id": "quantile-sparse", "trial_source": "fixed", "fold_id": 0},
+    ]
     assert result.selection_efficiency.select("budget_family", "budget_value").unique().sort(
         ["budget_family", "budget_value"]
     ).to_dicts() == [
@@ -530,6 +549,10 @@ def test_tailtree_pipeline_appends_hpo_setting_feedback_rows(
     ]
     assert result.selection_efficiency.get_column("feasibility_pass_int").sum() == 0
     persisted_summary = pl.read_csv(tmp_path / "diagnostics" / "tailtree-run-summary.csv")
+    assert set(persisted_summary.get_column("trial_id").unique().to_list()) == {
+        "primary",
+        "quantile-sparse",
+    }
     assert set(persisted_summary.get_column("objective").unique().to_list()) == {
         "tail_severity_gpd",
         "tail_utility_quantile",
@@ -953,6 +976,10 @@ def test_tailtree_selection_efficiency_frame_replays_equal_topk_budgets() -> Non
 def test_tailtree_selection_budget_winners_use_normalized_opportunity_score() -> None:
     efficiency = pl.DataFrame(
         {
+            "trial_id": ["primary", "primary", "primary"],
+            "trial_source": ["primary", "primary", "primary"],
+            "fold_id": [0, 0, 0],
+            "evaluation_protocol": ["single_split", "single_split", "single_split"],
             "universe_snapshot_id": ["u", "u", "u"],
             "model_tag": ["tag", "tag", "tag"],
             "objective": [
@@ -1034,6 +1061,10 @@ def test_tailtree_selection_efficiency_marks_shared_label_feasibility() -> None:
     )
 
     rows = {row["budget_value"]: row for row in efficiency.iter_rows(named=True)}
+    assert rows[1.0]["trial_id"] == "primary"
+    assert rows[1.0]["trial_source"] == "primary"
+    assert rows[1.0]["fold_id"] == 0
+    assert rows[1.0]["evaluation_protocol"] == "single_split"
     assert rows[1.0]["outcome_label_family"] == "path_extreme_return"
     assert rows[1.0]["comparison_surface"] == "selection_efficiency"
     assert rows[1.0]["objective_score_comparable_int"] == 0
@@ -1046,6 +1077,10 @@ def test_tailtree_selection_efficiency_marks_shared_label_feasibility() -> None:
 def test_tailtree_objective_winners_compare_feasible_shared_surfaces_not_raw_scores() -> None:
     efficiency = pl.DataFrame(
         {
+            "trial_id": ["gpd", "quantile"],
+            "trial_source": ["fixed", "fixed"],
+            "fold_id": [0, 0],
+            "evaluation_protocol": ["single_split", "single_split"],
             "universe_snapshot_id": ["u", "u"],
             "model_tag": ["gpd-model", "quantile-model"],
             "objective": ["tail_severity_gpd", "tail_utility_quantile"],
@@ -1081,6 +1116,10 @@ def test_tailtree_objective_winners_compare_feasible_shared_surfaces_not_raw_sco
 def test_tailtree_hpo_feedback_ranks_settings_by_feasible_selection_surface() -> None:
     efficiency = pl.DataFrame(
         {
+            "trial_id": ["gpd", "quantile-balanced", "quantile-sparse"],
+            "trial_source": ["fixed", "fixed", "fixed"],
+            "fold_id": [0, 0, 0],
+            "evaluation_protocol": ["single_split", "single_split", "single_split"],
             "universe_snapshot_id": ["u", "u", "u"],
             "model_tag": ["gpd", "quantile", "quantile"],
             "objective": [

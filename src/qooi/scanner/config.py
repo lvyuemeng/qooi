@@ -90,9 +90,10 @@ class TailtreeSelectionConfig(BaseModel):
         return tuple(value for value in values if value > 0.0)
 
 
-class TailtreeHpoSetting(BaseModel):
+class TailtreeTrialConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    trial_id: str
     objective: TailtreeObjective = "tail_severity_gpd"
     training_profile: str = "balanced_baseline"
     model_tag: str
@@ -101,6 +102,16 @@ class TailtreeHpoSetting(BaseModel):
     learning_rate: float = 0.05
     num_iterations: int = 200
     early_stopping_rounds: int = 20
+
+    @field_validator("trial_id")
+    @classmethod
+    def nonempty_trial_id(cls, value: str) -> str:
+        trial_id = value.strip()
+        if not trial_id:
+            raise ValueError("tailtree trial_id must not be empty")
+        if trial_id == "primary":
+            raise ValueError("tailtree trial_id 'primary' is reserved")
+        return trial_id
 
 
 class TailtreeConfig(BaseModel):
@@ -119,7 +130,7 @@ class TailtreeConfig(BaseModel):
     early_stopping_rounds: int = 20
     outcome_horizon: tuple[int, ...] = (12,)
     selection: TailtreeSelectionConfig = TailtreeSelectionConfig()
-    hpo_settings: tuple[TailtreeHpoSetting, ...] = ()
+    trials: tuple[TailtreeTrialConfig, ...] = ()
 
     @field_validator("outcome_horizon", mode="before")
     @classmethod
@@ -132,6 +143,13 @@ class TailtreeConfig(BaseModel):
             values = tuple(value)  # type: ignore[arg-type]
         horizons = tuple(dict.fromkeys(int(horizon) for horizon in values if int(horizon) > 0))
         return horizons or (12,)
+
+    @model_validator(mode="after")
+    def require_unique_trial_ids(self) -> TailtreeConfig:
+        trial_ids = [trial.trial_id for trial in self.trials]
+        if len(trial_ids) != len(set(trial_ids)):
+            raise ValueError("tailtree trial_id values must be unique")
+        return self
 
 
 class EvidenceConfig(BaseModel):

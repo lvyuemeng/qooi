@@ -15,6 +15,15 @@ TailtreeModelTag = NewType("TailtreeModelTag", str)
 TailtreeTrainingProfile = NewType("TailtreeTrainingProfile", str)
 
 TAILTREE_SELECTION_EFFICIENCY_SCHEMA = {
+    "trial_id": pl.String,
+    "trial_source": pl.String,
+    "fold_id": pl.Int64,
+    "evaluation_protocol": pl.String,
+    "train_start_ms": pl.Int64,
+    "train_end_ms": pl.Int64,
+    "valid_start_ms": pl.Int64,
+    "valid_end_ms": pl.Int64,
+    "embargo_bars": pl.Int64,
     "universe_snapshot_id": pl.String,
     "model_tag": pl.String,
     "objective": pl.String,
@@ -100,6 +109,15 @@ class TailtreeSelectionFeasibilityPolicy(BaseModel):
 class TailtreeSelectionContext:
     """Opaque replay identity for one tailtree selection-efficiency pass."""
 
+    trial_id: str
+    trial_source: str
+    fold_id: int
+    evaluation_protocol: str
+    train_start_ms: int | None
+    train_end_ms: int | None
+    valid_start_ms: int | None
+    valid_end_ms: int | None
+    embargo_bars: int
     universe_snapshot_id: UniverseSnapshotId
     model_tag: TailtreeModelTag
     objective: str
@@ -109,12 +127,30 @@ class TailtreeSelectionContext:
     def from_strings(
         cls,
         *,
+        trial_id: str = "primary",
+        trial_source: str = "primary",
+        fold_id: int = 0,
+        evaluation_protocol: str = "single_split",
+        train_start_ms: int | None = None,
+        train_end_ms: int | None = None,
+        valid_start_ms: int | None = None,
+        valid_end_ms: int | None = None,
+        embargo_bars: int = 0,
         universe_snapshot_id: str,
         model_tag: str,
         objective: str,
         training_profile: str,
     ) -> TailtreeSelectionContext:
         return cls(
+            trial_id=trial_id,
+            trial_source=trial_source,
+            fold_id=int(fold_id),
+            evaluation_protocol=evaluation_protocol,
+            train_start_ms=train_start_ms,
+            train_end_ms=train_end_ms,
+            valid_start_ms=valid_start_ms,
+            valid_end_ms=valid_end_ms,
+            embargo_bars=int(embargo_bars),
             universe_snapshot_id=UniverseSnapshotId(universe_snapshot_id),
             model_tag=TailtreeModelTag(model_tag),
             objective=objective,
@@ -218,6 +254,15 @@ class TailtreeCandidateReplay:
             profit_per_selected >= self.feasibility.min_profit_proxy_per_selected_obs
         )
         return {
+            "trial_id": self.context.trial_id,
+            "trial_source": self.context.trial_source,
+            "fold_id": self.context.fold_id,
+            "evaluation_protocol": self.context.evaluation_protocol,
+            "train_start_ms": self.context.train_start_ms,
+            "train_end_ms": self.context.train_end_ms,
+            "valid_start_ms": self.context.valid_start_ms,
+            "valid_end_ms": self.context.valid_end_ms,
+            "embargo_bars": self.context.embargo_bars,
             "universe_snapshot_id": str(self.context.universe_snapshot_id),
             "model_tag": str(self.context.model_tag),
             "objective": self.context.objective,
@@ -321,6 +366,15 @@ class TailtreeCandidateReplay:
 def tailtree_selection_efficiency_frame(
     candidates: pl.DataFrame,
     *,
+    trial_id: str = "primary",
+    trial_source: str = "primary",
+    fold_id: int = 0,
+    evaluation_protocol: str = "single_split",
+    train_start_ms: int | None = None,
+    train_end_ms: int | None = None,
+    valid_start_ms: int | None = None,
+    valid_end_ms: int | None = None,
+    embargo_bars: int = 0,
     run_summary: pl.DataFrame,
     universe_snapshot_id: str,
     model_tag: str,
@@ -340,6 +394,15 @@ def tailtree_selection_efficiency_frame(
     if eligible.is_empty():
         return pl.DataFrame(schema=TAILTREE_SELECTION_EFFICIENCY_SCHEMA)
     context = TailtreeSelectionContext.from_strings(
+        trial_id=trial_id,
+        trial_source=trial_source,
+        fold_id=fold_id,
+        evaluation_protocol=evaluation_protocol,
+        train_start_ms=train_start_ms,
+        train_end_ms=train_end_ms,
+        valid_start_ms=valid_start_ms,
+        valid_end_ms=valid_end_ms,
+        embargo_bars=embargo_bars,
         universe_snapshot_id=universe_snapshot_id,
         model_tag=model_tag,
         objective=objective,
@@ -396,6 +459,8 @@ def select_tailtree_budget_winners(selection_efficiency: pl.DataFrame) -> pl.Dat
     liquidity, cost, funding, and sizing are not part of this surface.
     """
     group_cols = [
+        "trial_id",
+        "fold_id",
         "model_tag",
         "objective",
         "training_profile",
@@ -444,6 +509,8 @@ def select_tailtree_budget_winners(selection_efficiency: pl.DataFrame) -> pl.Dat
                 False,
                 False,
                 False,
+                False,
+                False,
                 True,
                 True,
                 True,
@@ -462,6 +529,8 @@ def select_tailtree_budget_winners(selection_efficiency: pl.DataFrame) -> pl.Dat
 def select_tailtree_objective_winners(selection_efficiency: pl.DataFrame) -> pl.DataFrame:
     group_cols = [
         "universe_snapshot_id",
+        "evaluation_protocol",
+        "fold_id",
         "outcome_label_family",
         "outcome_horizon",
         "tree_direction",
@@ -509,6 +578,8 @@ def select_tailtree_objective_winners(selection_efficiency: pl.DataFrame) -> pl.
                 False,
                 False,
                 False,
+                False,
+                False,
                 True,
                 True,
                 True,
@@ -529,6 +600,8 @@ def select_tailtree_objective_winners(selection_efficiency: pl.DataFrame) -> pl.
 def tailtree_hpo_feedback_frame(selection_efficiency: pl.DataFrame) -> pl.DataFrame:
     group_cols = [
         "universe_snapshot_id",
+        "evaluation_protocol",
+        "fold_id",
         "outcome_label_family",
         "outcome_horizon",
         "tree_direction",
@@ -561,6 +634,7 @@ def tailtree_hpo_feedback_frame(selection_efficiency: pl.DataFrame) -> pl.DataFr
             [
                 pl.col("objective"),
                 pl.col("training_profile"),
+                pl.col("trial_id"),
                 pl.col("budget_family"),
                 pl.col("budget_value").cast(pl.String),
             ],
@@ -581,6 +655,8 @@ def tailtree_hpo_feedback_frame(selection_efficiency: pl.DataFrame) -> pl.DataFr
             "budget_value",
         ],
         descending=[
+            False,
+            False,
             False,
             False,
             False,
