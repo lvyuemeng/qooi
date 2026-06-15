@@ -379,6 +379,96 @@ is theoretically cleaner when `X` is raw threshold exceedance. Utility can be au
 with mean/p90 and may later get its own utility-exceedance GPD, but the current utility
 objective does not overload raw `gpd_shape_xi` / `gpd_scale_sigma` as utility-GPD truth.
 
+### Tailtree objective benchmark note — 2026-06-15
+
+Bounded cache-only universe benchmark rerun:
+
+```text
+uv run python - <<'PY'
+from pathlib import Path
+from qooi.scanner.workflow import run
+
+for config in (
+    Path(".hermes/tailtree-bench-gpd.toml"),
+    Path(".hermes/tailtree-bench-quantile.toml"),
+):
+    print(f"RUN {config}")
+    print(run(config))
+PY
+```
+
+The benchmark configs intentionally did **not** set `potential.symbols`. In current
+workflow code, `resolve_universe(config)` uses explicit symbols only when
+`config.symbols` is non-empty; otherwise it calls OKX swap discovery and then applies
+`transition.scan_budget`. Both reports confirmed a universe-derived scan:
+
+```text
+Universe: research
+Selected symbols scanned: 20 of 240 eligible symbols
+Transition scan budget: 20
+Refresh mode: cache_only
+```
+
+Configuration limitation: `potential.universe = "research"` is currently report/config
+metadata, not a typed universe provider selector. The effective universe guarantee is
+therefore `symbols == ()` plus the `resolve_universe` branch into OKX discovery. This is
+acceptable for this bounded benchmark, but durable HPO runs should persist the discovery
+snapshot or promote universe selection into a typed config object so repeated objective
+comparisons cannot drift with live OKX listings/tickers.
+
+Objective comparison at identical scan budget, bar, history window, threshold, horizons,
+and LightGBM shape:
+
+| Objective | Direction rows | Trainable rows | Train exceedances | Selected obs | Selected tails | Mean lift | Median lift | Min lift | Max lift | Mean selected utility | Mean selected p90 utility |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `tail_severity_gpd` | 6 | 6 | 369122 | 47097 | 13439 | 2.216100 | 2.070481 | 1.000034 | 4.667812 | 0.645379 | 1.663366 |
+| `tail_utility_quantile` | 6 | 6 | 369122 | 66470 | 19993 | 1.720277 | 1.685211 | 1.235320 | 2.293910 | 0.953919 | 2.709586 |
+
+Per-horizon/direction detail:
+
+| Objective | H | Dir | Train exceedances | Baseline tail rate | Selected obs | Selected tails | Selected tail rate | Lift | Selected utility mean | Selected utility p90 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| GPD | 6 | down | 29712 | 0.071996 | 8376 | 1172 | 0.139924 | 1.943485 | 0.702918 | 1.510476 |
+| GPD | 6 | up | 30156 | 0.086591 | 1910 | 772 | 0.404188 | 4.667812 | 1.243623 | 3.607524 |
+| GPD | 12 | down | 58663 | 0.144489 | 4374 | 1505 | 0.344079 | 2.381355 | 0.594547 | 1.398613 |
+| GPD | 12 | up | 56971 | 0.168142 | 6011 | 2221 | 0.369489 | 2.197478 | 0.686035 | 1.935597 |
+| GPD | 24 | down | 100748 | 0.272607 | 4930 | 1487 | 0.301623 | 1.106437 | 0.346157 | 0.883460 |
+| GPD | 24 | up | 92872 | 0.292230 | 21496 | 6282 | 0.292240 | 1.000034 | 0.298993 | 0.644527 |
+| Quantile | 6 | down | 29712 | 0.107332 | 2770 | 682 | 0.246209 | 2.293910 | 0.811813 | 2.299895 |
+| Quantile | 6 | up | 30156 | 0.108936 | 2770 | 438 | 0.158123 | 1.451524 | 1.430368 | 4.376116 |
+| Quantile | 12 | down | 58663 | 0.212006 | 27695 | 7971 | 0.287814 | 1.357571 | 0.459101 | 1.343956 |
+| Quantile | 12 | up | 56971 | 0.205891 | 27695 | 7044 | 0.254342 | 1.235320 | 0.735775 | 2.045359 |
+| Quantile | 24 | down | 100748 | 0.364416 | 2770 | 1937 | 0.699278 | 1.918899 | 0.883613 | 2.461170 |
+| Quantile | 24 | up | 92872 | 0.335928 | 2770 | 1921 | 0.693502 | 2.064436 | 1.402843 | 3.731022 |
+
+Interpretation: quantile is the better *utility-selection* objective in this run: it
+selects 41.1% more observations and 48.8% more realized tail rows while lifting mean
+selected utility from 0.645379 to 0.953919 (+47.8%) and selected p90 utility from
+1.663366 to 2.709586 (+62.9%). It is not a universal lift winner: GPD has higher mean
+and max validation lift because it is more concentrated/sparser, especially 6h-up. The
+architectural decision is therefore not "quantile replaces GPD evidence". The cleaner
+design is objective-dispatched evidence: quantile for utility-ranked candidate breadth,
+GPD descriptors for tail-shape audit and sparse extreme concentration checks.
+
+Design/HPO grill:
+
+1. The objective is doing too much policy work. `tail_utility_quantile` changes target,
+   LightGBM objective, evidence bucket, and selection breadth. Keep those as typed fields
+   in the objective instance so HPO can vary target and selection independently.
+2. The benchmark is still single split by run, not rolling time-block validation. Treat
+   lift and utility as first-pass evidence, not deployable proof.
+3. `min_data_in_leaf=30`, `num_leaves=64`, `learning_rate=0.05`, and
+   `num_iterations=200` are static across horizons with very different tail rates. HPO
+   should be per horizon/direction or at least horizon-bucketed.
+4. Selection size is not normalized across objectives. Add budgeted top-k/top-pct replay
+   so GPD-vs-quantile comparisons separate scoring quality from different gate widths.
+5. Source features were unavailable in this cache-only run (`Source freshness:
+   missing=276944`), so the benchmark mostly tests kline/state/path features. Do not tune
+   source-family HPO from this result.
+6. The 24h GPD rows show near-baseline lift but low utility, while 24h quantile improves
+   utility and lift. Horizon-specific dispatch is justified; averaging horizons would
+   hide this.
+
 The model may train separate artifacts per horizon/model_tag first. Multi-horizon shared
 models are a later optimization after the per-horizon label quality is measurable.
 
