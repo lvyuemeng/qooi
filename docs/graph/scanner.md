@@ -123,8 +123,8 @@ rank product
     candidate-inspection.csv, candidate-rank.csv, candidate-horizon-consistency.csv
   candidate-rank contract:
     rank_score is evidence-inspection score
-    profit_proxy_score is current tail_utility proxy minus scanner data/source penalties
-    promotion_score is the candidate-selection score consumed by feasibility/report
+    profit_proxy_score is current tail_utility opportunity proxy, not execution-adjusted profit
+    promotion_score is the scanner-internal opportunity score consumed by feasibility/report
   invariant:
     candidate evidence/rank pipe carries `outcome_horizon`; consumers do not posterior-check it
 
@@ -137,7 +137,7 @@ feasibility product
   outputs:
     candidate-feasibility.csv plus source/history/watchlist feasibility projections
   candidate-feasibility contract:
-    one best row per symbol by promotion_score, then source/data penalties
+    one best row per symbol by promotion_score, then source/data diagnostics as tie-breakers
     carries promotion_score, profit_proxy_score, tail_utility_mean, and normalized profit_proxy columns
     report renderer consumes this prepared frame only; no rank/HPO CSV read-back
 
@@ -376,17 +376,13 @@ Important columns:
 | `taker_age_ms` | Int64 | taker source age at decision close |
 | `lsr_age_ms` | Int64 | long/short ratio source age at decision close |
 
-Planned cost/freshness extensions for promoted candidate review:
+Planned freshness extensions for promoted candidate review:
 
 | Column | Type | Purpose |
 |---|---|---|
 | `source_age_hours` | Float64 | numeric freshness for sorting/gating |
 | `bar_age_bars` | Float64 | current bar recency check |
-| `spread_percentile_30d` | Float64 | symbol-relative spread condition |
-| `depth_percentile_30d` | Float64 | symbol-relative book depth condition |
-| `estimated_slippage_bps_for_size` | Float64 | size-aware cost estimate |
-| `expected_edge_bps` | Float64 | evidence-implied move budget |
-| `cost_adjusted_score` | Float64 | rank score after liquidity/cost penalty |
+
 
 ---
 
@@ -697,7 +693,8 @@ columns:
 
 This projection is semantic, not presentational. It may derive `rank_tier`, select the best row per symbol, and derive stable blocker/reason codes. It must not emit display-formatted strings for numeric values.
 
-Promoted-rank scoring should be explicit, capability-aware, and cost-aware:
+Promoted-rank scoring should be explicit and capability-aware. Liquidity, spread,
+slippage, funding, sizing, and market-impact checks are not scanner search inputs:
 
 ```text
 source_gate = required_missing_source_count == 0
@@ -707,7 +704,6 @@ source_gate = required_missing_source_count == 0
 promoted = selected_evidence_level
            and source_gate
            and bar recency gate
-           and liquidity sanity gate
 
 source_penalty = missing_required_penalty
                + stale_required_penalty
@@ -717,11 +713,11 @@ source_penalty = missing_required_penalty
 provider_bounded_penalty = 0 or low when frame_fresh_int=1 and coverage_capability_pct is high
 optional_absent_penalty  = 0 for messages until a real provider is enabled
 
-cost_adjusted_score = raw_tail_score - source_penalty - cost_penalty
-cost_penalty        = estimated_roundtrip_cost_bps / expected_edge_bps
+promotion_score = opportunity_proxy + lift + horizon_consistency - breadth - conflict
 ```
 
-Manual slippage thresholds are allowed only as extreme sanity guards. Normal review should use symbol-relative, size-aware columns such as `spread_percentile_30d`, `depth_percentile_30d`, and `estimated_slippage_bps_for_size`.
+Execution feasibility, if needed later, belongs to a downstream strategy/execution
+artifact and must not rewrite scanner opportunity scores.
 
 ---
 

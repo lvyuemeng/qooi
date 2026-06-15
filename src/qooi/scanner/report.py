@@ -381,7 +381,7 @@ class CandidateSelectionSection:
                 "2=tail_lift≥1.5,N≥30 | 3=tail_lift≥1.0 | —=below tail gate"
             ),
             (
-                "- Units: Promo=promotion_score, Profit=profit_proxy_score, "
+                "- Units: Promo=promotion_score, Proxy=profit_proxy_score, "
                 "P/Obs=profit_proxy_per_selected_obs, P/1k=profit_proxy_per_1k_observed, "
                 "Util=tail_utility_mean, Rank=rank_score, SrcPen=source_penalty_score, "
                 "Miss/Stale/Bound/Opt=source-family counts, "
@@ -399,7 +399,7 @@ class CandidateSelectionSection:
             [
                 "",
                 (
-                    "| Symbol | H | Feas | Promo | Profit | P/Obs | P/1k | Util | "
+                    "| Symbol | H | Feas | Promo | Proxy | P/Obs | P/1k | Util | "
                     "Rank | SrcPen | Miss | Stale | Bound | Opt | "
                     "Hist% | Cap% | Tree | TailLift | ξ | Reason |"
                 ),

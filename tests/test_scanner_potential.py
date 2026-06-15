@@ -666,6 +666,82 @@ def test_rank_candidate_evidence_exposes_profit_proxy_and_promotion_score() -> N
     assert row["promotion_score"] > row["rank_score"]
 
 
+def test_promotion_score_does_not_subtract_source_or_external_penalties() -> None:
+    candidates = pl.DataFrame(
+        [
+            {
+                "symbol": "BTC-USDT-SWAP",
+                "decision_timeframe": "1H",
+                "decision_bar_close_ms": 1,
+                "outcome_horizon": 12,
+                "matched_evidence_level": "score_bucket",
+                "candidate_status": "matched_evidence",
+                "statistical_direction": "up",
+                "research_suggestion": "score_bucket_tail_utility",
+                "conditioned_observations": 100,
+                "symbol_count": 20,
+                "conditioned_p_up": 0.4,
+                "conditioned_p_down": 0.2,
+                "conditioned_p_flat": 0.4,
+                "lift_up": 1.4,
+                "lift_down": 0.7,
+                "lift_flat": 1.0,
+                "information_gain_bits": 0.5,
+                "transition_information_gain_bits": 0.2,
+                "tail_up_rate": 0.1,
+                "tail_down_rate": 0.05,
+                "avg_forward_max_return_pct": 4.0,
+                "avg_forward_min_return_pct": -2.0,
+                "avg_path_range_pct": 6.0,
+                "path_skew": 0.3,
+                "returned_to_origin_rate": 0.2,
+                "information_stability": 1.0,
+                "transition_information_stability": 1.0,
+                "evidence_status": "selected",
+                "transition_status": "supported",
+                "source_freshness": "fresh",
+                "source_age_ms": 0,
+                "market_alignment": "aligned",
+                "source_market_alignment": "source_aligned",
+                "required_missing_source_count": 2,
+                "required_stale_source_count": 3,
+                "provider_bounded_source_count": 0,
+                "optional_absent_source_count": 0,
+                "tail_lift": 2.0,
+                "N_tail_exceedances": 50,
+                "tail_utility_mean": 8.0,
+                "tail_utility_p90": 10.0,
+            }
+        ]
+    )
+
+    ranked = potential_rank.rank_candidate_evidence(candidates)
+    row = ranked.row(0, named=True)
+
+    opportunity_score = (
+        row["profit_proxy_score"]
+        + row["rank_tail_component"]
+        + row["rank_path_component"]
+        + row["rank_stability_component"]
+    )
+    assert row["source_penalty_score"] == pytest.approx(4.9)
+    assert row["rank_score"] < opportunity_score
+    assert row["promotion_score"] == pytest.approx(opportunity_score)
+
+
+def test_scanner_architecture_excludes_execution_cost_from_internal_promotion() -> None:
+    architecture = Path("docs/architecture/scanner.md").read_text(encoding="utf-8")
+    graph = Path("docs/graph/scanner.md").read_text(encoding="utf-8")
+    acceptance = architecture.split("Acceptance rule:", 1)[1].split(
+        "Universe reproducibility", 1
+    )[0]
+
+    assert "estimated_cost_slippage_penalty" not in acceptance
+    assert "data_cost_penalty" not in acceptance
+    assert "cost_adjusted_score" not in graph
+    assert "cost_penalty" not in graph
+
+
 def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> None:
     candidate_rank = pl.DataFrame(
         [
@@ -863,7 +939,7 @@ mode = "stage"
     assert "## Decision Rule Audit" not in report
     assert "Tiers: 1=top-decile" not in report
     assert (
-        "| Symbol | H | Feas | Promo | Profit | P/Obs | P/1k | Util | "
+        "| Symbol | H | Feas | Promo | Proxy | P/Obs | P/1k | Util | "
         "Rank | SrcPen | Miss | Stale | Bound | Opt | "
         "Hist% | Cap% | Tree | TailLift | ξ | Reason |" in report
     )

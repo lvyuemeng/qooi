@@ -327,7 +327,7 @@ to one of these products. Prefer typed products and direct field access over ad-
 training population   = tail rows only
 validation population = all rows with known outcomes
 final target          = profit from selected extreme behavior/events
-selection proxy       = concentrated extreme-event utility after path/cost penalties
+selection proxy       = concentrated extreme-event utility after path-shape constraints
 non-goal              = smooth mean-market probability distribution or average accuracy
 ```
 
@@ -386,12 +386,15 @@ objective does not overload raw `gpd_shape_xi` / `gpd_scale_sigma` as utility-GP
 
 ### Tailtree profit-selection efficiency architecture
 
-Tailtree architecture optimizes **profit-selection ability per unit of data/model cost**,
+Tailtree architecture optimizes **profit-selection ability per unit of data/model budget**,
 not a single global classifier score. The final target is profit from selected extreme
 behavior/events. Utility is an intermediate proxy only when it increases the expected
-profit quality of selected opportunities after path-shape, cost, conflict, and breadth
-penalties. A utility objective that merely selects more rows is not aligned; it is aligned
-only if it selects **more better** extreme-event opportunities under comparable budgets.
+profit quality of selected opportunities after path-shape, conflict, and breadth
+normalization. Liquidity, fee, slippage, funding, and sizing costs are not internal search
+penalties; for altcoin discovery they are downstream strategy/execution concerns and are
+not part of scanner candidate promotion. A utility objective that merely selects more rows
+is not aligned; it is aligned only if it selects **more better** extreme-event
+opportunities under comparable budgets.
 
 The objective comparison from the 2026-06-15 bounded universe benchmark is a design
 driver, not an architecture authority. On the same universe path (`symbols == ()`, OKX
@@ -433,12 +436,12 @@ efficiency columns:
 ```
 
 `selected_utility_*` may remain in artifacts as the current measurable proxy. The
-implemented profit proxy is deliberately explicit: until execution-aware replay exists,
-`profit_proxy` is `tail_utility` minus only the data/source penalties already available
-to scanner review. It is not realized PnL, and the report must name it as a proxy rather
-than implying an allocation-ready profit estimate. Once cost, slippage, funding, and
-liquidity fields exist, they feed `selected_profit_proxy_*` and `promotion_score`; they
-do not create another ranking surface.
+implemented profit proxy is deliberately explicit: `profit_proxy` is selected tail/path
+opportunity utility, not realized PnL and not execution-adjusted profit. The report must
+name it as a proxy rather than implying an allocation-ready profit estimate. Liquidity,
+fee, slippage, funding, and sizing fields may appear only in downstream feasibility or
+strategy artifacts; they do not feed scanner `selected_profit_proxy_*` or
+`promotion_score`.
 
 The model workflow should evaluate objectives on normalized budgets before promotion:
 
@@ -574,14 +577,13 @@ promotion_score =
   + horizon_consistency_component
   - breadth_penalty
   - conflict_penalty
-  - data_cost_penalty
-  - estimated_cost_slippage_penalty
 ```
 
 Where each component is numeric and auditable. `rank_score` remains an evidence-inspection
-score; the canonical candidate table orders by `promotion_score`. Do not encode promotion
-as qualitative labels such as "good" or "fresh"; use thresholds inline in the report
-legend.
+score and may include data/source diagnostics. The canonical candidate table orders by
+scanner-internal `promotion_score`, then uses source/data diagnostics only as tie-breakers
+and blockers. Do not encode promotion as qualitative labels such as "good" or "fresh";
+use thresholds inline in the report legend.
 
 Universe reproducibility is part of model efficiency. Current config has
 `potential.universe = "research"`, but effective universe selection is the branch where
@@ -781,8 +783,8 @@ feature_count > 0
 validation tail count > 0
 ```
 
-The HPO score optimizes profit from extreme-event selection. Utility concentration is only
-the current measurable proxy until cost/slippage/replay profit fields are available:
+The HPO score optimizes profit from extreme-event selection. Utility concentration is the
+current measurable proxy for scanner-side opportunity quality:
 
 ```text
 hpo_score =
@@ -790,7 +792,7 @@ hpo_score =
   + lift
   + selected_extreme_count
   + concentration/stability terms
-  - breadth/cost/conflict penalties
+  - breadth/conflict penalties
 ```
 
 Until then, the correct output is an honest baseline summary, not tuned parameters.
@@ -1174,7 +1176,7 @@ The top-level report should have one candidate-selection table sourced from `can
 
 Candidate feasibility semantics belong to the feasibility product: best-row selection, promotion gates, source/history blocker codes, and stable numeric schema. Report rendering belongs to `report.py`; artifact writing belongs to `diagnostics.py`. Keep candidate/source/history feasibility in `feasibility.py`; do not create `selection.py` as a forwarding layer.
 
-Freshness, capability, and tradability are numeric inputs, not manual labels:
+Freshness and capability are numeric scanner diagnostics, not manual labels:
 
 ```text
 source_age_ms
@@ -1189,12 +1191,6 @@ coverage_target_pct_min
 coverage_capability_pct_min
 market_data_fresh_rate
 source_penalty_score
-spread_bps
-spread_percentile_30d
-depth_percentile_30d
-estimated_slippage_bps_for_size
-expected_edge_bps
-cost_adjusted_score
 ```
 
 Source penalty policy:
@@ -1207,7 +1203,9 @@ optional absent context family -> zero main-rank penalty
 fetch failed but frame fresh -> zero or low penalty
 ```
 
-Static slippage thresholds are acceptable only as hard sanity guards. Promotion should prefer data-derived, symbol-relative, size-aware cost features and penalize cost against expected edge.
+Liquidity, spread, slippage, funding, sizing, and market-impact checks are not scanner
+promotion inputs. If a later strategy/execution layer needs them, it owns separate
+feasibility artifacts and must not rewrite scanner opportunity scores.
 
 ## Diagnostics and report runtime boundary
 

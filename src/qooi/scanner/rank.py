@@ -634,7 +634,6 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
                 + pl.col("rank_tail_component")
                 + pl.col("rank_path_component")
                 + pl.col("rank_stability_component")
-                - pl.col("rank_penalty_component")
             ).alias("promotion_score"),
             pl.when(pl.col("candidate_status") == "matched_evidence")
             .then(pl.lit("matched_selected_evidence"))
