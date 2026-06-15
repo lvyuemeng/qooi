@@ -9,7 +9,7 @@ import qooi.scanner.diagnostics as diagnostics
 import qooi.scanner.tailrun as tailrun
 import qooi.scanner.tailtree as tailtree
 import qooi.scanner.workflow as potential
-from qooi.scanner import PotentialArtifacts
+from qooi.scanner import PotentialArtifacts, PotentialUniverse
 from qooi.scanner.config import EvidenceConfig, TailtreeConfig, TransitionConfig
 
 
@@ -74,6 +74,14 @@ class _Inputs:
             diagnostics_dir=diagnostics_dir,
             states_dir=diagnostics_dir.parent / "states",
         )
+        self.universe = PotentialUniverse(
+            symbols=("AAA", "BBB"),
+            discovery=pl.DataFrame(),
+            selection_note="fixture",
+            missing_reason="",
+            eligible_count=2,
+        )
+        self.context = type("Context", (), {"availability": {}})()
 
 
 def test_tailtree_lifecycle_config_loads_named_instance(tmp_path: Path) -> None:
@@ -115,6 +123,44 @@ def test_tailtree_config_normalizes_outcome_horizon() -> None:
 
     assert config.outcome_horizon == (12, 6)
     assert int_config.outcome_horizon == (12,)
+
+
+def test_tailtree_config_loads_hpo_setting_grid(tmp_path: Path) -> None:
+    config_path = tmp_path / "potential.toml"
+    config_path.write_text(
+        """
+[potential.evidence]
+kind = "tailtree"
+
+[potential.evidence.tailtree]
+model_tag = "tailtree-grid"
+training_profile = "balanced_baseline"
+
+[[potential.evidence.tailtree.hpo_settings]]
+objective = "tail_utility_quantile"
+training_profile = "sparse_interpretable"
+model_tag = "tailtree-grid-quantile-sparse"
+num_leaves = 16
+min_data_in_leaf = 60
+learning_rate = 0.03
+num_iterations = 80
+early_stopping_rounds = 10
+""",
+        encoding="utf-8",
+    )
+
+    config = potential.load_config(config_path)
+    setting = config.evidence.tailtree.hpo_settings[0]
+
+    assert config.evidence.tailtree.training_profile == "balanced_baseline"
+    assert setting.objective == "tail_utility_quantile"
+    assert setting.training_profile == "sparse_interpretable"
+    assert setting.model_tag == "tailtree-grid-quantile-sparse"
+    assert setting.num_leaves == 16
+    assert setting.min_data_in_leaf == 60
+    assert setting.learning_rate == pytest.approx(0.03)
+    assert setting.num_iterations == 80
+    assert setting.early_stopping_rounds == 10
 
 
 def test_tailtree_config_loads_tail_utility_objective(tmp_path: Path) -> None:
@@ -340,6 +386,121 @@ def test_tailtree_load_predict_loads_every_configured_horizon(
     assert set(result.models) == {(6, "up"), (12, "up")}
     assert set(result.evidence.get_column("outcome_horizon").unique().to_list()) == {6, 12}
     assert (tmp_path / "diagnostics" / "tailtree-run-summary.csv").exists()
+
+
+def test_tailtree_pipeline_appends_hpo_setting_feedback_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = potential.PotentialConfig(
+        evidence=EvidenceConfig(
+            kind="tailtree",
+            tailtree=TailtreeConfig(
+                model_dir=tmp_path / "models",
+                model_tag="tailtree-base",
+                objective="tail_severity_gpd",
+                training_profile="balanced_baseline",
+                hpo_settings=(
+                    {
+                        "objective": "tail_utility_quantile",
+                        "training_profile": "sparse_interpretable",
+                        "model_tag": "tailtree-quantile-sparse",
+                        "num_leaves": 16,
+                        "min_data_in_leaf": 60,
+                        "learning_rate": 0.03,
+                        "num_iterations": 80,
+                        "early_stopping_rounds": 10,
+                    },
+                ),
+            ),
+        ),
+        bar="1H",
+        days=3,
+    )
+    inputs = _Inputs(config, tmp_path / "diagnostics")
+    observed_settings: list[tuple[str, str, str]] = []
+
+    def _fake_run(observations, source_outcomes, realized_transitions, setting_inputs, **kwargs):
+        tailtree = setting_inputs.config.evidence.tailtree
+        observed_settings.append(
+            (tailtree.objective, tailtree.training_profile, tailtree.model_tag)
+        )
+        setting_inputs.artifacts.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "summary_scope": ["up"],
+                "outcome_horizon": [12],
+                "valid_observation_count": [100],
+                "valid_tail_count": [10],
+                "valid_tail_rate": [0.1],
+                "feature_count": [3],
+                "train_exceedance_count": [20],
+                "trained_tree_count": [1],
+                "selected_leaf_count": [1],
+                "fit_seconds": [0.1],
+                "score_seconds": [0.1],
+            }
+        ).write_csv(setting_inputs.artifacts.diagnostics_dir / "tailtree-run-summary.csv")
+        return tailrun.TailtreeResult(
+            evidence=pl.DataFrame({"objective": [tailtree.objective]}),
+            candidates=pl.DataFrame(),
+            ranked=pl.DataFrame(),
+            selection_efficiency=pl.DataFrame(),
+            models={},
+            sections=(),
+        )
+
+    def _fake_candidates(observations, evidence, tree_models):
+        objective = evidence.get_column("objective")[0]
+        tail_count = 12 if objective == "tail_utility_quantile" else 4
+        profit = 1.4 if objective == "tail_utility_quantile" else 0.3
+        return pl.DataFrame(
+            {
+                "symbol": ["AAA"],
+                "outcome_horizon": [12],
+                "tree_direction": ["up"],
+                "candidate_status": ["matched_evidence"],
+                "N_total": [20],
+                "N_tail_exceedances": [tail_count],
+                "rank_score": [profit],
+                "tail_utility_p90": [profit + 0.2],
+            }
+        )
+
+    monkeypatch.setattr(diagnostics.tailrun_eval, "run", _fake_run)
+    monkeypatch.setattr(diagnostics.candidate_eval, "candidate_evidence_frame", _fake_candidates)
+    monkeypatch.setattr(diagnostics.rank_eval, "rank_candidate_evidence", lambda frame: frame)
+    monkeypatch.setattr(
+        diagnostics.feasibility_eval,
+        "join_candidate_source_constraints",
+        lambda frame, availability: frame,
+    )
+
+    result = diagnostics._run_tailtree_pipeline(
+        pl.DataFrame({"symbol": ["AAA"], "decision_bar_close_ms": [1]}),
+        pl.DataFrame(),
+        pl.DataFrame(),
+        pl.DataFrame(),
+        inputs,
+    )
+    feedback = tailrun.tailtree_hpo_feedback_frame(result.selection_efficiency)
+    selected = feedback.filter(pl.col("hpo_feedback_selected_int") == 1).row(0, named=True)
+
+    assert observed_settings == [
+        ("tail_severity_gpd", "balanced_baseline", "tailtree-base"),
+        ("tail_utility_quantile", "sparse_interpretable", "tailtree-quantile-sparse"),
+    ]
+    assert set(result.selection_efficiency.get_column("objective").unique().to_list()) == {
+        "tail_severity_gpd",
+        "tail_utility_quantile",
+    }
+    persisted_summary = pl.read_csv(tmp_path / "diagnostics" / "tailtree-run-summary.csv")
+    assert set(persisted_summary.get_column("objective").unique().to_list()) == {
+        "tail_severity_gpd",
+        "tail_utility_quantile",
+    }
+    assert selected["objective"] == "tail_utility_quantile"
+    assert selected["training_profile"] == "sparse_interpretable"
+    assert selected["hpo_feedback_rank"] == 1
 
 
 def test_tailtree_train_lifecycle_writes_frozen_artifact_set(tmp_path: Path) -> None:

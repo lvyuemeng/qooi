@@ -67,6 +67,19 @@ class ReviewConfig(BaseModel):
     require_context: bool = True
 
 
+class TailtreeHpoSetting(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    objective: TailtreeObjective = "tail_severity_gpd"
+    training_profile: str = "balanced_baseline"
+    model_tag: str
+    num_leaves: int = 64
+    min_data_in_leaf: int = 30
+    learning_rate: float = 0.05
+    num_iterations: int = 200
+    early_stopping_rounds: int = 20
+
+
 class TailtreeConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -74,6 +87,7 @@ class TailtreeConfig(BaseModel):
     model_dir: Path = Path("data/output/potential/models")
     model_tag: str = "tailtree-current"
     objective: TailtreeObjective = "tail_severity_gpd"
+    training_profile: str = "balanced_baseline"
     threshold_pct: float = 5.0
     num_leaves: int = 64
     min_data_in_leaf: int = 30
@@ -81,6 +95,7 @@ class TailtreeConfig(BaseModel):
     num_iterations: int = 200
     early_stopping_rounds: int = 20
     outcome_horizon: tuple[int, ...] = (12,)
+    hpo_settings: tuple[TailtreeHpoSetting, ...] = ()
 
     @field_validator("outcome_horizon", mode="before")
     @classmethod

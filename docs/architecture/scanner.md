@@ -516,6 +516,12 @@ budget_families:
 The first implementation must not add a core dependency. If Optuna is introduced later,
 it must consume the same typed trial objects and write the same artifact; it must not
 create a parallel HPO report, a second artifact family, or sampler-owned column names.
+The workflow entrypoint remains the monolithic `[potential]` config, but tailtree owns the
+grid under `[potential.evidence.tailtree]`. The root tailtree config is the primary setting;
+extra `[[potential.evidence.tailtree.hpo_settings]]` rows are complete named objective/
+profile/model instances with their own LightGBM parameters. The diagnostics pipeline trains
+each setting, replays common budgets, appends all rows into the canonical selection-
+efficiency frame, and leaves candidate selection/reporting on the primary setting.
 
 Canonical model-selection artifact:
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import polars as pl
 
@@ -34,6 +35,12 @@ from qooi.sources.context import SourceAvailability
 LadderResult = ladder_eval.LadderResult
 TailtreeResult = tailrun_eval.TailtreeResult
 TailtreeEvidenceResult = tailrun_eval.TailtreeEvidenceResult
+
+
+@dataclass(frozen=True)
+class _TailtreeSettingInputs:
+    config: object
+    artifacts: PotentialArtifacts
 
 
 @dataclass(frozen=True)
@@ -790,6 +797,51 @@ def _run_ladder_pipeline(
     )
 
 
+def _tailtree_setting_configs(config):
+    base = config.evidence.tailtree
+    settings = [base]
+    for setting in base.hpo_settings:
+        settings.append(
+            base.model_copy(
+                update={
+                    "objective": setting.objective,
+                    "training_profile": setting.training_profile,
+                    "model_tag": setting.model_tag,
+                    "num_leaves": setting.num_leaves,
+                    "min_data_in_leaf": setting.min_data_in_leaf,
+                    "learning_rate": setting.learning_rate,
+                    "num_iterations": setting.num_iterations,
+                    "early_stopping_rounds": setting.early_stopping_rounds,
+                    "hpo_settings": (),
+                }
+            )
+        )
+    unique = []
+    seen = set()
+    for tailtree in settings:
+        key = (tailtree.objective, tailtree.training_profile, tailtree.model_tag)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(tailtree)
+    return tuple(unique)
+
+
+def _config_for_tailtree_setting(config, tailtree):
+    return config.model_copy(
+        update={
+            "evidence": config.evidence.model_copy(update={"tailtree": tailtree}),
+        }
+    )
+
+
+def _tailtree_universe_snapshot_id(inputs) -> str:
+    return (
+        f"{inputs.config.bar}:{inputs.config.days}:"
+        f"{inputs.universe.eligible_count}:{len(inputs.universe.symbols)}"
+    )
+
+
 def _run_tailtree_pipeline(
     observations,
     source_events,
@@ -798,47 +850,89 @@ def _run_tailtree_pipeline(
     inputs,
 ) -> TailtreeResult:
     """Self-contained tailtree pipeline: evidence + candidates + trees."""
-    result = tailrun_eval.run(
-        observations,
-        source_outcomes,
-        realized_transitions,
-        inputs,
-        source_event_row_count=len(source_events),
+    selection_frames = []
+    summary_frames = []
+    primary_result = None
+    primary_candidates = pl.DataFrame()
+    primary_ranked = pl.DataFrame()
+    setting_configs = _tailtree_setting_configs(inputs.config)
+    for index, tailtree in enumerate(setting_configs):
+        setting_config = _config_for_tailtree_setting(inputs.config, tailtree)
+        setting_inputs = cast(
+            ReportInputs,
+            _TailtreeSettingInputs(setting_config, inputs.artifacts),
+        )
+        result = tailrun_eval.run(
+            observations,
+            source_outcomes,
+            realized_transitions,
+            setting_inputs,
+            source_event_row_count=len(source_events),
+        )
+        candidates = candidate_eval.candidate_evidence_frame(
+            observations,
+            result.evidence,
+            tree_models=result.models,
+        )
+        candidates = feasibility_eval.join_candidate_source_constraints(
+            candidates, inputs.context.availability
+        )
+        ranked = rank_eval.rank_candidate_evidence(candidates)
+        summary_path = inputs.artifacts.diagnostics_dir / "tailtree-run-summary.csv"
+        summary = pl.read_csv(summary_path) if summary_path.exists() else pl.DataFrame()
+        if not summary.is_empty():
+            summary = summary.with_columns(
+                pl.lit(tailtree.model_tag).alias("model_tag"),
+                pl.lit(tailtree.training_profile).alias("training_profile"),
+                pl.lit(tailtree.objective).alias("objective"),
+            )
+            summary_frames.append(summary)
+        selection_frames.append(
+            tailrun_eval.tailtree_selection_efficiency_frame(
+                ranked,
+                run_summary=summary,
+                universe_snapshot_id=_tailtree_universe_snapshot_id(inputs),
+                model_tag=tailtree.model_tag,
+                objective=tailtree.objective,
+                training_profile=tailtree.training_profile,
+            )
+        )
+        if index == 0:
+            primary_result = result
+            primary_candidates = candidates
+            primary_ranked = ranked
+    selection_efficiency = (
+        pl.concat(selection_frames, how="diagonal_relaxed")
+        if selection_frames
+        else pl.DataFrame(schema=tailrun_eval.TAILTREE_SELECTION_EFFICIENCY_SCHEMA)
     )
-    candidates = candidate_eval.candidate_evidence_frame(
-        observations,
-        result.evidence,
-        tree_models=result.models,
-    )
-    candidates = feasibility_eval.join_candidate_source_constraints(
-        candidates, inputs.context.availability
-    )
-    ranked = rank_eval.rank_candidate_evidence(candidates)
-    summary_path = inputs.artifacts.diagnostics_dir / "tailtree-run-summary.csv"
-    summary = pl.read_csv(summary_path) if summary_path.exists() else pl.DataFrame()
     tailtree = inputs.config.evidence.tailtree
     model_root = Path(tailtree.model_dir) / tailtree.model_tag
-    selection_efficiency = tailrun_eval.tailtree_selection_efficiency_frame(
-        ranked,
-        run_summary=summary,
-        universe_snapshot_id=(
-            f"{inputs.config.bar}:{inputs.config.days}:"
-            f"{inputs.universe.eligible_count}:{len(inputs.universe.symbols)}"
-        ),
-        model_tag=tailtree.model_tag,
-        objective=tailtree.objective,
-        training_profile="balanced_baseline",
-    )
+    if summary_frames:
+        combined_summary = pl.concat(summary_frames, how="diagonal_relaxed")
+        inputs.artifacts.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        model_root.mkdir(parents=True, exist_ok=True)
+        combined_summary.write_csv(inputs.artifacts.diagnostics_dir / "tailtree-run-summary.csv")
+        combined_summary.write_csv(model_root / "tailtree-run-summary.csv")
     tailrun_eval.write_tailtree_selection_efficiency(
         selection_efficiency,
         inputs.artifacts.diagnostics_dir,
         model_root,
     )
+    if primary_result is None:
+        primary_result = tailrun_eval.TailtreeResult(
+            evidence=pl.DataFrame(),
+            candidates=pl.DataFrame(),
+            ranked=pl.DataFrame(),
+            selection_efficiency=pl.DataFrame(),
+            models={},
+            sections=(),
+        )
     return TailtreeResult(
-        evidence=result.evidence,
-        candidates=candidates,
-        ranked=ranked,
+        evidence=primary_result.evidence,
+        candidates=primary_candidates,
+        ranked=primary_ranked,
         selection_efficiency=selection_efficiency,
-        models=result.models,
+        models=primary_result.models,
         sections=(),
     )
