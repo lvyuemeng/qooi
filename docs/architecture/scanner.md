@@ -379,95 +379,169 @@ is theoretically cleaner when `X` is raw threshold exceedance. Utility can be au
 with mean/p90 and may later get its own utility-exceedance GPD, but the current utility
 objective does not overload raw `gpd_shape_xi` / `gpd_scale_sigma` as utility-GPD truth.
 
-### Tailtree objective benchmark note — 2026-06-15
+### Tailtree selection-efficiency architecture
 
-Bounded cache-only universe benchmark rerun:
+Tailtree architecture optimizes **selection ability per unit of data/model cost**, not a
+single global classifier score. Selection ability means the model can concentrate scarce
+future tail utility into a smaller current candidate set while exposing how much breadth,
+stability, and cost the concentration required.
+
+The objective comparison from the 2026-06-15 bounded universe benchmark is a design
+driver, not an architecture authority. On the same universe path (`symbols == ()`, OKX
+discovery, `scan_budget=20`), `tail_utility_quantile` selected more realized tail rows
+and much higher utility, while `tail_severity_gpd` kept higher sparse lift. The design
+therefore keeps both as objective instances with different selection roles:
+
+| Role | Preferred objective | Selection ability measured by | Efficiency pressure |
+|---|---|---|---|
+| Sparse extreme concentration | `tail_severity_gpd` | lift, selected tail rate, max lift | small selected set, interpretable leaf evidence |
+| Utility-ranked breadth | `tail_utility_quantile` | selected utility mean/p90, selected tail count | more candidates accepted, score-bucket evidence |
+| Horizon dispatch | per `(horizon, direction)` winner | horizon-local lift and utility | avoid averaging incompatible horizons |
+| Tail-shape audit | GPD descriptors | `xi`, `sigma`, exceedance count | descriptive only, not a trade trigger |
+
+Selection surfaces must report both **ability** and **efficiency** columns:
 
 ```text
-uv run python - <<'PY'
-from pathlib import Path
-from qooi.scanner.workflow import run
+ability columns:
+  valid_tail_lift
+  valid_selected_tail_rate
+  valid_selected_tail_count
+  valid_selected_utility_mean
+  valid_selected_utility_p90
+  horizon_count
+  strong_horizon_count
+  direction_consistency_score
 
-for config in (
-    Path(".hermes/tailtree-bench-gpd.toml"),
-    Path(".hermes/tailtree-bench-quantile.toml"),
-):
-    print(f"RUN {config}")
-    print(run(config))
-PY
+efficiency columns:
+  selected_observation_rate        # selected_obs / valid_observation_count
+  selected_tail_per_1k_obs         # selected tails per 1000 selected observations
+  utility_per_selected_obs         # selected utility sum / selected_obs
+  train_exceedance_per_feature     # train_exceedance_count / feature_count
+  trained_tree_count
+  selected_leaf_or_bucket_count
+  fit_seconds / score_seconds      # profiler-owned, when available
 ```
 
-The benchmark configs intentionally did **not** set `potential.symbols`. In current
-workflow code, `resolve_universe(config)` uses explicit symbols only when
-`config.symbols` is non-empty; otherwise it calls OKX swap discovery and then applies
-`transition.scan_budget`. Both reports confirmed a universe-derived scan:
+The candidate selector should evaluate objectives on normalized budgets before promotion:
 
 ```text
-Universe: research
-Selected symbols scanned: 20 of 240 eligible symbols
-Transition scan budget: 20
-Refresh mode: cache_only
+universe snapshot -> observation/outcome frames
+  -> objective × horizon × direction training
+  -> evidence rows
+  -> candidate score rows
+  -> budget replay: top_k, top_pct, min_score_gate
+  -> selection-efficiency summary
+  -> canonical candidate table
 ```
 
-Configuration limitation: `potential.universe = "research"` is currently report/config
-metadata, not a typed universe provider selector. The effective universe guarantee is
-therefore `symbols == ()` plus the `resolve_universe` branch into OKX discovery. This is
-acceptable for this bounded benchmark, but durable HPO runs should persist the discovery
-snapshot or promote universe selection into a typed config object so repeated objective
-comparisons cannot drift with live OKX listings/tickers.
+Budget replay is the key design correction. A wide quantile gate and a sparse GPD gate
+cannot be compared only by raw selected counts. Every objective/horizon/direction row must
+be replayable under the same budget families:
 
-Objective comparison at identical scan budget, bar, history window, threshold, horizons,
-and LightGBM shape:
+```text
+top_k      = 1, 3, 5, 10
+top_pct    = 1%, 5%, 10%, 20%
+score_gate = objective-native threshold after calibration
+```
 
-| Objective | Direction rows | Trainable rows | Train exceedances | Selected obs | Selected tails | Mean lift | Median lift | Min lift | Max lift | Mean selected utility | Mean selected p90 utility |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `tail_severity_gpd` | 6 | 6 | 369122 | 47097 | 13439 | 2.216100 | 2.070481 | 1.000034 | 4.667812 | 0.645379 | 1.663366 |
-| `tail_utility_quantile` | 6 | 6 | 369122 | 66470 | 19993 | 1.720277 | 1.685211 | 1.235320 | 2.293910 | 0.953919 | 2.709586 |
+Promotion should prefer rows that survive more than one budget family. A candidate that
+only looks good because its objective admitted a very wide set is inspection evidence, not
+a promoted high-confidence selection.
 
-Per-horizon/direction detail:
+HPO is a deterministic search over typed objective instances, not an unbounded optimizer
+over the whole workflow:
 
-| Objective | H | Dir | Train exceedances | Baseline tail rate | Selected obs | Selected tails | Selected tail rate | Lift | Selected utility mean | Selected utility p90 |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| GPD | 6 | down | 29712 | 0.071996 | 8376 | 1172 | 0.139924 | 1.943485 | 0.702918 | 1.510476 |
-| GPD | 6 | up | 30156 | 0.086591 | 1910 | 772 | 0.404188 | 4.667812 | 1.243623 | 3.607524 |
-| GPD | 12 | down | 58663 | 0.144489 | 4374 | 1505 | 0.344079 | 2.381355 | 0.594547 | 1.398613 |
-| GPD | 12 | up | 56971 | 0.168142 | 6011 | 2221 | 0.369489 | 2.197478 | 0.686035 | 1.935597 |
-| GPD | 24 | down | 100748 | 0.272607 | 4930 | 1487 | 0.301623 | 1.106437 | 0.346157 | 0.883460 |
-| GPD | 24 | up | 92872 | 0.292230 | 21496 | 6282 | 0.292240 | 1.000034 | 0.298993 | 0.644527 |
-| Quantile | 6 | down | 29712 | 0.107332 | 2770 | 682 | 0.246209 | 2.293910 | 0.811813 | 2.299895 |
-| Quantile | 6 | up | 30156 | 0.108936 | 2770 | 438 | 0.158123 | 1.451524 | 1.430368 | 4.376116 |
-| Quantile | 12 | down | 58663 | 0.212006 | 27695 | 7971 | 0.287814 | 1.357571 | 0.459101 | 1.343956 |
-| Quantile | 12 | up | 56971 | 0.205891 | 27695 | 7044 | 0.254342 | 1.235320 | 0.735775 | 2.045359 |
-| Quantile | 24 | down | 100748 | 0.364416 | 2770 | 1937 | 0.699278 | 1.918899 | 0.883613 | 2.461170 |
-| Quantile | 24 | up | 92872 | 0.335928 | 2770 | 1921 | 0.693502 | 2.064436 | 1.402843 | 3.731022 |
+```text
+HPO grain = universe_snapshot × objective × outcome_horizon × direction × budget_family
 
-Interpretation: quantile is the better *utility-selection* objective in this run: it
-selects 41.1% more observations and 48.8% more realized tail rows while lifting mean
-selected utility from 0.645379 to 0.953919 (+47.8%) and selected p90 utility from
-1.663366 to 2.709586 (+62.9%). It is not a universal lift winner: GPD has higher mean
-and max validation lift because it is more concentrated/sparser, especially 6h-up. The
-architectural decision is therefore not "quantile replaces GPD evidence". The cleaner
-design is objective-dispatched evidence: quantile for utility-ranked candidate breadth,
-GPD descriptors for tail-shape audit and sparse extreme concentration checks.
+typed instance fields:
+  target_basis              # raw_exceedance | path_utility
+  lightgbm_objective        # custom GPD surrogate | quantile
+  evidence_bucket           # leaf_id | score_bucket
+  selection_budget_family   # top_k | top_pct | score_gate
+  num_leaves
+  min_data_in_leaf
+  learning_rate
+  num_iterations
+  early_stopping_rounds
+```
 
-Design/HPO grill:
+Required HPO artifact:
 
-1. The objective is doing too much policy work. `tail_utility_quantile` changes target,
-   LightGBM objective, evidence bucket, and selection breadth. Keep those as typed fields
-   in the objective instance so HPO can vary target and selection independently.
-2. The benchmark is still single split by run, not rolling time-block validation. Treat
-   lift and utility as first-pass evidence, not deployable proof.
-3. `min_data_in_leaf=30`, `num_leaves=64`, `learning_rate=0.05`, and
-   `num_iterations=200` are static across horizons with very different tail rates. HPO
-   should be per horizon/direction or at least horizon-bucketed.
-4. Selection size is not normalized across objectives. Add budgeted top-k/top-pct replay
-   so GPD-vs-quantile comparisons separate scoring quality from different gate widths.
-5. Source features were unavailable in this cache-only run (`Source freshness:
-   missing=276944`), so the benchmark mostly tests kline/state/path features. Do not tune
-   source-family HPO from this result.
-6. The 24h GPD rows show near-baseline lift but low utility, while 24h quantile improves
-   utility and lift. Horizon-specific dispatch is justified; averaging horizons would
-   hide this.
+```text
+tailtree-selection-efficiency.csv
+```
+
+Required row grain:
+
+```text
+model_tag × objective × outcome_horizon × tree_direction × budget_family × budget_value
+```
+
+Required summary columns:
+
+```text
+universe_snapshot_id
+eligible_symbol_count
+selected_symbol_count
+observation_row_count
+feature_count
+train_exceedance_count
+valid_observation_count
+valid_tail_count
+valid_tail_rate
+selected_observation_count
+selected_observation_rate
+selected_tail_count
+selected_tail_rate
+selected_tail_per_1k_obs
+valid_tail_lift
+selected_utility_mean
+selected_utility_p90
+utility_per_selected_obs
+trained_tree_count
+selected_bucket_or_leaf_count
+fit_seconds
+score_seconds
+```
+
+Acceptance rule:
+
+```text
+promotion_score =
+  lift_component
+  + utility_component
+  + horizon_consistency_component
+  - breadth_penalty
+  - conflict_penalty
+  - data_cost_penalty
+```
+
+Where each component is numeric and auditable. Do not encode promotion as qualitative
+labels such as "good" or "fresh"; use thresholds inline in the report legend.
+
+Universe reproducibility is part of model efficiency. Current config has
+`potential.universe = "research"`, but effective universe selection is the branch where
+`symbols == ()` and `resolve_universe(config)` calls OKX discovery, then applies
+`transition.scan_budget`. Durable HPO must persist either:
+
+```text
+universe_snapshot_id + discovery frame
+```
+
+or a typed universe provider object. Otherwise objective comparisons mix model changes
+with live listing/ticker drift.
+
+Feature efficiency is evaluated separately from objective efficiency:
+
+```text
+state/path only
+state/path + persistent derivative source features
+derivative source features only
+```
+
+Do not tune source-family HPO from a run where source freshness is structurally missing.
+That run is a valid kline/state/path benchmark, not a source-feature benchmark.
 
 The model may train separate artifacts per horizon/model_tag first. Multi-horizon shared
 models are a later optimization after the per-horizon label quality is measurable.

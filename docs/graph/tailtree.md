@@ -211,6 +211,55 @@ The artifact is written as `candidate-horizon-consistency.csv` beside
 `candidate-rank.csv` and is report-only feedback. Candidate promotion still uses the
 canonical ranked candidate rows.
 
+Selection-efficiency/HPO feedback is a separate artifact; it does not replace candidate
+rank rows:
+
+```text
+tailtree-selection-efficiency.csv
+```
+
+Row grain:
+
+```text
+model_tag × objective × outcome_horizon × tree_direction × budget_family × budget_value
+```
+
+Required columns:
+
+```text
+universe_snapshot_id
+eligible_symbol_count
+selected_symbol_count
+observation_row_count
+feature_count
+train_exceedance_count
+valid_observation_count
+valid_tail_count
+valid_tail_rate
+selected_observation_count
+selected_observation_rate
+selected_tail_count
+selected_tail_rate
+selected_tail_per_1k_obs
+valid_tail_lift
+selected_utility_mean
+selected_utility_p90
+utility_per_selected_obs
+trained_tree_count
+selected_bucket_or_leaf_count
+fit_seconds
+score_seconds
+```
+
+Budget families compare selection ability at equal candidate budgets rather than comparing
+raw objective gate widths:
+
+```text
+top_k:      1, 3, 5, 10
+top_pct:    1, 5, 10, 20
+score_gate: calibrated objective-native threshold
+```
+
 ### Labeled outcome frame
 
 ```text
