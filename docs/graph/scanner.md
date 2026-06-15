@@ -121,6 +121,10 @@ rank product
     qooi.scanner.rank.candidate_horizon_consistency_frame(...)
   outputs:
     candidate-inspection.csv, candidate-rank.csv, candidate-horizon-consistency.csv
+  candidate-rank contract:
+    rank_score is evidence-inspection score
+    profit_proxy_score is current tail_utility proxy minus scanner data/source penalties
+    promotion_score is the candidate-selection score consumed by feasibility/report
   invariant:
     candidate evidence/rank pipe carries `outcome_horizon`; consumers do not posterior-check it
 
@@ -132,6 +136,10 @@ feasibility product
     qooi.scanner.feasibility
   outputs:
     candidate-feasibility.csv plus source/history/watchlist feasibility projections
+  candidate-feasibility contract:
+    one best row per symbol by promotion_score, then source/data penalties
+    carries promotion_score, profit_proxy_score, tail_utility_mean, and normalized profit_proxy columns
+    report renderer consumes this prepared frame only; no rank/HPO CSV read-back
 
 diagnostics/report outputs
   current calls:

@@ -241,6 +241,11 @@ class CandidateSelectionRow:
     outcome_horizon: int
     feasibility: str
     rank_score: float | None
+    promotion_score: float | None
+    profit_proxy_score: float | None
+    profit_proxy_per_selected_obs: float | None
+    profit_proxy_per_1k_observed: float | None
+    tail_utility_mean: float | None
     rank_tier: str
     source_penalty_score: float | None
     required_missing_source_count: int
@@ -262,6 +267,11 @@ class CandidateSelectionRow:
             outcome_horizon,
             feasibility,
             rank_score,
+            promotion_score,
+            profit_proxy_score,
+            profit_proxy_per_selected_obs,
+            profit_proxy_per_1k_observed,
+            tail_utility_mean,
             rank_tier,
             source_penalty_score,
             missing,
@@ -281,6 +291,11 @@ class CandidateSelectionRow:
             outcome_horizon=_int_value(outcome_horizon),
             feasibility=str(feasibility),
             rank_score=_float_value(rank_score),
+            promotion_score=_float_value(promotion_score),
+            profit_proxy_score=_float_value(profit_proxy_score),
+            profit_proxy_per_selected_obs=_float_value(profit_proxy_per_selected_obs),
+            profit_proxy_per_1k_observed=_float_value(profit_proxy_per_1k_observed),
+            tail_utility_mean=_float_value(tail_utility_mean),
             rank_tier=str(rank_tier),
             source_penalty_score=_float_value(source_penalty_score),
             required_missing_source_count=_int_value(missing),
@@ -299,7 +314,11 @@ class CandidateSelectionRow:
     def markdown_row(self) -> str:
         return (
             f"| `{self.symbol}` | {self.outcome_horizon} | {self.feasibility} | "
-            f"{_fmt_float(self.rank_score)} | {_fmt_float(self.source_penalty_score)} | "
+            f"{_fmt_float(self.promotion_score)} | {_fmt_float(self.profit_proxy_score)} | "
+            f"{_fmt_float(self.profit_proxy_per_selected_obs)} | "
+            f"{_fmt_float(self.profit_proxy_per_1k_observed)} | "
+            f"{_fmt_float(self.tail_utility_mean)} | {_fmt_float(self.rank_score)} | "
+            f"{_fmt_float(self.source_penalty_score)} | "
             f"{self.required_missing_source_count} | {self.required_stale_source_count} | "
             f"{self.provider_bounded_source_count} | {self.optional_absent_source_count} | "
             f"{_fmt_float(self.min_history_coverage_pct)} | "
@@ -315,6 +334,11 @@ class CandidateSelectionSection:
         "outcome_horizon",
         "watchlist_feasibility",
         "rank_score",
+        "promotion_score",
+        "profit_proxy_score",
+        "profit_proxy_per_selected_obs",
+        "profit_proxy_per_1k_observed",
+        "tail_utility_mean",
         "rank_tier",
         "source_penalty_score",
         "required_missing_source_count",
@@ -335,12 +359,13 @@ class CandidateSelectionSection:
             return ()
         ordered = frame.sort(
             [
-                "rank_score",
+                "promotion_score",
+                "profit_proxy_score",
                 "source_penalty_score",
                 "min_history_coverage_pct",
                 "min_source_capability_coverage_pct",
             ],
-            descending=[True, False, True, True],
+            descending=[True, True, False, True, True],
         ).select(self.columns)
         return tuple(CandidateSelectionRow.from_frame_row(row) for row in ordered.iter_rows())
 
@@ -356,7 +381,9 @@ class CandidateSelectionSection:
                 "2=tail_lift≥1.5,N≥30 | 3=tail_lift≥1.0 | —=below tail gate"
             ),
             (
-                "- Units: Rank=rank_score, SrcPen=source_penalty_score, "
+                "- Units: Promo=promotion_score, Profit=profit_proxy_score, "
+                "P/Obs=profit_proxy_per_selected_obs, P/1k=profit_proxy_per_1k_observed, "
+                "Util=tail_utility_mean, Rank=rank_score, SrcPen=source_penalty_score, "
                 "Miss/Stale/Bound/Opt=source-family counts, "
                 "Hist%/Cap%=minimum coverage percentages, H=outcome_horizon bars."
             ),
@@ -372,12 +399,14 @@ class CandidateSelectionSection:
             [
                 "",
                 (
-                    "| Symbol | H | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
+                    "| Symbol | H | Feas | Promo | Profit | P/Obs | P/1k | Util | "
+                    "Rank | SrcPen | Miss | Stale | Bound | Opt | "
                     "Hist% | Cap% | Tree | TailLift | ξ | Reason |"
                 ),
-                "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
+                "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
                 (
-                    "| | bars | status | score | penalty | count | count | count | count | "
+                    "| | bars | status | score | proxy | proxy | proxy/1k valid | utility | "
+                    "evidence score | penalty | count | count | count | count | "
                     "pct | pct | direction | x baseline | shape | blocker |"
                 ),
             ]
@@ -628,12 +657,7 @@ class _TreeSummarySection:
                 )
             return "\n".join(lines)
 
-        legacy_model_paths = sorted(d.glob("tail-tree-h*-*.json"))
-        legacy_evidence_paths = sorted(d.glob("potential-leaf-evidence-h*-*.csv"))
-        lines.append(f"- Model artifact files: `{len(legacy_model_paths)}`")
-        lines.append(f"- Evidence artifact files: `{len(legacy_evidence_paths)}`")
-        if not legacy_model_paths and not legacy_evidence_paths:
-            lines.append("- No tailtree artifacts found.")
+        lines.append("- Tailtree run summary artifact is missing.")
         return "\n".join(lines)
 
 

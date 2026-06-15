@@ -432,9 +432,13 @@ efficiency columns:
   fit_seconds / score_seconds      # profiler-owned, when available
 ```
 
-`selected_utility_*` may remain in artifacts as the current measurable proxy, but report
-and HPO semantics should read it as `selected_profit_proxy_*` once cost/slippage fields are
-available. The architecture must not stop at utility because profit is the final goal.
+`selected_utility_*` may remain in artifacts as the current measurable proxy. The
+implemented profit proxy is deliberately explicit: until execution-aware replay exists,
+`profit_proxy` is `tail_utility` minus only the data/source penalties already available
+to scanner review. It is not realized PnL, and the report must name it as a proxy rather
+than implying an allocation-ready profit estimate. Once cost, slippage, funding, and
+liquidity fields exist, they feed `selected_profit_proxy_*` and `promotion_score`; they
+do not create another ranking surface.
 
 The model workflow should evaluate objectives on normalized budgets before promotion:
 
@@ -446,6 +450,7 @@ universe snapshot -> observation/outcome frames
   -> validation/current candidate score rows
   -> budget replay: top_k, top_pct, min_score_gate
   -> canonical selection-efficiency artifact
+  -> candidate promotion projection
   -> canonical candidate table
 ```
 
@@ -573,8 +578,10 @@ promotion_score =
   - estimated_cost_slippage_penalty
 ```
 
-Where each component is numeric and auditable. Do not encode promotion as qualitative
-labels such as "good" or "fresh"; use thresholds inline in the report legend.
+Where each component is numeric and auditable. `rank_score` remains an evidence-inspection
+score; the canonical candidate table orders by `promotion_score`. Do not encode promotion
+as qualitative labels such as "good" or "fresh"; use thresholds inline in the report
+legend.
 
 Universe reproducibility is part of model efficiency. Current config has
 `potential.universe = "research"`, but effective universe selection is the branch where
@@ -1293,7 +1300,12 @@ candidate-feasibility.csv   # one best ranked row per symbol joined to feasibili
 report.md                   # candidate selection + data health + evidence/model diagnostics
 ```
 
-`candidate-feasibility.csv` is the only top-level candidate table source for the report. `candidate-rank.csv` remains available for per-direction detail, and `watchlist-feasibility.csv` remains available for source/history audit joins.
+`candidate-feasibility.csv` is the only top-level candidate table source for the report.
+It must carry the numeric promotion surface (`promotion_score`, `profit_proxy_score`,
+`tail_utility_mean`, `profit_proxy_per_selected_obs`, `profit_proxy_per_1k_observed`) so
+the renderer does not join/read back HPO or rank artifacts. `candidate-rank.csv` remains
+available for per-direction evidence-inspection detail, and `watchlist-feasibility.csv`
+remains available for source/history audit joins.
 
 A model iteration should be able to reuse materialized artifacts; code should not skip stages ad hoc to finish a scan. Reduce config when necessary, or split materialization from evidence/review in a later workflow command.
 

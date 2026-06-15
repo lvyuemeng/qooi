@@ -13,6 +13,12 @@ CANDIDATE_FEASIBILITY_SCHEMA = {
     "outcome_horizon": pl.Int64,
     "watchlist_feasibility": pl.String,
     "rank_score": pl.Float64,
+    "promotion_score": pl.Float64,
+    "profit_proxy_score": pl.Float64,
+    "profit_proxy_per_selected_obs": pl.Float64,
+    "profit_proxy_per_1k_observed": pl.Float64,
+    "tail_utility_mean": pl.Float64,
+    "tail_utility_p90": pl.Float64,
     "rank_tier": pl.String,
     "source_penalty_score": pl.Float64,
     "required_missing_source_count": pl.Int64,
@@ -54,6 +60,12 @@ _CANDIDATE_SELECTION_COLUMNS = (
     "symbol",
     "outcome_horizon",
     "rank_score",
+    "promotion_score",
+    "profit_proxy_score",
+    "profit_proxy_per_selected_obs",
+    "profit_proxy_per_1k_observed",
+    "tail_utility_mean",
+    "tail_utility_p90",
     "rank_tier",
     "source_penalty_score",
     "required_missing_source_count",
@@ -186,13 +198,15 @@ def candidate_feasibility_frame(
     best = (
         candidate_rank.sort(
             [
-                "rank_score",
+                "promotion_score",
+                "profit_proxy_score",
                 "source_penalty_score",
                 "required_missing_source_count",
                 "required_stale_source_count",
+                "rank_score",
                 "tail_lift",
             ],
-            descending=[True, False, False, False, True],
+            descending=[True, True, False, False, False, True, True],
         )
         .unique(subset=["symbol"], keep="first", maintain_order=True)
         .with_columns(

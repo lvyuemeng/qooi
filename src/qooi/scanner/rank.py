@@ -131,6 +131,8 @@ CANDIDATE_EVIDENCE_SCHEMA: dict[str, PolarsDtype] = {
     "gpd_scale_sigma": pl.Float64,
     "tail_lift_stability": pl.Float64,
     "N_tail_exceedances": pl.UInt32,
+    "tail_utility_mean": pl.Float64,
+    "tail_utility_p90": pl.Float64,
     "leaf_id": pl.Int32,
     "tree_direction": pl.String,
     "score_bucket": pl.String,
@@ -150,6 +152,10 @@ CANDIDATE_RANK_SCHEMA: dict[str, PolarsDtype] = CANDIDATE_EVIDENCE_SCHEMA | {
     "rank_quality_component": pl.Float64,
     "rank_penalty_component": pl.Float64,
     "rank_score": pl.Float64,
+    "profit_proxy_score": pl.Float64,
+    "profit_proxy_per_selected_obs": pl.Float64,
+    "profit_proxy_per_1k_observed": pl.Float64,
+    "promotion_score": pl.Float64,
     "rank_reason": pl.String,
 }
 
@@ -594,6 +600,27 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
         )
         .with_columns(
             (
+                pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0)
+                if has_tail_lift
+                else pl.lit(0.0)
+            ).alias("profit_proxy_score"),
+            (
+                pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0)
+                if has_tail_lift
+                else pl.lit(0.0)
+            ).alias("profit_proxy_per_selected_obs"),
+            (
+                (pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0) * 1000.0)
+                / pl.max_horizontal(
+                    pl.col("conditioned_observations").fill_null(0).cast(pl.Float64),
+                    pl.lit(1.0),
+                )
+                if has_tail_lift
+                else pl.lit(0.0)
+            ).alias("profit_proxy_per_1k_observed"),
+        )
+        .with_columns(
+            (
                 pl.col("rank_information_component")
                 + pl.col("rank_transition_component")
                 + pl.col("rank_tail_component")
@@ -602,6 +629,13 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
                 + pl.col("rank_quality_component")
                 - pl.col("rank_penalty_component")
             ).alias("rank_score"),
+            (
+                pl.col("profit_proxy_score")
+                + pl.col("rank_tail_component")
+                + pl.col("rank_path_component")
+                + pl.col("rank_stability_component")
+                - pl.col("rank_penalty_component")
+            ).alias("promotion_score"),
             pl.when(pl.col("candidate_status") == "matched_evidence")
             .then(pl.lit("matched_selected_evidence"))
             .otherwise(pl.col("candidate_status"))

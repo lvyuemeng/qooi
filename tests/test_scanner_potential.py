@@ -605,13 +605,80 @@ def test_rank_candidate_evidence_penalizes_required_source_gaps_not_optional_abs
     assert row["rank_penalty_component"] == pytest.approx(2.6)
 
 
+def test_rank_candidate_evidence_exposes_profit_proxy_and_promotion_score() -> None:
+    candidates = pl.DataFrame(
+        [
+            {
+                "symbol": "BTC-USDT-SWAP",
+                "decision_timeframe": "1H",
+                "decision_bar_close_ms": 1,
+                "outcome_horizon": 12,
+                "matched_evidence_level": "score_bucket",
+                "candidate_status": "matched_evidence",
+                "statistical_direction": "up",
+                "research_suggestion": "score_bucket_tail_utility",
+                "conditioned_observations": 100,
+                "symbol_count": 20,
+                "conditioned_p_up": 0.4,
+                "conditioned_p_down": 0.2,
+                "conditioned_p_flat": 0.4,
+                "lift_up": 1.4,
+                "lift_down": 0.7,
+                "lift_flat": 1.0,
+                "information_gain_bits": 0.5,
+                "transition_information_gain_bits": 0.2,
+                "tail_up_rate": 0.1,
+                "tail_down_rate": 0.05,
+                "avg_forward_max_return_pct": 4.0,
+                "avg_forward_min_return_pct": -2.0,
+                "avg_path_range_pct": 6.0,
+                "path_skew": 0.3,
+                "returned_to_origin_rate": 0.2,
+                "information_stability": 1.0,
+                "transition_information_stability": 1.0,
+                "evidence_status": "selected",
+                "transition_status": "supported",
+                "source_freshness": "fresh",
+                "source_age_ms": 0,
+                "market_alignment": "aligned",
+                "source_market_alignment": "source_aligned",
+                "required_missing_source_count": 0,
+                "required_stale_source_count": 0,
+                "provider_bounded_source_count": 0,
+                "optional_absent_source_count": 0,
+                "tail_lift": 2.0,
+                "N_tail_exceedances": 50,
+                "tail_utility_mean": 8.0,
+                "tail_utility_p90": 10.0,
+            }
+        ]
+    )
+
+    ranked = potential_rank.rank_candidate_evidence(candidates)
+    row = ranked.row(0, named=True)
+
+    assert "tail_utility_mean" in ranked.columns
+    assert "profit_proxy_score" in ranked.columns
+    assert "promotion_score" in ranked.columns
+    assert row["profit_proxy_score"] == pytest.approx(8.0)
+    assert row["profit_proxy_per_selected_obs"] == pytest.approx(8.0)
+    assert row["profit_proxy_per_1k_observed"] == pytest.approx(80.0)
+    assert row["promotion_score"] > row["rank_score"]
+
+
 def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> None:
     candidate_rank = pl.DataFrame(
         [
             {
                 "symbol": "AAA-USDT-SWAP",
                 "outcome_horizon": 6,
-                "rank_score": 10.0,
+                "rank_score": 20.0,
+                "promotion_score": 1.0,
+                "profit_proxy_score": 0.5,
+                "profit_proxy_per_selected_obs": 0.5,
+                "profit_proxy_per_1k_observed": 50.0,
+                "tail_utility_mean": 0.5,
+                "tail_utility_p90": 1.0,
                 "source_penalty_score": 0.3,
                 "required_missing_source_count": 0,
                 "required_stale_source_count": 1,
@@ -627,7 +694,13 @@ def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> Non
             {
                 "symbol": "AAA-USDT-SWAP",
                 "outcome_horizon": 12,
-                "rank_score": 20.0,
+                "rank_score": 10.0,
+                "promotion_score": 5.0,
+                "profit_proxy_score": 2.0,
+                "profit_proxy_per_selected_obs": 2.0,
+                "profit_proxy_per_1k_observed": 200.0,
+                "tail_utility_mean": 2.0,
+                "tail_utility_p90": 3.0,
                 "source_penalty_score": 0.1,
                 "required_missing_source_count": 0,
                 "required_stale_source_count": 0,
@@ -661,7 +734,9 @@ def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> Non
     row = frame.row(0, named=True)
     assert row["symbol"] == "AAA-USDT-SWAP"
     assert row["outcome_horizon"] == 12
-    assert row["rank_score"] == pytest.approx(20.0)
+    assert row["rank_score"] == pytest.approx(10.0)
+    assert row["promotion_score"] == pytest.approx(5.0)
+    assert row["profit_proxy_score"] == pytest.approx(2.0)
     assert row["tree_direction"] == "down"
     assert row["rank_tier"] == "1"
     assert row["candidate_reason"] == "reviewable"
@@ -738,6 +813,17 @@ def test_report_candidate_selection_uses_typed_rows_not_opaque_dicts() -> None:
     assert "dict[str, object]" not in candidate_section
 
 
+def test_tailtree_report_summary_does_not_read_legacy_artifact_names() -> None:
+    source = Path("src/qooi/scanner/report.py").read_text(encoding="utf-8")
+    section = source.split("class _TreeSummarySection", 1)[1].split(
+        "class _TreeImportanceSection", 1
+    )[0]
+
+    assert "tail-tree-up.json" not in section
+    assert "potential-leaf-evidence-h" not in section
+    assert "legacy_model_paths" not in section
+
+
 def test_potential_run_writes_report_and_diagnostics_without_trading_artifacts(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -777,7 +863,8 @@ mode = "stage"
     assert "## Decision Rule Audit" not in report
     assert "Tiers: 1=top-decile" not in report
     assert (
-        "| Symbol | H | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
+        "| Symbol | H | Feas | Promo | Profit | P/Obs | P/1k | Util | "
+        "Rank | SrcPen | Miss | Stale | Bound | Opt | "
         "Hist% | Cap% | Tree | TailLift | ξ | Reason |" in report
     )
     assert (diagnostics / "coverage.csv").exists()
