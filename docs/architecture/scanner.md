@@ -522,6 +522,12 @@ extra `[[potential.evidence.tailtree.hpo_settings]]` rows are complete named obj
 profile/model instances with their own LightGBM parameters. The diagnostics pipeline trains
 each setting, replays common budgets, appends all rows into the canonical selection-
 efficiency frame, and leaves candidate selection/reporting on the primary setting.
+Replay budgets and feasibility gates are typed under
+`[potential.evidence.tailtree.selection]`; they are shared across the root setting and every
+extra HPO setting so the feedback table compares like with like. Selection config can tune
+`top_k`, `top_pct`, `score_gate`, minimum selected observations/symbols/tails, minimum lift,
+and minimum scanner-internal profit proxy without changing workflow mode or creating a new
+artifact.
 
 Canonical model-selection artifact:
 

@@ -842,6 +842,26 @@ def _tailtree_universe_snapshot_id(inputs) -> str:
     )
 
 
+def _tailtree_selection_budgets(tailtree):
+    selection = tailtree.selection
+    return tailrun_eval.TailtreeSelectionBudgets(
+        top_k=selection.top_k,
+        top_pct=selection.top_pct,
+        score_gate=selection.score_gate,
+    )
+
+
+def _tailtree_selection_feasibility(tailtree):
+    selection = tailtree.selection
+    return tailrun_eval.TailtreeSelectionFeasibilityPolicy(
+        min_selected_observation_count=selection.min_selected_observation_count,
+        min_selected_symbol_count=selection.min_selected_symbol_count,
+        min_selected_tail_count=selection.min_selected_tail_count,
+        min_valid_tail_lift=selection.min_valid_tail_lift,
+        min_profit_proxy_per_selected_obs=selection.min_profit_proxy_per_selected_obs,
+    )
+
+
 def _run_tailtree_pipeline(
     observations,
     source_events,
@@ -895,6 +915,8 @@ def _run_tailtree_pipeline(
                 model_tag=tailtree.model_tag,
                 objective=tailtree.objective,
                 training_profile=tailtree.training_profile,
+                budgets=_tailtree_selection_budgets(tailtree),
+                feasibility=_tailtree_selection_feasibility(tailtree),
             )
         )
         if index == 0:

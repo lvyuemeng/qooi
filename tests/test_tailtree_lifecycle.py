@@ -136,6 +136,16 @@ kind = "tailtree"
 model_tag = "tailtree-grid"
 training_profile = "balanced_baseline"
 
+[potential.evidence.tailtree.selection]
+top_k = [1, 2]
+top_pct = []
+score_gate = [0.5]
+min_selected_observation_count = 25
+min_selected_symbol_count = 1
+min_selected_tail_count = 3
+min_valid_tail_lift = 1.2
+min_profit_proxy_per_selected_obs = 0.1
+
 [[potential.evidence.tailtree.hpo_settings]]
 objective = "tail_utility_quantile"
 training_profile = "sparse_interpretable"
@@ -153,6 +163,15 @@ early_stopping_rounds = 10
     setting = config.evidence.tailtree.hpo_settings[0]
 
     assert config.evidence.tailtree.training_profile == "balanced_baseline"
+    assert config.evidence.tailtree.selection.top_k == (1, 2)
+    assert config.evidence.tailtree.selection.top_pct == ()
+    assert config.evidence.tailtree.selection.score_gate == (0.5,)
+    assert config.evidence.tailtree.selection.min_selected_observation_count == 25
+    assert config.evidence.tailtree.selection.min_selected_tail_count == 3
+    assert config.evidence.tailtree.selection.min_valid_tail_lift == pytest.approx(1.2)
+    assert config.evidence.tailtree.selection.min_profit_proxy_per_selected_obs == pytest.approx(
+        0.1
+    )
     assert setting.objective == "tail_utility_quantile"
     assert setting.training_profile == "sparse_interpretable"
     assert setting.model_tag == "tailtree-grid-quantile-sparse"
@@ -411,6 +430,16 @@ def test_tailtree_pipeline_appends_hpo_setting_feedback_rows(
                         "early_stopping_rounds": 10,
                     },
                 ),
+                selection={
+                    "top_k": (1,),
+                    "top_pct": (),
+                    "score_gate": (0.75,),
+                    "min_selected_observation_count": 50,
+                    "min_selected_symbol_count": 1,
+                    "min_selected_tail_count": 5,
+                    "min_valid_tail_lift": 1.0,
+                    "min_profit_proxy_per_selected_obs": 0.0,
+                },
             ),
         ),
         bar="1H",
@@ -493,6 +522,13 @@ def test_tailtree_pipeline_appends_hpo_setting_feedback_rows(
         "tail_severity_gpd",
         "tail_utility_quantile",
     }
+    assert result.selection_efficiency.select("budget_family", "budget_value").unique().sort(
+        ["budget_family", "budget_value"]
+    ).to_dicts() == [
+        {"budget_family": "score_gate", "budget_value": 0.75},
+        {"budget_family": "top_k", "budget_value": 1.0},
+    ]
+    assert result.selection_efficiency.get_column("feasibility_pass_int").sum() == 0
     persisted_summary = pl.read_csv(tmp_path / "diagnostics" / "tailtree-run-summary.csv")
     assert set(persisted_summary.get_column("objective").unique().to_list()) == {
         "tail_severity_gpd",

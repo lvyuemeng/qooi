@@ -109,6 +109,7 @@ evidence product
     evidence="tailtree"
       → qooi.scanner.tailrun.run(...)
       → if configured, repeat for each [[potential.evidence.tailtree.hpo_settings]]
+      → replay [potential.evidence.tailtree.selection] budgets/feasibility
   outputs:
     potential_evidence plus tailtree model/evidence artifacts
   tailtree model-selection output:

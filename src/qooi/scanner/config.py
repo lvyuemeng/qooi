@@ -67,6 +67,29 @@ class ReviewConfig(BaseModel):
     require_context: bool = True
 
 
+class TailtreeSelectionConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    top_k: tuple[int, ...] = (1, 3, 5, 10)
+    top_pct: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20)
+    score_gate: tuple[float, ...] = ()
+    min_selected_observation_count: int = 10
+    min_selected_symbol_count: int = 1
+    min_selected_tail_count: int = 1
+    min_valid_tail_lift: float = 1.0
+    min_profit_proxy_per_selected_obs: float = 0.0
+
+    @field_validator("top_k")
+    @classmethod
+    def positive_top_k(cls, values: tuple[int, ...]) -> tuple[int, ...]:
+        return tuple(value for value in values if value > 0)
+
+    @field_validator("top_pct")
+    @classmethod
+    def positive_top_pct(cls, values: tuple[float, ...]) -> tuple[float, ...]:
+        return tuple(value for value in values if value > 0.0)
+
+
 class TailtreeHpoSetting(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -95,6 +118,7 @@ class TailtreeConfig(BaseModel):
     num_iterations: int = 200
     early_stopping_rounds: int = 20
     outcome_horizon: tuple[int, ...] = (12,)
+    selection: TailtreeSelectionConfig = TailtreeSelectionConfig()
     hpo_settings: tuple[TailtreeHpoSetting, ...] = ()
 
     @field_validator("outcome_horizon", mode="before")
