@@ -109,7 +109,10 @@ evidence product
     evidence="tailtree"
       → qooi.scanner.tailrun.run(...)
   outputs:
-    potential_evidence plus optional tailtree model/evidence artifacts
+    potential_evidence plus tailtree model/evidence artifacts
+  tailtree model-selection output:
+    tailtree-selection-efficiency.csv is the canonical objective/HPO feedback artifact;
+    tailtree-run-summary.csv is structural run health only
 
 rank product
   current calls:

@@ -436,15 +436,16 @@ efficiency columns:
 and HPO semantics should read it as `selected_profit_proxy_*` once cost/slippage fields are
 available. The architecture must not stop at utility because profit is the final goal.
 
-The candidate selector should evaluate objectives on normalized budgets before promotion:
+The model workflow should evaluate objectives on normalized budgets before promotion:
 
 ```text
 universe snapshot -> observation/outcome frames
+  -> small deterministic objective/training profile grid
   -> objective × horizon × direction training
   -> evidence rows
-  -> candidate score rows
+  -> validation/current candidate score rows
   -> budget replay: top_k, top_pct, min_score_gate
-  -> selection-efficiency summary
+  -> canonical selection-efficiency artifact
   -> canonical candidate table
 ```
 
@@ -463,8 +464,12 @@ profit proxy per selected observation. A candidate set that only looks good beca
 objective admitted a very wide set is inspection evidence, not a promoted high-confidence
 selection.
 
-HPO is a deterministic search over typed objective instances, not an unbounded optimizer
-over the whole workflow:
+HPO starts as a deterministic small grid over typed objective/profile instances, not an
+Optuna dependency and not an unbounded optimizer over the whole workflow. The grid is part
+of the model artifact contract: every trial must produce the same row schema, and the
+winner is explainable by numeric profit-selection columns. `optuna` is allowed only later
+as an optional `[hpo]` extra after the deterministic artifact has stable rows, stable
+budgets, and a score that repeatedly selects sensible winners.
 
 ```text
 HPO grain = universe_snapshot × objective × outcome_horizon × direction × budget_family
@@ -474,6 +479,7 @@ typed instance fields:
   lightgbm_objective        # custom GPD surrogate | quantile
   evidence_bucket           # leaf_id | score_bucket
   selection_budget_family   # top_k | top_pct | score_gate
+  training_profile          # tiny named grid profile, not arbitrary sampler params
   num_leaves
   min_data_in_leaf
   learning_rate
@@ -481,16 +487,45 @@ typed instance fields:
   early_stopping_rounds
 ```
 
-Required HPO artifact:
+Initial grid guidance:
+
+```text
+objectives:
+  tail_severity_gpd
+  tail_utility_quantile
+
+training_profiles:
+  sparse_interpretable   # smaller leaves, higher min_data_in_leaf
+  balanced_baseline      # current default-sized tree
+  broader_quantile       # only if enough train/validation tails exist
+
+budget_families:
+  top_k
+  top_pct
+  score_gate
+```
+
+The first implementation must not add a core dependency. If Optuna is introduced later,
+it must consume the same typed trial objects and write the same artifact; it must not
+create a parallel HPO report, a second artifact family, or sampler-owned column names.
+
+Canonical model-selection artifact:
 
 ```text
 tailtree-selection-efficiency.csv
 ```
 
+This artifact replaces ad-hoc objective-comparison/HPO feedback surfaces. It is the single
+place to compare objective, horizon, direction, training profile, and budget. Do not pile
+another `tailtree-hpo.csv`, `objective-benchmark.csv`, or `selection-summary.csv` beside it.
+`tailtree-run-summary.csv` remains only a structural trainability/coverage artifact
+(`did this run have labels/features/artifacts?`), not the model-selection surface. Candidate
+rank artifacts remain candidate-inspection products; they are not HPO feedback.
+
 Required row grain:
 
 ```text
-model_tag × objective × outcome_horizon × tree_direction × budget_family × budget_value
+model_tag × objective × training_profile × outcome_horizon × tree_direction × budget_family × budget_value
 ```
 
 Required summary columns:
@@ -517,6 +552,8 @@ selected_utility_mean
 selected_utility_p90
 profit_proxy_per_selected_obs
 profit_proxy_per_1k_observed
+hpo_score
+promotion_threshold_pass_int
 trained_tree_count
 selected_bucket_or_leaf_count
 fit_seconds
@@ -724,8 +761,9 @@ Missing or mismatched horizon artifacts fail loudly before candidate ranking; th
 no single-horizon fallback and no synthetic horizon such as `0`.
 
 HPO baseline uses no new dependency first: deterministic small grids over named objective
-and training profiles, written as CSV feedback. `optuna` may be added later as an optional
-`hpo` dependency only after the CSV validation score is stable.
+and training profiles, written only into the canonical `tailtree-selection-efficiency.csv`
+artifact. `optuna` may be added later as an optional `[hpo]` extra only after the artifact
+schema, budget replay, and validation score are stable.
 
 HPO may be added as deterministic blocked/walk-forward search only when:
 

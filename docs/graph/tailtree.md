@@ -211,8 +211,11 @@ The artifact is written as `candidate-horizon-consistency.csv` beside
 `candidate-rank.csv` and is report-only feedback. Candidate promotion still uses the
 canonical ranked candidate rows.
 
-Selection-efficiency/HPO feedback is a separate artifact; it does not replace candidate
-rank rows:
+Selection-efficiency/HPO feedback is the canonical model-selection artifact. It replaces
+ad-hoc objective benchmark/HPO feedback surfaces; do not add parallel `tailtree-hpo.csv`,
+`objective-benchmark.csv`, or `selection-summary.csv` files. It does not replace candidate
+rank rows because candidate rank is the current inspection product, while selection
+efficiency is the model/workflow evaluation product:
 
 ```text
 tailtree-selection-efficiency.csv
@@ -221,7 +224,7 @@ tailtree-selection-efficiency.csv
 Row grain:
 
 ```text
-model_tag × objective × outcome_horizon × tree_direction × budget_family × budget_value
+model_tag × objective × training_profile × outcome_horizon × tree_direction × budget_family × budget_value
 ```
 
 Required columns:
@@ -248,6 +251,8 @@ selected_utility_mean
 selected_utility_p90
 profit_proxy_per_selected_obs
 profit_proxy_per_1k_observed
+hpo_score
+promotion_threshold_pass_int
 trained_tree_count
 selected_bucket_or_leaf_count
 fit_seconds
@@ -266,6 +271,57 @@ raw objective gate widths:
 top_k:      1, 3, 5, 10
 top_pct:    1, 5, 10, 20
 score_gate: calibrated objective-native threshold
+```
+
+Small-grid HPO API graph, first implementation:
+
+```text
+qooi.scanner.tailrun.selection.tailtree_selection_efficiency_frame(
+    candidates: pl.DataFrame,
+    *,
+    run_summary: pl.DataFrame,
+    universe_snapshot_id: str,
+    model_tag: str,
+    objective: str,
+    training_profile: str,
+    budgets: TailtreeSelectionBudgets,
+) -> pl.DataFrame
+
+qooi.scanner.tailrun.selection.write_tailtree_selection_efficiency(
+    frame: pl.DataFrame,
+    diagnostics_dir: Path,
+    model_dir: Path,
+) -> None
+```
+
+Planned typed objects should stay package-local to `tailrun/` and should not introduce a
+new scanner-wide workflow plan:
+
+```text
+TailtreeTrainingProfile
+  name: str
+  num_leaves: int
+  min_data_in_leaf: int
+  learning_rate: float
+  num_iterations: int
+  early_stopping_rounds: int
+
+TailtreeSelectionBudgets
+  top_k: tuple[int, ...] = (1, 3, 5, 10)
+  top_pct: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20)
+  score_gate: tuple[float, ...] = ()
+```
+
+Coding guidance:
+
+```text
+1. Start with deterministic small-grid profiles; do not add Optuna or a core dependency.
+2. Thread `training_profile` through metadata, summaries, and selection-efficiency rows.
+3. Generate all HPO/objective feedback into `tailtree-selection-efficiency.csv` only.
+4. Keep `tailtree-run-summary.csv` as structural trainability coverage only.
+5. Do not add another report section/table for HPO; render the canonical artifact.
+6. If Optuna is added later, put it behind an optional `[hpo]` extra and make it emit the
+   exact same trial/efficiency schema rather than sampler-owned artifacts.
 ```
 
 ### Labeled outcome frame
