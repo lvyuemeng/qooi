@@ -49,6 +49,23 @@ class _FakeScoreTree:
             pl.Series("tailtree_score", [0.10, 0.90, 0.95, 0.99][: len(features)])
         )
 
+
+class _LeafEvidenceMetadata:
+    direction = "up"
+    global_baseline = type("Baseline", (), {"tail_rate": 0.5})()
+    leaf_params = {
+        1: type("Params", (), {"xi": 0.1, "sigma": 1.0})(),
+        2: type("Params", (), {"xi": 0.2, "sigma": 2.0})(),
+    }
+
+
+class _FakeLeafEvidenceTree:
+    metadata = _LeafEvidenceMetadata()
+
+    def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame:
+        return features.with_columns(pl.Series("leaf_id", [1, 1, 2, 2]).cast(pl.Int32))
+
+
 class _Inputs:
     def __init__(self, config: potential.PotentialConfig, diagnostics_dir: Path) -> None:
         self.config = config
@@ -179,6 +196,31 @@ def test_score_bucket_evidence_frame_uses_full_model_scores() -> None:
     assert "leaf_id" not in evidence.columns
     assert evidence.get_column("tail_lift").to_list() == pytest.approx([2.0, 2.0])
     assert evidence.get_column("tail_utility_p90").to_list()[1] == pytest.approx(1.6)
+
+
+def test_leaf_evidence_frame_carries_tail_utility_proxy() -> None:
+    observations = pl.DataFrame(
+        {
+            "symbol": ["A", "B", "C", "D"],
+            "decision_bar_close_ms": [1, 2, 3, 4],
+        }
+    )
+    outcomes = pl.DataFrame(
+        {
+            "symbol": ["A", "B", "C", "D"],
+            "decision_bar_close_ms": [1, 2, 3, 4],
+            "tail_up": [False, True, True, True],
+            "tail_utility_up": [0.0, 0.5, 1.0, 3.0],
+        }
+    )
+
+    evidence = tailtree.leaf_evidence_frame(_FakeLeafEvidenceTree(), observations, outcomes)
+
+    assert "tail_utility_mean" in evidence.columns
+    assert "tail_utility_p90" in evidence.columns
+    row = evidence.filter(pl.col("leaf_id") == 2).row(0, named=True)
+    assert row["tail_utility_mean"] == pytest.approx(2.0)
+    assert row["tail_utility_p90"] == pytest.approx(3.0)
 
 
 def test_tailtree_training_frame_carries_utility_values() -> None:

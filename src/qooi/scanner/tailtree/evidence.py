@@ -39,19 +39,38 @@ def leaf_evidence_frame(
                 "tail_lift_stability": pl.Float64,
                 "leaf_tail_rate": pl.Float64,
                 "global_tail_rate": pl.Float64,
+                "tail_utility_mean": pl.Float64,
+                "tail_utility_p90": pl.Float64,
             }
         )
 
     outcome_by_decision = _tailtree_outcome_by_decision(outcomes)
+    utility_col = f"tail_utility_{tree.metadata.direction}"
+    outcome_columns = ["symbol", "decision_bar_close_ms", tail_col]
+    if utility_col in outcome_by_decision.columns:
+        outcome_columns.append(utility_col)
     joined = with_leaf.join(
-        outcome_by_decision.select("symbol", "decision_bar_close_ms", tail_col),
+        outcome_by_decision.select(outcome_columns),
         on=["symbol", "decision_bar_close_ms"],
         how="left",
+    ).with_columns(
+        pl.col(tail_col).fill_null(False).cast(pl.Boolean).alias(tail_col),
+        (
+            pl.col(utility_col).fill_null(0.0).cast(pl.Float64)
+            if utility_col in outcome_by_decision.columns
+            else pl.lit(0.0)
+        ).alias(utility_col),
     )
 
     leaf_stats = joined.group_by("leaf_id").agg(
         pl.len().cast(pl.UInt32).alias("N_total"),
         pl.col(tail_col).cast(pl.UInt32).sum().alias("N_tail_exceedances"),
+        pl.col(utility_col).filter(pl.col(tail_col)).mean().fill_null(0.0).alias("tail_utility_mean"),
+        pl.col(utility_col)
+        .filter(pl.col(tail_col))
+        .quantile(0.9)
+        .fill_null(0.0)
+        .alias("tail_utility_p90"),
     )
 
     # Recent window
@@ -131,6 +150,8 @@ def leaf_evidence_frame(
         "tail_lift_stability",
         "leaf_tail_rate",
         "global_tail_rate",
+        "tail_utility_mean",
+        "tail_utility_p90",
     )
 
 

@@ -621,6 +621,9 @@ def _tailtree_outcome_by_decision(outcomes: pl.DataFrame) -> pl.DataFrame:
     for col in ("tail_up", "tail_down", "direction_changed", "returned_to_origin"):
         if col in outcomes.columns:
             exprs.append(pl.col(col).fill_null(False).cast(pl.Boolean).max().alias(col))
+    for col in ("tail_utility_up", "tail_utility_down"):
+        if col in outcomes.columns:
+            exprs.append(pl.col(col).fill_null(0.0).cast(pl.Float64).max().alias(col))
     if not exprs:
         return outcomes.select("symbol", "decision_bar_close_ms").unique()
     return outcomes.group_by("symbol", "decision_bar_close_ms").agg(*exprs)
