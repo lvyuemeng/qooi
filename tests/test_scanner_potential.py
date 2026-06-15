@@ -887,6 +887,9 @@ def test_tailtree_selection_efficiency_report_projects_budget_winners() -> None:
                 "model_tag": ["tag", "tag"],
                 "objective": ["tail_utility_quantile", "tail_utility_quantile"],
                 "training_profile": ["balanced_baseline", "balanced_baseline"],
+                "outcome_label_family": ["path_extreme_return", "path_extreme_return"],
+                "comparison_surface": ["selection_efficiency", "selection_efficiency"],
+                "objective_score_comparable_int": [0, 0],
                 "outcome_horizon": [12, 12],
                 "tree_direction": ["up", "up"],
                 "budget_family": ["top_k", "top_k"],
@@ -921,6 +924,9 @@ def test_tailtree_selection_efficiency_report_projects_budget_winners() -> None:
         "| 12 | up | tail_utility_quantile | balanced_baseline | top_k=3.0000 | 1 |"
         in rendered
     )
+    assert "## Tail Tree HPO Feedback" in rendered
+    assert "| Rank | H | Dir | Obj | Profile | Budget | Feas | Score | Margin |" in rendered
+    assert "| 1 | 12 | up | tail_utility_quantile | balanced_baseline | top_k=3.0000 |" in rendered
 
 
 def test_report_candidate_selection_uses_typed_rows_not_opaque_dicts() -> None:

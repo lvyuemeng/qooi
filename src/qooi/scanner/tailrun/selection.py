@@ -526,6 +526,89 @@ def select_tailtree_objective_winners(selection_efficiency: pl.DataFrame) -> pl.
     )
 
 
+def tailtree_hpo_feedback_frame(selection_efficiency: pl.DataFrame) -> pl.DataFrame:
+    group_cols = [
+        "universe_snapshot_id",
+        "outcome_label_family",
+        "outcome_horizon",
+        "tree_direction",
+    ]
+    required = {
+        *group_cols,
+        "objective",
+        "training_profile",
+        "budget_family",
+        "budget_value",
+        "selected_observation_rate",
+        "selected_tail_count",
+        "valid_tail_lift",
+        "profit_proxy_per_selected_obs",
+        "profit_proxy_per_1k_observed",
+        "promotion_threshold_pass_int",
+        "feasibility_pass_int",
+    }
+    if selection_efficiency.is_empty() or not required.issubset(selection_efficiency.columns):
+        return selection_efficiency.head(0).with_columns(
+            pl.lit(None, dtype=pl.String).alias("hpo_setting_id"),
+            pl.lit(None, dtype=pl.Float64).alias("hpo_feedback_score"),
+            pl.lit(None, dtype=pl.Float64).alias("hpo_feedback_margin_to_best"),
+            pl.lit(None, dtype=pl.Int64).alias("hpo_feedback_rank"),
+            pl.lit(None, dtype=pl.Int64).alias("hpo_feedback_selected_int"),
+        )
+    sorted_feedback = selection_efficiency.with_columns(
+        _winner_score_expr(group_cols, has_feasibility=True).alias("hpo_feedback_score"),
+        pl.concat_str(
+            [
+                pl.col("objective"),
+                pl.col("training_profile"),
+                pl.col("budget_family"),
+                pl.col("budget_value").cast(pl.String),
+            ],
+            separator="|",
+        ).alias("hpo_setting_id"),
+    ).sort(
+        [
+            *group_cols,
+            "feasibility_pass_int",
+            "hpo_feedback_score",
+            "profit_proxy_per_selected_obs",
+            "profit_proxy_per_1k_observed",
+            "valid_tail_lift",
+            "selected_observation_rate",
+            "objective",
+            "training_profile",
+            "budget_family",
+            "budget_value",
+        ],
+        descending=[
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+        ],
+    )
+    return sorted_feedback.with_columns(
+        (pl.cum_count("hpo_feedback_score").over(group_cols)).cast(pl.Int64).alias(
+            "hpo_feedback_rank"
+        ),
+        (pl.col("hpo_feedback_score").max().over(group_cols) - pl.col("hpo_feedback_score"))
+        .cast(pl.Float64)
+        .alias("hpo_feedback_margin_to_best"),
+    ).with_columns(
+        (pl.col("hpo_feedback_rank") == 1).cast(pl.Int64).alias("hpo_feedback_selected_int")
+    )
+
+
 def write_tailtree_selection_efficiency(
     frame: pl.DataFrame,
     diagnostics_dir: Path | str,
@@ -553,6 +636,7 @@ __all__ = [
     "UniverseSnapshotId",
     "select_tailtree_budget_winners",
     "select_tailtree_objective_winners",
+    "tailtree_hpo_feedback_frame",
     "tailtree_selection_efficiency_frame",
     "write_tailtree_selection_efficiency",
 ]

@@ -12,7 +12,7 @@ from typing import Protocol
 import polars as pl
 
 from qooi.scanner import ReportInputs
-from qooi.scanner.tailrun import select_tailtree_budget_winners
+from qooi.scanner.tailrun import select_tailtree_budget_winners, tailtree_hpo_feedback_frame
 
 # ── Protocol ─────────────────────────────────────────────────────────────────
 
@@ -703,6 +703,39 @@ class _TreeSelectionEfficiencySection:
                 f"{_int_value(row.get('selected_symbol_count'))} | "
                 f"{_int_value(row.get('selected_tail_count'))} |"
             )
+        feedback = tailtree_hpo_feedback_frame(efficiency)
+        if not feedback.is_empty():
+            lines.extend(
+                [
+                    "",
+                    "## Tail Tree HPO Feedback",
+                    "",
+                    "- Rows rank objective/profile/budget settings on the shared "
+                    "selection-efficiency surface.",
+                    "- Score ignores raw hpo_score and objective-native units; "
+                    "Margin is best-score minus row-score within horizon/direction.",
+                    "",
+                    "| Rank | H | Dir | Obj | Profile | Budget | Feas | Score | Margin | "
+                    "Proxy/Obs | Proxy/1k | Lift | Obs | Tail |",
+                    "|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                ]
+            )
+            for row in feedback.head(12).iter_rows(named=True):
+                budget = f"{row['budget_family']}={_fmt(row.get('budget_value'))}"
+                lines.append(
+                    f"| {_int_value(row.get('hpo_feedback_rank'))} | "
+                    f"{_int_value(row.get('outcome_horizon'))} | "
+                    f"{row.get('tree_direction')} | {row.get('objective')} | "
+                    f"{row.get('training_profile')} | {budget} | "
+                    f"{_int_value(row.get('feasibility_pass_int'))} | "
+                    f"{_fmt(row.get('hpo_feedback_score'))} | "
+                    f"{_fmt(row.get('hpo_feedback_margin_to_best'))} | "
+                    f"{_fmt(row.get('profit_proxy_per_selected_obs'))} | "
+                    f"{_fmt(row.get('profit_proxy_per_1k_observed'))} | "
+                    f"{_fmt(row.get('valid_tail_lift'))} | "
+                    f"{_int_value(row.get('selected_observation_count'))} | "
+                    f"{_int_value(row.get('selected_tail_count'))} |"
+                )
         return "\n".join(lines)
 
 

@@ -114,10 +114,11 @@ evidence product
     qooi.scanner.tailrun.tailtree_selection_efficiency_frame(...)
     qooi.scanner.tailrun.select_tailtree_budget_winners(...)
     qooi.scanner.tailrun.select_tailtree_objective_winners(...)
+    qooi.scanner.tailrun.tailtree_hpo_feedback_frame(...)
     tailtree-selection-efficiency.csv is the canonical objective/HPO feedback artifact;
     objective-native scores are private (`objective_score_comparable_int=0`);
-    budget/objective winners are in-memory normalized opportunity projections over
-    shared selection-efficiency and feasibility columns;
+    budget/objective winners and HPO feedback are in-memory normalized opportunity
+    projections over shared selection-efficiency and feasibility columns;
     tailtree-run-summary.csv is structural run health only
 
 rank product

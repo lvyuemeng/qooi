@@ -596,6 +596,11 @@ The report may render this projection as a compact Tail Tree Selection Efficienc
 selection-efficiency surfaces across objectives at `universe_snapshot_id ×
 outcome_label_family × outcome_horizon × tree_direction` grain; infeasible rows cannot win
 just because their private objective or raw `hpo_score` is larger.
+`qooi.scanner.tailrun.tailtree_hpo_feedback_frame(...)` renders every objective/profile/
+budget row as deterministic HPO feedback over that same surface. Its feedback score and
+rank are derived from feasible support/concentration/utility columns, not objective-native
+loss units, and its margin-to-best is computed within each horizon/direction group. This is
+an in-memory projection over `tailtree-selection-efficiency.csv`, not a new artifact.
 
 Acceptance rule:
 

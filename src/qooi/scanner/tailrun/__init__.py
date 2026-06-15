@@ -18,6 +18,7 @@ from qooi.scanner.tailrun.selection import (
     UniverseSnapshotId,
     select_tailtree_budget_winners,
     select_tailtree_objective_winners,
+    tailtree_hpo_feedback_frame,
     tailtree_selection_efficiency_frame,
     write_tailtree_selection_efficiency,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "UniverseSnapshotId",
     "select_tailtree_budget_winners",
     "select_tailtree_objective_winners",
+    "tailtree_hpo_feedback_frame",
     "tailtree_selection_efficiency_frame",
     "write_tailtree_selection_efficiency",
 ]

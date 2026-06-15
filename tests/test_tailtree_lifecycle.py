@@ -877,8 +877,66 @@ def test_tailtree_objective_winners_compare_feasible_shared_surfaces_not_raw_sco
     assert winners.height == 1
     winner = winners.row(0, named=True)
     assert winner["objective"] == "tail_utility_quantile"
-    assert winner["model_tag"] == "quantile-model"
-    assert winner["objective_winner_rank"] == 1
+    assert winner["feasibility_pass_int"] == 1
+    assert winner["hpo_score"] == pytest.approx(1.0)
+
+
+def test_tailtree_hpo_feedback_ranks_settings_by_feasible_selection_surface() -> None:
+    efficiency = pl.DataFrame(
+        {
+            "universe_snapshot_id": ["u", "u", "u"],
+            "model_tag": ["gpd", "quantile", "quantile"],
+            "objective": [
+                "tail_severity_gpd",
+                "tail_utility_quantile",
+                "tail_utility_quantile",
+            ],
+            "training_profile": [
+                "balanced_baseline",
+                "balanced_baseline",
+                "sparse_interpretable",
+            ],
+            "outcome_label_family": [
+                "path_extreme_return",
+                "path_extreme_return",
+                "path_extreme_return",
+            ],
+            "comparison_surface": [
+                "selection_efficiency",
+                "selection_efficiency",
+                "selection_efficiency",
+            ],
+            "objective_score_comparable_int": [0, 0, 0],
+            "outcome_horizon": [12, 12, 12],
+            "tree_direction": ["up", "up", "up"],
+            "budget_family": ["top_k", "top_k", "top_pct"],
+            "budget_value": [1.0, 3.0, 0.05],
+            "selected_symbol_count": [1, 3, 4],
+            "selected_observation_count": [8, 60, 80],
+            "selected_observation_rate": [0.08, 0.60, 0.80],
+            "selected_tail_count": [6, 18, 20],
+            "valid_tail_lift": [3.0, 2.4, 1.7],
+            "profit_proxy_per_selected_obs": [2.0, 1.2, 0.9],
+            "profit_proxy_per_1k_observed": [0.1, 0.8, 0.5],
+            "hpo_score": [9999.0, 1.0, 2.0],
+            "promotion_threshold_pass_int": [1, 1, 1],
+            "feasibility_pass_int": [0, 1, 1],
+        }
+    )
+
+    feedback = tailrun.tailtree_hpo_feedback_frame(efficiency)
+    selected = feedback.filter(pl.col("hpo_feedback_selected_int") == 1).row(0, named=True)
+
+    assert selected["objective"] == "tail_utility_quantile"
+    assert selected["training_profile"] == "balanced_baseline"
+    assert selected["budget_family"] == "top_k"
+    assert selected["budget_value"] == pytest.approx(3.0)
+    assert selected["hpo_feedback_rank"] == 1
+    assert selected["objective_score_comparable_int"] == 0
+    assert selected["hpo_score"] == pytest.approx(1.0)
+    assert selected["hpo_feedback_score"] > 0.0
+    assert selected["hpo_score"] < feedback.get_column("hpo_score").max()
+    assert feedback.get_column("hpo_setting_id").n_unique() == 3
 
 
 def test_tailtree_selection_efficiency_writer_replaces_canonical_artifact(
