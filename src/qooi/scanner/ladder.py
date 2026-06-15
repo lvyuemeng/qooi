@@ -19,6 +19,7 @@ class LadderResult:
     evidence: pl.DataFrame
     candidates: pl.DataFrame
     ranked: pl.DataFrame
+    selection_efficiency: pl.DataFrame
     sections: tuple
 
 

@@ -94,6 +94,7 @@ class TailtreeResult:
     evidence: pl.DataFrame
     candidates: pl.DataFrame
     ranked: pl.DataFrame
+    selection_efficiency: pl.DataFrame
     models: dict[tuple[int, TailtreeDirection], TailtreeArtifactTree]
     sections: tuple
 

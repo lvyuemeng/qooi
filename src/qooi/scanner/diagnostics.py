@@ -55,6 +55,7 @@ class DiagnosticFrames:
     potential_evidence: pl.DataFrame
     candidate_evidence: pl.DataFrame
     candidate_rank: pl.DataFrame
+    tailtree_selection_efficiency: pl.DataFrame
     candidate_horizon_consistency: pl.DataFrame
     candidate_feasibility: pl.DataFrame
     source_timeliness: pl.DataFrame
@@ -219,6 +220,7 @@ def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> D
         potential_evidence=pipeline_result.evidence,
         candidate_evidence=pipeline_result.candidates,
         candidate_rank=pipeline_result.ranked,
+        tailtree_selection_efficiency=pipeline_result.selection_efficiency,
         candidate_horizon_consistency=rank_eval.candidate_horizon_consistency_frame(
             pipeline_result.candidates
         ),
@@ -282,6 +284,7 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         "potential-evidence-selected": _selected_potential_evidence(frames.potential_evidence),
         "candidate-inspection": frames.candidate_evidence,
         "candidate-rank": frames.candidate_rank,
+        "tailtree-selection-efficiency": frames.tailtree_selection_efficiency,
         "candidate-horizon-consistency": frames.candidate_horizon_consistency,
         "candidate-feasibility": frames.candidate_feasibility,
         "source-timeliness": frames.source_timeliness,
@@ -776,7 +779,15 @@ def _run_ladder_pipeline(
         candidates, inputs.context.availability
     )
     ranked = rank_eval.rank_candidate_evidence(candidates)
-    return LadderResult(evidence=evidence, candidates=candidates, ranked=ranked, sections=())
+    return LadderResult(
+        evidence=evidence,
+        candidates=candidates,
+        ranked=ranked,
+        selection_efficiency=pl.DataFrame(
+            schema=tailrun_eval.TAILTREE_SELECTION_EFFICIENCY_SCHEMA
+        ),
+        sections=(),
+    )
 
 
 def _run_tailtree_pipeline(
@@ -803,10 +814,31 @@ def _run_tailtree_pipeline(
         candidates, inputs.context.availability
     )
     ranked = rank_eval.rank_candidate_evidence(candidates)
+    summary_path = inputs.artifacts.diagnostics_dir / "tailtree-run-summary.csv"
+    summary = pl.read_csv(summary_path) if summary_path.exists() else pl.DataFrame()
+    tailtree = inputs.config.evidence.tailtree
+    model_root = Path(tailtree.model_dir) / tailtree.model_tag
+    selection_efficiency = tailrun_eval.tailtree_selection_efficiency_frame(
+        ranked,
+        run_summary=summary,
+        universe_snapshot_id=(
+            f"{inputs.config.bar}:{inputs.config.days}:"
+            f"{inputs.universe.eligible_count}:{len(inputs.universe.symbols)}"
+        ),
+        model_tag=tailtree.model_tag,
+        objective=tailtree.objective,
+        training_profile="balanced_baseline",
+    )
+    tailrun_eval.write_tailtree_selection_efficiency(
+        selection_efficiency,
+        inputs.artifacts.diagnostics_dir,
+        model_root,
+    )
     return TailtreeResult(
         evidence=result.evidence,
         candidates=candidates,
         ranked=ranked,
+        selection_efficiency=selection_efficiency,
         models=result.models,
         sections=(),
     )

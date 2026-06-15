@@ -648,3 +648,91 @@ def test_tailtree_training_features_exclude_ephemeral_current_review_columns() -
     assert "buy_sell_ratio" not in continuous
     assert "book_age_ms" not in continuous
     assert "trade_age_ms" not in continuous
+
+
+def test_tailtree_selection_efficiency_frame_replays_equal_topk_budgets() -> None:
+    candidates = pl.DataFrame(
+        {
+            "symbol": ["BTC", "ETH", "SOL"],
+            "decision_timeframe": ["1H", "1H", "1H"],
+            "candidate_status": ["matched_evidence", "matched_evidence", "matched_evidence"],
+            "outcome_horizon": [12, 12, 12],
+            "tree_direction": ["up", "up", "up"],
+            "rank_score": [9.0, 5.0, 1.0],
+            "tail_lift": [3.0, 2.0, 1.2],
+            "N_tail_exceedances": [4, 2, 1],
+            "tail_utility_mean": [1.5, 0.5, 0.1],
+            "tail_utility_p90": [2.0, 0.8, 0.2],
+        }
+    )
+    run_summary = pl.DataFrame(
+        {
+            "summary_scope": ["up"],
+            "objective": ["tail_utility_quantile"],
+            "outcome_horizon": [12],
+            "direction": ["up"],
+            "observation_row_count": [100],
+            "feature_count": [7],
+            "train_exceedance_count": [20],
+            "valid_observation_count": [50],
+            "valid_tail_count": [5],
+            "valid_tail_rate": [0.1],
+            "trained_tree_count": [1],
+            "selected_leaf_count": [2],
+        }
+    )
+
+    efficiency = tailrun.tailtree_selection_efficiency_frame(
+        candidates,
+        run_summary=run_summary,
+        universe_snapshot_id="fixture-universe",
+        model_tag="tailtree-fixture",
+        objective="tail_utility_quantile",
+        training_profile="balanced_baseline",
+        budgets=tailrun.TailtreeSelectionBudgets(top_k=(1, 2), top_pct=(), score_gate=()),
+    )
+
+    assert efficiency.select("budget_family", "budget_value").to_dicts() == [
+        {"budget_family": "top_k", "budget_value": 1.0},
+        {"budget_family": "top_k", "budget_value": 2.0},
+    ]
+    top_one = efficiency.row(0, named=True)
+    assert top_one["model_tag"] == "tailtree-fixture"
+    assert top_one["training_profile"] == "balanced_baseline"
+    assert top_one["selected_symbol_count"] == 1
+    assert top_one["selected_observation_count"] == 1
+    assert top_one["selected_tail_count"] == 4
+    assert top_one["selected_profit_proxy_mean"] == 1.5
+    assert top_one["profit_proxy_per_selected_obs"] == 1.5
+    assert top_one["hpo_score"] > 0.0
+    assert top_one["promotion_threshold_pass_int"] == 1
+
+
+def test_tailtree_selection_efficiency_writer_replaces_canonical_artifact(
+    tmp_path: Path,
+) -> None:
+    frame = pl.DataFrame(
+        {
+            "model_tag": ["tailtree-fixture"],
+            "objective": ["tail_severity_gpd"],
+            "training_profile": ["balanced_baseline"],
+            "outcome_horizon": [12],
+            "tree_direction": ["up"],
+            "budget_family": ["top_k"],
+            "budget_value": [1.0],
+        }
+    )
+    diagnostics_dir = tmp_path / "diagnostics"
+    model_dir = tmp_path / "models" / "tailtree-fixture"
+    diagnostics_dir.mkdir()
+    model_dir.mkdir(parents=True)
+    stale = diagnostics_dir / "tailtree-selection-efficiency.csv"
+    stale.write_text("stale\n", encoding="utf-8")
+
+    tailrun.write_tailtree_selection_efficiency(frame, diagnostics_dir, model_dir)
+
+    assert "stale" not in stale.read_text(encoding="utf-8")
+    assert pl.read_csv(stale).height == 1
+    assert pl.read_csv(model_dir / "tailtree-selection-efficiency.csv").height == 1
+    assert not (diagnostics_dir / "tailtree-hpo.csv").exists()
+    assert not (diagnostics_dir / "objective-benchmark.csv").exists()

@@ -8,6 +8,16 @@ from qooi.scanner.tailrun.core import (
     run,
     train_evaluate_predict,
 )
+from qooi.scanner.tailrun.selection import (
+    TAILTREE_SELECTION_EFFICIENCY_SCHEMA,
+    TailtreeModelTag,
+    TailtreeSelectionBudgets,
+    TailtreeSelectionContext,
+    TailtreeTrainingProfile,
+    UniverseSnapshotId,
+    tailtree_selection_efficiency_frame,
+    write_tailtree_selection_efficiency,
+)
 from qooi.scanner.tailrun.types import (
     TailtreeArtifactMetadata,
     TailtreeArtifactTree,
@@ -25,11 +35,19 @@ __all__ = [
     "load_predict",
     "run",
     "train_evaluate_predict",
+    "TAILTREE_SELECTION_EFFICIENCY_SCHEMA",
     "TailtreeArtifactMetadata",
     "TailtreeArtifactTree",
     "TailtreeDirection",
     "TailtreeDirectionQuality",
     "TailtreeEvidenceResult",
     "TailtreeModelMetadata",
+    "TailtreeModelTag",
     "TailtreeResult",
+    "TailtreeSelectionBudgets",
+    "TailtreeSelectionContext",
+    "TailtreeTrainingProfile",
+    "UniverseSnapshotId",
+    "tailtree_selection_efficiency_frame",
+    "write_tailtree_selection_efficiency",
 ]
