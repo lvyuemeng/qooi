@@ -224,12 +224,21 @@ tailtree-selection-efficiency.csv
 Row grain:
 
 ```text
-model_tag × objective × training_profile × outcome_horizon × tree_direction × budget_family × budget_value
+trial_id × fold_id × model_tag × objective × training_profile × outcome_horizon × tree_direction × budget_family × budget_value
 ```
 
 Required columns:
 
 ```text
+trial_id
+trial_source
+fold_id
+evaluation_protocol
+train_start_ms
+train_end_ms
+valid_start_ms
+valid_end_ms
+embargo_bars
 universe_snapshot_id
 eligible_symbol_count
 selected_symbol_count
@@ -285,6 +294,7 @@ qooi.scanner.tailrun.selection.tailtree_selection_efficiency_frame(
     objective: str,
     training_profile: str,
     budgets: TailtreeSelectionBudgets,
+    feasibility: TailtreeSelectionFeasibilityPolicy,
 ) -> pl.DataFrame
 
 qooi.scanner.tailrun.selection.write_tailtree_selection_efficiency(
@@ -294,17 +304,29 @@ qooi.scanner.tailrun.selection.write_tailtree_selection_efficiency(
 ) -> None
 ```
 
-Planned typed objects should stay package-local to `tailrun/` and should not introduce a
-new scanner-wide workflow plan:
+Decoupled tuning API graph, target shape:
 
 ```text
-TailtreeTrainingProfile
-  name: str
+TailtreeTrialSpec
+  trial_id: str
+  trial_source: Literal["primary", "fixed", "search"]
+  model_tag: str
+  objective: str
+  training_profile: str
   num_leaves: int
   min_data_in_leaf: int
   learning_rate: float
   num_iterations: int
   early_stopping_rounds: int
+
+TailtreeEvaluationSpec
+  evaluation_protocol: Literal["single_split", "walkforward"]
+  fold_id: int
+  train_start_ms: int | None
+  train_end_ms: int | None
+  valid_start_ms: int | None
+  valid_end_ms: int | None
+  embargo_bars: int
 
 TailtreeSelectionBudgets
   top_k: tuple[int, ...] = (1, 3, 5, 10)
@@ -315,13 +337,14 @@ TailtreeSelectionBudgets
 Coding guidance:
 
 ```text
-1. Start with deterministic small-grid profiles; do not add Optuna or a core dependency.
-2. Thread `training_profile` through metadata, summaries, and selection-efficiency rows.
-3. Generate all HPO/objective feedback into `tailtree-selection-efficiency.csv` only.
-4. Keep `tailtree-run-summary.csv` as structural trainability coverage only.
-5. Do not add another report section/table for HPO; render the canonical artifact.
-6. If Optuna is added later, put it behind an optional `[hpo]` extra and make it emit the
-   exact same trial/efficiency schema rather than sampler-owned artifacts.
+1. Keep fixed trials, sampler/search, walkforward evaluation, and selection replay separate.
+2. Treat current [[potential.evidence.tailtree.hpo_settings]] as transitional fixed trials.
+3. Do not put Optuna state, fold settings, or selection gates into the fixed-trial shape.
+4. Walkforward must be available to one fixed parameter set without HPO search.
+5. Optuna, if added, is an optional trial source only; it emits TailtreeTrialSpec rows.
+6. Generate all tuning/objective feedback into `tailtree-selection-efficiency.csv` only.
+7. Keep `tailtree-run-summary.csv` as structural trainability coverage only.
+8. Do not add sampler-owned artifacts or another report section/table for HPO.
 ```
 
 ### Labeled outcome frame

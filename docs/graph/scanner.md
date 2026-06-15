@@ -107,8 +107,9 @@ evidence product
     evidence="ladder"
       → qooi.scanner.ladder.potential_evidence_frame(...)
     evidence="tailtree"
-      → qooi.scanner.tailrun.run(...)
-      → if configured, repeat for each [[potential.evidence.tailtree.hpo_settings]]
+      → trial source emits primary/fixed/search trial specs
+      → evaluation protocol emits single-split or walkforward fold specs
+      → qooi.scanner.tailrun.run(...) per trial × fold × horizon × direction
       → replay [potential.evidence.tailtree.selection] budgets/feasibility
   outputs:
     potential_evidence plus tailtree model/evidence artifacts
@@ -118,6 +119,7 @@ evidence product
     qooi.scanner.tailrun.select_tailtree_objective_winners(...)
     qooi.scanner.tailrun.tailtree_hpo_feedback_frame(...)
     tailtree-selection-efficiency.csv is the canonical objective/HPO feedback artifact;
+    trial source, evaluation protocol, and selection replay are orthogonal typed inputs;
     objective-native scores are private (`objective_score_comparable_int=0`);
     budget/objective winners and HPO feedback are in-memory normalized opportunity
     projections over shared selection-efficiency and feasibility columns;

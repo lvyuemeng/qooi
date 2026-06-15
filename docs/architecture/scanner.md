@@ -447,19 +447,36 @@ The model workflow should evaluate objectives on normalized budgets before promo
 
 ```text
 universe snapshot -> observation/outcome frames
-  -> small deterministic objective/training profile grid
-  -> objective × horizon × direction training
+  -> trial source: primary config | fixed trial list | optional sampler
+  -> evaluation protocol: single split | walkforward folds
+  -> objective × horizon × direction training with one fixed trial parameter set
   -> evidence rows
   -> validation/current candidate score rows
-  -> budget replay: top_k, top_pct, min_score_gate
+  -> budget replay: top_k, top_pct, score_gate
   -> canonical selection-efficiency artifact
   -> candidate promotion projection
   -> canonical candidate table
 ```
 
-Budget replay is the key design correction. A wide quantile gate and a sparse GPD gate
-cannot be compared only by raw selected counts. Every objective/horizon/direction row must
-be replayable under the same budget families:
+These concerns are orthogonal and must not be fused into one workflow flag:
+
+| Concern | Owns | Does not own |
+|---|---|---|
+| fixed trial parameters | objective, training profile, LGBM params, threshold | fold construction, sampler state, artifact names |
+| trial source | primary config, explicit fixed trial list, optional sampler-generated trial stream | model training semantics, selection scoring |
+| evaluation protocol | single chronological split or walkforward folds | hyperparameter sampling, profile naming |
+| selection replay | top-k/top-pct/score-gate budgets and support/concentration/utility gates | tree training, fold boundaries, sampler pruning |
+| feedback projection | normalized selection-efficiency score/rank/margin | new artifact families, objective-native loss comparison |
+
+Walkforward is a training/evaluation protocol, not an HPO feature. A fixed-parameter scan
+may run under walkforward; an HPO search must run under walkforward when it selects
+parameters; and manual deterministic trials use the same protocol. The final full-window
+model may be retrained after the trial is selected, but trial selection must use only
+validation folds whose timestamps are strictly after their training windows.
+
+Budget replay is a selection concern. A wide quantile gate and a sparse GPD gate cannot be
+compared only by raw selected counts. Every objective/horizon/direction row must be
+replayable under independently configured budget families:
 
 ```text
 top_k      = 1, 3, 5, 10
@@ -472,30 +489,44 @@ profit proxy per selected observation. A candidate set that only looks good beca
 objective admitted a very wide set is inspection evidence, not a promoted high-confidence
 selection.
 
-HPO starts as a deterministic small grid over typed objective/profile instances, not an
-Optuna dependency and not an unbounded optimizer over the whole workflow. The grid is part
-of the model artifact contract: every trial must produce the same row schema, and the
-winner is explainable by numeric profit-selection columns. `optuna` is allowed only later
-as an optional `[hpo]` extra after the deterministic artifact has stable rows, stable
-budgets, and a score that repeatedly selects sensible winners.
+HPO search is a trial generator only. It is orthogonal to multiple fixed profiles and to
+walkforward evaluation. A hand-written trial list and an Optuna study both emit the same
+typed trial shape; neither is allowed to create sampler-owned artifact names, bypass
+walkforward, or compare objective-native loss units directly. The grid/search choice is
+therefore a source of trial parameters, not a workflow mode.
 
 ```text
-HPO grain = universe_snapshot × objective × outcome_horizon × direction × budget_family
+feedback row grain = universe_snapshot × trial_id × fold_id × objective × outcome_horizon × direction × budget_family
 
-typed instance fields:
+typed trial fields:
+  trial_id                  # stable opaque id: primary | fixed:<name> | search:<study>:<n>
+  trial_source              # primary | fixed | search
   target_basis              # raw_exceedance | path_utility
   lightgbm_objective        # custom GPD surrogate | quantile
   evidence_bucket           # leaf_id | score_bucket
-  selection_budget_family   # top_k | top_pct | score_gate
-  training_profile          # tiny named grid profile, not arbitrary sampler params
+  training_profile          # named label, independent from search/manual source
   num_leaves
   min_data_in_leaf
   learning_rate
   num_iterations
   early_stopping_rounds
+
+typed evaluation fields:
+  evaluation_protocol       # single_split | walkforward
+  fold_id                   # primary/current split can be fold_id = 0
+  train_start_ms
+  train_end_ms
+  valid_start_ms
+  valid_end_ms
+  embargo_bars
+
+typed selection fields:
+  selection_budget_family   # top_k | top_pct | score_gate
+  selection_budget_value
+  feasibility gate values
 ```
 
-Initial grid guidance:
+Initial deterministic trial guidance:
 
 ```text
 objectives:
@@ -513,21 +544,24 @@ budget_families:
   score_gate
 ```
 
-The first implementation must not add a core dependency. If Optuna is introduced later,
-it must consume the same typed trial objects and write the same artifact; it must not
-create a parallel HPO report, a second artifact family, or sampler-owned column names.
-The workflow entrypoint remains the monolithic `[potential]` config, but tailtree owns the
-grid under `[potential.evidence.tailtree]`. The root tailtree config is the primary setting;
-extra `[[potential.evidence.tailtree.hpo_settings]]` rows are complete named objective/
-profile/model instances with their own LightGBM parameters. The diagnostics pipeline trains
-each setting, replays common budgets, appends all rows into the canonical selection-
-efficiency frame, and leaves candidate selection/reporting on the primary setting.
-Replay budgets and feasibility gates are typed under
-`[potential.evidence.tailtree.selection]`; they are shared across the root setting and every
-extra HPO setting so the feedback table compares like with like. Selection config can tune
-`top_k`, `top_pct`, `score_gate`, minimum selected observations/symbols/tails, minimum lift,
-and minimum scanner-internal profit proxy without changing workflow mode or creating a new
-artifact.
+The workflow entrypoint remains the monolithic `[potential]` config, but tailtree sections
+are decoupled:
+
+```text
+[potential.evidence.tailtree]                 # primary fixed trial/model identity
+[[potential.evidence.tailtree.trials]]        # optional fixed trial list, if used
+[potential.evidence.tailtree.search]          # optional sampler/trial generator, if used
+[potential.evidence.tailtree.evaluation]      # single_split or walkforward protocol
+[potential.evidence.tailtree.selection]       # replay budgets and feasibility gates
+```
+
+The currently implemented `[[potential.evidence.tailtree.hpo_settings]]` shape is a fixed
+trial-list slice and should be treated as transitional naming. It must not grow search,
+walkforward, or selection fields. The next migration should rename/reshape it toward
+`trials` and move evaluation/search ownership into their own typed sections without changing
+the canonical artifact. Replay budgets and feasibility gates remain under
+`[potential.evidence.tailtree.selection]`; they are shared across every trial and every fold
+so feedback compares like with like.
 
 Canonical model-selection artifact:
 
@@ -545,12 +579,21 @@ rank artifacts remain candidate-inspection products; they are not HPO feedback.
 Required row grain:
 
 ```text
-model_tag × objective × training_profile × outcome_horizon × tree_direction × budget_family × budget_value
+trial_id × fold_id × model_tag × objective × training_profile × outcome_horizon × tree_direction × budget_family × budget_value
 ```
 
 Required summary columns:
 
 ```text
+trial_id
+trial_source
+fold_id
+evaluation_protocol
+train_start_ms
+train_end_ms
+valid_start_ms
+valid_end_ms
+embargo_bars
 universe_snapshot_id
 outcome_label_family
 comparison_surface
@@ -815,33 +858,37 @@ up/down model file, the matching evidence CSV, and evidence row `outcome_horizon
 Missing or mismatched horizon artifacts fail loudly before candidate ranking; there is
 no single-horizon fallback and no synthetic horizon such as `0`.
 
-HPO baseline uses no new dependency first: deterministic small grids over named objective
-and training profiles, written only into the canonical `tailtree-selection-efficiency.csv`
-artifact. `optuna` may be added later as an optional `[hpo]` extra only after the artifact
-schema, budget replay, and validation score are stable.
+Tailtree tuning uses decoupled fixed trials, optional search, and evaluation protocol.
+Deterministic fixed trials are not “HPO mode”; they are named parameter instances.
+Optuna is not a separate model workflow; it is an optional trial source that emits the same
+trial shape as the fixed list. Walkforward is independent of both: it can evaluate one fixed
+parameter set, a manual trial list, or sampler-generated trials.
 
-HPO may be added as deterministic blocked/walk-forward search only when:
+Any tuning/search is allowed only when each validation fold has enough data:
 
 ```text
 forward_min/max non-null count > 0
 tail_count >= min_exceedance_required
 feature_count > 0
 validation tail count > 0
+train_end_ms < valid_start_ms
+embargo_bars applied between train and validation if configured
 ```
 
-The HPO score optimizes profit from extreme-event selection. Utility concentration is the
-current measurable proxy for scanner-side opportunity quality:
+The score optimizes scanner-internal extreme-event selection efficiency. Utility
+concentration is the current measurable proxy for scanner-side opportunity quality:
 
 ```text
-hpo_score =
-  profit_proxy
+feedback_score =
+  feasible(profit_proxy)
   + lift
   + selected_extreme_count
-  + concentration/stability terms
+  + concentration/stability terms across folds
   - breadth/conflict penalties
 ```
 
-Until then, the correct output is an honest baseline summary, not tuned parameters.
+Until folds and trial rows satisfy those gates, the correct output is an honest baseline
+summary, not tuned parameters.
 
 ## Lean reduction target
 
