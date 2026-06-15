@@ -326,7 +326,9 @@ to one of these products. Prefer typed products and direct field access over ad-
 ```text
 training population   = tail rows only
 validation population = all rows with known outcomes
-selection target      = concentrated extreme-event utility, not smooth average accuracy
+final target          = profit from selected extreme behavior/events
+selection proxy       = concentrated extreme-event utility after path/cost penalties
+non-goal              = smooth mean-market probability distribution or average accuracy
 ```
 
 Objective strategies are named instances, not boolean flags:
@@ -358,7 +360,10 @@ The `score_bucket` artifact is separate from leaf evidence. It is keyed by horiz
 direction, and score bucket, not by `leaf_id`, so artifact schemas remain explicit and
 old leaf evidence is not reinterpreted.
 
-`tail_utility_quantile` constrains raw excursion severity with path quality:
+`tail_utility_quantile` is aligned with the profit-from-extremes thesis only as a
+selection proxy: it asks whether the model selects more and better extreme opportunities,
+not whether it estimates the mean market distribution. The utility target constrains raw
+excursion severity with path quality:
 
 ```text
 up utility   = max(forward_max_return_pct - threshold_pct, 0)
@@ -379,12 +384,14 @@ is theoretically cleaner when `X` is raw threshold exceedance. Utility can be au
 with mean/p90 and may later get its own utility-exceedance GPD, but the current utility
 objective does not overload raw `gpd_shape_xi` / `gpd_scale_sigma` as utility-GPD truth.
 
-### Tailtree selection-efficiency architecture
+### Tailtree profit-selection efficiency architecture
 
-Tailtree architecture optimizes **selection ability per unit of data/model cost**, not a
-single global classifier score. Selection ability means the model can concentrate scarce
-future tail utility into a smaller current candidate set while exposing how much breadth,
-stability, and cost the concentration required.
+Tailtree architecture optimizes **profit-selection ability per unit of data/model cost**,
+not a single global classifier score. The final target is profit from selected extreme
+behavior/events. Utility is an intermediate proxy only when it increases the expected
+profit quality of selected opportunities after path-shape, cost, conflict, and breadth
+penalties. A utility objective that merely selects more rows is not aligned; it is aligned
+only if it selects **more better** extreme-event opportunities under comparable budgets.
 
 The objective comparison from the 2026-06-15 bounded universe benchmark is a design
 driver, not an architecture authority. On the same universe path (`symbols == ()`, OKX
@@ -392,17 +399,19 @@ discovery, `scan_budget=20`), `tail_utility_quantile` selected more realized tai
 and much higher utility, while `tail_severity_gpd` kept higher sparse lift. The design
 therefore keeps both as objective instances with different selection roles:
 
-| Role | Preferred objective | Selection ability measured by | Efficiency pressure |
+| Role | Preferred objective | Profit-selection ability measured by | Efficiency pressure |
 |---|---|---|---|
-| Sparse extreme concentration | `tail_severity_gpd` | lift, selected tail rate, max lift | small selected set, interpretable leaf evidence |
-| Utility-ranked breadth | `tail_utility_quantile` | selected utility mean/p90, selected tail count | more candidates accepted, score-bucket evidence |
-| Horizon dispatch | per `(horizon, direction)` winner | horizon-local lift and utility | avoid averaging incompatible horizons |
+| Sparse extreme concentration | `tail_severity_gpd` | lift, selected tail rate, max lift | high tail/profit proxy per selected row |
+| Utility-ranked breadth | `tail_utility_quantile` | net utility mean/p90, selected tail count, replay profit proxy | more better candidates, not merely more candidates |
+| Horizon dispatch | per `(horizon, direction)` winner | horizon-local lift, utility, and profit proxy | avoid averaging incompatible horizons |
 | Tail-shape audit | GPD descriptors | `xi`, `sigma`, exceedance count | descriptive only, not a trade trigger |
 
 Selection surfaces must report both **ability** and **efficiency** columns:
 
 ```text
 ability columns:
+  selected_profit_proxy_mean
+  selected_profit_proxy_p90
   valid_tail_lift
   valid_selected_tail_rate
   valid_selected_tail_count
@@ -415,12 +424,17 @@ ability columns:
 efficiency columns:
   selected_observation_rate        # selected_obs / valid_observation_count
   selected_tail_per_1k_obs         # selected tails per 1000 selected observations
-  utility_per_selected_obs         # selected utility sum / selected_obs
+  profit_proxy_per_selected_obs    # net profit proxy sum / selected_obs
+  profit_proxy_per_1k_observed     # net profit proxy sum / 1000 valid observations
   train_exceedance_per_feature     # train_exceedance_count / feature_count
   trained_tree_count
   selected_leaf_or_bucket_count
   fit_seconds / score_seconds      # profiler-owned, when available
 ```
+
+`selected_utility_*` may remain in artifacts as the current measurable proxy, but report
+and HPO semantics should read it as `selected_profit_proxy_*` once cost/slippage fields are
+available. The architecture must not stop at utility because profit is the final goal.
 
 The candidate selector should evaluate objectives on normalized budgets before promotion:
 
@@ -444,9 +458,10 @@ top_pct    = 1%, 5%, 10%, 20%
 score_gate = objective-native threshold after calibration
 ```
 
-Promotion should prefer rows that survive more than one budget family. A candidate that
-only looks good because its objective admitted a very wide set is inspection evidence, not
-a promoted high-confidence selection.
+Promotion should prefer rows that survive more than one budget family **and** improve net
+profit proxy per selected observation. A candidate set that only looks good because its
+objective admitted a very wide set is inspection evidence, not a promoted high-confidence
+selection.
 
 HPO is a deterministic search over typed objective instances, not an unbounded optimizer
 over the whole workflow:
@@ -496,9 +511,12 @@ selected_tail_count
 selected_tail_rate
 selected_tail_per_1k_obs
 valid_tail_lift
+selected_profit_proxy_mean
+selected_profit_proxy_p90
 selected_utility_mean
 selected_utility_p90
-utility_per_selected_obs
+profit_proxy_per_selected_obs
+profit_proxy_per_1k_observed
 trained_tree_count
 selected_bucket_or_leaf_count
 fit_seconds
@@ -509,12 +527,13 @@ Acceptance rule:
 
 ```text
 promotion_score =
-  lift_component
-  + utility_component
+  profit_proxy_component
+  + lift_component
   + horizon_consistency_component
   - breadth_penalty
   - conflict_penalty
   - data_cost_penalty
+  - estimated_cost_slippage_penalty
 ```
 
 Where each component is numeric and auditable. Do not encode promotion as qualitative
@@ -717,10 +736,16 @@ feature_count > 0
 validation tail count > 0
 ```
 
-The HPO score optimizes extreme utility concentration:
+The HPO score optimizes profit from extreme-event selection. Utility concentration is only
+the current measurable proxy until cost/slippage/replay profit fields are available:
 
 ```text
-hpo_score = lift + count + utility + concentration/stability penalties
+hpo_score =
+  profit_proxy
+  + lift
+  + selected_extreme_count
+  + concentration/stability terms
+  - breadth/cost/conflict penalties
 ```
 
 Until then, the correct output is an honest baseline summary, not tuned parameters.

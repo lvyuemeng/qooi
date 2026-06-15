@@ -242,14 +242,22 @@ selected_tail_count
 selected_tail_rate
 selected_tail_per_1k_obs
 valid_tail_lift
+selected_profit_proxy_mean
+selected_profit_proxy_p90
 selected_utility_mean
 selected_utility_p90
-utility_per_selected_obs
+profit_proxy_per_selected_obs
+profit_proxy_per_1k_observed
 trained_tree_count
 selected_bucket_or_leaf_count
 fit_seconds
 score_seconds
 ```
+
+`selected_utility_*` columns are the current measurable proxy. The durable selection
+contract is profit from selected extreme behavior/events, so future cost/slippage/replay
+fields should feed `selected_profit_proxy_*` rather than optimizing mean-market
+probability or raw utility alone.
 
 Budget families compare selection ability at equal candidate budgets rather than comparing
 raw objective gate widths:
