@@ -7,7 +7,9 @@ from dataclasses import dataclass
 import polars as pl
 
 from qooi.scanner import entropy_expr
-from qooi.scanner.frames import SOURCE_KLINE_RECENT_WINDOW_MS, potential_outcome_frame
+from qooi.scanner.outcome import potential_outcome_frame
+
+SOURCE_KLINE_RECENT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
 
 @dataclass(frozen=True)

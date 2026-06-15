@@ -9,8 +9,8 @@ from typing import Literal, Protocol
 import polars as pl
 
 from qooi.exchange.store import HistoryCoverage
-from qooi.scanner.classifiers import StateDirection
 from qooi.scanner.config import EvidenceConfig, ReviewConfig, SourceConfig, TransitionConfig
+from qooi.scanner.state import StateDirection
 from qooi.sources.context import SourceContextResult
 
 
@@ -205,7 +205,6 @@ class ReportInputs:
     transitions: TransitionAnalysis
     bundles: tuple[SymbolStateBundle, ...]
     decisions: tuple[ScanDecision, ...]
-    report_sections: tuple = ()
 
 
 def missing_state(

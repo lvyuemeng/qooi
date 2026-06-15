@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 from pathlib import Path
 
-import polars as pl
-
 import qooi.scanner as scanner
-from qooi.scanner import frames, ladder
+from qooi.scanner import ladder, outcome, state
 
 SCANNER_ROOT = Path(__file__).resolve().parents[1] / "src" / "qooi" / "scanner"
 
@@ -21,52 +20,50 @@ def test_scanner_contracts_live_at_package_root() -> None:
 
 def test_scanner_legacy_compatibility_modules_removed() -> None:
     for module_name in (
+        "qooi.scanner.classifiers",
         "qooi.scanner.contracts",
+        "qooi.scanner.decisions",
         "qooi.scanner.evidence",
         "qooi.scanner.candidates",
+        "qooi.scanner.events",
+        "qooi.scanner.features",
+        "qooi.scanner.history",
+        "qooi.scanner.source_events",
     ):
         assert importlib.util.find_spec(module_name) is None
 
 
 def test_resolved_scanner_modules_are_importable() -> None:
-    for module_name in ["frames", "ladder", "tailrun", "rank", "events"]:
+    module_names = [
+        "ladder",
+        "tailrun",
+        "rank",
+        "feasibility",
+        "state",
+        "outcome",
+    ]
+    for module_name in module_names:
         module = importlib.import_module(f"qooi.scanner.{module_name}")
         assert module.__name__ == f"qooi.scanner.{module_name}"
 
 
-def test_frames_and_ladder_own_public_functions() -> None:
-    assert frames.potential_observation_frame.__module__ == "qooi.scanner.frames"
-    assert frames.potential_outcome_frame.__module__ == "qooi.scanner.frames"
+def test_state_outcome_and_ladder_own_public_functions() -> None:
+    assert state.KlineClassifier.__module__ == "qooi.scanner.state"
+    assert state.extract_continuous_features.__module__ == "qooi.scanner.state"
+    assert state.potential_observation_frame.__module__ == "qooi.scanner.state"
+    assert outcome.kline_path_history_frame.__module__ == "qooi.scanner.outcome"
+    assert outcome.potential_outcome_frame.__module__ == "qooi.scanner.outcome"
+    assert outcome.realized_transition_frame.__module__ == "qooi.scanner.outcome"
+    assert outcome.source_events_frame.__module__ == "qooi.scanner.outcome"
+    assert outcome.source_outcomes_frame.__module__ == "qooi.scanner.outcome"
+    assert outcome.source_timeliness_frame.__module__ == "qooi.scanner.outcome"
+    assert outcome.source_state_predictability_frame.__module__ == "qooi.scanner.outcome"
     assert ladder.potential_evidence_frame.__module__ == "qooi.scanner.ladder"
     assert ladder.add_potential_parent_gain.__module__ == "qooi.scanner.ladder"
     assert ladder.select_potential_evidence_level.__module__ == "qooi.scanner.ladder"
-
-
-def test_diagnostics_exposes_build_write_boundary_apis() -> None:
-    diagnostics = importlib.import_module("qooi.scanner.diagnostics")
-
-    assert diagnostics.build_diagnostic_frames.__module__ == "qooi.scanner.diagnostics"
-    assert diagnostics.write_diagnostic_frames.__module__ == "qooi.scanner.diagnostics"
-
-
-def test_rank_module_owns_candidate_ranking_entrypoint() -> None:
-    rank = importlib.import_module("qooi.scanner.rank")
-    frame = pl.DataFrame(
-        {
-            "symbol": ["AAA"],
-            "evidence_level": ["symbol_state"],
-            "probability_lift": [2.0],
-            "information_gain_bits": [0.5],
-            "candidate_score": [1.0],
-            "N": [30],
-            "selected_evidence_level": [True],
-        }
-    )
-
-    expected = rank.rank_candidate_evidence(frame)
-    actual = rank.rank_candidates(frame)
-
-    assert actual.to_dicts() == expected.to_dicts()
+    assert not hasattr(state, "ClassifierDiagnosticsBuilder")
+    assert not hasattr(state, "evaluate_classifier_frame")
+    assert not hasattr(importlib.import_module("qooi.scanner.rank"), "rank_candidates")
 
 
 def test_scanner_modules_do_not_import_strategies() -> None:
@@ -98,7 +95,9 @@ def test_diagnostics_imports_resolved_graph_boundaries() -> None:
                 imported_aliases[alias.asname or alias.name] = alias.name
 
     assert imported_aliases["candidate_eval"] == "rank"
-    assert imported_aliases["source_eval"] == "events"
+    assert imported_aliases["feasibility_eval"] == "feasibility"
+    assert imported_aliases["state_eval"] == "state"
+    assert imported_aliases["outcome_eval"] == "outcome"
     assert imported_aliases["ladder_eval"] == "ladder"
     assert imported_aliases["rank_eval"] == "rank"
     assert imported_aliases["tailrun_eval"] == "tailrun"
@@ -106,10 +105,9 @@ def test_diagnostics_imports_resolved_graph_boundaries() -> None:
 
 def test_resolved_modules_do_not_reexport_old_owners() -> None:
     forbidden = {
-        "frames.py": ("qooi.scanner.evidence",),
         "ladder.py": ("qooi.scanner.evidence",),
         "rank.py": ("qooi.scanner.candidates",),
-        "tailrun.py": ("qooi.scanner.diagnostics",),
+        "tailrun/__init__.py": ("qooi.scanner.diagnostics",),
     }
     offenders: list[str] = []
     for filename, forbidden_modules in forbidden.items():
@@ -155,9 +153,11 @@ def test_workflow_does_not_own_scanner_config_models() -> None:
 
 def test_scanner_config_is_composed_by_domain_sections() -> None:
     config_module = importlib.import_module("qooi.scanner.config")
-    config = config_module.PotentialConfig(
-        transition={"horizon": 8, "scan_budget": 13},
-        evidence={"kind": "tailtree", "tailtree": {"model_tag": "unit"}},
+    config = config_module.PotentialConfig.model_validate(
+        {
+            "transition": {"horizon": 8, "scan_budget": 13},
+            "evidence": {"kind": "tailtree", "tailtree": {"model_tag": "unit"}},
+        }
     )
 
     assert config.transition.horizon == 8

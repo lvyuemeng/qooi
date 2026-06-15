@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol, TypeAlias
+from collections.abc import Mapping
+from typing import Literal, Protocol, TypeAlias
 
 import polars as pl
 
@@ -11,6 +12,10 @@ PolarsDtype: TypeAlias = type[pl.DataType] | pl.DataType
 
 class TailTreePredictor(Protocol):
     def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame: ...
+
+
+TailTreeDirection: TypeAlias = Literal["up", "down"]
+TailTreeModelKey: TypeAlias = tuple[int, TailTreeDirection]
 
 
 EVIDENCE_LEVEL_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -128,6 +133,10 @@ CANDIDATE_EVIDENCE_SCHEMA: dict[str, PolarsDtype] = {
     "N_tail_exceedances": pl.UInt32,
     "leaf_id": pl.Int32,
     "tree_direction": pl.String,
+    "score_bucket": pl.String,
+    "tailtree_score": pl.Float64,
+    "score_min": pl.Float64,
+    "score_max": pl.Float64,
     "leaf_path": pl.String,
 }
 
@@ -145,21 +154,149 @@ CANDIDATE_RANK_SCHEMA: dict[str, PolarsDtype] = CANDIDATE_EVIDENCE_SCHEMA | {
 }
 
 
+CANDIDATE_HORIZON_CONSISTENCY_SCHEMA: dict[str, PolarsDtype] = {
+    "symbol": pl.String,
+    "decision_timeframe": pl.String,
+    "tree_direction": pl.String,
+    "horizon_count": pl.UInt32,
+    "strong_horizon_count": pl.UInt32,
+    "horizon_span_bars": pl.Int64,
+    "best_outcome_horizon": pl.Int64,
+    "best_rank_score": pl.Float64,
+    "best_tail_lift": pl.Float64,
+    "best_tail_utility_score": pl.Float64,
+    "direction_consistency_score": pl.Float64,
+    "opposite_direction_count": pl.UInt32,
+    "opposite_direction_best_rank_score": pl.Float64,
+    "conflict_penalty_score": pl.Float64,
+    "consistency_rank_score": pl.Float64,
+}
+
+
+def candidate_horizon_consistency_frame(candidate_rank: pl.DataFrame) -> pl.DataFrame:
+    """Summarize same-direction horizon agreement without averaging raw scores."""
+    if candidate_rank.is_empty() or "tree_direction" not in candidate_rank.columns:
+        return pl.DataFrame(schema=CANDIDATE_HORIZON_CONSISTENCY_SCHEMA)
+    required = {"symbol", "decision_timeframe", "outcome_horizon", "tree_direction"}
+    if not required.issubset(candidate_rank.columns):
+        return pl.DataFrame(schema=CANDIDATE_HORIZON_CONSISTENCY_SCHEMA)
+    base = candidate_rank.filter(pl.col("candidate_status") == "matched_evidence")
+    if base.is_empty():
+        return pl.DataFrame(schema=CANDIDATE_HORIZON_CONSISTENCY_SCHEMA)
+    tail_lift_expr = (
+        pl.col("tail_lift").fill_null(0.0).fill_nan(0.0)
+        if "tail_lift" in base.columns
+        else pl.lit(0.0)
+    )
+    tail_count_expr = (
+        pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64)
+        if "N_tail_exceedances" in base.columns
+        else pl.lit(0.0)
+    )
+    tail_utility_expr = tail_lift_expr * (tail_count_expr + 1.0).log()
+    rank_score_expr = (
+        pl.col("rank_score").fill_null(0.0).fill_nan(0.0)
+        if "rank_score" in base.columns
+        else tail_utility_expr
+    )
+    enriched = base.with_columns(
+        tail_lift_expr.alias("_tail_lift_value"),
+        tail_utility_expr.alias("_tail_utility_score"),
+        rank_score_expr.alias("_rank_score_value"),
+        ((tail_lift_expr >= 1.5) & (rank_score_expr > 0.0))
+        .cast(pl.UInt32)
+        .alias("_strong_horizon_flag"),
+    )
+    per_horizon = enriched.sort(
+        [
+            "symbol",
+            "decision_timeframe",
+            "tree_direction",
+            "outcome_horizon",
+            "_rank_score_value",
+        ],
+        descending=[False, False, False, False, True],
+    ).unique(
+        subset=["symbol", "decision_timeframe", "tree_direction", "outcome_horizon"],
+        keep="first",
+        maintain_order=True,
+    )
+    grouped = per_horizon.group_by(
+        "symbol", "decision_timeframe", "tree_direction", maintain_order=True
+    ).agg(
+        pl.col("outcome_horizon").n_unique().cast(pl.UInt32).alias("horizon_count"),
+        pl.col("_strong_horizon_flag").sum().cast(pl.UInt32).alias("strong_horizon_count"),
+        (pl.col("outcome_horizon").max() - pl.col("outcome_horizon").min()).alias(
+            "horizon_span_bars"
+        ),
+        pl.col("outcome_horizon").sort_by("_rank_score_value", descending=True)
+        .first()
+        .alias("best_outcome_horizon"),
+        pl.col("_rank_score_value").max().alias("best_rank_score"),
+        pl.col("_tail_lift_value").max().alias("best_tail_lift"),
+        pl.col("_tail_utility_score").max().alias("best_tail_utility_score"),
+    )
+    opposite = grouped.rename(
+        {
+            "tree_direction": "_opposite_tree_direction",
+            "horizon_count": "opposite_direction_count",
+            "best_rank_score": "opposite_direction_best_rank_score",
+        }
+    ).select(
+        "symbol",
+        "decision_timeframe",
+        "_opposite_tree_direction",
+        "opposite_direction_count",
+        "opposite_direction_best_rank_score",
+    )
+    panel = grouped.with_columns(
+        pl.when(pl.col("tree_direction") == "up")
+        .then(pl.lit("down"))
+        .otherwise(pl.lit("up"))
+        .alias("_opposite_tree_direction"),
+        (
+            pl.col("strong_horizon_count").cast(pl.Float64)
+            * (1.0 + pl.col("best_tail_lift").fill_null(0.0).fill_nan(0.0)).log()
+            * (1.0 + pl.col("best_rank_score").fill_null(0.0).fill_nan(0.0)).log()
+        ).alias("direction_consistency_score"),
+    ).join(
+        opposite,
+        on=["symbol", "decision_timeframe", "_opposite_tree_direction"],
+        how="left",
+    )
+    panel = panel.with_columns(
+        pl.col("opposite_direction_count").fill_null(0).cast(pl.UInt32),
+        pl.col("opposite_direction_best_rank_score").fill_null(0.0),
+    ).with_columns(
+        pl.when(pl.col("opposite_direction_best_rank_score") > pl.col("best_rank_score"))
+        .then(pl.col("opposite_direction_best_rank_score") - pl.col("best_rank_score"))
+        .otherwise(0.0)
+        .alias("conflict_penalty_score")
+    ).with_columns(
+        (pl.col("direction_consistency_score") - pl.col("conflict_penalty_score")).alias(
+            "consistency_rank_score"
+        )
+    )
+    return _select_schema(
+        panel.drop("_opposite_tree_direction").sort(
+            "consistency_rank_score", descending=True
+        ),
+        CANDIDATE_HORIZON_CONSISTENCY_SCHEMA,
+    )
+
+
 def candidate_evidence_frame(
     observations: pl.DataFrame,
     evidence: pl.DataFrame,
     *,
     latest_only: bool = True,
-    tree_up: TailTreePredictor | None = None,
-    tree_down: TailTreePredictor | None = None,
+    tree_models: Mapping[TailTreeModelKey, TailTreePredictor] | None = None,
 ) -> pl.DataFrame:
     """Match observation rows to selected evidence rows."""
     if observations.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
-    if tree_up is not None or tree_down is not None:
-        return _candidate_from_trees(
-            observations, evidence, tree_up, tree_down, latest_only=latest_only
-        )
+    if tree_models:
+        return _candidate_from_trees(observations, evidence, tree_models, latest_only=latest_only)
     base = _candidate_observations(observations, latest_only=latest_only)
     selected = _selected_evidence(evidence)
     if selected.is_empty():
@@ -184,8 +321,7 @@ def candidate_evidence_frame(
 def _candidate_from_trees(
     observations: pl.DataFrame,
     evidence: pl.DataFrame,
-    tree_up: TailTreePredictor | None,
-    tree_down: TailTreePredictor | None,
+    tree_models: Mapping[TailTreeModelKey, TailTreePredictor],
     *,
     latest_only: bool = True,
 ) -> pl.DataFrame:
@@ -194,24 +330,46 @@ def _candidate_from_trees(
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
 
     frames = []
-    for tree, direction in ((tree_up, "up"), (tree_down, "down")):
-        if tree is None:
-            continue
-        try:
-            with_leaf = tree.predict_leaf(base)
-        except Exception:
-            continue
+    for (outcome_horizon, direction), tree in sorted(tree_models.items()):
         dir_evidence = (
-            evidence.filter(pl.col("tree_direction") == direction)
+            evidence.filter(
+                (pl.col("tree_direction") == direction)
+                & (pl.col("outcome_horizon") == int(outcome_horizon))
+            )
             if "tree_direction" in evidence.columns
             else evidence
         )
         if dir_evidence.is_empty():
             continue
+        predict_score = getattr(tree, "predict_score", None)
+        if "score_bucket" in dir_evidence.columns and callable(predict_score):
+            try:
+                with_score = predict_score(base).with_columns(
+                    pl.lit(int(outcome_horizon)).alias("outcome_horizon")
+                )
+            except Exception:
+                continue
+            matched = with_score.join(dir_evidence, how="cross").filter(
+                (pl.col("tailtree_score") >= pl.col("score_min"))
+                & (pl.col("tailtree_score") <= pl.col("score_max"))
+            )
+            if matched.is_empty():
+                continue
+            matched = matched.with_columns(
+                pl.lit(f"tree_{direction}").alias("matched_evidence_level"),
+                pl.lit("matched_evidence").alias("candidate_status"),
+            )
+            frames.append(matched)
+            continue
+        try:
+            with_leaf = tree.predict_leaf(base).with_columns(
+                pl.lit(int(outcome_horizon)).alias("outcome_horizon")
+            )
+        except Exception:
+            continue
         matched = with_leaf.join(
             dir_evidence,
-            left_on="leaf_id",
-            right_on="leaf_id",
+            on=["outcome_horizon", "leaf_id"],
             how="inner",
         )
         if matched.is_empty():
@@ -348,6 +506,8 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
     """
     if candidates.is_empty():
         return pl.DataFrame(schema=CANDIDATE_RANK_SCHEMA)
+    if "outcome_horizon" not in candidates.columns:
+        raise ValueError("candidate evidence pipe missing outcome_horizon")
 
     has_tail_lift = (
         "tail_lift" in candidates.columns and candidates["tail_lift"].drop_nulls().len() > 0
@@ -469,16 +629,9 @@ def _select_schema(frame: pl.DataFrame, schema: dict[str, PolarsDtype]) -> pl.Da
     return filled.select(*(pl.col(column).cast(dtype) for column, dtype in schema.items()))
 
 
-def rank_candidates(candidates: pl.DataFrame) -> pl.DataFrame:
-    """Rank promoted candidate rows for review output."""
-
-    return rank_candidate_evidence(candidates)
-
-
 __all__ = [
     "CANDIDATE_EVIDENCE_SCHEMA",
     "CANDIDATE_RANK_SCHEMA",
     "candidate_evidence_frame",
     "rank_candidate_evidence",
-    "rank_candidates",
 ]

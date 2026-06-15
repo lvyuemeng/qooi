@@ -21,15 +21,14 @@ from qooi.scanner import (
     TransitionEdge,
     UnsupportedTransitionPath,
 )
-from qooi.scanner import events as source_eval
-from qooi.scanner import features as features_eval
-from qooi.scanner import frames as frames_eval
-from qooi.scanner import history as history_eval
+from qooi.scanner import feasibility as feasibility_eval
 from qooi.scanner import ladder as ladder_eval
+from qooi.scanner import outcome as outcome_eval
 from qooi.scanner import rank as candidate_eval
 from qooi.scanner import rank as rank_eval
+from qooi.scanner import state as state_eval
 from qooi.scanner import tailrun as tailrun_eval
-from qooi.scanner.classifiers import STATE_FRAME_SCHEMA, validate_state_frame
+from qooi.scanner.state import STATE_FRAME_SCHEMA, validate_state_frame
 from qooi.sources.context import SourceAvailability
 
 LadderResult = ladder_eval.LadderResult
@@ -56,6 +55,7 @@ class DiagnosticFrames:
     potential_evidence: pl.DataFrame
     candidate_evidence: pl.DataFrame
     candidate_rank: pl.DataFrame
+    candidate_horizon_consistency: pl.DataFrame
     candidate_feasibility: pl.DataFrame
     source_timeliness: pl.DataFrame
     source_state_predictability: pl.DataFrame
@@ -70,13 +70,11 @@ class StateFrames:
     context: pl.DataFrame
 
 
-def write_diagnostics(inputs: ReportInputs, profile: ProfileContext | None = None) -> None:
+def write_diagnostics(
+    inputs: ReportInputs, profile: ProfileContext | None = None
+) -> DiagnosticFrames:
     profile = ProfileContext.disabled_if_none(profile)
     diagnostic_frames = build_diagnostic_frames(inputs, profile)
-
-    from qooi.scanner.report import report_sections_for
-
-    inputs.report_sections = report_sections_for(inputs.config.evidence.kind)
 
     state_frames = _build_state_frames(inputs)
     diagnostics = inputs.artifacts.diagnostics_dir
@@ -105,6 +103,7 @@ def write_diagnostics(inputs: ReportInputs, profile: ProfileContext | None = Non
 
     write_diagnostic_frames(diagnostic_frames, inputs.artifacts)
     _write_state_frames(state_frames, states)
+    return diagnostic_frames
 
 
 def build_diagnostic_frames(
@@ -125,7 +124,7 @@ def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> D
     logger = logging.getLogger("qooi.scanner")
     logger.info("features begin")
     with profile.stage("scanner", "diagnostics", "history_feasibility"):
-        history_feasibility = _history_feasibility_frame(inputs.bars.coverage)
+        history_feasibility = feasibility_eval.history_feasibility_frame(inputs.bars.coverage)
     profile.frame("scanner", "diagnostics", "history_feasibility", history_feasibility)
     with profile.stage("scanner", "diagnostics", "source_freshness"):
         source_freshness = _source_freshness_frame(inputs.context.availability)
@@ -133,31 +132,29 @@ def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> D
     bars = _bars_with_symbol(inputs.bars.frames, inputs.config.bar)
     profile.frame("scanner", "diagnostics", "decision_bars", bars)
     with profile.stage("scanner", "events", "source_events_frame"):
-        source_events = source_eval.source_events_frame(
+        source_events = outcome_eval.source_events_frame(
             inputs.context.frames,
             bars,
             inputs.config.bar,
         )
     profile.frame("scanner", "events", "source_events", source_events)
     with profile.stage("scanner", "history", "kline_path_history_frame"):
-        kline_history = history_eval.kline_path_history_frame(
-            inputs.config, inputs.bars.state_frames
+        kline_history = outcome_eval.kline_path_history_frame(
+            inputs.config, inputs.bars.state_frames, inputs.bars.frames
         )
     profile.frame("scanner", "history", "kline_history", kline_history)
     with profile.stage("scanner", "events", "source_outcomes_frame"):
-        source_outcomes = source_eval.source_outcomes_frame(source_events, bars)
+        source_outcomes = outcome_eval.source_outcomes_frame(source_events, bars)
     profile.frame("scanner", "events", "source_outcomes", source_outcomes)
     with profile.stage("scanner", "history", "realized_transition_frame"):
-        realized_transitions = history_eval.realized_transition_frame(
+        realized_transitions = outcome_eval.realized_transition_frame(
             kline_history.filter(pl.col("timeframe") == inputs.config.bar),
-            tuple(source_outcomes.get_column("outcome_horizon").unique().to_list())
-            if not source_outcomes.is_empty()
-            else (inputs.config.transition.horizon,),
+            inputs.config.evidence.tailtree.outcome_horizon,
         )
     profile.frame("scanner", "history", "realized_transitions", realized_transitions)
 
     with profile.stage("scanner", "features", "extract_continuous_features"):
-        continuous_features = features_eval.extract_continuous_features(
+        continuous_features = state_eval.continuous_features_frame(
             inputs.bars.frames,
             inputs.bars.state_frames,
             inputs.context.frames,
@@ -166,7 +163,7 @@ def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> D
     profile.frame("scanner", "features", "continuous_features", continuous_features)
 
     with profile.stage("scanner", "frames", "potential_observation_frame"):
-        potential_observations = frames_eval.potential_observation_frame(
+        potential_observations = state_eval.potential_observation_frame(
             kline_history,
             source_events,
             continuous_features,
@@ -179,7 +176,7 @@ def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> D
     logger.info("evidence begin path=%s", inputs.config.evidence.kind)
     with profile.stage("scanner", "diagnostics", "run_pipeline"):
         pipeline_result = _run_pipeline(
-            potential_observations, source_outcomes, realized_transitions, inputs
+            potential_observations, source_events, source_outcomes, realized_transitions, inputs
         )
     profile.frame("scanner", "diagnostics", "potential_evidence", pipeline_result.evidence)
     profile.frame("scanner", "diagnostics", "candidate_evidence", pipeline_result.candidates)
@@ -190,20 +187,15 @@ def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> D
         pipeline_result.candidates.height,
         pipeline_result.ranked.height,
     )
-    # Populate report sections for render_report
-    from qooi.scanner.report import report_sections_for
-
-    inputs.report_sections = report_sections_for(inputs.config.evidence.kind)
-
     with profile.stage("scanner", "events", "source_timeliness_frame"):
-        source_timeliness = source_eval.source_timeliness_frame(source_outcomes)
+        source_timeliness = outcome_eval.source_timeliness_frame(source_outcomes)
     with profile.stage("scanner", "events", "source_state_predictability_frame"):
-        source_state_predictability = source_eval.source_state_predictability_frame(
+        source_state_predictability = outcome_eval.source_state_predictability_frame(
             source_outcomes,
             return_threshold_pct=inputs.config.transition.return_threshold_pct,
         )
     with profile.stage("scanner", "diagnostics", "watchlist_feasibility_frame"):
-        watchlist_feasibility = _watchlist_feasibility_frame(
+        watchlist_feasibility = feasibility_eval.watchlist_feasibility_frame(
             inputs.decisions,
             history_feasibility,
             source_freshness,
@@ -227,7 +219,10 @@ def _build_diagnostic_frames(inputs: ReportInputs, profile: ProfileContext) -> D
         potential_evidence=pipeline_result.evidence,
         candidate_evidence=pipeline_result.candidates,
         candidate_rank=pipeline_result.ranked,
-        candidate_feasibility=candidate_feasibility_frame(
+        candidate_horizon_consistency=rank_eval.candidate_horizon_consistency_frame(
+            pipeline_result.candidates
+        ),
+        candidate_feasibility=feasibility_eval.candidate_feasibility_frame(
             pipeline_result.ranked,
             watchlist_feasibility,
         ),
@@ -287,156 +282,13 @@ def _write_diagnostic_frames(frames: DiagnosticFrames, diagnostics: Path | str) 
         "potential-evidence-selected": _selected_potential_evidence(frames.potential_evidence),
         "candidate-inspection": frames.candidate_evidence,
         "candidate-rank": frames.candidate_rank,
+        "candidate-horizon-consistency": frames.candidate_horizon_consistency,
         "candidate-feasibility": frames.candidate_feasibility,
         "source-timeliness": frames.source_timeliness,
         "source-state-predictability": frames.source_state_predictability,
     }
     for name, frame in frame_groups.items():
         frame.write_csv(diagnostics / f"{name}.csv")
-
-
-def candidate_feasibility_frame(
-    candidate_rank: pl.DataFrame, watchlist_feasibility: pl.DataFrame
-) -> pl.DataFrame:
-    columns = [
-        "symbol",
-        "watchlist_feasibility",
-        "rank_score",
-        "rank_tier",
-        "source_penalty_score",
-        "required_missing_source_count",
-        "required_stale_source_count",
-        "provider_bounded_source_count",
-        "optional_absent_source_count",
-        "min_history_coverage_pct",
-        "min_source_capability_coverage_pct",
-        "tree_direction",
-        "matched_evidence_level",
-        "tail_lift",
-        "gpd_shape_xi",
-        "N_tail_exceedances",
-        "source_status",
-        "history_status",
-        "candidate_reason",
-    ]
-    schema = {
-        "symbol": pl.String,
-        "watchlist_feasibility": pl.String,
-        "rank_score": pl.Float64,
-        "rank_tier": pl.String,
-        "source_penalty_score": pl.Float64,
-        "required_missing_source_count": pl.Int64,
-        "required_stale_source_count": pl.Int64,
-        "provider_bounded_source_count": pl.Int64,
-        "optional_absent_source_count": pl.Int64,
-        "min_history_coverage_pct": pl.Float64,
-        "min_source_capability_coverage_pct": pl.Float64,
-        "tree_direction": pl.String,
-        "matched_evidence_level": pl.String,
-        "tail_lift": pl.Float64,
-        "gpd_shape_xi": pl.Float64,
-        "N_tail_exceedances": pl.Int64,
-        "source_status": pl.String,
-        "history_status": pl.String,
-        "candidate_reason": pl.String,
-    }
-    if candidate_rank.is_empty():
-        return pl.DataFrame(schema=schema)
-
-    best = (
-        candidate_rank.sort("rank_score", descending=True)
-        .unique(subset=["symbol"], keep="first", maintain_order=True)
-        .with_columns(
-            _rank_tier_expr().alias("rank_tier"),
-        )
-    )
-    selected = best.select(
-        [
-            "symbol",
-            "rank_score",
-            "rank_tier",
-            "source_penalty_score",
-            "required_missing_source_count",
-            "required_stale_source_count",
-            "provider_bounded_source_count",
-            "optional_absent_source_count",
-            "tree_direction",
-            "matched_evidence_level",
-            "tail_lift",
-            "gpd_shape_xi",
-            "N_tail_exceedances",
-            "rank_reason",
-        ]
-    )
-    if watchlist_feasibility.is_empty():
-        return selected.with_columns(
-            pl.lit("unclassified").alias("watchlist_feasibility"),
-            pl.lit(None, dtype=pl.Float64).alias("min_history_coverage_pct"),
-            pl.lit(None, dtype=pl.Float64).alias("min_source_capability_coverage_pct"),
-            pl.lit("missing").alias("source_status"),
-            pl.lit("missing").alias("history_status"),
-            pl.col("rank_reason").alias("candidate_reason"),
-        ).select(columns)
-
-    watch_columns = [
-        "symbol",
-        "watchlist_feasibility",
-        "min_history_coverage_pct",
-        "min_source_capability_coverage_pct",
-        "source_status",
-        "history_status",
-    ]
-    return (
-        selected.join(watchlist_feasibility.select(watch_columns), on="symbol", how="left")
-        .with_columns(
-            pl.col("watchlist_feasibility").fill_null("unclassified"),
-            pl.col("source_status").fill_null("missing"),
-            pl.col("history_status").fill_null("missing"),
-        )
-        .with_columns(_candidate_reason_expr().alias("candidate_reason"))
-        .select(columns)
-    )
-
-
-def _candidate_reason_expr() -> pl.Expr:
-    return (
-        pl.when(pl.col("required_missing_source_count") > 0)
-        .then(
-            pl.lit("missing_required_sources=")
-            + pl.col("required_missing_source_count").cast(pl.String)
-        )
-        .when(pl.col("required_stale_source_count") > 0)
-        .then(
-            pl.lit("stale_required_sources=")
-            + pl.col("required_stale_source_count").cast(pl.String)
-        )
-        .when(pl.col("watchlist_feasibility") == "coverage_limited_review")
-        .then(pl.lit("history=") + pl.col("history_status"))
-        .when(pl.col("watchlist_feasibility") == "blocked_by_evidence_gate")
-        .then(pl.lit("evidence_gate_blocked"))
-        .when(pl.col("watchlist_feasibility") == "reviewable")
-        .then(pl.lit("reviewable"))
-        .otherwise(pl.col("rank_reason"))
-    )
-
-
-def _rank_tier_expr() -> pl.Expr:
-    return (
-        pl.when(
-            (pl.col("tail_lift").fill_null(0.0) >= 2.0)
-            & (pl.col("N_tail_exceedances").fill_null(0) >= 50)
-            & (pl.col("gpd_shape_xi").fill_null(0.0) > 0.15)
-        )
-        .then(pl.lit("1"))
-        .when(
-            (pl.col("tail_lift").fill_null(0.0) >= 1.5)
-            & (pl.col("N_tail_exceedances").fill_null(0) >= 30)
-        )
-        .then(pl.lit("2"))
-        .when(pl.col("tail_lift").fill_null(0.0) >= 1.0)
-        .then(pl.lit("3"))
-        .otherwise(pl.lit("—"))
-    )
 
 
 def _potential_evidence_summary(evidence: pl.DataFrame) -> pl.DataFrame:
@@ -889,223 +741,20 @@ def _state_frame_from_rows(rows: tuple[SourceStateRow, ...], scale: str) -> pl.D
     )
 
 
-def _history_feasibility_frame(coverage: tuple[HistoryCoverage, ...]) -> pl.DataFrame:
-    rows = []
-    for item in coverage:
-        note_text = ";".join(item.notes)
-        rows.append(
-            {
-                "symbol": item.inst_id,
-                "bar": item.bar,
-                "target_rows": item.target.target_bars,
-                "actual_rows": item.actual_bars,
-                "coverage_pct": item.coverage_pct,
-                "range_start": item.actual_start_ms,
-                "range_end": item.actual_end_ms,
-                "newest_age_hours": item.newest_age_hours,
-                "gap_count": item.gap_count,
-                "duplicate_timestamps": item.duplicate_timestamps,
-                "refreshed": item.refreshed,
-                "feasibility_status": _history_feasibility_status(item, note_text),
-                "feasibility_reason": _history_feasibility_reason(item, note_text),
-                "notes": note_text,
-            }
-        )
-    return pl.DataFrame(
-        rows,
-        schema={
-            "symbol": pl.String,
-            "bar": pl.String,
-            "target_rows": pl.Int64,
-            "actual_rows": pl.Int64,
-            "coverage_pct": pl.Float64,
-            "range_start": pl.Int64,
-            "range_end": pl.Int64,
-            "newest_age_hours": pl.Float64,
-            "gap_count": pl.Int64,
-            "duplicate_timestamps": pl.Int64,
-            "refreshed": pl.Boolean,
-            "feasibility_status": pl.String,
-            "feasibility_reason": pl.String,
-            "notes": pl.String,
-        },
-    )
-
-
-def _history_feasibility_status(item: HistoryCoverage, note_text: str) -> str:
-    if item.actual_bars <= 0:
-        return "missing_history"
-    if "cache_only=yes" in note_text and item.coverage_pct < 95.0:
-        return "cache_incomplete"
-    if item.gap_count > 0 or item.duplicate_timestamps > 0:
-        return "history_integrity_issue"
-    if "page_error" in note_text or "HTTPStatusError" in note_text:
-        return "fetch_limited"
-    if "starts_after_target_since" in note_text and item.coverage_pct < 95.0:
-        return "history_start_limited"
-    if item.coverage_pct < 80.0:
-        return "low_coverage"
-    if item.coverage_pct < 95.0:
-        return "partial_coverage"
-    return "reviewable_history"
-
-
-def _history_feasibility_reason(item: HistoryCoverage, note_text: str) -> str:
-    if item.actual_bars <= 0:
-        return "no bars available for requested history"
-    if "cache_only=yes" in note_text and item.coverage_pct < 95.0:
-        return "cache-only mode prevented filling the requested history"
-    if item.gap_count > 0 or item.duplicate_timestamps > 0:
-        return "timeline has gaps or duplicate timestamps"
-    if "page_error" in note_text or "HTTPStatusError" in note_text:
-        return "fetch stopped with provider or transport error"
-    if "starts_after_target_since" in note_text and item.coverage_pct < 95.0:
-        return "available exchange/cache history starts after requested horizon"
-    if item.coverage_pct < 80.0:
-        return "coverage is materially below requested target"
-    if item.coverage_pct < 95.0:
-        return "coverage is below requested target but may still support current-state review"
-    return "requested history is available and timeline is clean"
-
-
-def _watchlist_feasibility_frame(
-    decisions: tuple[ScanDecision, ...],
-    history_feasibility: pl.DataFrame,
-    source_freshness: pl.DataFrame,
-) -> pl.DataFrame:
-    rows = pl.DataFrame(
-        {
-            "symbol": [decision.symbol for decision in decisions],
-            "group": [decision.group for decision in decisions],
-            "direction": [decision.direction for decision in decisions],
-            "confidence": [decision.confidence for decision in decisions],
-            "missing_evidence": [";".join(decision.missing_evidence) for decision in decisions],
-            "contradictory_evidence": [
-                ";".join(decision.contradictory_evidence) for decision in decisions
-            ],
-            "block_reason": [decision.block_reason for decision in decisions],
-        },
-        schema={
-            "symbol": pl.String,
-            "group": pl.String,
-            "direction": pl.String,
-            "confidence": pl.String,
-            "missing_evidence": pl.String,
-            "contradictory_evidence": pl.String,
-            "block_reason": pl.String,
-        },
-    )
-    history = _symbol_history_feasibility(history_feasibility)
-    source = _symbol_source_feasibility(source_freshness)
-    rows = rows.join(history, on="symbol", how="left")
-    rows = rows.join(source, on="symbol", how="left")
-    return rows.with_columns(
-        pl.col("history_status").fill_null("history_missing"),
-        pl.col("source_status").fill_null("sources_not_loaded"),
-        pl.col("history_reason").fill_null("no history coverage row for symbol"),
-        pl.col("source_reason").fill_null("no source freshness rows for symbol"),
-    ).with_columns(
-        pl.when(pl.col("group") == "blocked")
-        .then(pl.lit("blocked_by_evidence_gate"))
-        .when(pl.col("history_status").is_in(["missing_history", "history_integrity_issue"]))
-        .then(pl.lit("blocked_by_history"))
-        .when(pl.col("source_status").is_in(["required_sources_missing", "required_sources_stale"]))
-        .then(pl.lit("source_limited_review"))
-        .when(pl.col("history_status").is_in(["cache_incomplete", "fetch_limited", "low_coverage"]))
-        .then(pl.lit("coverage_limited_review"))
-        .otherwise(pl.lit("reviewable"))
-        .alias("watchlist_feasibility")
-    )
-
-
-def _symbol_history_feasibility(frame: pl.DataFrame) -> pl.DataFrame:
-    if frame.is_empty():
-        return pl.DataFrame(
-            schema={"symbol": pl.String, "history_status": pl.String, "history_reason": pl.String}
-        )
-    status_rank = pl.when(pl.col("feasibility_status") == "missing_history").then(0)
-    status_rank = status_rank.when(pl.col("feasibility_status") == "history_integrity_issue").then(
-        1
-    )
-    status_rank = status_rank.when(pl.col("feasibility_status") == "fetch_limited").then(2)
-    status_rank = status_rank.when(pl.col("feasibility_status") == "cache_incomplete").then(3)
-    status_rank = status_rank.when(pl.col("feasibility_status") == "low_coverage").then(4)
-    status_rank = status_rank.when(pl.col("feasibility_status") == "history_start_limited").then(5)
-    status_rank = status_rank.when(pl.col("feasibility_status") == "partial_coverage").then(6)
-    status_rank = status_rank.otherwise(7).alias("status_rank")
-    return (
-        frame.with_columns(status_rank)
-        .sort(["symbol", "status_rank", "coverage_pct"], descending=[False, False, False])
-        .group_by("symbol")
-        .agg(
-            pl.first("feasibility_status").alias("history_status"),
-            pl.first("feasibility_reason").alias("history_reason"),
-            pl.min("coverage_pct").alias("min_history_coverage_pct"),
-        )
-    )
-
-
-def _symbol_source_feasibility(frame: pl.DataFrame) -> pl.DataFrame:
-    if frame.is_empty():
-        return pl.DataFrame(
-            schema={"symbol": pl.String, "source_status": pl.String, "source_reason": pl.String}
-        )
-    return (
-        frame.group_by("symbol")
-        .agg(
-            pl.len().alias("source_family_rows"),
-            pl.col("usable_int").sum().alias("fresh_source_families"),
-            pl.col("frame_missing_int").sum().alias("missing_source_families"),
-            pl.col("frame_missing_int").sum().alias("required_missing_source_count"),
-            pl.col("frame_stale_int").sum().alias("required_stale_source_count"),
-            pl.col("provider_bounded_int").sum().alias("provider_bounded_source_count"),
-            pl.col("optional_absent_int").sum().alias("optional_absent_source_count"),
-            pl.when(pl.col("required_for_review_int") == 1)
-            .then(pl.col("coverage_capability_pct"))
-            .otherwise(None)
-            .min()
-            .alias("min_source_capability_coverage_pct"),
-            pl.sum("source_penalty_component").alias("source_penalty_score"),
-            pl.concat_str("source_family", "status", separator="=")
-            .str.join(";")
-            .alias("source_reason"),
-        )
-        .with_columns(
-            pl.when(pl.col("required_missing_source_count") > 0)
-            .then(pl.lit("required_sources_missing"))
-            .when(pl.col("required_stale_source_count") > 0)
-            .then(pl.lit("required_sources_stale"))
-            .when(pl.col("fresh_source_families") > 0)
-            .then(pl.lit("source_context_available"))
-            .otherwise(pl.lit("source_context_partial"))
-            .alias("source_status")
-        )
-        .select(
-            "symbol",
-            "source_status",
-            "source_reason",
-            "source_family_rows",
-            "fresh_source_families",
-            "missing_source_families",
-            "required_missing_source_count",
-            "required_stale_source_count",
-            "provider_bounded_source_count",
-            "optional_absent_source_count",
-            "min_source_capability_coverage_pct",
-            "source_penalty_score",
-        )
-    )
 
 
 def _run_pipeline(
     observations,
+    source_events,
     source_outcomes,
     realized_transitions,
     inputs,
 ) -> LadderResult | TailtreeResult:
     """One dispatch. Returns concrete type — no downstream branching."""
     if inputs.config.evidence.kind == "tailtree":
-        return _run_tailtree_pipeline(observations, source_outcomes, realized_transitions, inputs)
+        return _run_tailtree_pipeline(
+            observations, source_events, source_outcomes, realized_transitions, inputs
+        )
     return _run_ladder_pipeline(observations, source_outcomes, realized_transitions, inputs)
 
 
@@ -1123,114 +772,41 @@ def _run_ladder_pipeline(
         return_threshold_pct=inputs.config.transition.return_threshold_pct,
     )
     candidates = candidate_eval.candidate_evidence_frame(observations, evidence)
-    candidates = _join_candidate_source_constraints(candidates, inputs.context.availability)
-    ranked = rank_eval.rank_candidates(candidates)
+    candidates = feasibility_eval.join_candidate_source_constraints(
+        candidates, inputs.context.availability
+    )
+    ranked = rank_eval.rank_candidate_evidence(candidates)
     return LadderResult(evidence=evidence, candidates=candidates, ranked=ranked, sections=())
 
 
 def _run_tailtree_pipeline(
     observations,
+    source_events,
     source_outcomes,
     realized_transitions,
     inputs,
 ) -> TailtreeResult:
     """Self-contained tailtree pipeline: evidence + candidates + trees."""
-    result = tailrun_eval.run(observations, source_outcomes, realized_transitions, inputs)
+    result = tailrun_eval.run(
+        observations,
+        source_outcomes,
+        realized_transitions,
+        inputs,
+        source_event_row_count=len(source_events),
+    )
     candidates = candidate_eval.candidate_evidence_frame(
         observations,
         result.evidence,
-        tree_up=result.tree_up,
-        tree_down=result.tree_down,
+        tree_models=result.models,
     )
-    candidates = _join_candidate_source_constraints(candidates, inputs.context.availability)
-    ranked = rank_eval.rank_candidates(candidates)
+    candidates = feasibility_eval.join_candidate_source_constraints(
+        candidates, inputs.context.availability
+    )
+    ranked = rank_eval.rank_candidate_evidence(candidates)
     return TailtreeResult(
         evidence=result.evidence,
         candidates=candidates,
         ranked=ranked,
-        tree_up=result.tree_up,
-        tree_down=result.tree_down,
+        models=result.models,
         sections=(),
-    )
-
-
-def _join_candidate_source_constraints(
-    candidates: pl.DataFrame, availability: tuple[SourceAvailability, ...]
-) -> pl.DataFrame:
-    if candidates.is_empty() or not availability:
-        return candidates
-    source_context = pl.DataFrame(
-        {
-            "symbol": [row.symbol for row in availability],
-            "required_missing_source_count": [row.frame_missing_int for row in availability],
-            "required_stale_source_count": [row.frame_stale_int for row in availability],
-            "provider_bounded_source_count": [row.provider_bounded_int for row in availability],
-            "optional_absent_source_count": [row.optional_absent_int for row in availability],
-            "source_penalty_score": [row.source_penalty_component for row in availability],
-        },
-        schema={
-            "symbol": pl.String,
-            "required_missing_source_count": pl.Int64,
-            "required_stale_source_count": pl.Int64,
-            "provider_bounded_source_count": pl.Int64,
-            "optional_absent_source_count": pl.Int64,
-            "source_penalty_score": pl.Float64,
-        },
-    )
-    if source_context.is_empty():
-        return candidates
-    by_symbol = source_context.group_by("symbol").agg(
-        pl.sum("required_missing_source_count"),
-        pl.sum("required_stale_source_count"),
-        pl.sum("provider_bounded_source_count"),
-        pl.sum("optional_absent_source_count"),
-        pl.sum("source_penalty_score"),
-    )
-    existing = [
-        column
-        for column in by_symbol.columns
-        if column in candidates.columns and column != "symbol"
-    ]
-    base = candidates.drop(existing) if existing else candidates
-    return base.join(by_symbol, on="symbol", how="left")
-
-
-def _tailtree_model_root(inputs) -> Path:
-    return tailrun_eval._tailtree_model_root(inputs)
-
-
-def _tailtree_feature_schema_hash(
-    categorical_features: list[str], continuous_features: list[str]
-) -> str:
-    return tailrun_eval._tailtree_feature_schema_hash(categorical_features, continuous_features)
-
-
-def _tailtree_artifact_metadata(
-    inputs,
-    tree_up: tailrun_eval.TailtreeArtifactTree | None,
-    tree_down: tailrun_eval.TailtreeArtifactTree | None,
-) -> tailrun_eval.TailtreeArtifactMetadata:
-    return tailrun_eval._tailtree_artifact_metadata(inputs, tree_up, tree_down)
-
-
-def _write_tailtree_artifacts(
-    inputs,
-    evidence_by_direction: dict[str, pl.DataFrame],
-    trees: dict[tailrun_eval.TailtreeDirection, tailrun_eval.TailtreeArtifactTree],
-) -> None:
-    tailrun_eval._write_tailtree_artifacts(inputs, evidence_by_direction, trees)
-
-
-def _load_tail_tree_evidence(observations: pl.DataFrame, inputs):
-    return tailrun_eval._load_tail_tree_evidence(observations, inputs)
-
-
-def _build_tail_tree_evidence(
-    observations,
-    source_outcomes,
-    realized_transitions,
-    inputs,
-):
-    return tailrun_eval._build_tail_tree_evidence(
-        observations, source_outcomes, realized_transitions, inputs
     )

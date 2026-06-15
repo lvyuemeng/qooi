@@ -9,6 +9,7 @@ import polars as pl
 from qooi.scanner import (
     PotentialScanConfig,
     SourceStateRow,
+    StateDirection,
     TransitionAnalysis,
     TransitionEdge,
     TransitionInsight,
@@ -16,7 +17,6 @@ from qooi.scanner import (
     UnsupportedTransitionPath,
     missing_state,
 )
-from qooi.scanner.classifiers import StateDirection
 
 
 def compute_transition_insights(

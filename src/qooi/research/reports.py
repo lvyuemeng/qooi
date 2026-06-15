@@ -49,7 +49,7 @@ from qooi.research.data import (
     prepare_signal_frame,
 )
 from qooi.research.patterns import build_transition_bundle
-from qooi.scanner.classifiers import classifier_health
+from qooi.scanner.state import classifier_health
 from qooi.strategies import StrategyBehavior, compute_signal_frame, strategy_signal_diagnostics
 from qooi.strategies.catalog import (
     strategy_metadata,

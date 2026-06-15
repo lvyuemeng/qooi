@@ -7,7 +7,6 @@ No evidence-path branching inside any section.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 import polars as pl
@@ -20,13 +19,23 @@ from qooi.scanner import ReportInputs
 class ReportSection(Protocol):
     """A composable section of the scanner report."""
 
-    def render(self, inputs: ReportInputs) -> str: ...
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str: ...
+
+
+class DiagnosticFrameSet(Protocol):
+    history_feasibility: pl.DataFrame
+    source_freshness: pl.DataFrame
+    potential_observations: pl.DataFrame
+    potential_evidence: pl.DataFrame
+    candidate_rank: pl.DataFrame
+    candidate_horizon_consistency: pl.DataFrame
+    candidate_feasibility: pl.DataFrame
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 
-def render_report(inputs: ReportInputs) -> str:
+def render_report(inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
     """Compose report from pre-built sections. No dispatch. No branching."""
     sections = (
         [
@@ -34,11 +43,12 @@ def render_report(inputs: ReportInputs) -> str:
             _SourceFreshnessSection(),
             DataHealthSection(),
             CandidateSelectionSection(),
+            HorizonConsistencySection(),
         ]
-        + list(inputs.report_sections)
+        + list(report_sections_for(inputs.config.evidence.kind))
         + [_CaveatsSection()]
     )
-    parts = [s.render(inputs) for s in sections]
+    parts = [s.render(inputs, frames) for s in sections]
     return "\n\n".join(p for p in parts if p) + "\n"
 
 
@@ -49,12 +59,10 @@ def report_sections_for(evidence: str) -> tuple:
             _TreeSummarySection(),
             _TreeImportanceSection(),
             _TreeLeafSection(),
-            _TreeReviewSection(),
             _TreeGateSection(),
         )
     return (
         _LadderEvidenceSection(),
-        _LadderReviewSection(),
         _LadderGateSection(),
     )
 
@@ -63,7 +71,7 @@ def report_sections_for(evidence: str) -> tuple:
 
 
 class _ScanScopeSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         c = inputs.config
         watch = sum(1 for d in inputs.decisions if d.group == "watch")
         blocked = sum(1 for d in inputs.decisions if d.group == "blocked")
@@ -101,11 +109,9 @@ class _ScanScopeSection:
 
 
 class _SourceFreshnessSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         path = inputs.artifacts.diagnostics_dir / "potential-observation-summary.csv"
-        if not path.exists():
-            return f"## Source Freshness\n\n- Missing observation summary: `{path}`"
-        obs = pl.read_csv(path)
+        obs = _observation_summary_frame(frames.potential_observations)
         if obs.is_empty():
             return f"## Source Freshness\n\n- Observation summary empty: `{path}`"
         total = int(obs.get_column("row_count").sum())
@@ -146,11 +152,10 @@ class DataHealthRow:
 
 
 class DataHealthSection:
-    def rows(self, diagnostics_dir: Path) -> tuple[DataHealthRow, ...]:
+    def rows(self, frames: DiagnosticFrameSet) -> tuple[DataHealthRow, ...]:
         rows: list[DataHealthRow] = []
-        source_path = diagnostics_dir / "source-freshness.csv"
-        if source_path.exists():
-            source = pl.read_csv(source_path)
+        source = frames.source_freshness
+        if not source.is_empty():
             rows.append(
                 DataHealthRow(
                     scope="sources",
@@ -164,9 +169,8 @@ class DataHealthSection:
                     + _sum_int_column(source, "frame_missing_int"),
                 )
             )
-        history_path = diagnostics_dir / "history-feasibility.csv"
-        if history_path.exists():
-            history = pl.read_csv(history_path)
+        history = frames.history_feasibility
+        if not history.is_empty():
             reviewable = _count_value(history, "feasibility_status", "reviewable_history")
             rows.append(
                 DataHealthRow(
@@ -180,9 +184,8 @@ class DataHealthSection:
                     limited_count=history.height - reviewable,
                 )
             )
-        candidate_path = diagnostics_dir / "candidate-feasibility.csv"
-        if candidate_path.exists():
-            candidates = pl.read_csv(candidate_path)
+        candidates = frames.candidate_feasibility
+        if not candidates.is_empty():
             reviewable = _count_value(candidates, "watchlist_feasibility", "reviewable")
             rows.append(
                 DataHealthRow(
@@ -206,11 +209,11 @@ class DataHealthSection:
             )
         return tuple(rows)
 
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         d = inputs.artifacts.diagnostics_dir
         hist_path = d / "history-feasibility.csv"
         watch_path = d / "watchlist-feasibility.csv"
-        rows = self.rows(d)
+        rows = self.rows(frames)
         lines = [
             "## Data Health Summary",
             "",
@@ -235,6 +238,7 @@ class DataHealthSection:
 @dataclass(frozen=True)
 class CandidateSelectionRow:
     symbol: str
+    outcome_horizon: int
     feasibility: str
     rank_score: float | None
     rank_tier: str
@@ -255,6 +259,7 @@ class CandidateSelectionRow:
     def from_frame_row(cls, row: tuple[object, ...]) -> CandidateSelectionRow:
         (
             symbol,
+            outcome_horizon,
             feasibility,
             rank_score,
             rank_tier,
@@ -273,6 +278,7 @@ class CandidateSelectionRow:
         ) = row
         return cls(
             symbol=str(symbol),
+            outcome_horizon=_int_value(outcome_horizon),
             feasibility=str(feasibility),
             rank_score=_float_value(rank_score),
             rank_tier=str(rank_tier),
@@ -292,7 +298,7 @@ class CandidateSelectionRow:
 
     def markdown_row(self) -> str:
         return (
-            f"| `{self.symbol}` | {self.feasibility} | "
+            f"| `{self.symbol}` | {self.outcome_horizon} | {self.feasibility} | "
             f"{_fmt_float(self.rank_score)} | {_fmt_float(self.source_penalty_score)} | "
             f"{self.required_missing_source_count} | {self.required_stale_source_count} | "
             f"{self.provider_bounded_source_count} | {self.optional_absent_source_count} | "
@@ -306,6 +312,7 @@ class CandidateSelectionRow:
 class CandidateSelectionSection:
     columns = [
         "symbol",
+        "outcome_horizon",
         "watchlist_feasibility",
         "rank_score",
         "rank_tier",
@@ -323,11 +330,7 @@ class CandidateSelectionSection:
         "candidate_reason",
     ]
 
-    def rows(self, diagnostics_dir: Path) -> tuple[CandidateSelectionRow, ...]:
-        path = diagnostics_dir / "candidate-feasibility.csv"
-        if not path.exists():
-            return ()
-        frame = pl.read_csv(path)
+    def rows(self, frame: pl.DataFrame) -> tuple[CandidateSelectionRow, ...]:
         if frame.is_empty():
             return ()
         ordered = frame.sort(
@@ -341,9 +344,9 @@ class CandidateSelectionSection:
         ).select(self.columns)
         return tuple(CandidateSelectionRow.from_frame_row(row) for row in ordered.iter_rows())
 
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         path = inputs.artifacts.diagnostics_dir / "candidate-feasibility.csv"
-        rows = self.rows(inputs.artifacts.diagnostics_dir)
+        rows = self.rows(frames.candidate_feasibility)
         lines = [
             "## Candidate Selection",
             "",
@@ -355,25 +358,26 @@ class CandidateSelectionSection:
             (
                 "- Units: Rank=rank_score, SrcPen=source_penalty_score, "
                 "Miss/Stale/Bound/Opt=source-family counts, "
-                "Hist%/Cap%=minimum coverage percentages."
+                "Hist%/Cap%=minimum coverage percentages, H=outcome_horizon bars."
             ),
         ]
-        if path.exists():
-            frame = pl.read_csv(path)
-            if not frame.is_empty():
-                lines.append("- Feasibility: " + _value_counts(frame, "watchlist_feasibility"))
+        if not frames.candidate_feasibility.is_empty():
+            lines.append(
+                "- Feasibility: "
+                + _value_counts(frames.candidate_feasibility, "watchlist_feasibility")
+            )
         else:
-            lines.append("- Candidate feasibility artifact is missing.")
+            lines.append("- Candidate feasibility frame is empty.")
         lines.extend(
             [
                 "",
                 (
-                    "| Symbol | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
+                    "| Symbol | H | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
                     "Hist% | Cap% | Tree | TailLift | ξ | Reason |"
                 ),
-                "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
+                "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
                 (
-                    "| | status | score | penalty | count | count | count | count | "
+                    "| | bars | status | score | penalty | count | count | count | count | "
                     "pct | pct | direction | x baseline | shape | blocker |"
                 ),
             ]
@@ -388,8 +392,63 @@ class CandidateSelectionSection:
         return "\n".join(lines)
 
 
+class HorizonConsistencySection:
+    columns = [
+        "symbol",
+        "tree_direction",
+        "horizon_count",
+        "strong_horizon_count",
+        "best_outcome_horizon",
+        "best_rank_score",
+        "best_tail_lift",
+        "direction_consistency_score",
+        "opposite_direction_count",
+        "conflict_penalty_score",
+        "consistency_rank_score",
+    ]
+
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
+        path = inputs.artifacts.diagnostics_dir / "candidate-horizon-consistency.csv"
+        lines = [
+            "## Horizon Consistency",
+            "",
+            f"- Consistency panel: `{path}`",
+            (
+                "- Units: HCnt=matched horizons, Strong=lift≥1.5 and rank>0, "
+                "BestH=best horizon bars, no mean raw-score averaging."
+            ),
+            "",
+            (
+                "| Symbol | Dir | HCnt | Strong | BestH | BestRank | BestLift | "
+                "Cons | OppCnt | Conflict | Final |"
+            ),
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            (
+                "| | direction | count | count | bars | score | x baseline | score | "
+                "count | penalty | score |"
+            ),
+        ]
+        frame = frames.candidate_horizon_consistency
+        if frame.is_empty():
+            lines.append("- No multi-horizon candidate consistency rows produced.")
+            return "\n".join(lines)
+        ordered = frame.sort("consistency_rank_score", descending=True).select(self.columns)
+        for row in ordered.head(12).iter_rows(named=True):
+            lines.append(
+                "| {symbol} | {tree_direction} | {horizon_count} | {strong_horizon_count} | "
+                "{best_outcome_horizon} | {best_rank_score:.4f} | {best_tail_lift:.4f} | "
+                "{direction_consistency_score:.4f} | {opposite_direction_count} | "
+                "{conflict_penalty_score:.4f} | {consistency_rank_score:.4f} |".format(
+                    **row
+                )
+            )
+        if frame.height > 12:
+            lines.append(f"- {frame.height - 12} additional consistency rows omitted.")
+        return "\n".join(lines)
+
+
 class _CaveatsSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         use_tree = inputs.config.evidence.kind == "tailtree"
         base = [
             "## Baseline Caveats",
@@ -438,7 +497,7 @@ class _CaveatsSection:
 
 
 class _LadderEvidenceSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         d = inputs.artifacts.diagnostics_dir
         summary_path = d / "potential-evidence-summary.csv"
         selected_path = d / "potential-evidence-selected.csv"
@@ -504,46 +563,8 @@ class _LadderEvidenceSection:
         return "\n".join(lines)
 
 
-class _LadderReviewSection:
-    def render(self, inputs: ReportInputs) -> str:
-        decisions = [d for d in inputs.decisions if d.group == "watch"]
-        lines = [
-            "## Decision Rule Audit",
-            "",
-            "Tiers: 1=top-decile Info,Sym≥15  |  2=top-quartile Info  | 3=ranked  |  —=no evidence",
-            "",
-            "< evidence (cross-coin) | decision (coin-specific) >",
-        ]
-        if not decisions:
-            lines.append("\n- No watchlist candidates.")
-            return "\n".join(lines)
-
-        rank_path = inputs.artifacts.diagnostics_dir / "candidate-rank.csv"
-        rank_data = _read_rank_data(rank_path)
-        lines.extend(
-            [
-                "| T | Symbol | Info | Rank | Direction | Suggestion | Caveat |",
-                "|---|---:|---:|---:|---:|---:|---:|",
-                "| | | bits | score | | | |",
-            ]
-        )
-        for d in decisions[:15]:
-            rd = rank_data.get(d.symbol, {})
-            tier = rd.get("tier", "—") if rd else "—"
-            info = _fmt(rd.get("transition_information_gain_bits"))
-            rank = _fmt(rd.get("rank_score"))
-            suggestion = _suggestion_from_decision(d)
-            lines.append(
-                f"| {tier} | `{d.symbol}` | {info} | {rank} | "
-                f"{d.direction} | {suggestion} | {d.review_caveat} |"
-            )
-        if len(decisions) > 15:
-            lines.append(f"- {len(decisions) - 15} additional watch rows omitted.")
-        return "\n".join(lines)
-
-
 class _LadderGateSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         path = inputs.artifacts.diagnostics_dir / "potential-evidence-summary.csv"
         if not path.exists():
             return "## Evidence Gate Summary\n\n- Evidence summary artifact missing."
@@ -573,64 +594,51 @@ class _LadderGateSection:
 
 
 class _TreeSummarySection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         d = inputs.artifacts.diagnostics_dir
         lines = ["## Tail Tree Evidence", "", "Path: LightGBM + GPD (tail exceedances only)", ""]
-
-        for direction in ("up", "down"):
-            tree_path = d / f"tail-tree-{direction}.json"
-            leaf_path = d / "potential-leaf-evidence.csv"
-            sel_path = d / f"potential-leaves-selected-{direction}.csv"
-
-            if tree_path.exists():
-                lines.append(f"- Tree_{direction.upper()}: model saved to `{tree_path.name}`")
-            else:
+        summary_path = d / "tailtree-run-summary.csv"
+        if summary_path.exists():
+            summary = pl.read_csv(summary_path)
+            if summary.is_empty():
+                lines.append("- Tailtree run summary is empty.")
+                return "\n".join(lines)
+            lines.extend(
+                [
+                    f"- Run summary: `{summary_path}`",
+                    "",
+                    "| H | Scope | Obj | Trees | TrainTail | ValidLift | UtilMean | "
+                    "VSelUtil | ModelFiles | EvidenceFiles |",
+                    "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
+                    "| bars | run/up/down | objective | count | count | x baseline | "
+                    "utility | selected utility | count | count |",
+                ]
+            )
+            for row in summary.sort(["outcome_horizon", "summary_scope"]).iter_rows(named=True):
                 lines.append(
-                    f"- Tree_{direction.upper()}: not trained (insufficient tail exceedances)"
+                    f"| {_int_value(row.get('outcome_horizon'))} | {row.get('summary_scope')} | "
+                    f"{row.get('objective', '—')} | "
+                    f"{_int_value(row.get('trained_tree_count'))} | "
+                    f"{_int_value(row.get('train_tail_count'))} | "
+                    f"{_fmt(row.get('valid_tail_lift'))} | "
+                    f"{_fmt(row.get('tail_utility_mean'))} | "
+                    f"{_fmt(row.get('valid_selected_utility_mean'))} | "
+                    f"{_int_value(row.get('written_model_file_count'))} | "
+                    f"{_int_value(row.get('written_evidence_file_count'))} |"
                 )
+            return "\n".join(lines)
 
-        if leaf_path.exists():
-            evidence = pl.read_csv(leaf_path)
-            if not evidence.is_empty():
-                total_leaves = evidence.get_column("leaf_id").n_unique()
-                lines.append(f"- Total leaves: `{total_leaves}` across both trees")
-
-            for direction in ("up", "down"):
-                if sel_path.exists():
-                    sel = pl.read_csv(sel_path) if sel_path.exists() else pl.DataFrame()
-                    if not sel.is_empty():
-                        dir_sel = (
-                            sel.filter(pl.col("tree_direction") == direction)
-                            if "tree_direction" in sel.columns
-                            else sel
-                        )
-                        lines.append(
-                            f"- Tree_{direction.upper()} leaves passing tail gate: "
-                            f"`{dir_sel.height}`"
-                        )
-
-        # Global baseline from any tree JSON
-        for direction in ("up", "down"):
-            tree_path = d / f"tail-tree-{direction}.json"
-            if tree_path.exists():
-                import json
-
-                with open(tree_path) as f:
-                    data = json.load(f)
-                gb = data.get("metadata", {}).get("global_baseline", {})
-                if gb:
-                    lines.append(
-                        f"- Global baseline (from Tree_{direction.upper()}): "
-                        f"ξ={gb.get('xi', '?'):.3f}, σ={gb.get('sigma', '?'):.2f}, "
-                        f"tail_rate={gb.get('tail_rate', 0) * 100:.1f}%"
-                    )
-                    break
-
+        legacy_model_paths = sorted(d.glob("tail-tree-h*-*.json"))
+        legacy_evidence_paths = sorted(d.glob("potential-leaf-evidence-h*-*.csv"))
+        lines.append(f"- Model artifact files: `{len(legacy_model_paths)}`")
+        lines.append(f"- Evidence artifact files: `{len(legacy_evidence_paths)}`")
+        if not legacy_model_paths and not legacy_evidence_paths:
+            lines.append("- No tailtree artifacts found.")
         return "\n".join(lines)
 
 
 class _TreeImportanceSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         d = inputs.artifacts.diagnostics_dir
         imp_path = d / "tail-tree-feature-importance.csv"
         if not imp_path.exists():
@@ -682,7 +690,7 @@ class _TreeImportanceSection:
 
 
 class _TreeLeafSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         d = inputs.artifacts.diagnostics_dir
         leaf_path = d / "potential-leaf-evidence.csv"
         if not leaf_path.exists():
@@ -718,44 +726,8 @@ class _TreeLeafSection:
         return "\n".join(lines)
 
 
-class _TreeReviewSection:
-    def render(self, inputs: ReportInputs) -> str:
-        decisions = [d for d in inputs.decisions if d.group == "watch"]
-        if not decisions:
-            return "## Review Rows\n\n- No watchlist candidates."
-
-        rank_path = inputs.artifacts.diagnostics_dir / "candidate-rank.csv"
-        rank_data = _read_rank_data(rank_path)
-        lines = [
-            "## Decision Rule Audit",
-            "",
-            "Tiers: 1=tail_lift≥2.0,ξ>0.15,N≥50  |  2=lift≥1.5,N≥30  | 3=lift≥1.0  |  —=below gate",
-            "",
-            "< evidence (cross-coin) | decision (coin-specific) >",
-            "| T | Symbol | TailLift | ξ | Depth | Direction | Leaf | Caveat |",
-            "|---|---:|---:|---:|---:|---:|---:|",
-            "| | | × | | | | | |",
-        ]
-        for d in decisions[:15]:
-            rd = rank_data.get(d.symbol, {})
-            tier = rd.get("tier", "—") if rd else "—"
-            lift = _fmt(rd.get("tail_lift"))
-            xi = _fmt(rd.get("gpd_shape_xi"))
-            depth = str(rd.get("leaf_depth", "—")) if rd.get("leaf_depth") is not None else "—"
-            lpath = str(rd.get("leaf_path", "—")) if rd.get("leaf_path") else "—"
-            if len(lpath) > 60:
-                lpath = lpath[:57] + "..."
-            lines.append(
-                f"| {tier} | `{d.symbol}` | {lift} | {xi} | {depth} | "
-                f"{d.direction} | {lpath} | {d.review_caveat} |"
-            )
-        if len(decisions) > 15:
-            lines.append(f"- {len(decisions) - 15} additional watch rows omitted.")
-        return "\n".join(lines)
-
-
 class _TreeGateSection:
-    def render(self, inputs: ReportInputs) -> str:
+    def render(self, inputs: ReportInputs, frames: DiagnosticFrameSet) -> str:
         d = inputs.artifacts.diagnostics_dir
         lines = ["## Tail Gate Summary", ""]
 
@@ -785,71 +757,19 @@ class _TreeGateSection:
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _read_rank_data(rank_path) -> dict[str, dict]:
-    if not rank_path.exists():
-        return {}
-    df = pl.read_csv(rank_path).sort("rank_score", descending=True)
-    numeric_cols = (
-        "rank_score",
-        "transition_information_gain_bits",
-        "symbol_count",
-        "tail_lift",
-        "N_tail_exceedances",
-        "gpd_shape_xi",
-    )
-    df = df.with_columns(
-        pl.col(col).cast(pl.Float64, strict=False).alias(col)
-        for col in numeric_cols
-        if col in df.columns
-    )
-
-    has_tail = "tail_lift" in df.columns and df["tail_lift"].drop_nulls().len() > 0
-    if has_tail:
-        df = df.with_columns(
-            pl.when(
-                (pl.col("tail_lift") >= 2.0)
-                & (pl.col("N_tail_exceedances").fill_null(0) >= 50)
-                & (pl.col("gpd_shape_xi").fill_null(0) > 0.15)
-            )
-            .then(pl.lit("1"))
-            .when((pl.col("tail_lift") >= 1.5) & (pl.col("N_tail_exceedances").fill_null(0) >= 30))
-            .then(pl.lit("2"))
-            .when(pl.col("tail_lift") >= 1.0)
-            .then(pl.lit("3"))
-            .otherwise(pl.lit("—"))
-            .alias("tier"),
-        )
-    else:
-        decile = df.get_column("rank_score").quantile(0.9)
-        quartile = df.get_column("rank_score").quantile(0.75)
-        df = df.with_columns(
-            pl.when(
-                (pl.col("transition_information_gain_bits").fill_null(0) >= decile)
-                & (pl.col("symbol_count").fill_null(0) >= 15)
-            )
-            .then(pl.lit("1"))
-            .when(pl.col("transition_information_gain_bits").fill_null(0) >= quartile)
-            .then(pl.lit("2"))
-            .when(pl.col("rank_score") > 0)
-            .then(pl.lit("3"))
-            .otherwise(pl.lit("—"))
-            .alias("tier"),
-        )
-
-    result = {}
-    for row in df.iter_rows(named=True):
-        result.setdefault(row["symbol"], row)
-    return result
-
-
-def _suggestion_from_decision(decision) -> str:
-    if decision.block_reason:
-        return f"watch: {decision.block_reason}"
-    if decision.transition_evidence:
-        for part in decision.transition_evidence.split("; "):
-            if part.startswith("suggestion="):
-                return part.removeprefix("suggestion=")
-    return "research review only"
+def _observation_summary_frame(observations: pl.DataFrame) -> pl.DataFrame:
+    schema = {
+        "source_family": pl.String,
+        "source_freshness": pl.String,
+        "market_alignment": pl.String,
+        "row_count": pl.UInt32,
+    }
+    if observations.is_empty():
+        return pl.DataFrame(schema=schema)
+    return observations.group_by(
+        ["source_family", "source_freshness", "market_alignment"],
+        maintain_order=True,
+    ).len(name="row_count")
 
 
 def _counts(frame: pl.DataFrame, column: str) -> str:

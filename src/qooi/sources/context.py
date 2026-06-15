@@ -43,7 +43,6 @@ CONTEXT_FAMILIES = (
 
 
 class SourceSection(Protocol):
-    refresh_mode: Literal["inherit", "incremental", "cache_only", "force"]
     book_mode: BookMode
     book_depth: int
     max_staleness_hours: int

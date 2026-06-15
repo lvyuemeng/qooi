@@ -8,17 +8,34 @@ import pytest
 import qooi.scanner as scan
 import qooi.scanner.workflow as potential
 from qooi.exchange.discovery import DiscoveryResult, empty_discovery_frame
-from qooi.scanner import classifiers, decisions, features, source_events, transitions
-from qooi.scanner import diagnostics as potential_diagnostics
-from qooi.scanner import frames as potential_frames
-from qooi.scanner import history as potential_history
+from qooi.scanner import feasibility as potential_feasibility
 from qooi.scanner import ladder as potential_ladder
+from qooi.scanner import outcome as potential_outcome
 from qooi.scanner import rank as potential_rank
 from qooi.scanner import report as potential_report
-from qooi.scanner.classifiers import STATE_FRAME_SCHEMA
+from qooi.scanner import state as potential_state
+from qooi.scanner import transitions
 from qooi.scanner.config import TransitionConfig
+from qooi.scanner.state import STATE_FRAME_SCHEMA
 from qooi.scanner.tailtree import _tailtree_outcome_by_decision, select_tail_leaves
 from qooi.scanner.workflow import run
+
+
+class _FakeLeafTree:
+    def __init__(self, leaf_id: int) -> None:
+        self.leaf_id = leaf_id
+
+    def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame:
+        return features.with_columns(pl.lit(self.leaf_id).cast(pl.Int32).alias("leaf_id"))
+
+
+class _FakeScoreTreeForRank:
+    def predict_score(self, features: pl.DataFrame) -> pl.DataFrame:
+        return features.with_columns(pl.lit(0.95).alias("tailtree_score"))
+
+class _ReportInputsForTest:
+    def __init__(self, artifacts: scan.PotentialArtifacts) -> None:
+        self.artifacts = artifacts
 
 
 def _bullish_pattern() -> scan.TransitionPattern:
@@ -183,6 +200,17 @@ def _realized_transition(symbol: str, index: int, *, changed: bool) -> dict[str,
         "time_to_direction_change_bars": 1 if changed else None,
         "time_to_core_change_bars": 1 if changed else None,
         "transition_count": 1 if changed else 0,
+        "forward_return_pct": 3.0 if changed else -1.0,
+        "forward_min_return_pct": -1.0,
+        "forward_max_return_pct": 4.0 if changed else 1.0,
+        "path_range_pct": 5.0 if changed else 2.0,
+        "tail_asymmetry_pct": 3.0 if changed else 0.0,
+        "time_to_max_bar": 1 if changed else 1,
+        "time_to_min_bar": 2 if changed else 1,
+        "close_retention_ratio": 0.75 if changed else None,
+        "post_max_drawdown_pct": 1.0 if changed else 2.0,
+        "post_min_rebound_pct": 4.0 if changed else 0.0,
+        "path_efficiency": 0.6 if changed else 0.5,
     }
 
 
@@ -192,6 +220,9 @@ def test_realized_transition_frame_preserves_future_path_metrics() -> None:
             "symbol": ["BTC", "BTC", "BTC", "BTC", "ETH", "ETH"],
             "timeframe": ["1H", "1H", "1H", "1H", "4H", "4H"],
             "bar_close_ms": [1, 2, 3, 4, 1, 2],
+            "close": [100.0, 105.0, 110.0, 103.0, 50.0, 55.0],
+            "high": [101.0, 108.0, 115.0, 104.0, 51.0, 58.0],
+            "low": [99.0, 104.0, 109.0, 95.0, 49.0, 54.0],
             "direction_hint": ["flat", "flat", "up", "flat", "down", "up"],
             "regime_state": ["range", "range", "trend", "range", "bear", "bull"],
             "structure_state": ["coil", "coil", "break", "coil", "drop", "rise"],
@@ -215,7 +246,7 @@ def test_realized_transition_frame_preserves_future_path_metrics() -> None:
         }
     )
 
-    rows = potential_history.realized_transition_frame(history, (1, 2)).sort(
+    rows = potential_outcome.realized_transition_frame(history, (1, 2)).sort(
         "symbol", "timeframe", "bar_close_ms", "outcome_horizon"
     )
 
@@ -237,8 +268,49 @@ def test_realized_transition_frame_preserves_future_path_metrics() -> None:
     assert btc_h2["transition_count"] == 1
     assert btc_h2["event_fired"] is True
     assert btc_h2["returned_to_origin"] is False
+    assert btc_h2["forward_return_pct"] == 10.0
+    assert btc_h2["forward_min_return_pct"] == 4.0
+    assert btc_h2["forward_max_return_pct"] == 15.0
+    assert btc_h2["path_range_pct"] == 11.0
+    assert btc_h2["time_to_max_bar"] == 2
+    assert btc_h2["time_to_min_bar"] == 1
+    assert btc_h2["close_retention_ratio"] == 10.0 / 15.0
+    assert btc_h2["post_max_drawdown_pct"] == 5.0
+    assert btc_h2["post_min_rebound_pct"] == 6.0
+    assert btc_h2["path_efficiency"] == 10.0 / 11.0
     assert eth_h1["direction_changed"] is True
     assert eth_h1["core_context_changed"] is True
+    assert eth_h1["forward_return_pct"] == 10.0
+    assert eth_h1["forward_max_return_pct"] == 16.0
+
+
+def test_potential_outcome_frame_preserves_market_forward_excursions() -> None:
+    outcome = potential_outcome.potential_outcome_frame(
+        pl.DataFrame(
+            [_observation("BTC-USDT-SWAP", 0, changed=True)],
+            schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
+        ),
+        pl.DataFrame(schema=potential_outcome.SOURCE_OUTCOME_SCHEMA),
+        pl.DataFrame(
+            [_realized_transition("BTC-USDT-SWAP", 0, changed=True)],
+            schema=potential_outcome.REALIZED_TRANSITION_SCHEMA,
+        ),
+        return_threshold_pct=3.5,
+    )
+
+    row = outcome.row(0, named=True)
+    assert row["forward_return_pct"] == 3.0
+    assert row["forward_min_return_pct"] == -1.0
+    assert row["forward_max_return_pct"] == 4.0
+    assert row["path_range_pct"] == 5.0
+    assert row["time_to_max_bar"] == 1
+    assert row["time_to_min_bar"] == 2
+    assert row["close_retention_ratio"] == 0.75
+    assert row["post_max_drawdown_pct"] == 1.0
+    assert row["post_min_rebound_pct"] == 4.0
+    assert row["path_efficiency"] == 0.6
+    assert row["tail_up"] is True
+    assert row["tail_down"] is False
 
 
 def _selected_evidence_for_test() -> pl.DataFrame:
@@ -287,7 +359,7 @@ def test_candidate_evidence_matches_latest_observation_to_selected_evidence() ->
             _observation("BTC-USDT-SWAP", 1, changed=True),
             _observation("BTC-USDT-SWAP", 2, changed=True),
         ],
-        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
     )
 
     candidates = potential_rank.candidate_evidence_frame(
@@ -303,13 +375,130 @@ def test_candidate_evidence_matches_latest_observation_to_selected_evidence() ->
     assert row["candidate_status"] == "matched_evidence"
 
 
+def test_candidate_evidence_scores_all_tailtree_horizon_models() -> None:
+    observations = pl.DataFrame(
+        [_observation("BTC-USDT-SWAP", 1, changed=True)],
+        schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
+    )
+    evidence = pl.DataFrame(
+        {
+            "outcome_horizon": [6, 12],
+            "tree_direction": ["up", "up"],
+            "leaf_id": [6, 12],
+            "selected_evidence_level": [True, True],
+            "tail_lift": [1.6, 2.4],
+        }
+    )
+
+    candidates = potential_rank.candidate_evidence_frame(
+        observations,
+        evidence,
+        tree_models={(6, "up"): _FakeLeafTree(6), (12, "up"): _FakeLeafTree(12)},
+    )
+
+    assert candidates.height == 2
+    rows = {row["outcome_horizon"]: row for row in candidates.iter_rows(named=True)}
+    assert set(rows) == {6, 12}
+    assert rows[6]["matched_evidence_level"] == "tree_up"
+    assert rows[12]["tail_lift"] == 2.4
+
+
+def test_candidate_evidence_matches_tailtree_score_bucket_models() -> None:
+    observations = pl.DataFrame(
+        [_observation("BTC-USDT-SWAP", 1, changed=True)],
+        schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
+    )
+    evidence = pl.DataFrame(
+        {
+            "outcome_horizon": [6],
+            "tree_direction": ["up"],
+            "score_bucket": ["top_5pct"],
+            "score_min": [0.90],
+            "score_max": [1.0],
+            "selected_evidence_level": [True],
+            "tail_lift": [2.7],
+            "N_tail_exceedances": [50],
+        }
+    )
+
+    candidates = potential_rank.candidate_evidence_frame(
+        observations,
+        evidence,
+        tree_models={(6, "up"): _FakeScoreTreeForRank()},
+    )
+
+    assert candidates.height == 1
+    row = candidates.row(0, named=True)
+    assert row["score_bucket"] == "top_5pct"
+    assert row["matched_evidence_level"] == "tree_up"
+    assert row["tail_lift"] == pytest.approx(2.7)
+    assert row["candidate_status"] == "matched_evidence"
+
+
+def test_candidate_horizon_consistency_counts_agreement_without_mean_cancellation() -> None:
+    ranked = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC", "BTC", "BTC"],
+            "decision_timeframe": ["1H", "1H", "1H", "1H"],
+            "tree_direction": ["up", "up", "down", "down"],
+            "outcome_horizon": [6, 12, 6, 24],
+            "rank_score": [8.0, 7.0, 9.0, 2.0],
+            "tail_lift": [2.4, 2.1, 2.5, 1.1],
+            "N_tail_exceedances": [60, 40, 70, 10],
+            "candidate_status": [
+                "matched_evidence",
+                "matched_evidence",
+                "matched_evidence",
+                "matched_evidence",
+            ],
+        }
+    )
+
+    panel = potential_rank.candidate_horizon_consistency_frame(ranked)
+
+    assert set(panel.get_column("tree_direction")) == {"up", "down"}
+    rows = {row["tree_direction"]: row for row in panel.iter_rows(named=True)}
+    assert rows["up"]["horizon_count"] == 2
+    assert rows["up"]["strong_horizon_count"] == 2
+    assert rows["up"]["best_outcome_horizon"] == 6
+    assert rows["up"]["best_rank_score"] == pytest.approx(8.0)
+    assert rows["up"]["opposite_direction_count"] == 2
+    assert rows["up"]["opposite_direction_best_rank_score"] == pytest.approx(9.0)
+    assert rows["up"]["conflict_penalty_score"] > 0.0
+    assert "mean_rank_score" not in panel.columns
+    assert "mean_tailtree_score" not in panel.columns
+
+
+def test_candidate_horizon_consistency_counts_each_horizon_once() -> None:
+    ranked = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC", "BTC"],
+            "decision_timeframe": ["1H", "1H", "1H"],
+            "tree_direction": ["down", "down", "down"],
+            "outcome_horizon": [6, 6, 12],
+            "rank_score": [3.0, 8.0, 4.0],
+            "tail_lift": [2.0, 2.5, 1.6],
+            "N_tail_exceedances": [10, 20, 30],
+            "candidate_status": ["matched_evidence", "matched_evidence", "matched_evidence"],
+        }
+    )
+
+    panel = potential_rank.candidate_horizon_consistency_frame(ranked)
+
+    row = panel.row(0, named=True)
+    assert row["horizon_count"] == 2
+    assert row["strong_horizon_count"] == 2
+    assert row["best_outcome_horizon"] == 6
+    assert row["best_rank_score"] == pytest.approx(8.0)
+
+
 def test_candidate_evidence_combines_matched_and_unmatched_latest_observations() -> None:
     observations = pl.DataFrame(
         [
             _observation("BTC-USDT-SWAP", 1, changed=True),
             _observation("ETH-USDT-SWAP", 1, changed=False),
         ],
-        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
     )
 
     candidates = potential_rank.candidate_evidence_frame(
@@ -325,7 +514,7 @@ def test_candidate_evidence_combines_matched_and_unmatched_latest_observations()
 def test_candidate_evidence_emits_unmatched_latest_observation_caveat() -> None:
     observations = pl.DataFrame(
         [_observation("BTC-USDT-SWAP", 1, changed=True)],
-        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
     )
     evidence = pl.DataFrame(schema={"selected_evidence_level": pl.Boolean})
 
@@ -341,7 +530,7 @@ def test_candidate_evidence_emits_unmatched_latest_observation_caveat() -> None:
 def test_rank_candidate_evidence_exposes_components_without_trading_signal() -> None:
     observations = pl.DataFrame(
         [_observation("BTC-USDT-SWAP", 1, changed=True)],
-        schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
+        schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
     )
     candidates = potential_rank.candidate_evidence_frame(
         observations, _selected_evidence_for_test()
@@ -421,6 +610,7 @@ def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> Non
         [
             {
                 "symbol": "AAA-USDT-SWAP",
+                "outcome_horizon": 6,
                 "rank_score": 10.0,
                 "source_penalty_score": 0.3,
                 "required_missing_source_count": 0,
@@ -436,6 +626,7 @@ def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> Non
             },
             {
                 "symbol": "AAA-USDT-SWAP",
+                "outcome_horizon": 12,
                 "rank_score": 20.0,
                 "source_penalty_score": 0.1,
                 "required_missing_source_count": 0,
@@ -464,16 +655,75 @@ def test_candidate_feasibility_frame_selects_best_ranked_row_per_symbol() -> Non
         ]
     )
 
-    frame = potential_diagnostics.candidate_feasibility_frame(candidate_rank, watchlist)
+    frame = potential_feasibility.candidate_feasibility_frame(candidate_rank, watchlist)
 
     assert frame.height == 1
     row = frame.row(0, named=True)
     assert row["symbol"] == "AAA-USDT-SWAP"
+    assert row["outcome_horizon"] == 12
     assert row["rank_score"] == pytest.approx(20.0)
     assert row["tree_direction"] == "down"
     assert row["rank_tier"] == "1"
     assert row["candidate_reason"] == "reviewable"
     assert row["watchlist_feasibility"] == "reviewable"
+
+
+def test_candidate_rank_pipe_requires_outcome_horizon() -> None:
+    candidate_rank = pl.DataFrame(
+        {
+            "symbol": ["AAA-USDT-SWAP"],
+            "rank_score": [1.0],
+            "source_penalty_score": [0.0],
+            "required_missing_source_count": [0],
+            "required_stale_source_count": [0],
+            "provider_bounded_source_count": [0],
+            "optional_absent_source_count": [0],
+            "tree_direction": ["up"],
+            "matched_evidence_level": ["tree_up"],
+            "tail_lift": [1.0],
+            "gpd_shape_xi": [0.1],
+            "N_tail_exceedances": [30],
+            "rank_reason": ["missing_horizon"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="candidate evidence pipe missing outcome_horizon"):
+        potential_rank.rank_candidate_evidence(candidate_rank)
+
+
+def test_tailtree_report_summary_uses_horizon_run_summary(tmp_path: Path) -> None:
+    diagnostics_dir = tmp_path / "diagnostics"
+    diagnostics_dir.mkdir()
+    pl.DataFrame(
+        {
+            "summary_scope": ["run", "up", "down", "run", "up", "down"],
+            "objective": ["tail_utility_quantile"] * 6,
+            "outcome_horizon": [6, 6, 6, 12, 12, 12],
+            "trained_tree_count": [2, 2, 2, 1, 1, 1],
+            "train_tail_count": [30, 20, 10, 40, 40, 0],
+            "valid_tail_lift": [1.5, 2.0, 1.2, 2.5, 2.5, 0.0],
+            "tail_utility_mean": [0.7, 0.8, 0.5, 0.6, 0.6, 0.0],
+            "valid_selected_utility_mean": [0.9, 1.1, 0.4, 1.0, 1.0, 0.0],
+            "written_model_file_count": [4, 4, 4, 2, 2, 2],
+            "written_evidence_file_count": [4, 4, 4, 2, 2, 2],
+        }
+    ).write_csv(diagnostics_dir / "tailtree-run-summary.csv")
+    inputs = _ReportInputsForTest(
+        artifacts=scan.PotentialArtifacts(
+            report=tmp_path / "report.md",
+            diagnostics_dir=diagnostics_dir,
+            states_dir=tmp_path / "states",
+        )
+    )
+
+    rendered = potential_report._TreeSummarySection().render(inputs, object())
+
+    assert "| H | Scope | Obj | Trees | TrainTail | ValidLift | UtilMean |" in rendered
+    assert (
+        "| 6 | up | tail_utility_quantile | 2 | 20 | 2.0000 | "
+        "0.8000 | 1.1000 | 4 | 4 |" in rendered
+    )
+    assert "Tree_UP: not trained" not in rendered
 
 
 def test_report_candidate_selection_uses_typed_rows_not_opaque_dicts() -> None:
@@ -523,10 +773,11 @@ mode = "stage"
     assert "## Unified Evidence Surface" in report
     assert "## Data Health Summary" in report
     assert "## Candidate Selection" in report
-    assert "## Decision Rule Audit" in report
-    assert "Tiers: 1=top-decile" in report
+    assert "## Horizon Consistency" in report
+    assert "## Decision Rule Audit" not in report
+    assert "Tiers: 1=top-decile" not in report
     assert (
-        "| Symbol | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
+        "| Symbol | H | Feas | Rank | SrcPen | Miss | Stale | Bound | Opt | "
         "Hist% | Cap% | Tree | TailLift | ξ | Reason |" in report
     )
     assert (diagnostics / "coverage.csv").exists()
@@ -537,6 +788,7 @@ mode = "stage"
     assert (diagnostics / "potential-evidence-selected.csv").exists()
     assert (diagnostics / "candidate-inspection.csv").exists()
     assert (diagnostics / "candidate-rank.csv").exists()
+    assert (diagnostics / "candidate-horizon-consistency.csv").exists()
     assert (diagnostics / "candidate-feasibility.csv").exists()
     profile = report_path.parent / "profile"
     assert (profile / "stages.csv").exists()
@@ -696,21 +948,6 @@ def test_universe_context_and_min_bar_selection_respect_scanner_config(monkeypat
     assert potential.target_min_bars(10, "4H") == 120
 
 
-def test_rank_report_reader_casts_csv_numeric_columns(tmp_path: Path) -> None:
-    path = tmp_path / "candidate-rank.csv"
-    path.write_text(
-        "symbol,rank_score,transition_information_gain_bits,symbol_count\n"
-        "AAA-USDT-SWAP,1.0,not_available,20\n"
-        "BBB-USDT-SWAP,2.0,3.0,30\n",
-        encoding="utf-8",
-    )
-
-    rows = potential_report._read_rank_data(path)
-
-    assert rows["BBB-USDT-SWAP"]["tier"] == "1"
-    assert rows["AAA-USDT-SWAP"]["tier"] == "3"
-
-
 def test_source_events_are_known_at_close_and_exclude_availability_states() -> None:
     bars = pl.DataFrame(
         {
@@ -750,7 +987,7 @@ def test_source_events_are_known_at_close_and_exclude_availability_states() -> N
         ),
     }
 
-    events = source_events.source_events_frame(source_frames, bars, "1H")
+    events = potential_outcome.source_events_frame(source_frames, bars, "1H")
     states = set(events.get_column("source_state").to_list())
     assert "short_buildup_with_price_down" in states
     assert "taker_buy_trap" in states
@@ -773,7 +1010,7 @@ def test_source_outcomes_predictability_and_timeliness_report_missing_futures() 
             "aligned_bar_close_ms": [1, 2],
             "serialization_status": ["historical_event", "historical_event"],
         },
-        schema=source_events.SOURCE_EVENT_SCHEMA,
+        schema=potential_outcome.SOURCE_EVENT_SCHEMA,
     )
     bars = pl.DataFrame(
         {
@@ -807,14 +1044,14 @@ def test_source_outcomes_predictability_and_timeliness_report_missing_futures() 
             "outcome_available": [False, True],
             "outcome_reason": ["future_bar_missing", "available"],
         },
-        schema=source_events.SOURCE_OUTCOME_SCHEMA,
+        schema=potential_outcome.SOURCE_OUTCOME_SCHEMA,
     )
 
-    outcomes = source_events.source_outcomes_frame(events, bars)
-    predictability = source_events.source_state_predictability_frame(
+    outcomes = potential_outcome.source_outcomes_frame(events, bars)
+    predictability = potential_outcome.source_state_predictability_frame(
         outcomes, return_threshold_pct=0.5
     )
-    timeliness = source_events.source_timeliness_frame(snapshot)
+    timeliness = potential_outcome.source_timeliness_frame(snapshot)
 
     first = outcomes.filter(
         (pl.col("outcome_horizon") == 1) & (pl.col("aligned_bar_close_ms") == 1)
@@ -854,18 +1091,18 @@ def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe(
         for index, symbol in enumerate(symbols)
     ]
     evidence = potential_ladder.potential_evidence_frame(
-        pl.DataFrame(observations, schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA),
-        pl.DataFrame(outcomes, schema=source_events.SOURCE_OUTCOME_SCHEMA),
-        pl.DataFrame(realized, schema=potential_history.REALIZED_TRANSITION_SCHEMA),
+        pl.DataFrame(observations, schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA),
+        pl.DataFrame(outcomes, schema=potential_outcome.SOURCE_OUTCOME_SCHEMA),
+        pl.DataFrame(realized, schema=potential_outcome.REALIZED_TRANSITION_SCHEMA),
         return_threshold_pct=0.5,
     )
 
-    configured_timeframe = potential_frames.potential_outcome_frame(
+    configured_timeframe = potential_outcome.potential_outcome_frame(
         pl.DataFrame(
             [_observation("BTC-USDT-SWAP", 999, changed=True) | {"decision_timeframe": "4H"}],
-            schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA,
+            schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA,
         ),
-        pl.DataFrame(schema=source_events.SOURCE_OUTCOME_SCHEMA),
+        pl.DataFrame(schema=potential_outcome.SOURCE_OUTCOME_SCHEMA),
         pl.DataFrame(
             [
                 _realized_transition("BTC-USDT-SWAP", 999, changed=True)
@@ -873,7 +1110,7 @@ def test_unified_evidence_uses_neutral_ladder_and_configured_decision_timeframe(
                 _realized_transition("BTC-USDT-SWAP", 999, changed=True)
                 | {"timeframe": "4H", "terminal_direction": "bullish"},
             ],
-            schema=potential_history.REALIZED_TRANSITION_SCHEMA,
+            schema=potential_outcome.REALIZED_TRANSITION_SCHEMA,
         ),
         return_threshold_pct=0.5,
     )
@@ -909,9 +1146,9 @@ def test_evidence_gate_excludes_market_background_and_requires_stable_informatio
         for index, symbol in enumerate(symbols * 200)
     ]
     evidence = potential_ladder.potential_evidence_frame(
-        pl.DataFrame(observations, schema=potential_frames.POTENTIAL_OBSERVATION_SCHEMA),
-        pl.DataFrame(outcomes, schema=source_events.SOURCE_OUTCOME_SCHEMA),
-        pl.DataFrame(realized, schema=potential_history.REALIZED_TRANSITION_SCHEMA),
+        pl.DataFrame(observations, schema=potential_state.POTENTIAL_OBSERVATION_SCHEMA),
+        pl.DataFrame(outcomes, schema=potential_outcome.SOURCE_OUTCOME_SCHEMA),
+        pl.DataFrame(realized, schema=potential_outcome.REALIZED_TRANSITION_SCHEMA),
         return_threshold_pct=0.5,
     )
     selected = evidence.filter(pl.col("selected_evidence_level"))
@@ -947,16 +1184,16 @@ def test_kline_history_classifier_and_transition_paths_are_known_at_close() -> N
         }
     )
 
-    history = potential_history.kline_path_rows(rows, 2)
-    classified = classifiers.KlineClassifier("1H").classify(frame)
-    missing = classifiers.KlineClassifier("1H").classify(frame.head(1))
+    history = potential_outcome.kline_path_rows(rows, 2)
+    classified = potential_state.KlineClassifier("1H").classify(frame)
+    missing = potential_state.KlineClassifier("1H").classify(frame.head(1))
     third = history.filter(pl.col("bar_close_ms") == 3).row(0, named=True)
 
     assert third["transition_path"] == "range -> markdown"
     assert third["transition_kind"] == "state_and_event_transition"
     assert third["state_age_bars"] == 1
     assert third["event_age_bars"] == 1
-    assert tuple(classified.columns) == classifiers.STATE_FRAME_COLUMNS
+    assert tuple(classified.columns) == potential_state.STATE_FRAME_COLUMNS
     assert classified.select("source_family").item(0, 0) == "kline"
     assert classified.select("scale").item(0, 0) == "1H"
     assert classified.row(60, named=True)["context_event"] == "none_in_accumulation"
@@ -981,7 +1218,7 @@ def test_kline_path_rows_keep_state_runs_separate_by_timeframe() -> None:
         }
     )
 
-    history = potential_history.kline_path_rows(rows, 2).sort("timeframe", "bar_close_ms")
+    history = potential_outcome.kline_path_rows(rows, 2).sort("timeframe", "bar_close_ms")
 
     one_h = history.filter(pl.col("timeframe") == "1H").to_dicts()
     four_h = history.filter(pl.col("timeframe") == "4H").to_dicts()
@@ -1052,7 +1289,7 @@ def test_kline_path_rows_keep_state_runs_separate_by_timeframe() -> None:
 def test_scan_review_decisions_require_transition_quality_and_source_confirmation(
     bundle, config, expected_group, expected_direction, expected_reason
 ) -> None:
-    decision = decisions.scan_review_decisions(config, (bundle,))[0]
+    decision = potential.scan_review_decisions(config, (bundle,))[0]
 
     assert decision.group == expected_group
     assert decision.direction == expected_direction
@@ -1131,7 +1368,7 @@ def test_continuous_features_use_canonical_volume_column() -> None:
     )
     state_frame = pl.DataFrame({"timestamp": list(range(30))})
 
-    result = features.extract_continuous_features(
+    result = potential_state.extract_continuous_features(
         {("BTC-USDT-SWAP", "1H"): bar_frame},
         {("BTC-USDT-SWAP", "1H"): state_frame},
         {},
@@ -1164,7 +1401,7 @@ def test_source_features_align_as_known_at_close_without_rewriting_source_time()
         )
     }
 
-    result = features.extract_continuous_features(
+    result = potential_state.extract_continuous_features(
         {("BTC-USDT-SWAP", "1H"): bar_frame},
         {("BTC-USDT-SWAP", "1H"): state_frame},
         source_frames,
@@ -1201,7 +1438,7 @@ def test_stale_source_features_are_nulled_after_family_max_age() -> None:
         )
     }
 
-    result = features.extract_continuous_features(
+    result = potential_state.extract_continuous_features(
         {("BTC-USDT-SWAP", "1H"): bar_frame},
         {("BTC-USDT-SWAP", "1H"): state_frame},
         source_frames,
