@@ -332,7 +332,19 @@ TailtreeSelectionBudgets
   top_k: tuple[int, ...] = (1, 3, 5, 10)
   top_pct: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20)
   score_gate: tuple[float, ...] = ()
+
+TailtreeSelectionFeasibilityPolicy
+  min_selected_observation_count: int
+  min_selected_symbol_count: int
+  min_selected_tail_count: int
+  min_valid_tail_lift: float
+  min_profit_proxy_per_selected_obs: float
 ```
+
+Budgets and feasibility stay separate despite sharing the ergonomic
+`[potential.evidence.tailtree.selection]` config section. Budgets enumerate replay rows;
+feasibility determines whether each replay row is allowed to win. Neither type owns trial
+generation, walkforward fold construction, or artifact naming.
 
 Coding guidance:
 

@@ -468,6 +468,21 @@ These concerns are orthogonal and must not be fused into one workflow flag:
 | selection replay | top-k/top-pct/score-gate budgets and support/concentration/utility gates | tree training, fold boundaries, sampler pruning |
 | feedback projection | normalized selection-efficiency score/rank/margin | new artifact families, objective-native loss comparison |
 
+`TailtreeSelectionBudgets` and `TailtreeSelectionFeasibilityPolicy` are not meant to be
+parallel config surfaces. They are runtime ports with different semantics:
+
+```text
+TailtreeSelectionBudgets             # enumerates selected candidate subsets
+TailtreeSelectionFeasibilityPolicy   # judges whether each subset is eligible to win
+```
+
+The config load shape may keep them under one ergonomic
+`[potential.evidence.tailtree.selection]` section, but it must materialize those two runtime
+ports at the diagnostics boundary. Do not let budgets inherit feasibility fields, do not let
+feasibility choose budgets, and do not add a third selection artifact because both policies
+are present. Budgets change *what rows are replayed*; feasibility changes *which replayed
+rows can win*.
+
 Walkforward is a training/evaluation protocol, not an HPO feature. A fixed-parameter scan
 may run under walkforward; an HPO search must run under walkforward when it selects
 parameters; and manual deterministic trials use the same protocol. The final full-window
