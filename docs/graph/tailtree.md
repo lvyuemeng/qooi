@@ -1,6 +1,18 @@
 # Tailtree Module Graph
 
-`qooi.scanner.tailtree` is the LightGBM + GPD extreme-value evidence path. It consumes scanner observation/outcome frames and emits tree models plus per-leaf numeric evidence.
+`qooi.scanner.tailtree` is the public LightGBM + GPD extreme-value evidence API. It consumes scanner observation/outcome frames and emits tree models plus numeric evidence products.
+
+Implementation layout:
+
+```text
+qooi.scanner.tailtree             # package export surface, no implementation sprawl
+qooi.scanner.tailtree.model       # labels, training frame, LightGBM/GPD model
+qooi.scanner.tailtree.evidence    # leaf and score-bucket evidence products
+```
+
+Callers should import from `qooi.scanner.tailtree`; graph docs may name the owner module
+when documenting internals. Public compatibility is preserved while implementation code
+stays grouped by product rather than by `_tailtree_*` prefixes.
 
 Design doc: `docs/architecture/scanner.md`.
 
@@ -65,6 +77,140 @@ For the daily-deep config, `bar = "1H"` and `transition.mae_mfe_horizon = 12`, s
 
 ## Public data products
 
+### Feature, label, and output grains
+
+Tailtree has three separate data products. Do not collapse them into one
+"prediction" table:
+
+```text
+Feature row grain
+  key: symbol, decision_timeframe, decision_bar_close_ms, optional source_family/source_state/source_known_at_ms
+  meaning: known-at-close state available at the decision bar
+
+Label row grain
+  key: symbol, decision_bar_close_ms, outcome_horizon, direction
+  meaning: future path excursion after the decision bar
+
+Leaf evidence row grain
+  key: tree_direction, leaf_id
+  meaning: historical concentration/severity of tail labels for observations assigned to that leaf
+```
+
+Consistent historical source features are restricted to funding-like derivative families:
+
+```text
+funding_rate
+oi_delta
+taker_buy_sell_ratio
+long_short_ratio
+funding_age_ms
+oi_age_ms
+taker_age_ms
+lsr_age_ms
+```
+
+Books/trades fields such as `imbalance_value`, `spread_bps`, `buy_sell_ratio`,
+`book_age_ms`, and `trade_age_ms` are not training features unless a consistent
+historical source contract exists for the active run. They may still be current-review
+or cost/liquidity features outside tailtree training.
+
+Tailtree feature selection is contract-based, not manifest-based. The trainable feature
+set is the explicit list of columns from families whose persisted data contract is
+historically consistent at the decision-bar grain:
+
+```text
+persistent source family + known-at aligned historical artifact -> allowed training columns
+ephemeral/current-only source family -> review/cost/feasibility columns only
+```
+
+Implemented selector:
+
+```text
+qooi.scanner.tailrun._tailtree_training_features(
+    observations: pl.DataFrame,
+) -> tuple[list[str], list[str]]
+```
+
+It returns categorical and continuous training feature names from the explicit persistent
+contract. It does not infer trainability from column presence alone; column presence only
+filters the already-allowed list.
+
+A future API becomes trainable by landing a persistent artifact contract and then adding
+its columns to the tailtree training feature list. The model must not infer trainability
+from column presence alone.
+
+Tailtree outputs evidence, not execution decisions:
+
+```text
+TailTreeModel.predict_leaf(...)       -> observation row + leaf_id
+TailTreeModel.predict_score(...)      -> observation row + tailtree_score
+leaf_evidence_frame(...)              -> per-leaf tail frequency/severity evidence
+score_bucket_evidence_frame(...)      -> per-score-bucket tail frequency/utility evidence
+candidate_evidence_frame(...)         -> current observation matched to historical evidence
+candidate_horizon_consistency_frame(...) -> candidate-level horizon agreement panel
+rank/candidate selection              -> downstream inspection surface, not model-owned
+```
+
+Evidence bucket dispatch is objective-owned:
+
+```text
+tail_severity_gpd
+  model output used for evidence: leaf_id
+  persisted evidence artifact: potential-leaf-evidence-h{H}-{direction}.csv
+  candidate match key: outcome_horizon, tree_direction, leaf_id
+
+tail_utility_quantile
+  model output used for evidence: tailtree_score
+  persisted evidence artifact: potential-score-bucket-evidence-h{H}-{direction}.csv
+  candidate match key: outcome_horizon, tree_direction, score_bucket
+```
+
+The score-bucket artifact is additive. It must not overwrite or reinterpret leaf evidence
+Utility candidates may carry `leaf_id = null`; rank/report consumers use the
+numeric score-bucket evidence columns.
+
+Multi-horizon candidate ensemble is a consistency panel over calibrated candidate rows.
+It does not average raw model scores and does not average opposite directions together.
+
+```text
+qooi.scanner.rank.candidate_horizon_consistency_frame(
+    candidate_rank: pl.DataFrame,
+) -> pl.DataFrame
+```
+
+Input grain:
+
+```text
+symbol × decision_timeframe × tree_direction × outcome_horizon
+```
+
+Output grain:
+
+```text
+symbol × decision_timeframe × tree_direction
+```
+
+Required output columns:
+
+```text
+horizon_count
+strong_horizon_count          # horizons passing lift/score gates
+horizon_span_bars             # max(horizon)-min(horizon)
+best_outcome_horizon
+best_rank_score
+best_tail_lift
+best_tail_utility_score       # max tail_lift × log1p(N_tail_exceedances)
+direction_consistency_score   # count/strength score, not mean raw score
+opposite_direction_count
+opposite_direction_best_rank_score
+conflict_penalty_score
+consistency_rank_score
+```
+
+The artifact is written as `candidate-horizon-consistency.csv` beside
+`candidate-rank.csv` and is report-only feedback. Candidate promotion still uses the
+canonical ranked candidate rows.
+
 ### Labeled outcome frame
 
 ```text
@@ -82,20 +228,22 @@ tail_up: bool
 tail_down: bool
 tail_exceedance_value_up: float
 tail_exceedance_value_down: float
+tail_utility_up: float
+tail_utility_down: float
 ```
 
-Planned path-shape extension should keep the excursion label but add retention/exhaustion columns:
+Fixed-horizon path-shape columns preserve the excursion label but add retention/exhaustion diagnostics:
 
 ```text
 time_to_max_bar: int
 time_to_min_bar: int
 close_retention_ratio: float
-post_peak_drawdown_pct: float
+post_max_drawdown_pct: float
+post_min_rebound_pct: float
 path_efficiency: float
-entry_delay_bars: int
 ```
 
-These columns let downstream selection distinguish:
+These numeric columns let downstream selection distinguish:
 
 ```text
 up_touch          # high excursion only
@@ -106,6 +254,29 @@ down_continuation
 down_exhaustion
 volatility        # both directions show elevated tail lift
 ```
+
+Multi-horizon extension should use rows keyed by `outcome_horizon` first:
+
+```text
+qooi.scanner.outcome.potential_outcome_frame(...)
+    -> rows for horizon in configured_horizons
+
+qooi.scanner.tailtree.label_tail_exceedances(...)
+    -> preserves outcome_horizon and adds direction labels per row
+```
+
+Artifact identity must include horizon semantics:
+
+```text
+model_tag
+bar
+outcome_horizon
+threshold_pct
+feature_schema_hash
+```
+
+Start with separate per-horizon model artifacts. A shared multi-horizon model is allowed
+only after per-horizon summaries show enough non-null labels and validation tail counts.
 
 ### Tailtree training frame
 
@@ -128,10 +299,27 @@ TailtreeTrainingFrame
 ├── all_observations        # denominator population
 ├── tail_observations       # tree/GPD training population
 ├── exceedance_values       # positive threshold excesses
+├── utility_values          # log/quantile target source for tail_utility objectives
 └── global_tail_rate        # len(tail_observations) / len(all_observations)
 ```
 
 Training uses `tail_observations`; diagnostics project `all_observations` through the trained model.
+Validation-quality diagnostics use the same deterministic tailtree validation fraction
+and stay numeric:
+
+```text
+train_tail_count
+valid_observation_count
+valid_tail_count
+valid_tail_rate
+valid_selected_observation_count
+valid_selected_tail_count
+valid_selected_tail_rate
+valid_tail_lift
+```
+
+`valid_tail_lift` is selected-validation tail rate divided by validation baseline
+tail rate. Zero valid baseline produces zero lift.
 
 ---
 
@@ -140,6 +328,7 @@ Training uses `tail_observations`; diagnostics project `all_observations` throug
 ### `qooi.scanner.tailtree.TrainConfig`
 
 ```text
+objective: Literal["tail_severity_gpd", "tail_utility_quantile"]
 num_leaves: int
 min_data_in_leaf: int
 learning_rate: float
@@ -148,6 +337,74 @@ early_stopping_rounds: int
 validation_fraction: float
 random_seed: int
 ```
+
+Objective behavior:
+
+```text
+tail_severity_gpd
+  target rows = tail rows only
+  target      = tail_exceedance_value_{direction}
+  objective   = custom bounded-ξ GPD NLL surrogate
+  GPD params  = post-hoc leaf exceedance fit
+
+tail_utility_quantile
+  target rows = tail rows only
+  target      = log1p(tail_utility_{direction})
+  objective   = LightGBM quantile loss, alpha=0.8
+  evidence    = full-ensemble score buckets, not last-tree leaves
+  GPD params  = raw exceedance descriptor; utility remains moment-based feedback
+```
+
+Baseline feedback columns are numeric and written into `tailtree-run-summary.csv`:
+
+```text
+objective
+tail_utility_mean
+tail_utility_p90
+valid_selected_utility_mean
+valid_selected_utility_p90
+```
+
+### `qooi.scanner.tailtree.score_bucket_evidence_frame`
+
+```text
+qooi.scanner.tailtree.score_bucket_evidence_frame(
+    tree: TailTreeModel,
+    observations: pl.DataFrame,
+    outcomes: pl.DataFrame,
+    *,
+    score_quantiles: tuple[float, ...] = (0.99, 0.98, 0.95, 0.90),
+) -> pl.DataFrame
+```
+
+Output grain:
+
+```text
+outcome_horizon × tree_direction × score_bucket
+```
+
+Required columns:
+
+```text
+score_bucket                  # top_1pct/top_2pct/top_5pct/top_10pct
+score_quantile                # numeric cutoff quantile
+score_min
+score_max
+N_total
+N_tail_exceedances
+leaf_tail_rate                # bucket tail rate, retained name for rank compatibility
+global_tail_rate
+tail_lift
+tail_lift_stability
+tail_utility_mean
+tail_utility_p90
+gpd_shape_xi                  # raw exceedance GPD basis only when available, else null
+gpd_scale_sigma
+```
+
+Candidate matching for this artifact scores current rows with the full ensemble, assigns
+the configured bucket, then joins on `(outcome_horizon, tree_direction, score_bucket)`.
+It does not use LightGBM `pred_leaf=True` for boosted utility evidence.
 
 ### `qooi.scanner.tailtree.GPDParams`
 
@@ -203,25 +460,33 @@ TailTreeModel.from_json(path) -> TailTreeModel
 ## Training graph per direction
 
 ```text
-labeled_outcomes = label_tail_exceedances(outcomes, threshold_pct)
-training_frame   = tailtree_training_frame(observations, labeled_outcomes, direction)
+for outcome_horizon in config.evidence.tailtree.outcome_horizon:
+    labeled_horizon = labeled_outcomes.filter(pl.col("outcome_horizon") == outcome_horizon)
+    training_frame = tailtree_training_frame(observations, labeled_horizon, direction)
 
-all_n       = training_frame.train_n_observations
-tail_train  = training_frame.tail_observations
-excess      = training_frame.exceedance_values
-global_rate = training_frame.global_tail_rate
+    all_n       = training_frame.train_n_observations
+    tail_train  = training_frame.tail_observations
+    excess      = training_frame.exceedance_values
+    global_rate = training_frame.global_tail_rate
 
-model = TailTreeModel.train(
-    tail_train,
-    excess,
-    config=TrainConfig(...),
-    categorical_features=present_categoricals,
-    continuous_features=present_continuous,
-    direction=direction,
-    global_tail_rate=global_rate,
-    train_n_observations=all_n,
-)
+    model = TailTreeModel.train(
+        tail_train,
+        excess,
+        config=TrainConfig(...),
+        categorical_features=present_categoricals,
+        continuous_features=present_continuous,
+        direction=direction,
+        global_tail_rate=global_rate,
+        train_n_observations=all_n,
+    )
+
+    summary = _tailtree_run_summary_frame(..., outcome_horizon=outcome_horizon)
+    quality = TailtreeDirectionQuality.from_labeled_leaf_frame(...)
 ```
+
+`tailrun/` keeps config/artifact access typed at the boundary via `ReportInputs`
+and groups summary math in dataclass methods. It should not use untyped helper
+arguments plus repeated `inputs.config...` attribute chains inside dataframe hot paths.
 
 ---
 
@@ -239,24 +504,40 @@ kind = "tailtree"
 lifecycle = "train"        # "train" or "load_predict"
 model_dir = "data/output/potential/daily-deep/models"
 model_tag = "tailtree-1h-12h-v1"
+outcome_horizon = [6, 12, 24]  # int or list[int]
+# train writes one horizon-suffixed artifact set per configured horizon
 ```
 
 Implemented lifecycle calls:
 
 ```text
-qooi.scanner.tailrun.run(...)
+qooi.scanner.tailrun.run(
+    observations,
+    source_outcomes,
+    realized_transitions,
+    inputs,
+    *,
+    source_event_row_count: int,
+) -> TailtreeEvidenceResult
     if config.evidence.tailtree.lifecycle == "train":
         → qooi.scanner.tailrun.train_evaluate_predict(...)
-        → write model_dir/model_tag/tail-tree-up.json
-        → write model_dir/model_tag/tail-tree-down.json
-        → write model_dir/model_tag/potential-leaf-evidence-up.csv
-        → write model_dir/model_tag/potential-leaf-evidence-down.csv
-        → write model_dir/model_tag/tailtree-artifact.json
+        → remove stale direction artifacts for model_tag
+        → write model_dir/model_tag/tailtree-run-summary.csv
+        → write diagnostics/tailtree-run-summary.csv
+        → summary rows include outcome_horizon
+        → write model_dir/model_tag/tailtree-artifact-h{horizon}.json
+        → conditionally write tail-tree-h{horizon}-{up,down}.json for trained directions
+        → conditionally write potential-leaf-evidence-h{horizon}-{up,down}.csv for nonempty evidence
     if config.evidence.tailtree.lifecycle == "load_predict":
         → qooi.scanner.tailrun.load_predict(...)
-        → load frozen models/evidence
-        → validate artifact metadata against config
-        → return TailtreeEvidenceResult
+        → for each configured outcome_horizon:
+            → load tailtree-artifact-h{horizon}.json
+            → validate metadata outcome_horizon/bar/threshold/model_tag
+            → load tail-tree-h{horizon}-{up,down}.json where present
+            → load matching potential-leaf-evidence-h{horizon}-{up,down}.csv
+            → validate evidence rows carry the same outcome_horizon
+            → copy frozen tailtree-run-summary.csv into current diagnostics for report feedback
+        → return TailtreeEvidenceResult(models={(horizon, direction): tree}, evidence=concat(...))
 
 qooi.scanner.tailtree
     → statistical/model code only: labels, training frame, TailTreeModel,
@@ -264,7 +545,7 @@ qooi.scanner.tailtree
 
 qooi.scanner.tailrun
     → lifecycle code: artifact root, metadata hash, save/load, validation,
-      train-vs-load dispatch
+      train-vs-load dispatch, structural train-summary rows
 ```
 
 Do not move lifecycle dispatch into report, candidate, or ranking modules.
@@ -273,14 +554,14 @@ Mode semantics:
 
 | Lifecycle | Input contract | Model action | Output contract |
 |---|---|---|---|
-| `train` | observations + outcomes | train, validate, persist `tail-tree-up/down.json` | evidence + model + candidates |
-| `load_predict` | latest observations + frozen evidence/model artifact | load only; no outcome dependency for prediction | candidates from frozen evidence/model |
+| `train` | observations + outcomes + source-event count | train eligible directions, replace artifact set, always write summary | evidence + optional models + candidates |
+| `load_predict` | latest observations + frozen evidence/model artifacts for every configured horizon | load only; no outcome dependency for prediction | same horizon-dimensional candidate/rank/report grain as train |
 
 `load_predict` must validate artifact compatibility before ranking:
 
 ```text
 bar
-horizon_bars
+outcome_horizon
 threshold_pct
 categorical_features
 continuous_features
@@ -408,7 +689,22 @@ and path-shape quality passes
 and freshness/cost gates pass at candidate time
 ```
 
-Multi-horizon output should preserve one row per `(horizon_bars, tree_direction, leaf_id)` so rank can compare short-burst, medium-continuation, and long-horizon setups quantitatively.
+Multi-horizon output preserves one row per `(outcome_horizon, tree_direction, leaf_id)` so rank can compare short-burst, medium-continuation, and long-horizon setups quantitatively.
+
+Candidate bridge:
+
+```text
+qooi.scanner.rank.candidate_evidence_frame(
+    observations,
+    evidence,
+    tree_models={(outcome_horizon, direction): TailTreeModel, ...},
+) -> rows keyed by symbol, decision_bar_close_ms, outcome_horizon, tree_direction
+```
+
+The rank bridge must not collapse to a single model pair. Current observations are
+projected through every trained horizon/direction model, joined to evidence on
+`(outcome_horizon, tree_direction, leaf_id)`, and then ranked as candidate-horizon
+rows.
 
 ---
 

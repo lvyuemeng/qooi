@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from qooi.profiling import ProfileConfig
 from qooi.sources.collect import BookMode
@@ -13,6 +13,7 @@ from qooi.sources.collect import BookMode
 RefreshMode = Literal["incremental", "cache_only", "force"]
 EvidenceKind = Literal["ladder", "tailtree"]
 TailtreeLifecycle = Literal["train", "load_predict"]
+TailtreeObjective = Literal["tail_severity_gpd", "tail_utility_quantile"]
 
 
 class SourceConfig(BaseModel):
@@ -67,17 +68,31 @@ class ReviewConfig(BaseModel):
 
 
 class TailtreeConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     lifecycle: TailtreeLifecycle = "train"
     model_dir: Path = Path("data/output/potential/models")
     model_tag: str = "tailtree-current"
+    objective: TailtreeObjective = "tail_severity_gpd"
     threshold_pct: float = 5.0
     num_leaves: int = 64
     min_data_in_leaf: int = 30
     learning_rate: float = 0.05
     num_iterations: int = 200
     early_stopping_rounds: int = 20
+    outcome_horizon: tuple[int, ...] = (12,)
+
+    @field_validator("outcome_horizon", mode="before")
+    @classmethod
+    def normalize_outcome_horizon(cls, value: object) -> tuple[int, ...]:
+        if value is None:
+            return (12,)
+        if isinstance(value, int):
+            values = (value,)
+        else:
+            values = tuple(value)  # type: ignore[arg-type]
+        horizons = tuple(dict.fromkeys(int(horizon) for horizon in values if int(horizon) > 0))
+        return horizons or (12,)
 
 
 class EvidenceConfig(BaseModel):

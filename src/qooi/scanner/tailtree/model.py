@@ -34,6 +34,7 @@ class LightGbmDataset(Protocol):
 class TrainConfig(BaseModel):
     """Training hyperparameters. Validated on construction."""
 
+    objective: Literal["tail_severity_gpd", "tail_utility_quantile"] = "tail_severity_gpd"
     num_leaves: int = Field(default=64, ge=8, le=256)
     min_data_in_leaf: int = Field(default=30, ge=10, le=500)
     learning_rate: float = Field(default=0.05, gt=0, le=1.0)
@@ -79,6 +80,7 @@ class TailtreeTrainingFrame:
     all_observations: pl.DataFrame
     tail_observations: pl.DataFrame
     exceedance_values: np.ndarray
+    utility_values: np.ndarray
     global_tail_rate: float
 
     @property
@@ -93,7 +95,15 @@ class TailtreeTrainingFrame:
         return self.train_n_exceedances >= min_count
 
 
-# ── TailTreeModel ────────────────────────────────────────────────────────────
+def _leaf_id_vector(pred_leaf: object) -> np.ndarray:
+    """Return one leaf id per row from LightGBM pred_leaf output."""
+    leaves = np.asarray(pred_leaf)
+    if leaves.ndim == 2:
+        leaves = leaves[:, -1]
+    return leaves.astype("int32").ravel()
+
+
+
 
 
 @dataclass
@@ -119,6 +129,7 @@ class TailTreeModel:
         direction: Literal["up", "down"],
         global_tail_rate: float | None = None,
         train_n_observations: int | None = None,
+        utility_values: np.ndarray | None = None,
     ) -> TailTreeModel:
         """Train a LightGBM tree with GPD-based objective on tail exceedances.
 
@@ -145,6 +156,13 @@ class TailTreeModel:
             raise ValueError(
                 f"Not enough exceedances ({len(exceedance_values)}) for "
                 f"min_data_in_leaf={config.min_data_in_leaf}"
+            )
+        utility_values = (
+            utility_values.astype(float) if utility_values is not None else exceedance_values
+        )
+        if len(utility_values) != len(features):
+            raise ValueError(
+                "utility_values length " f"{len(utility_values)} != features length {len(features)}"
             )
 
         # 1. Global GPD fit over tail exceedance severity.
@@ -179,7 +197,12 @@ class TailTreeModel:
 
         n_valid = max(1, int(len(x) * config.validation_fraction))
         x_train, x_valid = x[:-n_valid], x[-n_valid:]
-        y_train, y_valid = exceedance_values[:-n_valid], exceedance_values[-n_valid:]
+        target_values = (
+            np.log1p(np.maximum(utility_values, 0.0))
+            if config.objective == "tail_utility_quantile"
+            else exceedance_values
+        )
+        y_train, y_valid = target_values[:-n_valid], target_values[-n_valid:]
 
         train_data = lgb.Dataset(
             x_train,
@@ -194,9 +217,11 @@ class TailTreeModel:
         )
 
         # 3. Train LightGBM
+        is_gpd_objective = config.objective == "tail_severity_gpd"
         params = {
-            "objective": _gpd_xi_objective,
-            "metric": "None",
+            "objective": _gpd_xi_objective if is_gpd_objective else "quantile",
+            "metric": "None" if is_gpd_objective else "quantile",
+            "alpha": 0.8,
             "num_leaves": config.num_leaves,
             "min_data_in_leaf": config.min_data_in_leaf,
             "learning_rate": config.learning_rate,
@@ -211,7 +236,7 @@ class TailTreeModel:
             num_boost_round=config.num_iterations,
             valid_sets=[valid_data],
             valid_names=["valid"],
-            feval=_gpd_nll_eval,
+            feval=_gpd_nll_eval if is_gpd_objective else None,
             callbacks=[
                 lgb.early_stopping(config.early_stopping_rounds),
                 lgb.log_evaluation(0),
@@ -219,7 +244,7 @@ class TailTreeModel:
         )
 
         # 4. Per-leaf GPD fit
-        leaf_ids = booster.predict(x_train, pred_leaf=True).astype(int).ravel()
+        leaf_ids = _leaf_id_vector(booster.predict(x_train, pred_leaf=True))
         leaf_params: dict[int, GPDParams] = {}
         for lid in np.unique(leaf_ids):
             mask = leaf_ids == lid
@@ -281,8 +306,21 @@ class TailTreeModel:
                 codes = features.get_column(col).cast(pl.Categorical).to_physical().to_numpy()
                 idx = present.index(col)
                 x[:, idx] = codes.astype(np.float64)
-        leaf_ids = self._booster.predict(x, pred_leaf=True).astype("int32").ravel()
+        leaf_ids = _leaf_id_vector(self._booster.predict(x, pred_leaf=True))
         return features.with_columns(pl.Series("leaf_id", leaf_ids))
+
+    def predict_score(self, features: pl.DataFrame) -> pl.DataFrame:
+        """Score each row with the full boosted model ensemble."""
+        all_cols = self.metadata.categorical_features + self.metadata.continuous_features
+        present = [c for c in all_cols if c in features.columns]
+        x = features.select(present).to_numpy()
+        for col in self.metadata.categorical_features:
+            if col in features.columns and features[col].dtype == pl.String:
+                codes = features.get_column(col).cast(pl.Categorical).to_physical().to_numpy()
+                idx = present.index(col)
+                x[:, idx] = codes.astype(np.float64)
+        scores = np.asarray(self._booster.predict(x)).astype(float).ravel()
+        return features.with_columns(pl.Series("tailtree_score", scores))
 
     def predict_leaf_params(self, features: pl.DataFrame) -> pl.DataFrame:
         """Predict leaf and join per-leaf GPD params. Adds xi, sigma, tail_rate."""
@@ -392,6 +430,37 @@ def label_tail_exceedances(
     has_max = "forward_max_return_pct" in outcome_frame.columns
     has_min = "forward_min_return_pct" in outcome_frame.columns
 
+    retention = (
+        pl.col("close_retention_ratio").cast(pl.Float64).clip(0.0, 1.0)
+        if "close_retention_ratio" in outcome_frame.columns
+        else pl.lit(1.0)
+    )
+    efficiency = (
+        pl.col("path_efficiency").cast(pl.Float64).clip(0.0, 1.0)
+        if "path_efficiency" in outcome_frame.columns
+        else pl.lit(1.0)
+    )
+    max_speed = (
+        1.0 / (1.0 + pl.col("time_to_max_bar").cast(pl.Float64).fill_null(0.0)).sqrt()
+        if "time_to_max_bar" in outcome_frame.columns
+        else pl.lit(1.0)
+    )
+    min_speed = (
+        1.0 / (1.0 + pl.col("time_to_min_bar").cast(pl.Float64).fill_null(0.0)).sqrt()
+        if "time_to_min_bar" in outcome_frame.columns
+        else pl.lit(1.0)
+    )
+    max_drawdown_penalty = (
+        pl.col("post_max_drawdown_pct").cast(pl.Float64).fill_null(0.0).clip(0.0, None)
+        if "post_max_drawdown_pct" in outcome_frame.columns
+        else pl.lit(0.0)
+    )
+    min_rebound_penalty = (
+        pl.col("post_min_rebound_pct").cast(pl.Float64).fill_null(0.0).clip(0.0, None)
+        if "post_min_rebound_pct" in outcome_frame.columns
+        else pl.lit(0.0)
+    )
+
     exprs = []
     if has_max:
         exprs.extend(
@@ -403,6 +472,18 @@ def label_tail_exceedances(
                 .then(pl.col("forward_max_return_pct").cast(pl.Float64) - threshold_pct)
                 .otherwise(None)
                 .alias("tail_exceedance_value_up"),
+                pl.when(pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct)
+                .then(
+                    (
+                        (pl.col("forward_max_return_pct").cast(pl.Float64) - threshold_pct)
+                        * retention
+                        * efficiency
+                        * max_speed
+                        - 0.1 * max_drawdown_penalty
+                    ).clip(0.0, None)
+                )
+                .otherwise(0.0)
+                .alias("tail_utility_up"),
             ]
         )
     if has_min:
@@ -415,6 +496,18 @@ def label_tail_exceedances(
                 .then(pl.col("forward_min_return_pct").cast(pl.Float64).abs() - threshold_pct)
                 .otherwise(None)
                 .alias("tail_exceedance_value_down"),
+                pl.when(pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct)
+                .then(
+                    (
+                        (pl.col("forward_min_return_pct").cast(pl.Float64).abs() - threshold_pct)
+                        * retention
+                        * efficiency
+                        * min_speed
+                        - 0.1 * min_rebound_penalty
+                    ).clip(0.0, None)
+                )
+                .otherwise(0.0)
+                .alias("tail_utility_down"),
             ]
         )
 
@@ -438,6 +531,7 @@ def tailtree_training_frame(
     """
     empty_obs = observations.head(0)
     exceed_col = f"tail_exceedance_value_{direction}"
+    utility_col = f"tail_utility_{direction}"
     tail_col = f"tail_{direction}"
     if (
         observations.is_empty()
@@ -449,6 +543,7 @@ def tailtree_training_frame(
             all_observations=empty_obs,
             tail_observations=empty_obs,
             exceedance_values=np.array([], dtype=float),
+            utility_values=np.array([], dtype=float),
             global_tail_rate=0.0,
         )
 
@@ -464,12 +559,16 @@ def tailtree_training_frame(
             all_observations=all_observations,
             tail_observations=empty_obs,
             exceedance_values=np.array([], dtype=float),
+            utility_values=np.array([], dtype=float),
             global_tail_rate=0.0,
         )
 
+    selected_cols = ["symbol", "decision_bar_close_ms", exceed_col]
+    if utility_col in labeled_outcomes.columns:
+        selected_cols.append(utility_col)
     tail_outcomes = (
         labeled_outcomes.filter(pl.col(tail_col).fill_null(False))
-        .select("symbol", "decision_bar_close_ms", exceed_col)
+        .select(selected_cols)
         .unique(subset=["symbol", "decision_bar_close_ms"], keep="first")
     )
     tail_observations = observations.join(
@@ -482,6 +581,11 @@ def tailtree_training_frame(
         if not tail_observations.is_empty()
         else np.array([], dtype=float)
     )
+    utility_values = (
+        tail_observations.get_column(utility_col).fill_null(0.0).to_numpy()
+        if utility_col in tail_observations.columns and not tail_observations.is_empty()
+        else exceedance_values
+    )
     global_tail_rate = (
         len(tail_observations) / len(all_observations) if not all_observations.is_empty() else 0.0
     )
@@ -490,6 +594,7 @@ def tailtree_training_frame(
         all_observations=all_observations,
         tail_observations=tail_observations,
         exceedance_values=exceedance_values,
+        utility_values=utility_values,
         global_tail_rate=global_tail_rate,
     )
 
@@ -519,293 +624,3 @@ def _tailtree_outcome_by_decision(outcomes: pl.DataFrame) -> pl.DataFrame:
     if not exprs:
         return outcomes.select("symbol", "decision_bar_close_ms").unique()
     return outcomes.group_by("symbol", "decision_bar_close_ms").agg(*exprs)
-
-
-def leaf_evidence_frame(
-    tree: TailTreeModel,
-    observations: pl.DataFrame,
-    outcomes: pl.DataFrame,
-    *,
-    recent_window_days: int = 30,
-) -> pl.DataFrame:
-    """Per-leaf tail evidence: N_total, N_tail, xi, sigma, tail_lift, stability."""
-    with_leaf = tree.predict_leaf(observations)
-
-    global_tr = tree.metadata.global_baseline.tail_rate
-    tail_col = "tail_up" if tree.metadata.direction == "up" else "tail_down"
-    has_tail = tail_col in outcomes.columns
-
-    if not has_tail:
-        return pl.DataFrame(
-            schema={
-                "leaf_id": pl.Int32,
-                "tree_direction": pl.String,
-                "N_total": pl.UInt32,
-                "N_tail_exceedances": pl.UInt32,
-                "gpd_shape_xi": pl.Float64,
-                "gpd_scale_sigma": pl.Float64,
-                "tail_lift": pl.Float64,
-                "tail_lift_stability": pl.Float64,
-                "leaf_tail_rate": pl.Float64,
-                "global_tail_rate": pl.Float64,
-            }
-        )
-
-    outcome_by_decision = _tailtree_outcome_by_decision(outcomes)
-    joined = with_leaf.join(
-        outcome_by_decision.select("symbol", "decision_bar_close_ms", tail_col),
-        on=["symbol", "decision_bar_close_ms"],
-        how="left",
-    )
-
-    leaf_stats = joined.group_by("leaf_id").agg(
-        pl.len().cast(pl.UInt32).alias("N_total"),
-        pl.col(tail_col).cast(pl.UInt32).sum().alias("N_tail_exceedances"),
-    )
-
-    # Recent window
-    max_ts = observations.get_column("decision_bar_close_ms").max()
-    recent_cutoff = max_ts - recent_window_days * 24 * 60 * 60 * 1000
-    recent = joined.filter(pl.col("decision_bar_close_ms") >= recent_cutoff)
-    if not recent.is_empty():
-        recent_stats = recent.group_by("leaf_id").agg(
-            pl.len().cast(pl.UInt32).alias("N_recent"),
-            pl.col(tail_col).cast(pl.UInt32).sum().alias("N_tail_recent"),
-        )
-        leaf_stats = leaf_stats.join(recent_stats, on="leaf_id", how="left")
-    else:
-        leaf_stats = leaf_stats.with_columns(
-            pl.lit(0, dtype=pl.UInt32).alias("N_recent"),
-            pl.lit(0, dtype=pl.UInt32).alias("N_tail_recent"),
-        )
-
-    leaf_params_df = pl.DataFrame(
-        [
-            {"leaf_id": lid, "gpd_shape_xi": p.xi, "gpd_scale_sigma": p.sigma}
-            for lid, p in tree.metadata.leaf_params.items()
-        ],
-        schema={
-            "leaf_id": pl.Int32,
-            "gpd_shape_xi": pl.Float64,
-            "gpd_scale_sigma": pl.Float64,
-        },
-    )
-
-    result = (
-        leaf_stats.join(leaf_params_df, on="leaf_id", how="left")
-        .with_columns(
-            pl.lit(tree.metadata.direction).alias("tree_direction"),
-            (
-                pl.col("N_tail_exceedances").cast(pl.Float64)
-                / pl.when(pl.col("N_total") > 0).then(pl.col("N_total")).otherwise(None)
-            )
-            .fill_null(0.0)
-            .alias("leaf_tail_rate"),
-            pl.lit(global_tr).alias("global_tail_rate"),
-        )
-        .with_columns(
-            (
-                pl.col("leaf_tail_rate")
-                / pl.when(pl.col("global_tail_rate") > 0)
-                .then(pl.col("global_tail_rate"))
-                .otherwise(None)
-            )
-            .fill_null(0.0)
-            .alias("tail_lift"),
-        )
-        .with_columns(
-            (
-                (
-                    pl.col("N_tail_recent").cast(pl.Float64)
-                    / pl.when(pl.col("N_recent") > 0).then(pl.col("N_recent")).otherwise(None)
-                )
-                / pl.when(pl.col("leaf_tail_rate") > 0)
-                .then(pl.col("leaf_tail_rate"))
-                .otherwise(None)
-            )
-            .clip(0, 2)
-            .fill_null(0.0)
-            .alias("tail_lift_stability"),
-        )
-    )
-
-    return result.select(
-        "leaf_id",
-        "tree_direction",
-        "N_total",
-        "N_tail_exceedances",
-        "gpd_shape_xi",
-        "gpd_scale_sigma",
-        "tail_lift",
-        "tail_lift_stability",
-        "leaf_tail_rate",
-        "global_tail_rate",
-    )
-
-
-def leaf_context_frame(
-    tree: TailTreeModel,
-    observations: pl.DataFrame,
-    outcomes: pl.DataFrame,
-    *,
-    global_baseline: pl.DataFrame | None = None,
-) -> pl.DataFrame:
-    """Per-leaf context: directional probabilities, path diagnostics."""
-    with_leaf = tree.predict_leaf(observations)
-
-    if outcomes.is_empty():
-        return pl.DataFrame(
-            schema={
-                "leaf_id": pl.Int32,
-                "p_up": pl.Float64,
-                "p_down": pl.Float64,
-                "p_flat": pl.Float64,
-                "conditioned_entropy_bits": pl.Float64,
-                "information_gain_bits": pl.Float64,
-                "tail_up_rate": pl.Float64,
-                "tail_down_rate": pl.Float64,
-                "path_skew": pl.Float64,
-                "returned_to_origin_rate": pl.Float64,
-                "statistical_direction": pl.String,
-                "research_suggestion": pl.String,
-            }
-        )
-
-    outcome_by_decision = _tailtree_outcome_by_decision(outcomes)
-    joined = with_leaf.join(
-        outcome_by_decision.select(
-            [
-                "symbol",
-                "decision_bar_close_ms",
-                "outcome_bucket",
-                "tail_up",
-                "tail_down",
-                "direction_changed",
-                "returned_to_origin",
-            ]
-        ),
-        on=["symbol", "decision_bar_close_ms"],
-        how="left",
-    )
-
-    leaf_agg = joined.group_by("leaf_id").agg(
-        pl.len().cast(pl.UInt32).alias("N_leaf"),
-        (pl.col("outcome_bucket") == "up").mean().alias("p_up"),
-        (pl.col("outcome_bucket") == "down").mean().alias("p_down"),
-        (pl.col("outcome_bucket") == "flat").mean().alias("p_flat"),
-    )
-
-    has_tails = "tail_up" in joined.columns and "tail_down" in joined.columns
-    if has_tails:
-        tail_agg = joined.group_by("leaf_id").agg(
-            pl.col("tail_up").cast(pl.Float64).mean().alias("tail_up_rate"),
-            pl.col("tail_down").cast(pl.Float64).mean().alias("tail_down_rate"),
-        )
-        leaf_agg = leaf_agg.join(tail_agg, on="leaf_id", how="left")
-
-    path_agg = (
-        joined.group_by("leaf_id").agg(
-            (
-                pl.col("tail_up").cast(pl.Float64).mean().fill_null(0.0)
-                - pl.col("tail_down").cast(pl.Float64).mean().fill_null(0.0)
-            ).alias("path_skew"),
-            pl.col("returned_to_origin").cast(pl.Float64).mean().alias("returned_to_origin_rate"),
-        )
-        if "returned_to_origin" in joined.columns and has_tails
-        else joined.group_by("leaf_id").agg(
-            pl.lit(0.0).alias("path_skew"),
-            pl.lit(0.0).alias("returned_to_origin_rate"),
-        )
-    )
-    leaf_agg = leaf_agg.join(path_agg, on="leaf_id", how="left")
-
-    # Entropy
-    from qooi.scanner import entropy_expr
-
-    leaf_agg = leaf_agg.with_columns(
-        entropy_expr("p_up", "p_down", "p_flat").alias("conditioned_entropy_bits"),
-        pl.lit(0.0).alias("information_gain_bits"),
-    )
-
-    # Statistical direction
-    leaf_agg = leaf_agg.with_columns(
-        pl.when(pl.col("p_up") > pl.max_horizontal("p_down", "p_flat"))
-        .then(pl.lit("up"))
-        .when(pl.col("p_down") > pl.max_horizontal("p_up", "p_flat"))
-        .then(pl.lit("down"))
-        .otherwise(pl.lit("flat"))
-        .alias("statistical_direction"),
-    )
-
-    # Research suggestion
-    leaf_agg = leaf_agg.with_columns(
-        pl.when((pl.col("returned_to_origin_rate") >= 0.25) & (pl.col("path_skew").abs() <= 0.10))
-        .then(pl.lit("chop_avoid"))
-        .otherwise(pl.lit("insufficient_evidence"))
-        .alias("research_suggestion"),
-    )
-
-    return leaf_agg.select(
-        "leaf_id",
-        "p_up",
-        "p_down",
-        "p_flat",
-        "conditioned_entropy_bits",
-        "information_gain_bits",
-        "tail_up_rate",
-        "tail_down_rate",
-        "path_skew",
-        "returned_to_origin_rate",
-        "statistical_direction",
-        "research_suggestion",
-    )
-
-
-def select_tail_leaves(
-    leaf_evidence: pl.DataFrame,
-    *,
-    min_tail_exceedances: int = 30,
-    min_tail_lift: float = 1.5,
-    min_tail_lift_stability: float = 0.3,
-    fallback_top_n: int = 10,
-) -> pl.DataFrame:
-    """Select tail leaves by hard gate, or top-ranked best available leaves.
-
-    The fallback is deliberately labelled; it does not pretend weak leaves passed.
-    It gives review/candidate ranking a quantitative surface when the strict gate
-    selects zero leaves.
-    """
-    if leaf_evidence.is_empty():
-        return leaf_evidence
-
-    scored = leaf_evidence.with_columns(
-        (pl.col("N_tail_exceedances") >= min_tail_exceedances).alias("passes_tail_count_gate"),
-        (pl.col("tail_lift") >= min_tail_lift).alias("passes_tail_lift_gate"),
-        (
-            (pl.col("tail_lift_stability") >= min_tail_lift_stability) | (pl.col("N_total") < 200)
-        ).alias("passes_stability_gate"),
-    ).with_columns(
-        (
-            pl.col("passes_tail_count_gate")
-            & pl.col("passes_tail_lift_gate")
-            & pl.col("passes_stability_gate")
-        ).alias("selected_evidence_level"),
-        (
-            pl.max_horizontal(pl.col("tail_lift").fill_null(0.0), pl.lit(0.0))
-            * (pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log()
-            * pl.max_horizontal(pl.col("tail_lift_stability").fill_null(0.0), pl.lit(0.05))
-        ).alias("tail_evidence_score"),
-    )
-
-    hard = scored.filter(pl.col("selected_evidence_level"))
-    if not hard.is_empty():
-        return hard.with_columns(pl.lit("hard_gate").alias("selection_mode"))
-
-    return (
-        scored.sort(
-            ["tail_evidence_score", "tail_lift", "N_tail_exceedances"],
-            descending=[True, True, True],
-        )
-        .head(fallback_top_n)
-        .with_columns(pl.lit("best_available").alias("selection_mode"))
-    )
