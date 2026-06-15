@@ -795,6 +795,92 @@ def test_tailtree_selection_budget_winners_use_normalized_opportunity_score() ->
     assert winner["winner_score"] > 0.0
 
 
+def test_tailtree_selection_efficiency_marks_shared_label_feasibility() -> None:
+    candidates = pl.DataFrame(
+        {
+            "symbol": ["BTC", "ETH"],
+            "candidate_status": ["matched_evidence", "matched_evidence"],
+            "outcome_horizon": [12, 12],
+            "tree_direction": ["up", "up"],
+            "rank_score": [4.0, 3.0],
+            "N_total": [8, 12],
+            "N_tail_exceedances": [3, 2],
+            "tail_lift": [1.6, 1.2],
+            "tail_utility_mean": [0.5, 0.4],
+            "tail_utility_p90": [0.7, 0.6],
+        }
+    )
+    run_summary = pl.DataFrame(
+        {
+            "summary_scope": ["up"],
+            "objective": ["tail_severity_gpd"],
+            "outcome_horizon": [12],
+            "direction": ["up"],
+            "valid_observation_count": [100],
+            "valid_tail_rate": [0.1],
+        }
+    )
+
+    efficiency = tailrun.tailtree_selection_efficiency_frame(
+        candidates,
+        run_summary=run_summary,
+        universe_snapshot_id="fixture-universe",
+        model_tag="gpd-model",
+        objective="tail_severity_gpd",
+        budgets=tailrun.TailtreeSelectionBudgets(top_k=(1, 2), top_pct=(), score_gate=()),
+        feasibility=tailrun.TailtreeSelectionFeasibilityPolicy(
+            min_selected_observation_count=10,
+            min_selected_tail_count=3,
+            min_valid_tail_lift=1.0,
+            min_profit_proxy_per_selected_obs=0.1,
+        ),
+    )
+
+    rows = {row["budget_value"]: row for row in efficiency.iter_rows(named=True)}
+    assert rows[1.0]["outcome_label_family"] == "path_extreme_return"
+    assert rows[1.0]["comparison_surface"] == "selection_efficiency"
+    assert rows[1.0]["objective_score_comparable_int"] == 0
+    assert rows[1.0]["feasibility_support_pass_int"] == 0
+    assert rows[1.0]["feasibility_pass_int"] == 0
+    assert rows[2.0]["feasibility_support_pass_int"] == 1
+    assert rows[2.0]["feasibility_pass_int"] == 1
+
+
+def test_tailtree_objective_winners_compare_feasible_shared_surfaces_not_raw_scores() -> None:
+    efficiency = pl.DataFrame(
+        {
+            "universe_snapshot_id": ["u", "u"],
+            "model_tag": ["gpd-model", "quantile-model"],
+            "objective": ["tail_severity_gpd", "tail_utility_quantile"],
+            "training_profile": ["balanced_baseline", "balanced_baseline"],
+            "outcome_label_family": ["path_extreme_return", "path_extreme_return"],
+            "comparison_surface": ["selection_efficiency", "selection_efficiency"],
+            "outcome_horizon": [12, 12],
+            "tree_direction": ["up", "up"],
+            "budget_family": ["top_k", "top_k"],
+            "budget_value": [1.0, 3.0],
+            "selected_symbol_count": [1, 3],
+            "selected_observation_count": [8, 60],
+            "selected_observation_rate": [0.08, 0.6],
+            "selected_tail_count": [6, 18],
+            "valid_tail_lift": [3.0, 2.4],
+            "profit_proxy_per_selected_obs": [2.0, 1.2],
+            "profit_proxy_per_1k_observed": [0.1, 0.8],
+            "hpo_score": [9999.0, 1.0],
+            "promotion_threshold_pass_int": [1, 1],
+            "feasibility_pass_int": [0, 1],
+        }
+    )
+
+    winners = tailrun.select_tailtree_objective_winners(efficiency)
+
+    assert winners.height == 1
+    winner = winners.row(0, named=True)
+    assert winner["objective"] == "tail_utility_quantile"
+    assert winner["model_tag"] == "quantile-model"
+    assert winner["objective_winner_rank"] == 1
+
+
 def test_tailtree_selection_efficiency_writer_replaces_canonical_artifact(
     tmp_path: Path,
 ) -> None:

@@ -19,6 +19,9 @@ TAILTREE_SELECTION_EFFICIENCY_SCHEMA = {
     "model_tag": pl.String,
     "objective": pl.String,
     "training_profile": pl.String,
+    "outcome_label_family": pl.String,
+    "comparison_surface": pl.String,
+    "objective_score_comparable_int": pl.Int64,
     "outcome_horizon": pl.Int64,
     "tree_direction": pl.String,
     "budget_family": pl.String,
@@ -45,6 +48,10 @@ TAILTREE_SELECTION_EFFICIENCY_SCHEMA = {
     "profit_proxy_per_1k_observed": pl.Float64,
     "hpo_score": pl.Float64,
     "promotion_threshold_pass_int": pl.Int64,
+    "feasibility_support_pass_int": pl.Int64,
+    "feasibility_concentration_pass_int": pl.Int64,
+    "feasibility_utility_pass_int": pl.Int64,
+    "feasibility_pass_int": pl.Int64,
     "trained_tree_count": pl.Int64,
     "selected_bucket_or_leaf_count": pl.Int64,
     "fit_seconds": pl.Float64,
@@ -77,6 +84,16 @@ class TailtreeSelectionBudgets(BaseModel):
             *(("top_pct", float(value)) for value in self.top_pct),
             *(("score_gate", float(value)) for value in self.score_gate),
         )
+
+
+class TailtreeSelectionFeasibilityPolicy(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    min_selected_observation_count: int = 10
+    min_selected_symbol_count: int = 1
+    min_selected_tail_count: int = 1
+    min_valid_tail_lift: float = 1.0
+    min_profit_proxy_per_selected_obs: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -162,6 +179,7 @@ class TailtreeCandidateReplay:
     context: TailtreeSelectionContext
     outcome_horizon: int
     direction: str
+    feasibility: TailtreeSelectionFeasibilityPolicy
 
     def row_for_budget(self, family: str, value: float) -> dict[str, object]:
         selected = self.selected_for_budget(family, value)
@@ -190,11 +208,23 @@ class TailtreeCandidateReplay:
         profit_per_selected = profit_mean
         profit_per_1k = profit_sum / valid_count * 1000.0 if valid_count else 0.0
         hpo_score = profit_per_selected + lift + log1p(max(selected_tail_count, 0)) - selected_rate
+        support_pass = int(
+            selected_count >= self.feasibility.min_selected_observation_count
+            and selected_symbol_count >= self.feasibility.min_selected_symbol_count
+            and selected_tail_count >= self.feasibility.min_selected_tail_count
+        )
+        concentration_pass = int(lift >= self.feasibility.min_valid_tail_lift)
+        utility_pass = int(
+            profit_per_selected >= self.feasibility.min_profit_proxy_per_selected_obs
+        )
         return {
             "universe_snapshot_id": str(self.context.universe_snapshot_id),
             "model_tag": str(self.context.model_tag),
             "objective": self.context.objective,
             "training_profile": str(self.context.training_profile),
+            "outcome_label_family": "path_extreme_return",
+            "comparison_surface": "selection_efficiency",
+            "objective_score_comparable_int": 0,
             "outcome_horizon": int(self.outcome_horizon),
             "tree_direction": self.direction,
             "budget_family": family,
@@ -221,6 +251,10 @@ class TailtreeCandidateReplay:
             "profit_proxy_per_1k_observed": profit_per_1k,
             "hpo_score": hpo_score,
             "promotion_threshold_pass_int": int(profit_per_selected > 0.0 and lift >= 1.0),
+            "feasibility_support_pass_int": support_pass,
+            "feasibility_concentration_pass_int": concentration_pass,
+            "feasibility_utility_pass_int": utility_pass,
+            "feasibility_pass_int": int(support_pass and concentration_pass and utility_pass),
             "trained_tree_count": self.summary.integer("trained_tree_count"),
             "selected_bucket_or_leaf_count": self.summary.integer("selected_leaf_count"),
             "fit_seconds": self.summary.number("fit_seconds"),
@@ -293,6 +327,7 @@ def tailtree_selection_efficiency_frame(
     objective: str,
     training_profile: str = "balanced_baseline",
     budgets: TailtreeSelectionBudgets = TailtreeSelectionBudgets(),
+    feasibility: TailtreeSelectionFeasibilityPolicy = TailtreeSelectionFeasibilityPolicy(),
 ) -> pl.DataFrame:
     """Replay candidate budgets into canonical profit-selection efficiency rows."""
     if candidates.is_empty() or not {"outcome_horizon", "tree_direction"}.issubset(
@@ -324,17 +359,33 @@ def tailtree_selection_efficiency_frame(
             context=context,
             outcome_horizon=int(outcome_horizon),
             direction=str(direction),
+            feasibility=feasibility,
         )
         rows.extend(replay.row_for_budget(family, value) for family, value in budgets.iter_rows())
     return pl.DataFrame(rows, schema=TAILTREE_SELECTION_EFFICIENCY_SCHEMA)
 
 
-def _normalized_component(column: str) -> pl.Expr:
+def _normalized_component(column: str, group_cols: list[str]) -> pl.Expr:
     value = pl.col(column).fill_null(0.0).fill_nan(0.0)
-    maximum = value.max().over(
-        ["model_tag", "objective", "training_profile", "outcome_horizon", "tree_direction"]
-    )
+    maximum = value.max().over(group_cols)
     return pl.when(maximum > 0.0).then(value / maximum).otherwise(0.0)
+
+
+def _winner_score_expr(group_cols: list[str], *, has_feasibility: bool) -> pl.Expr:
+    feasibility = (
+        pl.col("feasibility_pass_int").fill_null(1).cast(pl.Float64)
+        if has_feasibility
+        else pl.lit(1.0)
+    )
+    return (
+        feasibility
+        + pl.col("promotion_threshold_pass_int").fill_null(0).cast(pl.Float64)
+        + _normalized_component("profit_proxy_per_selected_obs", group_cols)
+        + _normalized_component("profit_proxy_per_1k_observed", group_cols)
+        + _normalized_component("valid_tail_lift", group_cols)
+        + _normalized_component("selected_tail_count", group_cols)
+        - pl.col("selected_observation_rate").fill_null(0.0).fill_nan(0.0)
+    )
 
 
 def select_tailtree_budget_winners(selection_efficiency: pl.DataFrame) -> pl.DataFrame:
@@ -369,13 +420,9 @@ def select_tailtree_budget_winners(selection_efficiency: pl.DataFrame) -> pl.Dat
         )
 
     scored = selection_efficiency.with_columns(
-        (
-            pl.col("promotion_threshold_pass_int").fill_null(0).cast(pl.Float64)
-            + _normalized_component("profit_proxy_per_selected_obs")
-            + _normalized_component("profit_proxy_per_1k_observed")
-            + _normalized_component("valid_tail_lift")
-            + _normalized_component("selected_tail_count")
-            - pl.col("selected_observation_rate").fill_null(0.0).fill_nan(0.0)
+        _winner_score_expr(
+            group_cols,
+            has_feasibility="feasibility_pass_int" in selection_efficiency.columns,
         ).alias("winner_score")
     )
     return (
@@ -412,6 +459,73 @@ def select_tailtree_budget_winners(selection_efficiency: pl.DataFrame) -> pl.Dat
     )
 
 
+def select_tailtree_objective_winners(selection_efficiency: pl.DataFrame) -> pl.DataFrame:
+    group_cols = [
+        "universe_snapshot_id",
+        "outcome_label_family",
+        "outcome_horizon",
+        "tree_direction",
+    ]
+    required = {
+        *group_cols,
+        "model_tag",
+        "objective",
+        "training_profile",
+        "budget_family",
+        "budget_value",
+        "selected_observation_rate",
+        "selected_tail_count",
+        "valid_tail_lift",
+        "profit_proxy_per_selected_obs",
+        "profit_proxy_per_1k_observed",
+        "promotion_threshold_pass_int",
+        "feasibility_pass_int",
+    }
+    if selection_efficiency.is_empty() or not required.issubset(selection_efficiency.columns):
+        return selection_efficiency.head(0).with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("objective_winner_score"),
+            pl.lit(None, dtype=pl.Int64).alias("objective_winner_rank"),
+        )
+    scored = selection_efficiency.with_columns(
+        _winner_score_expr(group_cols, has_feasibility=True).alias("objective_winner_score")
+    )
+    return (
+        scored.sort(
+            [
+                *group_cols,
+                "feasibility_pass_int",
+                "objective_winner_score",
+                "profit_proxy_per_selected_obs",
+                "profit_proxy_per_1k_observed",
+                "valid_tail_lift",
+                "selected_observation_rate",
+                "objective",
+                "training_profile",
+                "budget_family",
+                "budget_value",
+            ],
+            descending=[
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ],
+        )
+        .unique(subset=group_cols, keep="first", maintain_order=True)
+        .with_columns(pl.lit(1, dtype=pl.Int64).alias("objective_winner_rank"))
+    )
+
+
 def write_tailtree_selection_efficiency(
     frame: pl.DataFrame,
     diagnostics_dir: Path | str,
@@ -433,10 +547,12 @@ __all__ = [
     "TAILTREE_SELECTION_EFFICIENCY_SCHEMA",
     "TailtreeSelectionBudgets",
     "TailtreeSelectionContext",
+    "TailtreeSelectionFeasibilityPolicy",
     "TailtreeTrainingProfile",
     "TailtreeModelTag",
     "UniverseSnapshotId",
     "select_tailtree_budget_winners",
+    "select_tailtree_objective_winners",
     "tailtree_selection_efficiency_frame",
     "write_tailtree_selection_efficiency",
 ]

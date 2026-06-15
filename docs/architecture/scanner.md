@@ -540,6 +540,9 @@ Required summary columns:
 
 ```text
 universe_snapshot_id
+outcome_label_family
+comparison_surface
+objective_score_comparable_int
 eligible_symbol_count
 selected_symbol_count
 observation_row_count
@@ -562,11 +565,24 @@ profit_proxy_per_selected_obs
 profit_proxy_per_1k_observed
 hpo_score
 promotion_threshold_pass_int
+feasibility_support_pass_int
+feasibility_concentration_pass_int
+feasibility_utility_pass_int
+feasibility_pass_int
 trained_tree_count
 selected_bucket_or_leaf_count
 fit_seconds
 score_seconds
 ```
+
+Tailtree objectives may share the same label family (`path_extreme_return`) while using
+different private losses or score units. Objective-native scores are never comparable
+across objective families; `objective_score_comparable_int = 0` records this explicitly.
+Cross-objective comparison happens only after replaying each objective/profile under common
+candidate budgets and projecting the selected set onto `comparison_surface =
+"selection_efficiency"`. Feasibility is scanner-internal and numeric: support,
+concentration, and utility gates are represented by `feasibility_*_pass_int` columns before
+any objective winner is selected.
 
 Budget-winner projection is an in-memory view over the canonical artifact, not a second
 artifact family. `qooi.scanner.tailrun.select_tailtree_budget_winners(...)` selects one
@@ -576,6 +592,10 @@ proxy-per-1k-valid-observations, lift, selected-tail count, and narrowness. It d
 does not sort by raw `hpo_score`, because that column can contain unbounded components, and
 it does not include liquidity, cost, slippage, funding, sizing, or execution penalties.
 The report may render this projection as a compact Tail Tree Selection Efficiency table.
+`qooi.scanner.tailrun.select_tailtree_objective_winners(...)` compares those feasible
+selection-efficiency surfaces across objectives at `universe_snapshot_id ×
+outcome_label_family × outcome_horizon × tree_direction` grain; infeasible rows cannot win
+just because their private objective or raw `hpo_score` is larger.
 
 Acceptance rule:
 

@@ -680,10 +680,12 @@ class _TreeSelectionEfficiencySection:
             "and uses no liquidity/cost/execution penalties.",
             "- Units: Win=winner_score, Proxy/Obs=profit_proxy_per_selected_obs, "
             "Proxy/1k=profit_proxy_per_1k_observed, Lift=valid_tail_lift, "
+            "Feas=feasibility_pass_int, Obs=selected_observation_count, "
             "Sel=selected_symbol_count, Tail=selected_tail_count.",
             "",
-            "| H | Dir | Obj | Profile | Budget | Win | Proxy/Obs | Proxy/1k | Lift | Sel | Tail |",
-            "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+            "| H | Dir | Obj | Profile | Budget | Feas | Win | Proxy/Obs | "
+            "Proxy/1k | Lift | Obs | Sel | Tail |",
+            "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for row in winners.sort(["outcome_horizon", "tree_direction", "objective"]).iter_rows(
             named=True
@@ -692,10 +694,12 @@ class _TreeSelectionEfficiencySection:
             lines.append(
                 f"| {_int_value(row.get('outcome_horizon'))} | {row.get('tree_direction')} | "
                 f"{row.get('objective')} | {row.get('training_profile')} | {budget} | "
+                f"{_int_value(row.get('feasibility_pass_int'))} | "
                 f"{_fmt(row.get('winner_score'))} | "
                 f"{_fmt(row.get('profit_proxy_per_selected_obs'))} | "
                 f"{_fmt(row.get('profit_proxy_per_1k_observed'))} | "
                 f"{_fmt(row.get('valid_tail_lift'))} | "
+                f"{_int_value(row.get('selected_observation_count'))} | "
                 f"{_int_value(row.get('selected_symbol_count'))} | "
                 f"{_int_value(row.get('selected_tail_count'))} |"
             )

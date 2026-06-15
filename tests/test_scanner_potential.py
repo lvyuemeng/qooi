@@ -905,6 +905,7 @@ def test_tailtree_selection_efficiency_report_projects_budget_winners() -> None:
                 "profit_proxy_per_1k_observed": [0.03, 0.30],
                 "hpo_score": [9999.0, 20.0],
                 "promotion_threshold_pass_int": [1, 1],
+                "feasibility_pass_int": [0, 1],
             }
         )
 
@@ -913,10 +914,13 @@ def test_tailtree_selection_efficiency_report_projects_budget_winners() -> None:
     assert "## Tail Tree Selection Efficiency" in rendered
     assert "Winner=normalized opportunity score" in rendered
     assert (
-        "| H | Dir | Obj | Profile | Budget | Win | Proxy/Obs | Proxy/1k | "
-        "Lift | Sel | Tail |" in rendered
+        "| H | Dir | Obj | Profile | Budget | Feas | Win | Proxy/Obs | Proxy/1k | "
+        "Lift | Obs | Sel | Tail |" in rendered
     )
-    assert "| 12 | up | tail_utility_quantile | balanced_baseline | top_k=3.0000 |" in rendered
+    assert (
+        "| 12 | up | tail_utility_quantile | balanced_baseline | top_k=3.0000 | 1 |"
+        in rendered
+    )
 
 
 def test_report_candidate_selection_uses_typed_rows_not_opaque_dicts() -> None:

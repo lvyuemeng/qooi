@@ -13,9 +13,11 @@ from qooi.scanner.tailrun.selection import (
     TailtreeModelTag,
     TailtreeSelectionBudgets,
     TailtreeSelectionContext,
+    TailtreeSelectionFeasibilityPolicy,
     TailtreeTrainingProfile,
     UniverseSnapshotId,
     select_tailtree_budget_winners,
+    select_tailtree_objective_winners,
     tailtree_selection_efficiency_frame,
     write_tailtree_selection_efficiency,
 )
@@ -47,9 +49,11 @@ __all__ = [
     "TailtreeResult",
     "TailtreeSelectionBudgets",
     "TailtreeSelectionContext",
+    "TailtreeSelectionFeasibilityPolicy",
     "TailtreeTrainingProfile",
     "UniverseSnapshotId",
     "select_tailtree_budget_winners",
+    "select_tailtree_objective_winners",
     "tailtree_selection_efficiency_frame",
     "write_tailtree_selection_efficiency",
 ]
