@@ -43,7 +43,7 @@ With `return_threshold_pct = 0.0` (daily-deep config), the outcome is "did price
 
 ### 2.2. Classifier destroys continuous information (impact: HIGH, effort: MEDIUM)
 
-**What the code does** (`classifiers.py` L119-328):
+**What the code did** (former `scanner.classifiers`, now `scanner.state.KlineClassifier`):
 
 ```
 continuous price/volume data
@@ -65,7 +65,7 @@ The classifier chain destroys ~90% of the information present in the raw OHLCV. 
 
 ### 2.3. Features describe the past, not the future (impact: HIGH, effort: MEDIUM)
 
-**What the code does** (`classifiers.py` L129-253):
+**What the code did** (former `scanner.classifiers`, now `scanner.state.KlineClassifier`):
 
 ```
 MARKET_STAGE is determined by:

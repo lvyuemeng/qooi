@@ -577,7 +577,7 @@ messages
 
 ```text
 scanner.workflow   -> sources.context.load_source_context
-scanner.decisions  -> SourceContextResult.frames + availability
+scanner.workflow   -> SourceContextResult.frames + availability
 scanner.diagnostics-> SourceContextResult.frames + availability + manifest
 exchange.discovery -> sources.okx instruments/tickers only
 exchange.universe  -> broad provider wrappers only

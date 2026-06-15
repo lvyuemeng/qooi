@@ -6,24 +6,45 @@ The scanner is a deterministic research workflow for finding symbols whose known
 
 ## Module layout
 
+Scanner modules should be organized by durable data-product ownership, not by every
+intermediate helper computation. OHLCV labels, continuous features, source rows, kline
+path rows, observations, outcomes, evidence, ranks, and feasibility are necessary
+computations, but they do not all need peer public APIs.
+
+Target product-shaped layout:
+
 ```text
 src/qooi/scanner/
-├── workflow.py       # CLI orchestration: config, universe, fetch/cache, staged calls
+├── workflow.py       # outer scan lifecycle: config, universe, fetch/cache, final write
 ├── __init__.py       # scanner-local dataclasses/protocols + shared Polars expr helpers
-├── classifiers.py    # OHLCV → categorical kline state labels
-├── features.py       # bars/source frames → continuous features keyed by symbol,timestamp
-├── transitions.py    # n-gram transition/path discovery for the decision lens
-├── decisions.py      # current-state/source-state review lens
-├── history.py        # kline path history and realized transition frames
-├── source_events.py  # source event/outcome frames from source context
-├── frames.py         # shared observations/outcomes for evidence paths
-├── ladder.py         # fixed categorical evidence ladder
-├── tailtree.py       # LightGBM + GPD tail evidence path; optional deps
-├── tailrun.py        # tailtree train/load_predict lifecycle and model artifacts
-├── rank.py           # candidate-inspection and candidate-rank rows
-├── diagnostics.py    # artifact writer + pure report projection functions
-└── report.py         # markdown renderer from in-memory report frames
+├── config.py         # PotentialConfig and section config models
+├── state.py          # known-at-close observation/state/feature product facade
+├── outcome.py        # future/path/source outcome product facade
+├── ladder.py         # fixed categorical evidence path
+├── tailtree/         # LightGBM + GPD model/evidence package; optional deps
+├── tailrun/          # tailtree lifecycle/artifacts package
+├── rank.py           # candidate evidence, rank, and horizon-consistency products
+├── feasibility.py    # source/history/candidate feasibility projections
+├── diagnostics.py    # diagnostic artifact writer/assembler only
+└── report.py         # markdown renderer from prepared frames
 ```
+
+Removed transitional modules now live under their product owners:
+
+| Removed module | Current owner | Migration note |
+|---|---|---|
+| `classifiers.py` | `state.py` | OHLCV categorical labels are state internals. |
+| `features.py` | `state.py` | Continuous features are state internals. |
+| `source_events.py` | `outcome.py` | Source event materialization/outcomes route through outcome for the current pipe. |
+| `history.py` | `outcome.py` | Kline path history and realized transition rows are outcome products, not workflow APIs. |
+| `decisions.py` | `workflow.py` | Current review decision rows are workflow audit output, not a peer product module. |
+| former `frames.py` | removed | Observation and outcome implementations now live in state.py/outcome.py. |
+| feasibility projection helpers | `feasibility.py` | Feasibility owns candidate/source/history feasibility projections. |
+
+`pipeline.py` is intentionally not a target module yet. Add it only if a concrete typed
+`ScanProducts`/`ScannerProducts` object is introduced and consumed by more than one
+boundary. Moving `_build_diagnostic_frames` into `pipeline.py` without a stable product
+contract would only rename the diagnostics monolith.
 
 `contracts.py` is intentionally absent. Scanner-local contracts such as `ReportInputs`,
 `PotentialArtifacts`, `SourceStateRow`, and `TransitionPattern` live in the package root
@@ -31,57 +52,80 @@ src/qooi/scanner/
 `common.py`, or another contracts module unless a future public surface genuinely spans
 multiple packages.
 
-### Current resolved layout
+## Product data pipe
 
-The compatibility shims `contracts.py`, `evidence.py`, and `candidates.py` are removed. The resolved graph is:
+The scanner pipe is:
 
 ```text
-src/qooi/scanner/
-├── __init__.py     # shared scanner contracts + small expression helpers
-├── workflow.py     # config + top-level run only
-├── diagnostics.py  # diagnostic artifact assembly/writes only
-├── frames.py       # observation/outcome frames shared by evidence paths
-├── features.py     # known-at-close continuous features
-├── events.py       # scanner event/timeliness frames derived from source context
-├── ladder.py       # fixed categorical evidence ladder
-├── tailtree.py     # LightGBM/GPD model, labels, leaf evidence, selection
-├── tailrun.py      # tailtree train/load_predict lifecycle and model artifacts
-├── rank.py         # candidate-inspection and promoted candidate-rank rows
-├── costs.py        # spread/depth/slippage/cost-adjusted score
-├── validation.py   # rolling time-block leaf/candidate validation
-├── decisions.py    # current per-symbol review decision lens
-├── transitions.py  # transition patterns/insights
-├── history.py      # kline path history/realized transitions
-├── classifiers.py  # scanner-owned deterministic state classifiers
-└── report.py       # report sections/rendering
+workflow.run(config)
+  → load bars/source context/state bundles/transitions
+  → ReportInputs
+  → state product
+  → outcome product
+  → evidence product
+  → rank product
+  → feasibility product
+  → diagnostics/report outputs
 ```
 
-This layout keeps each module aligned to one data product or behavior. Planned modules such as `costs.py` and `validation.py` remain future work; removed compatibility modules must not be reintroduced.
+Detailed product flow:
+
+```text
+state product
+  owns known-at-close rows only
+  current sources: state.KlineClassifier, state.extract_continuous_features,
+                   source known-at-close rows, state.potential_observation_frame
+  target output: potential_observations
+
+outcome product
+  owns future/path labels and source outcomes
+  current sources: outcome.kline_path_history_frame, outcome.source_events_frame,
+                   outcome source-outcome rows, outcome.potential_outcome_frame
+  target output: potential_outcomes / realized_transitions / kline_path_history
+
+evidence product
+  ladder.py or tailrun/ + tailtree/
+  input: observations + outcomes
+  output: potential_evidence
+
+rank product
+  rank.candidate_evidence_frame
+  rank.rank_candidate_evidence
+  rank.candidate_horizon_consistency_frame
+  output: candidate_evidence, candidate_rank, candidate_horizon_consistency
+
+feasibility product
+  owner: feasibility.py
+  current owner: feasibility.py
+  output: candidate_feasibility, source/history/watchlist feasibility rows
+
+diagnostics/report outputs
+  diagnostics.py writes CSV artifacts and handles stale diagnostic cleanup
+  report.py renders prepared frames; it should not recover schema or perform business joins
+```
+
+Workflow should not import or call `outcome.py`, `rank.py`, `tailrun/`,
+`ladder.py`, or feasibility internals directly. Workflow owns outer lifecycle only; the
+scanner data pipe remains below the workflow boundary.
 
 ## Dependency direction
 
 ```text
 workflow
-  → features, frames, events, decisions, transitions, diagnostics, report
+  → config, exchange/source requests, review audit/transitions, diagnostics, report
+  → not state/outcome/rank/tailrun/ladder/feasibility internals
 
-diagnostics
-  → ladder | tailrun
-  → rank
-  → costs, validation when those products exist
-  → owns the single evidence dispatch point
-
-features
+state target
+  → known-at-close OHLCV/source features only
   → no outcomes, no future returns
-  → emits known-at-close continuous features only
 
-frames
-  → shared observation/outcome frames
+outcome target
+  → kline path/source outcome/realized transition rows
+  → may use future/path data
   → no evidence-path internals
-  → no model/lifecycle code
 
 ladder
   → fixed categorical evidence path
-  → consumes frames only
   → does not import tailtree
 
 tailtree
@@ -89,11 +133,19 @@ tailtree
   → model/statistical code only
 
 tailrun
-  → tailtree + artifact persistence + lifecycle validation
+  → tailtree lifecycle + artifact persistence + run summaries
 
 rank
-  → candidate-inspection rows
-  → candidate-rank rows from numeric evidence columns
+  → candidate evidence, candidate-rank rows, horizon-consistency panel
+  → enforces candidate evidence pipe invariants such as `outcome_horizon`
+
+feasibility target
+  → source/history/watchlist/candidate feasibility projections
+  → consumes ranked candidates; does not posterior-check rank schema columns
+
+diagnostics
+  → artifact write/read orchestration and diagnostic frame assembly
+  → not the long-term owner of state/outcome/evidence/rank/feasibility computation
 ```
 
 Forbidden:
@@ -101,9 +153,12 @@ Forbidden:
 - `qooi.scanner` must not import executor/basket/recovery/live-trading modules.
 - `qooi.scanner` should not import `qooi.strategies`; scanner emits research/review
   data products and strategies may consume promoted signals later.
-- `features.py` must not use future return/outcome columns.
-- `ladder.py` and `tailtree.py` must not cross-import each other as evidence paths.
+- Known-at-close state code must not use future return/outcome columns.
+- `ladder.py` and `tailtree/` must not cross-import each other as evidence paths.
 - Timestamp-only joins are forbidden in source-derived feature construction.
+- Do not introduce `pipeline.py` or one-file directory packages unless the graph has a
+  real typed product boundary that needs them.
+- Do not introduce a candidate-specific package as the target shape for feasibility; `feasibility.py` owns it.
 
 ## Scanner config workflow
 
@@ -157,26 +212,391 @@ qooi.profiling owns ProfileContext.
 This keeps the ergonomic monolithic config entry while avoiding full-root config
 leakage into packages.
 
-## Lean reduction target
+## Tailtree training integrity before HPO
 
-The current scanner has grown large report and diagnostics modules. The first
-target is fewer conversion layers, not more files. Split a module only after a
-pure product has independent tests/callers and extraction removes real lines.
+Tailtree improvement starts with label, feature, and artifact integrity, not parameter search. HPO is valid only after the current run has numeric tail labels, nonempty features, and time-block validation counts. Random row splits are forbidden for scanner tailtree tuning.
 
-| Surface | Owns | Does not own |
-|---|---|---|
-| `workflow.py` | staged run orchestration and boundary request construction | frame schema logic, report table construction |
-| `diagnostics.py` build phase | kline path history, realized transitions, source outcomes, evidence pipeline, candidate/data-health projections | Markdown formatting, provider fetches |
-| `diagnostics.py` write phase | persist already-built diagnostic/state frames | recompute evidence or report semantics |
-| `report.py` | render in-memory report frames to Markdown | CSV reading, type recovery, candidate/source/history business rules |
-
-Later split rule:
+Tailtree label source is explicit:
 
 ```text
-Move diagnostics.candidate_selection_frame -> selection.py only if it gains
-independent callers/tests or if diagnostics.py remains too large after removing
-CSV read-back and default audit rendering. Same for data-health.
+tail labels require forward_min_return_pct / forward_max_return_pct
+source-event outcomes may supply those columns when source events exist
+market realized-transition rows currently supply categorical transition outcomes only
 ```
+
+Historical source-feature scope is narrower than the source-family inventory. The only
+source families with consistent history suitable for tailtree training are the
+funding-like derivative families:
+
+```text
+funding
+open_interest
+taker_volume
+long_short_ratios
+```
+
+Books/trades are current-review/liquidity context unless a separate consistent history
+contract is implemented. Messages remain optional context until provider-backed history
+exists. Tailtree training must not treat inconsistent current-only source context as a
+historical feature panel.
+
+Tailtree IO contract:
+
+```text
+input feature row  = known-at-close market state + consistent derivative-source state at decision_bar_close_ms
+label row          = future excursion over the configured horizon, keyed by symbol + decision_bar_close_ms
+model output       = per-direction leaf assignment and per-leaf tail evidence, not a trade signal
+candidate output   = inspection/rank evidence rows after matching current observations to historical leaves
+```
+
+Market excursion labels belong to the realized-transition history product. The same
+market row that carries terminal categorical transition state should also carry numeric
+future path metrics when OHLCV bar columns are available:
+
+```text
+outcome.realized_transition_frame(...)
+  -> terminal state/context columns
+  -> forward_return_pct / forward_min_return_pct / forward_max_return_pct / path_range_pct
+  -> time_to_max_bar / time_to_min_bar / close_retention_ratio / path_efficiency
+```
+
+`outcome.potential_outcome_frame(...)` composes those market labels with source-event
+outcomes. It must not synthesize null forward-return columns when realized transitions
+already provide measured excursion labels.
+
+Tailtree training features are selected by data contract, not by an extra manifest or
+condition-check layer. A feature family is trainable only when its persisted artifact
+contract supplies a consistent historical panel at the decision-bar grain. Ephemeral
+families stay out of model training even if their current values are present in the
+observation frame.
+
+Extendability comes from the source/artifact boundary:
+
+```text
+new provider/API
+  -> persisted artifact with event-time/known-at-time semantics
+  -> historical panel aligned to decision_bar_close_ms
+  -> source family is classified as persistent by data contract
+  -> tailtree training feature list may include its columns
+```
+
+If a family only has latest/current snapshots, sparse one-off events, or inconsistent
+lookback, it remains an ephemeral review/cost/feasibility input and is not a tailtree
+training feature.
+
+Fixed-horizon labels are the first implemented data product, not the permanent output
+limit. Before adding more horizons, the fixed-horizon row must expose path-shape
+diagnostics that distinguish touch, continuation, exhaustion, and two-sided volatility:
+
+```text
+outcome_horizon
+forward_return_pct
+forward_min_return_pct
+forward_max_return_pct
+path_range_pct
+time_to_max_bar
+time_to_min_bar
+close_retention_ratio
+post_max_drawdown_pct
+post_min_rebound_pct
+path_efficiency
+```
+
+The base `tail_up` / `tail_down` labels remain thresholded excursion labels. Path-shape
+columns are numeric diagnostics beside those labels, not replacement qualitative labels.
+
+Tailtree objective policy is severity/utility-first, not whole-market probability
+classification. Market return mass is lumpy and profit concentrates in extreme behavior,
+so ordinary all-row binary probability training is not the default model target.
+
+Tailtree code is directory-owned rather than prefix-owned. The public API remains
+`qooi.scanner.tailtree`, but implementation is split by data-product boundary:
+
+```text
+qooi/scanner/tailtree/
+  __init__.py   # public exports only
+  model.py      # labels, training frame, LightGBM/GPD model
+  evidence.py   # leaf and score-bucket evidence products
+```
+
+Do not add more `_tailtree_*` helper sprawl to scanner-level modules when behavior belongs
+to one of these products. Prefer typed products and direct field access over ad-hoc
+`row.get`, `getattr`, or column-existence inference outside the product boundary.
+
+```text
+training population   = tail rows only
+validation population = all rows with known outcomes
+selection target      = concentrated extreme-event utility, not smooth average accuracy
+```
+
+Objective strategies are named instances, not boolean flags:
+
+```text
+tail_severity_gpd      # baseline: current GPD xi surrogate over raw exceedance
+tail_utility_quantile  # tail-only utility target; LightGBM quantile loss over log1p(utility)
+```
+
+Objective strategies dispatch both the training target and the evidence bucket. Do not
+train a boosted ensemble and then report only one residual tree leaf as if it were the
+whole model state.
+
+```text
+tail_severity_gpd
+  target_basis    = raw_exceedance
+  model_family    = shallow/interpretable leaf evidence
+  evidence_bucket = leaf_id
+  distribution    = raw exceedance GPD
+
+tail_utility_quantile
+  target_basis    = path-constrained tail utility
+  model_family    = boosted ensemble score
+  evidence_bucket = score_bucket
+  distribution    = raw exceedance GPD + utility moments
+```
+
+The `score_bucket` artifact is separate from leaf evidence. It is keyed by horizon,
+direction, and score bucket, not by `leaf_id`, so artifact schemas remain explicit and
+old leaf evidence is not reinterpreted.
+
+`tail_utility_quantile` constrains raw excursion severity with path quality:
+
+```text
+up utility   = max(forward_max_return_pct - threshold_pct, 0)
+             × retention_score × path_efficiency_score × speed_score
+             - post_max_drawdown_penalty
+
+down utility = max(abs(forward_min_return_pct) - threshold_pct, 0)
+             × retention_score × path_efficiency_score × speed_score
+             - post_min_rebound_penalty
+```
+
+The trained tree may use utility targets, while GPD `xi`/`sigma` remain leaf-level
+extreme-value evidence. GPD parameters are descriptive tail/utility descriptors under
+market-regime dependence, not a complete iid market probability model.
+
+Raw exceedance and engineered utility remain separate distribution bases. `X ~ GPD`
+is theoretically cleaner when `X` is raw threshold exceedance. Utility can be audited
+with mean/p90 and may later get its own utility-exceedance GPD, but the current utility
+objective does not overload raw `gpd_shape_xi` / `gpd_scale_sigma` as utility-GPD truth.
+
+The model may train separate artifacts per horizon/model_tag first. Multi-horizon shared
+models are a later optimization after the per-horizon label quality is measurable.
+
+Candidate-level multi-horizon use is a calibrated consistency panel, not raw score
+averaging. Raw LightGBM scores and leaf ids are horizon-local; averaging them would mix
+different label distributions and can cancel high-confidence long/short evidence. The
+supported panel consumes calibrated candidate rows after per-horizon evidence matching:
+
+```text
+input grain   = symbol × outcome_horizon × tree_direction candidate rows
+panel grain   = symbol × tree_direction
+signal        = horizon agreement/counts and max-strength consistency
+non-goal      = mean(raw_score) or mean(rank_score) across opposite directions
+```
+
+The panel reports counts and extrema rather than mean scores:
+
+```text
+horizon_count
+strong_horizon_count
+best_rank_score
+best_tail_lift
+best_tail_utility_score
+direction_consistency_score
+opposite_direction_count
+opposite_direction_best_rank_score
+conflict_penalty_score
+```
+
+This keeps independent horizon specialists while making h6/h12/h24 agreement visible
+without pretending their raw model outputs live on a shared scale.
+
+Therefore a tailtree run with zero non-null forward excursion columns is not a model failure and not an HPO target. It is an outcome-availability state that must be surfaced.
+
+`tailrun/` owns a run-complete artifact contract:
+
+```text
+one model_dir/model_tag directory represents exactly the latest train run for that tag
+directional tree/evidence artifacts from previous runs must not survive a zero-train run
+metadata and evidence files must not describe different runs
+```
+
+Every train run writes a structural summary, even when no tree trains:
+
+```text
+tailtree-run-summary.csv
+```
+
+Summary grain:
+
+```text
+run       # data, feature, label, and artifact counts
+up        # direction-level trainability and evidence counts
+down      # direction-level trainability and evidence counts
+```
+
+Required numeric columns include:
+
+```text
+observation_row_count
+outcome_row_count
+source_event_row_count
+source_outcome_row_count
+realized_transition_row_count
+feature_count
+categorical_feature_count
+continuous_feature_count
+forward_return_nonnull_count
+forward_min_return_nonnull_count
+forward_max_return_nonnull_count
+path_range_nonnull_count
+time_to_max_nonnull_count
+time_to_min_nonnull_count
+retention_nonnull_count
+path_efficiency_nonnull_count
+tail_utility_mean
+tail_utility_p90
+valid_selected_utility_mean
+valid_selected_utility_p90
+train_tail_count
+valid_observation_count
+valid_tail_count
+valid_tail_rate
+valid_selected_observation_count
+valid_selected_tail_count
+valid_selected_tail_rate
+valid_tail_lift
+tail_count
+tail_rate
+train_observation_count
+train_exceedance_count
+min_exceedance_required
+trainable_flag
+trained_tree_count
+written_model_file_count
+written_evidence_file_count
+removed_stale_file_count
+```
+
+Tailtree code layout stays lean:
+
+```text
+tailrun/ = tailtree lifecycle boundary, artifact names, summary rows, validation quality
+tailtree/ = model/training/evidence math split by data product
+outcome.py = market path/outcome row construction
+```
+
+Do not add a generic `_utils` module for this path. If a cross-scanner IO primitive
+already exists in `src/qooi/core`, use it directly; otherwise keep tailtree artifact
+file names local to `tailrun/` because they are part of the tailtree artifact
+contract, not a generic IO abstraction. Typing imports are regular imports, not
+`TYPE_CHECKING`-guarded aliases.
+
+Multi-horizon starts as an explicit row contract:
+
+```text
+[potential.evidence.tailtree]
+outcome_horizon = [6, 12, 24]
+```
+
+`outcome_horizon` accepts either one integer or a list of integers. Realized-transition
+and tailtree summary rows carry `outcome_horizon`. Tailtree training writes one
+horizon-suffixed artifact set per configured horizon so labels are never mixed
+across horizons.
+
+Multi-horizon is not a training-only feature. It changes the tailtree evidence and
+candidate grain:
+
+```text
+symbol × decision_bar_close_ms × outcome_horizon × direction
+```
+
+Each configured horizon trains its own up/down model pair first. Current observations
+are scored against every trained `(outcome_horizon, direction)` model, and ranking
+receives horizon-dimensional candidate rows. `train` and `load_predict` must have the
+same candidate/rank/report grain; a frozen multi-horizon model tag that scores only
+one horizon is invalid architecture noise.
+
+Per-horizon artifact metadata describes one artifact, not the config set:
+
+```text
+outcome_horizon = 6        # artifact identity, singular
+```
+
+Do not use `horizon_bars` in tailtree artifact metadata; `outcome_horizon` is the
+label/model/report horizon measured in bars.
+
+Load-predict feedback contract:
+
+```text
+configured horizons
+  == loaded metadata horizons
+  == loaded model horizons
+  == loaded evidence horizons
+```
+
+For each configured horizon, load-predict validates the metadata, every available
+up/down model file, the matching evidence CSV, and evidence row `outcome_horizon`.
+Missing or mismatched horizon artifacts fail loudly before candidate ranking; there is
+no single-horizon fallback and no synthetic horizon such as `0`.
+
+HPO baseline uses no new dependency first: deterministic small grids over named objective
+and training profiles, written as CSV feedback. `optuna` may be added later as an optional
+`hpo` dependency only after the CSV validation score is stable.
+
+HPO may be added as deterministic blocked/walk-forward search only when:
+
+```text
+forward_min/max non-null count > 0
+tail_count >= min_exceedance_required
+feature_count > 0
+validation tail count > 0
+```
+
+The HPO score optimizes extreme utility concentration:
+
+```text
+hpo_score = lift + count + utility + concentration/stability penalties
+```
+
+Until then, the correct output is an honest baseline summary, not tuned parameters.
+
+## Lean reduction target
+
+The current scanner still has large report and diagnostics modules. The reduction target is
+not more files by default; it is fewer public peer APIs and clearer product ownership.
+
+| Product surface | Target owner | Does not own |
+|---|---|---|
+| outer run lifecycle | `workflow.py` | state/outcome/evidence/rank internals |
+| known-at-close state/observation | `state.py` target | future returns, labels, evidence dispatch |
+| future/path/source outcomes | `outcome.py` target | known-at-close feature extraction, rank/report rendering |
+| categorical evidence | `ladder.py` | tailtree internals, feasibility, report joins |
+| tree evidence lifecycle | `tailrun/` + `tailtree/` | source refresh, report rendering, random-split HPO |
+| candidate evidence/rank/consistency | `rank.py` | source/history feasibility projection |
+| source/history/candidate feasibility | `feasibility.py` target | candidate rank scoring, renderer formatting |
+| diagnostics artifact IO | `diagnostics.py` | long-term state/outcome/evidence/rank/feasibility computation |
+| markdown rendering | `report.py` | CSV read-back, type recovery, business joins |
+
+Current transitional debt to remove deliberately:
+
+```text
+state.KlineClassifier + state.extract_continuous_features + state.potential_observation_frame
+  -> state.py
+
+outcome.kline_path_history_frame + outcome.realized_transition_frame + outcome.source_events_frame
+  + outcome.source_outcomes_frame + outcome.potential_outcome_frame -> outcome.py
+
+candidate/source/history feasibility helpers
+  -> feasibility.py
+
+diagnostics._build_diagnostic_frames / _run_pipeline
+  -> stays in diagnostics until a real typed ScanProducts object has multiple consumers
+```
+
+Do not create `pipeline.py`, `selection.py`, `_utils.py`, or one-file directory packages
+as line-count relief. Split only when the destination is a named product with a stable
+grain, schema, owner, and tests.
 
 Default report surface:
 
@@ -188,7 +608,9 @@ Path-specific Evidence Summary
 Caveats
 ```
 
-`Decision Rule Audit` is not a default peer section. It may remain as a CSV artifact or explicit appendix mode, because it is a rule-order trace rather than the canonical ranked candidate answer.
+`Decision Rule Audit` is not a default peer section. It may remain as a CSV artifact or
+explicit appendix mode, because it is a rule-order trace rather than the canonical ranked
+candidate answer.
 
 ## Cross-package boundaries
 
@@ -203,46 +625,67 @@ strategy or executor layer.
 | `research` ↔ `scanner` | `research → scanner artifacts` | research may inspect outputs; it should not depend on scanner internals |
 | `executor/basket` ↔ `scanner` | no scanner import | scanner diagnostics do not authorize live trading |
 
-Current overlap to remove: `scanner.classifiers` depends on strategy semantics. The
-scanner classifier vocabulary should become scanner-owned, with strategies consuming
-final signal columns rather than supplying scanner state labels.
+Resolved overlap: scanner classifier vocabulary is scanner-owned in `scanner.state`, with
+strategies consuming final signal columns rather than supplying scanner state labels.
 
-Naming cleanup: `scanner.source_events` is scanner-side event materialization, not
-external source acquisition. A later one-word rename to `scanner.events` would make the
-boundary clearer while `qooi.sources` remains the acquisition/source-context package.
+Source event materialization is scanner-side outcome construction in `scanner.outcome`,
+while `qooi.sources` remains the acquisition/source-context package.
 
 ## Composable pipeflow, not monolithic data bag
 
-The scanner shares by **behavior and data product**, not by passing a global `MaterializedScannerFrames` object.
+The scanner shares by named product grains, not by passing a global
+`MaterializedScannerFrames` object and letting downstream functions probe fields.
+
+Target pipe:
 
 ```text
-bars + state_frames
-  → qooi.scanner.features.extract_continuous_features
-  → continuous_features(symbol,timestamp,...)
-
-kline_history + source_events + continuous_features
-  → qooi.scanner.frames.potential_observation_frame
-  → observations(symbol,decision_bar_close_ms,...)
-
-observations + source_outcomes + realized_transitions
-  → qooi.scanner.frames.potential_outcome_frame
-  → outcomes(symbol,decision_bar_close_ms,horizon,...)
-
-observations + outcomes
-  → one evidence dispatch
-  → LadderResult | TailtreeResult
-
-result.evidence + latest observations
-  → rank.candidate_evidence_frame + rank.rank_candidate_evidence + report
+workflow.run(...)
+  -> ReportInputs
+  -> state product
+  -> outcome product
+  -> evidence product
+  -> rank product
+  -> feasibility product
+  -> diagnostics/report outputs
 ```
 
-Each stage consumes the smallest named data products it needs. No downstream function should accept the whole workflow state and select fields opportunistically.
+Current implementation path:
+
+```text
+bars + state_frames + source context
+  -> state.KlineClassifier / state.extract_continuous_features / state.potential_observation_frame
+  -> potential_observations
+
+kline path history + source outcomes + realized transitions
+  -> outcome.py internals / outcome.potential_outcome_frame
+  -> potential_outcomes
+
+potential_observations + potential_outcomes
+  -> ladder.py or tailrun/
+  -> potential_evidence
+
+potential_evidence + latest observations
+  -> rank.candidate_evidence_frame
+  -> rank.rank_candidate_evidence
+  -> rank.candidate_horizon_consistency_frame
+
+ranked candidates + source/history/watchlist feasibility
+  -> feasibility.py target
+  -> candidate_feasibility
+
+prepared frames
+  -> diagnostics.write_diagnostic_frames
+  -> report.render_report
+```
+
+Each stage consumes the smallest named product it needs. Workflow remains high-level and
+should not call history/frames/rank/tailrun/ladder/feasibility internals directly.
 
 ## Data products and invariants
 
 ### `source_availability`
 
-Owner: `qooi.sources.context.load_source_context(...)`; consumed by `qooi.scanner.decisions`, `qooi.scanner.diagnostics`, and `qooi.scanner.report`.
+Owner: `qooi.sources.context.load_source_context(...)`; consumed by `qooi.scanner.workflow`, `qooi.scanner.diagnostics`, and `qooi.scanner.report`.
 
 Key:
 
@@ -278,7 +721,7 @@ Invariants:
 
 ### `continuous_features`
 
-Owner: `qooi.scanner.features.extract_continuous_features(...)`
+Owner: `qooi.scanner.state.extract_continuous_features(...)`
 
 Key:
 
@@ -299,7 +742,7 @@ Invariants:
 
 ### `observations`
 
-Owner: `qooi.scanner.frames.potential_observation_frame(...)`
+Owner: `qooi.scanner.state.potential_observation_frame(...)`
 
 Key:
 
@@ -318,7 +761,7 @@ Source event timestamps are **not rewritten** into bar-close timestamps. The raw
 
 ### `outcomes`
 
-Owner: `qooi.scanner.frames.potential_outcome_frame(...)`
+Owner: `qooi.scanner.outcome.potential_outcome_frame(...)`
 
 Key:
 
@@ -495,7 +938,7 @@ Candidate output has three different grains. The report must not present all thr
 
 The top-level report should have one candidate-selection table sourced from `candidate-feasibility.csv` or its in-memory frame. `Review Rows`/decision-rule output is an audit lens and should be demoted to artifact/appendix, not a rank-ordered candidate list. `Data Coverage And Feasibility` should become an aggregate data-health summary, not another symbol table competing with candidate selection.
 
-Candidate-selection semantics belong to diagnostics/report projections: best-row selection, promotion gates, source/history blocker codes, and stable numeric schema. Report rendering belongs to `report.py`; artifact writing belongs to `diagnostics.py`. Extract a separate `selection.py` only when the code split removes real duplication rather than creating a new forwarding layer.
+Candidate feasibility semantics belong to the feasibility product: best-row selection, promotion gates, source/history blocker codes, and stable numeric schema. Report rendering belongs to `report.py`; artifact writing belongs to `diagnostics.py`. Keep candidate/source/history feasibility in `feasibility.py`; do not create `selection.py` as a forwarding layer.
 
 Freshness, capability, and tradability are numeric inputs, not manual labels:
 
@@ -546,10 +989,10 @@ Therefore "report construction" means diagnostic-frame construction, not Markdow
 rendering. The dominant current hotpath is:
 
 ```text
-history.realized_transition_frame      ~4.9s
+outcome.realized_transition_frame      ~4.9s
 history.kline_path_history_frame       ~1.8s
 tailtree/evidence pipeline             ~0.7s
-frames.potential_observation_frame     ~0.5s
+state.potential_observation_frame     ~0.5s
 ```
 
 Optimization must target these frame builders before Markdown table helpers or CSV
@@ -594,14 +1037,7 @@ business rules for source/history blocker semantics
 rank/feasibility joins
 ```
 
-Report sections should receive decisive frame schemas, for example:
-
-```text
-diagnostics.CANDIDATE_SELECTION_SCHEMA
-diagnostics.DATA_HEALTH_SCHEMA
-```
-
-The renderer should fail fast when projection schemas are wrong; it should not infer missing semantics with attribute checks, opaque row dictionaries, or CSV read-back conversions inside the same run.
+Report sections should receive decisive frame schemas from `DiagnosticFrames`. The renderer should fail fast when projection schemas are wrong; it should not infer missing semantics with attribute checks, opaque row dictionaries, or CSV read-back conversions inside the same run.
 
 ## Artifact boundaries
 
@@ -633,3 +1069,18 @@ report.md                   # candidate selection + data health + evidence/model
 `candidate-feasibility.csv` is the only top-level candidate table source for the report. `candidate-rank.csv` remains available for per-direction detail, and `watchlist-feasibility.csv` remains available for source/history audit joins.
 
 A model iteration should be able to reuse materialized artifacts; code should not skip stages ad hoc to finish a scan. Reduce config when necessary, or split materialization from evidence/review in a later workflow command.
+
+## Verification boundary
+
+For scanner migration/refactor slices, verify in this order and do not run slow scanner
+script execution unless explicitly requested:
+
+```bash
+uv run ruff check src tests
+uv run ty check
+uv run pytest tests/ -q
+git diff --check HEAD
+```
+
+The module-boundary tests own removal checks for legacy/transitional scanner modules.
+Architecture and graph docs must not document removed modules as active APIs.

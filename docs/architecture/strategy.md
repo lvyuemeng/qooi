@@ -75,4 +75,4 @@ Every promoted strategy path should produce:
 
 Research/scanner findings must be adapted into explicit signal columns before they can be tested through `qooi.core` execution. Until that happens, they remain research artifacts, not strategies.
 
-Concrete strategy/classifier implementation surfaces live in `docs/graph/strategy.md` and `docs/graph/classifier.md`.
+Concrete strategy implementation surfaces live in `docs/graph/strategy.md`.

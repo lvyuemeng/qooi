@@ -106,8 +106,8 @@ Do not preserve backward-compatible aliases when current callers can be updated.
 | `[potential.source]` | `qooi.sources` request/config type | source demand and freshness input | refresh mode, rank/report policy |
 | `[potential.transition]` | `qooi.scanner.transitions` | transition windows and thresholds | source/provider fields |
 | `[potential.evidence]` | `qooi.scanner.diagnostics` dispatch type | evidence path selection | booleans such as `use_tail_tree` |
-| `[potential.evidence.tailtree]` | `qooi.scanner.tailrun` | model lifecycle and artifact identity | source refresh, report rendering |
-| `[potential.review]` | `qooi.scanner.decisions` | current review requirements | candidate ranking, source acquisition |
+| `[potential.evidence.tailtree]` | `qooi.scanner.tailrun` | model lifecycle, artifact identity, train-summary integrity | source refresh, report rendering, random-split HPO |
+| `[potential.review]` | `qooi.scanner.workflow` | current review audit requirements | candidate ranking, source acquisition |
 | `[potential.profile]` | `qooi.profiling` | injected profile context mode | scanner/source-specific behavior |
 
 Refresh semantics must be singular:
@@ -151,7 +151,7 @@ Current high-pressure modules to reduce:
 
 | Package | Module | Current pressure | Reduction direction |
 |---|---|---:|---|
-| scanner | `diagnostics.py` | artifact assembly, evidence dispatch, report projections, frame writers | first extract pure functions inside the module; split only when a product has independent callers/tests |
+| scanner | `diagnostics.py`, `feasibility.py` | artifact assembly/write orchestration plus source/history/candidate feasibility projections | clarify pipe/product grains first; split only when a product has an owner, schema, and tests |
 | scanner | `report.py` | section logic plus CSV read-back plus type recovery | render in-memory report frames; remove default decision audit; delete conversion helpers |
 | sources | `collect.py` | demand planning plus provider execution | keep pure demand planning separate from side-effect collection within named APIs; no compatibility wrappers |
 | exchange | `store.py` | cache request, refresh, validation, coverage rows | keep cache/coverage contracts decisive; no source-context policy |

@@ -29,6 +29,17 @@ qooi.strategies.structure
   add_liquidity_sweep_features()
   add_none_context_diagnostics()
 
+  required classifier columns:
+    structure_trend_state
+    market_stage
+    structure_reason
+    market_stage_reason
+    stage_unknown_reason
+    range_width_atr_threshold
+    range_width_threshold_mode
+    range_width_threshold_ready
+    range_width_threshold_source
+
 qooi.strategies.semantics
   shared labels/enums
 

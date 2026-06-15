@@ -1,6 +1,6 @@
 # Scanner Module Graph
 
-Shared scanner skeleton: CLI orchestration, package-root scanner contracts, known-at-close feature/observation products, one evidence dispatch, candidate/rank/report. Current path internals live in `frames`, `ladder`, `tailrun`, and `rank`; removed compatibility modules such as `evidence.py`, `candidates.py`, and `contracts.py` are not public surfaces.
+Shared scanner skeleton: CLI orchestration, package-root scanner contracts, product-shaped data pipe, evidence dispatch, rank/feasibility/report outputs. The active graph is `state -> outcome -> evidence -> rank -> feasibility -> diagnostics/report`. State owns former classifier/feature internals; outcome owns former source-event/history internals. Removed compatibility/transitional modules such as `classifiers.py`, `features.py`, `source_events.py`, `history.py`, `decisions.py`, `frames.py`, `evidence.py`, `candidates.py`, and `contracts.py` are not public surfaces.
 
 Design doc: `docs/architecture/scanner.md`.
 
@@ -35,12 +35,13 @@ qooi.scanner.workflow.run(config_path: Path) -> Path
        # request.refresh_mode = config.refresh_mode; no nested source refresh override
   7. profile.stage("scanner", "workflow", "load_source_context")
        -> qooi.sources.context.load_source_context(request) -> SourceContextResult
-  8. qooi.scanner.decisions.compute_source_states(...)
-  9. qooi.scanner.decisions.scan_review_decisions(...)       # audit lens/artifact
- 10. qooi.scanner.diagnostics.build_diagnostic_frames(inputs, profile) -> DiagnosticFrames
- 11. qooi.scanner.diagnostics.write_diagnostic_frames(frames, artifacts) -> None
- 12. qooi.scanner.report.render_report(inputs, frames) -> str
- 13. profile.write()
+  8. qooi.scanner.workflow.compute_source_states(...)
+  9. qooi.scanner.workflow.scan_review_decisions(...)        # audit lens/artifact
+ 10. qooi.scanner.diagnostics.write_diagnostics(inputs, profile) -> DiagnosticFrames
+     # internally builds frames, writes CSV diagnostics, and writes state frames
+ 11. qooi.scanner.report.render_report(inputs, frames) -> str
+     # common report sections consume in-memory DiagnosticFrames
+ 12. profile.write()
 ```
 
 No separate `ScannerWorkflowPlan` is required unless a future caller needs to
@@ -61,37 +62,93 @@ PotentialConfig                      # single scanner config entry, not runtime 
 
 ## Shared data pipeflow
 
+The urgent API graph is the data pipe, not another orchestration module. Do not add
+`pipeline.py` unless a typed product object exists and has multiple real consumers. The
+current implementation still runs much of this through `diagnostics.build_diagnostic_frames`,
+but the target ownership is:
+
 ```text
-bars/state_frames/source_frames
-  → qooi.scanner.features.extract_continuous_features(...)
-  → continuous_features
+workflow.run(config_path)
+  → load config/universe/bars/source context/decisions/transitions
+  → ReportInputs
+  → diagnostics.write_diagnostics(inputs, profile) -> DiagnosticFrames
+  → report.render_report(inputs, frames)
+```
 
-kline_history/source_events/continuous_features
-  → qooi.scanner.frames.potential_observation_frame(...)
-  → observations
+Inside the scanner product pipe:
 
-observations/source_outcomes/realized_transitions
-  → qooi.scanner.frames.potential_outcome_frame(...)
-  → outcomes
+```text
+state product
+  current calls:
+    qooi.scanner.state.KlineClassifier.classify(...)
+    qooi.scanner.state.extract_continuous_features(...)
+    qooi.scanner.state.potential_observation_frame(...)
+  target owner:
+    qooi.scanner.state
+  output:
+    potential_observations
 
-observations/outcomes
-  → qooi.scanner.diagnostics._run_pipeline(...)
-       ├─ evidence="ladder"   → qooi.scanner.ladder.evaluate(...)
-       └─ evidence="tailtree" → qooi.scanner.tailrun.run(...)
+outcome product
+  current calls:
+    qooi.scanner.outcome.kline_path_history_frame(...)
+    qooi.scanner.outcome.realized_transition_frame(...)
+    qooi.scanner.outcome.source_events_frame(...)
+    qooi.scanner.outcome.source_outcomes_frame(...)
+    qooi.scanner.outcome.source_timeliness_frame(...)
+    qooi.scanner.outcome.source_state_predictability_frame(...)
+    qooi.scanner.outcome.potential_outcome_frame(...)
+  target owner:
+    qooi.scanner.outcome
+  outputs:
+    kline_path_history, realized_transitions, source_events, source_outcomes, potential_outcomes
 
-result.evidence/latest_observations
-  → qooi.scanner.rank.candidate_evidence_frame(...)
-  → qooi.scanner.rank.rank_candidate_evidence(...)
-  → qooi.scanner.diagnostics.candidate_feasibility_frame(...)
-  → qooi.scanner.diagnostics.data_health_frame(...)
-  → candidate-inspection.csv + candidate-rank.csv + candidate-feasibility.csv + report
+evidence product
+  current dispatch:
+    evidence="ladder"
+      → qooi.scanner.ladder.potential_evidence_frame(...)
+    evidence="tailtree"
+      → qooi.scanner.tailrun.run(...)
+  outputs:
+    potential_evidence plus optional tailtree model/evidence artifacts
+
+rank product
+  current calls:
+    qooi.scanner.rank.candidate_evidence_frame(...)
+    qooi.scanner.rank.rank_candidate_evidence(...)
+    qooi.scanner.rank.candidate_horizon_consistency_frame(...)
+  outputs:
+    candidate-inspection.csv, candidate-rank.csv, candidate-horizon-consistency.csv
+  invariant:
+    candidate evidence/rank pipe carries `outcome_horizon`; consumers do not posterior-check it
+
+feasibility product
+  current transitional owner:
+    qooi.scanner.feasibility.candidate_feasibility_frame(...)
+    qooi.scanner.feasibility.join_candidate_source_constraints(...)
+  target owner:
+    qooi.scanner.feasibility
+  outputs:
+    candidate-feasibility.csv plus source/history/watchlist feasibility projections
+
+diagnostics/report outputs
+  current calls:
+    qooi.scanner.diagnostics.write_diagnostic_frames(...)
+    qooi.scanner.report.render_report(...)
+  target:
+    diagnostics writes artifacts; report renders prepared frames only
 ```
 
 `qooi.scanner.__init__` owns scanner-local contracts/protocols and shared expression
 helpers. There are no `qooi.scanner.contracts`, `qooi.scanner.evidence`, or
 `qooi.scanner.candidates` compatibility modules in the resolved graph.
 
----
+Current transitional debt:
+
+```text
+qooi.scanner.feasibility          # source/history/candidate feasibility product
+qooi.scanner.diagnostics.py      # still builds too much of the data pipe
+qooi.scanner.report.py           # still owns some typed projection/render helper logic
+```
 
 ## Refresh and source context boundary
 
@@ -250,10 +307,10 @@ Can this current symbol row be reviewed with enough local history and fresh requ
 
 ---
 
-## Continuous features: `qooi.scanner.features`
+## Continuous features: `qooi.scanner.state`
 
 ```text
-qooi.scanner.features.extract_continuous_features(
+qooi.scanner.state.extract_continuous_features(
     bars: dict[tuple[str, str], pl.DataFrame],
     state_frames: dict[tuple[str, str], pl.DataFrame],
     source_frames: dict[str, pl.DataFrame],
@@ -322,10 +379,10 @@ Planned cost/freshness extensions for promoted candidate review:
 
 ---
 
-## Observation + outcome: `qooi.scanner.frames`
+## Observation + outcome products: `qooi.scanner.state` / `qooi.scanner.outcome`
 
 ```text
-qooi.scanner.frames.potential_observation_frame(
+qooi.scanner.state.potential_observation_frame(
     kline_history: pl.DataFrame,
     source_events: pl.DataFrame,
     continuous_features: pl.DataFrame | None,
@@ -345,7 +402,7 @@ continuous join: (symbol, decision_bar_close_ms) = (symbol, timestamp)
 Continuous features are joined on every path, including no-source/stale-source paths.
 
 ```text
-qooi.scanner.frames.potential_outcome_frame(
+qooi.scanner.outcome.potential_outcome_frame(
     observations: pl.DataFrame,
     source_outcomes: pl.DataFrame,
     realized_transitions: pl.DataFrame,
@@ -357,9 +414,25 @@ qooi.scanner.frames.potential_outcome_frame(
 Outcome contract:
 
 ```text
-key: symbol, decision_bar_close_ms, outcome_horizon
+key: symbol, decision_timeframe, decision_bar_close_ms, outcome_horizon
 contains future-return/path diagnostics only
 ```
+
+Market outcome source:
+
+```text
+qooi.scanner.outcome.kline_path_history_frame(config, state_frames, bar_frames)
+  -> known-at-close categorical state rows + raw close/high/low at the same bar close
+
+qooi.scanner.outcome.realized_transition_frame(kline_history, horizons)
+  -> terminal categorical transition columns
+  -> forward_return_pct / forward_min_return_pct / forward_max_return_pct / path_range_pct
+  -> time_to_max_bar / time_to_min_bar / close_retention_ratio / path_efficiency
+```
+
+`potential_outcome_frame(...)` preserves realized-transition excursion columns for market
+rows and joins source-event excursion columns for source rows. It does not recompute
+future labels.
 
 Implemented outcome columns:
 
@@ -369,20 +442,25 @@ Implemented outcome columns:
 | `forward_max_return_pct` | maximum high excursion inside horizon |
 | `forward_min_return_pct` | minimum low excursion inside horizon |
 | `path_range_pct` | high/low excursion width |
+| `time_to_max_bar` | first forward bar offset where max high excursion was reached |
+| `time_to_min_bar` | first forward bar offset where min low excursion was reached |
+| `close_retention_ratio` | terminal return divided by same-direction favorable excursion |
+| `post_max_drawdown_pct` | max-up excursion unwound by terminal close |
+| `post_min_rebound_pct` | min-down excursion rebounded by terminal close |
+| `path_efficiency` | absolute terminal return divided by path range |
 | `tail_up`, `tail_down` | excursion labels after thresholding |
 
-Planned path-shape columns:
+Path-shape columns classify fixed-horizon quality without replacing excursion labels:
 
 | Column | Meaning |
 |---|---|
-| `time_to_max_bar` | first bar offset where forward max was reached |
-| `time_to_min_bar` | first bar offset where forward min was reached |
-| `close_retention_ratio` | terminal close return divided by max favorable excursion |
-| `post_peak_drawdown_pct` | amount unwound after favorable peak |
-| `path_efficiency` | terminal move divided by path range |
-| `entry_delay_bars` | realistic delay between signal close and executable entry |
+| touch | threshold crossed intrahorizon |
+| continuation | favorable excursion retained into terminal close |
+| exhaustion | favorable excursion mostly unwound by terminal close |
+| two-sided volatility | both max and min excursions are large relative to terminal move |
 
-These planned columns distinguish continuation from burst-then-fade while preserving the current excursion label.
+Multi-horizon is represented by additional `outcome_horizon` rows. Tailtree trains
+and writes horizon-suffixed artifacts per configured `outcome_horizon` value.
 
 ---
 
@@ -413,6 +491,63 @@ if inputs.config.evidence.tailtree.lifecycle == "load_predict":
 else:
     result = _build_tail_tree_evidence(...)
 ```
+
+Tailtree train integrity artifacts:
+
+```text
+qooi.scanner.tailrun._build_tail_tree_evidence(...)
+  → qooi.scanner.outcome.potential_outcome_frame(...)
+  → qooi.scanner.tailtree.label_tail_exceedances(...)
+  → qooi.scanner.tailrun._tailtree_run_summary_frame(...)
+  → qooi.scanner.tailrun._write_tailtree_artifacts(...)
+
+outputs:
+  diagnostics/tailtree-run-summary.csv
+  model_dir/model_tag/tailtree-run-summary.csv
+  model_dir/model_tag/tailtree-artifact.json
+  model_dir/model_tag/tail-tree-{up,down}.json              # only current trained dirs
+  model_dir/model_tag/potential-leaf-evidence-{up,down}.csv # only current evidence dirs
+```
+
+Run-complete artifact rule:
+
+```text
+before writing a train run, tailrun removes stale direction artifacts for the same tag;
+current metadata, summary, tree files, and evidence CSVs must describe the same run.
+```
+
+Tailtree summary schema target:
+
+```text
+summary_scope: "run" | "up" | "down"
+direction: "" | "up" | "down"
+observation_row_count: int
+outcome_row_count: int
+source_event_row_count: int
+source_outcome_row_count: int
+realized_transition_row_count: int
+feature_count: int
+categorical_feature_count: int
+continuous_feature_count: int
+forward_return_nonnull_count: int
+forward_min_return_nonnull_count: int
+forward_max_return_nonnull_count: int
+path_range_nonnull_count: int
+threshold_pct: float
+tail_count: int
+tail_rate: float
+train_observation_count: int
+train_exceedance_count: int
+min_exceedance_required: int
+trainable_flag: int
+trained_tree_count: int
+selected_leaf_count: int
+written_model_file_count: int
+written_evidence_file_count: int
+removed_stale_file_count: int
+```
+
+HPO target edge is intentionally absent from implemented flow until walk-forward validation has nonzero labels and validation tail counts. Random-split HPO is not a scanner API.
 
 Downstream code consumes concrete result fields:
 
@@ -492,7 +627,6 @@ qooi.scanner.rank.candidate_evidence_frame(
 ) -> pl.DataFrame
 
 qooi.scanner.rank.rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame
-qooi.scanner.rank.rank_candidates(candidates: pl.DataFrame) -> pl.DataFrame
 ```
 
 The only caller that supplies tree models is the tailtree pipeline. Candidate internals prefer path-specific helpers rather than spreading config checks. Candidate inspection and ranking ownership is `rank.py`; there is no `candidates.py` compatibility shim.
@@ -500,9 +634,9 @@ The only caller that supplies tree models is the tailtree pipeline. Candidate in
 Current output:
 
 ```text
-candidate-inspection.csv  # latest rows matched to evidence/leaf metrics
-candidate-rank.csv        # symbol × selected direction ranked evidence matches
-candidate-feasibility.csv # one best ranked row per symbol joined to review feasibility
+candidate-inspection.csv  # latest rows matched to evidence/leaf metrics; one row per symbol × horizon × direction
+candidate-rank.csv        # ranked candidate-horizon-direction evidence rows
+candidate-feasibility.csv # best ranked horizon row per symbol joined to review feasibility
 ```
 
 `candidate-inspection.csv` is the diagnostic surface. `candidate-rank.csv` is rank detail and may contain multiple rows per symbol. `candidate-feasibility.csv` is the report-facing candidate-selection surface.
@@ -512,16 +646,16 @@ Ranking uses numeric columns that are present:
 - ladder: information gain, stability, support, path quality, data quality;
 - tailtree: tail lift, tail stability, support, path quality, data quality.
 
-Candidate selection projection currently belongs to `diagnostics.py`, not `report.py`:
+Candidate feasibility projection belongs to `qooi.scanner.feasibility`, not `report.py`:
 
 ```text
-qooi.scanner.diagnostics.candidate_feasibility_frame(
+qooi.scanner.feasibility.candidate_feasibility_frame(
     candidate_rank: pl.DataFrame,
     watchlist_feasibility: pl.DataFrame,
 ) -> pl.DataFrame
 ```
 
-Split to `selection.py` only if it removes real module pressure after CSV read-back and default audit rendering are removed; do not create a forwarding wrapper.
+Keep this product in `feasibility.py`; do not create `selection.py` as a forwarding wrapper.
 
 Output contract:
 
@@ -587,18 +721,18 @@ Manual slippage thresholds are allowed only as extreme sanity guards. Normal rev
 Canonical candidate-selection projection:
 
 ```text
-qooi.scanner.diagnostics.candidate_feasibility_frame(
+qooi.scanner.feasibility.candidate_feasibility_frame(
     candidate_rank: pl.DataFrame,
     watchlist_feasibility: pl.DataFrame,
 ) -> pl.DataFrame
 ```
 
-This function may later move to `qooi.scanner.selection.candidate_selection_frame(...)` only if that removes real module pressure without becoming a wrapper alias.
+This function lives in `qooi.scanner.feasibility`. Do not reintroduce the removed plural compatibility package `qooi.scanner.candidates`, and do not create a candidate-specific package for feasibility.
 
 Schema:
 
 ```text
-CANDIDATE_SELECTION_SCHEMA
+CANDIDATE_FEASIBILITY_SCHEMA
   symbol: String
   feasibility: String
   rank_score: Float64
@@ -629,42 +763,6 @@ candidate_reason: semantic blocker code, not display prose
 no Markdown strings or report formatting
 ```
 
-### Data-health projection
-
-Aggregate report-health projection:
-
-```text
-qooi.scanner.diagnostics.data_health_frame(
-    history_feasibility: pl.DataFrame,
-    source_availability: pl.DataFrame,
-    candidate_selection: pl.DataFrame,
-) -> pl.DataFrame
-```
-
-This function can stay in `diagnostics.py` while it only feeds diagnostics/report. Split to `health.py` only if it gains independent callers or materially reduces `diagnostics.py` after CSV read-back is removed.
-
-Schema:
-
-```text
-DATA_HEALTH_SCHEMA
-  scope: String
-  row_count: Int64
-  required_missing_source_count: Int64
-  required_stale_source_count: Int64
-  provider_bounded_source_count: Int64
-  optional_absent_source_count: Int64
-  reviewable_count: Int64
-  limited_count: Int64
-```
-
-Rules:
-
-```text
-source/history/candidate health are aggregate counts
-no symbol-level candidate rows in data-health report section
-no candidate ranking or source collection
-```
-
 ## Diagnostics build/write and report render
 
 ```text
@@ -679,22 +777,25 @@ qooi.scanner.report.render_report(
 ) -> str
 ```
 
-Current implementation has the public build/write boundary, while report rendering still reads some CSV artifacts during the same run:
+Current implementation has the public build/write boundary. Common report sections consume
+`DiagnosticFrames` in memory; path-specific tailtree artifact sections still inspect tree
+JSON/CSV artifacts written by `tailrun`.
 
 ```text
 build_diagnostic_frames(inputs) -> DiagnosticFrames
 write_diagnostic_frames(frames, artifacts) -> None
-render_report(inputs) -> str  # still reads some CSV artifacts during same run
+write_diagnostics(inputs, profile) -> DiagnosticFrames
+render_report(inputs, frames) -> str
 ```
 
 Target API removes same-run CSV read-back and separates expensive compute from cheap IO.
 Measured cache-only hotpath:
 
 ```text
-qooi.scanner.history.realized_transition_frame(...)        ~4.9s
-qooi.scanner.history.kline_path_history_frame(...)         ~1.8s
+qooi.scanner.outcome.realized_transition_frame(...)        ~4.9s
+qooi.scanner.outcome.kline_path_history_frame(...)         ~1.8s
 qooi.scanner.diagnostics._run_pipeline(...)                ~0.7s
-qooi.scanner.frames.potential_observation_frame(...)       ~0.5s
+qooi.scanner.state.potential_observation_frame(...)       ~0.5s
 qooi.scanner.diagnostics.write_diagnostic_frames(...)      ~0.1s
 qooi.scanner.report.render_report(...)                     ~0.1s
 ```
@@ -709,27 +810,28 @@ Optimization order:
 5. in-memory report frames to remove CSV type recovery
 ```
 
+Tailtree optimization precondition:
+
+```text
+do not tune LightGBM parameters while tailtree-run-summary shows
+forward_min/max non-null count = 0 or train_exceedance_count = 0
+```
+
 Do not optimize Markdown table formatting before these frame builders.
 
 Report rendering graph:
 
 ```text
-DiagnosticFrames.candidate_selection
+DiagnosticFrames.candidate_feasibility
   → qooi.scanner.report.CandidateSelectionSection.render(frame) -> str
 
-DiagnosticFrames.data_health
-  → qooi.scanner.report.DataHealthSection.render(frame) -> str
+DiagnosticFrames.history_feasibility/source_freshness/candidate_feasibility
+  → qooi.scanner.report.DataHealthSection.render(...) -> str
+  # current implementation derives aggregate data-health in the report section.
 
-DiagnosticFrames.path_evidence
+DiagnosticFrames.potential_evidence
   → report_sections_for(evidence)
-  → ReportSection.render(inputs, frames)
-```
 
-Target frame contracts:
-
-```text
-qooi.scanner.diagnostics.CANDIDATE_SELECTION_SCHEMA
-qooi.scanner.diagnostics.DATA_HEALTH_SCHEMA
 ```
 
 `report.py` should not read `diagnostics/*.csv` during the same run. CSV artifacts are an output boundary for users/tests, not an internal type transport.
@@ -745,6 +847,36 @@ business-rule joins between rank and feasibility
 ```
 
 Path-specific report sections are composed before rendering, not by branching inside every section. The renderer formats typed frame columns; it does not decide source, history, or candidate semantics. Default report excludes `Decision Rule Audit`; audit rows remain diagnostics unless an explicit appendix mode is added.
+
+---
+
+## Migration verification
+
+The workflow-first migration is complete when these static/fast checks pass without
+running scanner scripts:
+
+```bash
+uv run ruff check src tests
+uv run ty check
+uv run pytest tests/ -q
+git diff --check HEAD
+```
+
+Boundary checks must also show that removed compatibility/transitional modules are
+absent:
+
+```text
+qooi.scanner.classifiers
+qooi.scanner.features
+qooi.scanner.history
+qooi.scanner.source_events
+qooi.scanner.decisions
+qooi.scanner.frames
+qooi.scanner.events
+```
+
+The old one-file `tailtree.py` and `tailrun.py` modules are also removed; their public
+module names now resolve to real packages with product-owned files.
 
 ---
 

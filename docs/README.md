@@ -41,14 +41,13 @@ Concrete implementation-facing module graphs live under `docs/graph/`.
 | `graph/exchange.md` | Exchange/cache/universe/context module graph. |
 | `graph/sources.md` | Source collector and artifact module graph. |
 | `graph/strategy.md` | Strategy/signal module graph. |
-| `graph/classifier.md` | Cross-cutting deterministic strategy/scanner classifier module graph. |
 | `graph/core.md` | Core basket/executor/evaluation module graph. |
 | `graph/research.md` | Research table/report module graph. |
 | `graph/scanner.md` | Potential scanner module graph. |
 | `graph/profiling.md` | Cross-cutting profile context API and artifact graph. |
 | `graph/dynamic.md` | Dynamic/AI module graph and forbidden edges. |
 
-Each isolated module family owns its own graph. Cross-cutting graph appendices, such as `graph/classifier.md`, must not create new architecture parts unless the code also gains a matching package boundary.
+Each isolated module family owns its own graph. Do not keep cross-cutting graph appendices when the implementation has no matching package boundary; fold the API surface into the owning family graph instead.
 
 ## Reports
 
