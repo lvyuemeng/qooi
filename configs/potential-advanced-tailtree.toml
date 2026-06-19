@@ -9,30 +9,37 @@ fetch_concurrency = 8
 timeframes = ["1H"]
 days = 180
 refresh_mode = "incremental"
+latest_staleness_hours = 2
 
 [potential.books]
 limit = 25
+max_staleness_hours = 1
 
 [potential.trades]
 limit = 100
+max_staleness_hours = 1
 
 [potential.funding]
 limit = 100
+max_staleness_hours = 8
 
 [potential.open_interest]
 period = "1H"
 limit = 100
 unit = "2"
+max_staleness_hours = 2
 
 [potential.taker_volume]
 period = "1H"
 limit = 100
 unit = "2"
+max_staleness_hours = 2
 
 [potential.long_short]
 period = "1H"
 limit = 100
 unit = "2"
+max_staleness_hours = 2
 
 [potential.transition]
 scan_budget = 80

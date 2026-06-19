@@ -21,6 +21,7 @@ class BarsConfig(BaseModel):
     timeframes: tuple[str, ...] = ("1H",)
     days: int = 60
     refresh_mode: RefreshMode = "incremental"
+    latest_staleness_hours: int = 2
 
 
 class SnapshotConfig(BaseModel):
@@ -28,6 +29,7 @@ class SnapshotConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
     limit: int = 100
+    max_staleness_hours: int | None = None
 
 
 class RubikConfig(BaseModel):
@@ -37,6 +39,7 @@ class RubikConfig(BaseModel):
     period: str = "1H"
     limit: int = 100
     unit: Literal["0", "1", "2"] = "2"
+    max_staleness_hours: int = 2
 
 
 # ── Tailtree (unchanged below) ──

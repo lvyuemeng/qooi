@@ -3,8 +3,9 @@ from __future__ import annotations
 import polars as pl
 
 from qooi.scanner import rank
-from qooi.scanner.config import PotentialConfig
+from qooi.scanner.config import BarsConfig, PotentialConfig, RubikConfig, SnapshotConfig
 from qooi.scanner.output import review_decisions
+from qooi.scanner.workflow import scanner_market_request
 
 
 def test_rank_public_api_is_branch_explicit() -> None:
@@ -112,3 +113,33 @@ def test_potential_config_has_nested_tailtree_only() -> None:
 
     assert hasattr(config.evidence, "tailtree")
     assert not hasattr(config, "tailtree")
+
+
+def test_scanner_market_request_splits_fetch_freshness_from_review_tolerance() -> None:
+    config = PotentialConfig(
+        max_staleness_hours=24,
+        bars=BarsConfig(latest_staleness_hours=2),
+        books=SnapshotConfig(limit=25, max_staleness_hours=1),
+        trades=SnapshotConfig(limit=100, max_staleness_hours=1),
+        funding=SnapshotConfig(limit=100, max_staleness_hours=8),
+        open_interest=RubikConfig(max_staleness_hours=2),
+        taker_volume=RubikConfig(max_staleness_hours=2),
+        long_short=RubikConfig(max_staleness_hours=2),
+    )
+
+    request = scanner_market_request(config, ("BTC-USDT-SWAP",))
+    source_hours = {
+        product.name: product.max_staleness_hours for product in request.sources.products
+    }
+
+    assert request.bars.max_staleness_hours == 24
+    assert request.bars.latest_staleness_hours == 2
+    assert request.sources.max_staleness_hours == 24
+    assert source_hours == {
+        "books": 1,
+        "trades": 1,
+        "funding": 8,
+        "open_interest": 2,
+        "taker_volume": 2,
+        "long_short_ratios": 2,
+    }

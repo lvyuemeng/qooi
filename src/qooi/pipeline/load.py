@@ -44,6 +44,7 @@ class BarLoadRequest:
     timeframes: tuple[str, ...]
     target_days: int
     max_staleness_hours: int
+    latest_staleness_hours: int | None = None
     refresh_mode: LoadMode = "incremental"
 
 
@@ -53,6 +54,7 @@ class SourceProductLoadRequest:
     limit: int
     period: str = "1H"
     unit: str = "2"
+    max_staleness_hours: int | None = None
 
 
 @dataclass(frozen=True)
@@ -173,7 +175,8 @@ def _plan_market_coverage(
         spec = bar_spec(
             timeframe=timeframe,
             target_days=request.bars.target_days,
-            max_staleness_hours=request.bars.max_staleness_hours,
+            max_staleness_hours=request.bars.latest_staleness_hours
+            or request.bars.max_staleness_hours,
         )
         bar_plans.append(
             plan_product_coverage(
@@ -190,7 +193,7 @@ def _plan_market_coverage(
         spec = source_spec(
             product_name=product.name,
             target_days=request.sources.target_days,
-            max_staleness_hours=request.sources.max_staleness_hours,
+            max_staleness_hours=product.max_staleness_hours or request.sources.max_staleness_hours,
             page_limit=product.limit,
         )
         plans[product.name] = plan_product_coverage(
@@ -260,9 +263,14 @@ async def _execute_source_jobs(
             pages += len(current_symbols)
         for job in (job for job in plan.jobs if job.kind != "current_snapshot"):
             local = _symbol_frame(existing, job.symbol)
-            fetched, symbol_pages, is_bounded = await _backfill_source(
-                okx, product, job.symbol, local, policy, job.max_pages
-            )
+            if job.kind == "latest_refresh":
+                fetched, symbol_pages, is_bounded = await _refresh_latest_source(
+                    okx, product, job.symbol, local, policy
+                )
+            else:
+                fetched, symbol_pages, is_bounded = await _backfill_source(
+                    okx, product, job.symbol, local, policy, job.max_pages
+                )
             if is_bounded:
                 bounded.add((job.symbol, product.name, job.timeframe))
             if not fetched.is_empty():
@@ -293,8 +301,12 @@ def _source_products(
     products = {}
     for product in request.products:
         frame = frames.get(product.name, pl.DataFrame())
+        threshold_hours = product.max_staleness_hours or request.max_staleness_hours
         health = FrameHealth.from_frame(
-            frame, product=product.name, key="", threshold_hours=request.max_staleness_hours
+            frame,
+            product=product.name,
+            key="",
+            threshold_hours=threshold_hours,
         )
         products[product.name] = ProductResult(product.name, frame, health)
     return products
@@ -380,6 +392,23 @@ async def _backfill_source(
         merged = next_frame
         pages += 1
     return merged, pages, False
+
+
+async def _refresh_latest_source(
+    okx: OkxClient,
+    product: SourceProductLoadRequest,
+    symbol: str,
+    existing: pl.DataFrame,
+    policy: MarketLoadPolicy,
+) -> tuple[pl.DataFrame, int, bool]:
+    page = await _safe_fetch_source_page(okx, product, symbol, None, policy)
+    if page.is_empty():
+        return existing, 0, False
+    next_frame = _merge_source(existing, page)
+    pages = (
+        1 if next_frame.height > existing.height or _latest(next_frame) != _latest(existing) else 0
+    )
+    return next_frame, pages, False
 
 
 async def _safe_fetch_bar_page(

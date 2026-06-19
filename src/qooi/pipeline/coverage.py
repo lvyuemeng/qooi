@@ -333,7 +333,7 @@ def coverage_state(
             fresh,
             rows > 0,
         )
-    if provider_bounded:
+    if provider_bounded and fresh:
         return _state(
             spec,
             symbol,

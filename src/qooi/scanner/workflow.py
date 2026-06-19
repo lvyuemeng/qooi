@@ -61,6 +61,7 @@ def scanner_market_request(config: PotentialConfig, symbols: tuple[str, ...]) ->
                     product_config.limit,
                     getattr(product_config, "period", "1H"),
                     getattr(product_config, "unit", "2"),
+                    product_config.max_staleness_hours,
                 )
             )
     target_days = min(config.bars.days, 180)
@@ -70,6 +71,7 @@ def scanner_market_request(config: PotentialConfig, symbols: tuple[str, ...]) ->
             timeframes=config.bars.timeframes,
             target_days=target_days,
             max_staleness_hours=config.max_staleness_hours,
+            latest_staleness_hours=config.bars.latest_staleness_hours,
             refresh_mode=config.bars.refresh_mode,
         ),
         sources=SourceLoadRequest(
