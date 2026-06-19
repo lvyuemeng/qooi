@@ -1,0 +1,86 @@
+[potential]
+output = "data/output/potential/optuna-direct-smoke/report.md"
+universe = "research"
+max_symbols = 2
+max_staleness_hours = 24
+fetch_concurrency = 2
+
+[potential.bars]
+timeframes = ["1H"]
+days = 30
+refresh_mode = "incremental"
+
+[potential.transition]
+scan_budget = 2
+history_days = 30
+context_scope = "all_scanned"
+context_limit = 2
+ngram_length = 3
+horizon = 12
+mae_mfe_horizon = 12
+min_count = 12
+recent_window = 240
+long_window = 720
+return_threshold_pct = 0.0
+min_probability = 0.05
+min_directional_probability = 0.55
+min_probability_delta = -0.1
+min_reward_risk = 1.0
+max_tail_loss_pct = 20.0
+min_information_bits = 0.001
+
+[potential.profile]
+mode = "stage"
+top_n = 20
+
+[potential.evidence]
+kind = "tailtree"
+
+[potential.evidence.tailtree]
+lifecycle = "train"
+model_dir = "data/output/potential/optuna-direct-smoke/models"
+threshold_pct = 5.0
+outcome_horizon = [12]
+
+[[potential.evidence.tailtree.profiles]]
+profile_id = "quantile-smoke"
+model_tag = "tailtree-optuna-direct-smoke-primary"
+objective = "tail_utility_quantile"
+
+[potential.evidence.tailtree.profiles.training]
+kind = "fixed"
+num_leaves = 32
+min_data_in_leaf = 20
+learning_rate = 0.03
+num_iterations = 80
+early_stopping_rounds = 20
+
+[potential.evidence.tailtree.profiles.evaluation]
+protocol = "single_split"
+validation_fraction = 0.0
+embargo_bars = 0
+
+[[potential.evidence.tailtree.profiles]]
+profile_id = "optuna-direct-smoke"
+model_tag = "tailtree-optuna-direct-smoke"
+objective = "tail_utility_quantile"
+
+[potential.evidence.tailtree.profiles.training]
+kind = "optuna"
+max_trials = 1
+seed = 42
+num_leaves = 32
+min_data_in_leaf = 20
+learning_rate = 0.03
+num_iterations = 80
+early_stopping_rounds = 20
+num_leaves_range = [16, 64]
+min_data_in_leaf_range = [10, 80]
+learning_rate_range = [0.01, 0.08]
+num_iterations_range = [40, 120]
+early_stopping_rounds_range = [10, 40]
+
+[potential.evidence.tailtree.profiles.evaluation]
+protocol = "single_split"
+validation_fraction = 0.0
+embargo_bars = 0
