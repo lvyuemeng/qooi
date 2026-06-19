@@ -4,13 +4,10 @@ version = "0.1.0"
 description = "Crypto quantitative trading toolkit — OKX market data, backtesting, evaluation"
 requires-python = ">=3.11"
 dependencies = [
-    "ccxt>=4.5.51",
     "httpx>=0.27,<0.28",
     "matplotlib>=3.10",
     "polars>=1.0",
     "pydantic>=2.13.3",
-    "python-dotenv>=1.0",
-    "python-okx>=0.4.1",
     "tenacity>=9.0",
 ]
 
@@ -28,7 +25,6 @@ ml = [
     "torch>=2.3",
 ]
 tailtree = [
-    "colorlog>=6.0",
     "lightgbm>=4.0",
     "optuna>=4.0",
     "scipy>=1.11",
@@ -46,13 +42,10 @@ select = ["E", "F", "I", "N", "W", "UP"]
 extend-safe-fixes = ["E402"]
 
 [tool.ruff.lint.per-file-ignores]
-"src/qooi/exchange/trading.py" = ["E402"]
-"src/qooi/pipeline/plan.py" = ["E501", "E702", "E402"]
 "src/qooi/pipeline/discovery.py" = ["E501"]
 "src/qooi/transport/okx.py" = ["E701", "E702"]
 "src/qooi/scanner/__init__.py" = ["E501"]
 "src/qooi/scanner/workflow.py" = ["E501", "E701"]
-"src/qooi/products.py" = ["I001", "E702"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -63,11 +56,9 @@ root = ["./src"]
 
 [tool.ty.src]
 include = [
-    "src/qooi/sources/artifacts.py",
-    "src/qooi/sources/context.py",
-    "src/qooi/scanner/diagnostics.py",
+    "src/qooi/scanner/config.py",
+    "src/qooi/scanner/output.py",
     "src/qooi/scanner/rank.py",
-    "src/qooi/scanner/report.py",
 ]
 
 [tool.hatch.build.targets.wheel]

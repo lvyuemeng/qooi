@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Literal
 
@@ -226,9 +227,18 @@ class TailtreeConfig(BaseModel):
             return (12,)
         if isinstance(value, int):
             values = (value,)
+        elif isinstance(value, Iterable) and not isinstance(value, str | bytes):
+            values = tuple(value)
         else:
-            values = tuple(value)  # type: ignore[arg-type]
-        horizons = tuple(dict.fromkeys(int(horizon) for horizon in values if int(horizon) > 0))
+            values = (value,)
+        parsed_horizons = []
+        for horizon in values:
+            if not isinstance(horizon, int | float | str):
+                continue
+            horizon_int = int(horizon)
+            if horizon_int > 0:
+                parsed_horizons.append(horizon_int)
+        horizons = tuple(dict.fromkeys(parsed_horizons))
         return horizons or (12,)
 
     @model_validator(mode="after")
