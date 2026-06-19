@@ -19,7 +19,7 @@ from qooi.scanner import (
 )
 
 
-def compute_transition_insights(
+def transitions(
     config: PotentialScanConfig,
     symbols: tuple[str, ...],
     frames: dict[tuple[str, str], pl.DataFrame],
@@ -36,7 +36,7 @@ def compute_transition_insights(
     edges: list[TransitionEdge] = []
     unsupported: list[UnsupportedTransitionPath] = []
     symbol_index = {symbol: index for index, symbol in enumerate(symbols)}
-    for timeframe in config.timeframes:
+    for timeframe in config.bars.timeframes:
         classified = _classified_symbol_frame(config, symbols, frames, state_frames, timeframe)
         if classified.is_empty():
             continue
@@ -77,13 +77,13 @@ def compute_transition_insights(
             )
             unsupported.extend(
                 UnsupportedTransitionPath(
-                    str(row["symbol"]),
+                    str(d["symbol"]),
                     timeframe,
-                    str(row["transition_path"]),
-                    str(row["contextual_event"]),
+                    str(d["transition_path"]),
+                    str(d["contextual_event"]),
                     "no_supported_patterns_for_timeframe",
                 )
-                for row in current.iter_rows(named=True)
+                for d in current.to_dicts()
             )
             continue
         patterns = (
@@ -173,51 +173,51 @@ def compute_transition_insights(
         )
         unsupported.extend(
             UnsupportedTransitionPath(
-                str(row["symbol"]),
+                str(d["symbol"]),
                 timeframe,
-                str(row["transition_path"]),
-                str(row["contextual_event"]),
+                str(d["transition_path"]),
+                str(d["contextual_event"]),
                 "current_path_below_support_or_quality"
-                if row["count"] is None
+                if d["count"] is None
                 else "current_path_below_probability_or_outcome_quality",
             )
-            for row in current.filter(~pl.col("gate_pass")).iter_rows(named=True)
+            for d in current.filter(~pl.col("gate_pass")).to_dicts()
         )
-        for row in current.filter(pl.col("gate_pass")).iter_rows(named=True):
+        for d in current.filter(pl.col("gate_pass")).to_dicts():
             pattern = TransitionPattern(
-                symbol=str(row["symbol"]),
+                symbol=str(d["symbol"]),
                 timeframe=timeframe,
-                path=str(row["transition_path"]),
-                event=str(row["contextual_event"]),
-                count=int(row["count"]),
-                transition_probability=float(row["transition_probability"] or 0.0),
-                win_rate=float(row["win_rate"] or 0.0),
-                average_forward_return_pct=float(row["average_forward_return_pct"] or 0.0),
-                omega=float(row["omega"] or 0.0),
-                pwpr=float(row["pwpr"] or 0.0),
-                transition_information_bits=float(row["transition_information_bits"] or 0.0),
+                path=str(d["transition_path"]),
+                event=str(d["contextual_event"]),
+                count=int(d["count"]),
+                transition_probability=float(d["transition_probability"] or 0.0),
+                win_rate=float(d["win_rate"] or 0.0),
+                average_forward_return_pct=float(d["average_forward_return_pct"] or 0.0),
+                omega=float(d["omega"] or 0.0),
+                pwpr=float(d["pwpr"] or 0.0),
+                transition_information_bits=float(d["transition_information_bits"] or 0.0),
                 conditional_transition_information_bits=float(
-                    row["conditional_transition_information_bits"] or 0.0
+                    d["conditional_transition_information_bits"] or 0.0
                 ),
-                direction=cast(StateDirection, str(row["direction"])),
-                recent_transition_probability=float(row["recent_transition_probability"] or 0.0),
-                long_transition_probability=float(row["long_transition_probability"] or 0.0),
-                probability_delta=float(row["probability_delta"] or 0.0),
-                p_up=float(row["p_up"] or 0.0),
-                p_down=float(row["p_down"] or 0.0),
-                median_forward_return_pct=float(row["median_forward_return_pct"] or 0.0),
-                q10_forward_return_pct=float(row["q10_forward_return_pct"] or 0.0),
-                q25_forward_return_pct=float(row["q25_forward_return_pct"] or 0.0),
-                q75_forward_return_pct=float(row["q75_forward_return_pct"] or 0.0),
-                q90_forward_return_pct=float(row["q90_forward_return_pct"] or 0.0),
-                q25_forward_min_return_pct=float(row["q25_forward_min_return_pct"] or 0.0),
-                q75_forward_max_return_pct=float(row["q75_forward_max_return_pct"] or 0.0),
-                loss_stop_pct=float(row["loss_stop_pct"] or 0.0),
-                profit_stop_pct=float(row["profit_stop_pct"] or 0.0),
-                reward_risk=float(row["reward_risk"] or 0.0),
-                symbol_count=int(row["symbol_count"] or 0),
-                effective_count=float(row["effective_count"] or 0.0),
-                suggestion=str(row["suggestion"] or "watch"),
+                direction=cast(StateDirection, str(d["direction"])),
+                recent_transition_probability=float(d["recent_transition_probability"] or 0.0),
+                long_transition_probability=float(d["long_transition_probability"] or 0.0),
+                probability_delta=float(d["probability_delta"] or 0.0),
+                p_up=float(d["p_up"] or 0.0),
+                p_down=float(d["p_down"] or 0.0),
+                median_forward_return_pct=float(d["median_forward_return_pct"] or 0.0),
+                q10_forward_return_pct=float(d["q10_forward_return_pct"] or 0.0),
+                q25_forward_return_pct=float(d["q25_forward_return_pct"] or 0.0),
+                q75_forward_return_pct=float(d["q75_forward_return_pct"] or 0.0),
+                q90_forward_return_pct=float(d["q90_forward_return_pct"] or 0.0),
+                q25_forward_min_return_pct=float(d["q25_forward_min_return_pct"] or 0.0),
+                q75_forward_max_return_pct=float(d["q75_forward_max_return_pct"] or 0.0),
+                loss_stop_pct=float(d["loss_stop_pct"] or 0.0),
+                profit_stop_pct=float(d["profit_stop_pct"] or 0.0),
+                reward_risk=float(d["reward_risk"] or 0.0),
+                symbol_count=int(d["symbol_count"] or 0),
+                effective_count=float(d["effective_count"] or 0.0),
+                suggestion=str(d["suggestion"] or "watch"),
             )
             previous = insights[pattern.symbol]
             current_state = previous.current
@@ -228,7 +228,7 @@ def compute_transition_insights(
                 current_state = SourceStateRow(
                     symbol=pattern.symbol,
                     family="transition",
-                    timestamp=int(row["timestamp"]) if row["timestamp"] is not None else None,
+                    timestamp=int(d["timestamp"]) if d["timestamp"] is not None else None,
                     state=pattern.path,
                     direction=pattern.direction,
                     confidence=min(0.95, max(0.05, pattern.transition_probability)),
@@ -236,12 +236,14 @@ def compute_transition_insights(
                     missing_reason="",
                     stale=False,
                 )
-            insights[pattern.symbol] = transition_insight(
+            insights[pattern.symbol] = insight(
                 pattern.symbol, current_state, (*previous.patterns, pattern)
             )
     insights = {
-        symbol: transition_insight(symbol, insight.current, insight.patterns)
-        for symbol, insight in sorted(insights.items(), key=lambda item: symbol_index[item[0]])
+        symbol: insight(symbol, transition_insight.current, transition_insight.patterns)
+        for symbol, transition_insight in sorted(
+            insights.items(), key=lambda item: symbol_index[item[0]]
+        )
     }
     return TransitionAnalysis(insights, tuple(edges), tuple(unsupported))
 
@@ -421,25 +423,25 @@ def transition_edges(
         return ()
     joined = transition_counts.join(information, on=("prev_state", "state_key"), how="left")
     rows = []
-    for row in joined.iter_rows(named=True):
+    for d in joined.to_dicts():
         rows.append(
             TransitionEdge(
                 timeframe=timeframe,
-                prev_state=str(row["prev_state"]),
-                state=str(row["state_key"]),
-                event=str(row["contextual_event"]),
-                count=int(row["len"]),
-                transition_probability=float(row["transition_probability"]),
-                transition_information_bits=float(row["transition_information_bits"] or 0.0),
+                prev_state=str(d["prev_state"]),
+                state=str(d["state_key"]),
+                event=str(d["contextual_event"]),
+                count=int(d["len"]),
+                transition_probability=float(d["transition_probability"]),
+                transition_information_bits=float(d["transition_information_bits"] or 0.0),
                 conditional_transition_information_bits=float(
-                    row["conditional_transition_information_bits"] or 0.0
+                    d["conditional_transition_information_bits"] or 0.0
                 ),
             )
         )
     return tuple(rows)
 
 
-def transition_insight(
+def insight(
     symbol: str, current: SourceStateRow, patterns: tuple[TransitionPattern, ...]
 ) -> TransitionInsight:
     directional = tuple(

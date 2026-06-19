@@ -8,27 +8,42 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from qooi.profiling import ProfileConfig
-from qooi.sources.collect import BookMode
 
 RefreshMode = Literal["incremental", "cache_only", "force"]
+
+
+# ── Product configs (3 shapes, 7 products, None = disabled) ──
+
+
+class BarsConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    timeframes: tuple[str, ...] = ("1H",)
+    days: int = 60
+    refresh_mode: RefreshMode = "incremental"
+
+
+class SnapshotConfig(BaseModel):
+    """Books, trades, funding. limit sets fetch depth."""
+
+    model_config = ConfigDict(frozen=True)
+    limit: int = 100
+
+
+class RubikConfig(BaseModel):
+    """Open interest, taker volume, long/short."""
+
+    model_config = ConfigDict(frozen=True)
+    period: str = "1H"
+    limit: int = 100
+    unit: Literal["0", "1", "2"] = "2"
+
+
+# ── Tailtree (unchanged below) ──
+
 EvidenceKind = Literal["ladder", "tailtree"]
 TailtreeLifecycle = Literal["train", "load_predict"]
 TailtreeObjective = Literal["tail_severity_gpd", "tail_utility_quantile"]
-
-
-class SourceConfig(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    disabled_sources: tuple[str, ...] = ()
-    disabled_symbols: tuple[str, ...] = ()
-    book_mode: BookMode = "snapshot"
-    book_depth: int = 25
-    max_staleness_hours: int = 24
-    trade_limit: int = 100
-    funding_limit: int = 100
-    rubik_period: str = "1H"
-    rubik_limit: int = 100
-    rubik_taker_unit: Literal["0", "1", "2"] = "2"
+TailtreeTrainingKind = Literal["fixed", "optuna"]
 
 
 class TransitionConfig(BaseModel):
@@ -61,12 +76,6 @@ class TransitionConfig(BaseModel):
         return self.model_copy(update={"history_days": history_days, "ngram_length": ngram_length})
 
 
-class ReviewConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    require_context: bool = True
-
-
 class TailtreeSelectionConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -90,28 +99,101 @@ class TailtreeSelectionConfig(BaseModel):
         return tuple(value for value in values if value > 0.0)
 
 
-class TailtreeTrialConfig(BaseModel):
+class TailtreeFixedTrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    trial_id: str
-    objective: TailtreeObjective = "tail_severity_gpd"
-    training_profile: str = "balanced_baseline"
-    model_tag: str
+    kind: Literal["fixed"] = "fixed"
     num_leaves: int = 64
-    min_data_in_leaf: int = 30
-    learning_rate: float = 0.05
-    num_iterations: int = 200
-    early_stopping_rounds: int = 20
+    min_data_in_leaf: int = 80
+    learning_rate: float = 0.03
+    num_iterations: int = 240
+    early_stopping_rounds: int = 30
 
-    @field_validator("trial_id")
+
+class TailtreeOptunaTrainingConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["optuna"] = "optuna"
+    max_trials: int = 24
+    seed: int = 42
+    num_leaves: int = 64
+    min_data_in_leaf: int = 80
+    learning_rate: float = 0.03
+    num_iterations: int = 240
+    early_stopping_rounds: int = 30
+    num_leaves_range: tuple[int, int] | None = None
+    min_data_in_leaf_range: tuple[int, int] | None = None
+    learning_rate_range: tuple[float, float] | None = None
+    num_iterations_range: tuple[int, int] | None = None
+    early_stopping_rounds_range: tuple[int, int] | None = None
+
+    @field_validator(
+        "num_leaves_range",
+        "min_data_in_leaf_range",
+        "num_iterations_range",
+        "early_stopping_rounds_range",
+    )
     @classmethod
-    def nonempty_trial_id(cls, value: str) -> str:
-        trial_id = value.strip()
-        if not trial_id:
-            raise ValueError("tailtree trial_id must not be empty")
-        if trial_id == "primary":
-            raise ValueError("tailtree trial_id 'primary' is reserved")
-        return trial_id
+    def positive_int_range(cls, value: tuple[int, int] | None) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        low, high = int(value[0]), int(value[1])
+        if low <= 0 or high < low:
+            raise ValueError("tailtree optuna int ranges must be positive [low, high]")
+        return (low, high)
+
+    @field_validator("learning_rate_range")
+    @classmethod
+    def positive_float_range(cls, value: tuple[float, float] | None) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        low, high = float(value[0]), float(value[1])
+        if low <= 0.0 or high < low:
+            raise ValueError("tailtree optuna float ranges must be positive [low, high]")
+        return (low, high)
+
+
+TailtreeTrainingConfig = TailtreeFixedTrainingConfig | TailtreeOptunaTrainingConfig
+
+
+class TailtreeSingleSplitEvaluationConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    protocol: Literal["single_split"] = "single_split"
+    validation_fraction: float = 0.0
+    embargo_bars: int = 0
+
+
+class TailtreeWalkforwardEvaluationConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    protocol: Literal["walkforward"] = "walkforward"
+    train_days: int
+    valid_days: int
+    step_days: int
+    max_folds: int
+    embargo_bars: int = 0
+
+
+TailtreeEvaluationConfig = TailtreeSingleSplitEvaluationConfig | TailtreeWalkforwardEvaluationConfig
+
+
+class TailtreeProfileConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    profile_id: str
+    model_tag: str
+    objective: TailtreeObjective
+    training: TailtreeTrainingConfig = TailtreeFixedTrainingConfig()
+    evaluation: TailtreeEvaluationConfig = TailtreeSingleSplitEvaluationConfig()
+
+    @field_validator("profile_id", "model_tag")
+    @classmethod
+    def nonempty_profile_field(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("tailtree profile_id/model_tag must not be empty")
+        return cleaned
 
 
 class TailtreeConfig(BaseModel):
@@ -119,18 +201,23 @@ class TailtreeConfig(BaseModel):
 
     lifecycle: TailtreeLifecycle = "train"
     model_dir: Path = Path("data/output/potential/models")
-    model_tag: str = "tailtree-current"
-    objective: TailtreeObjective = "tail_severity_gpd"
-    training_profile: str = "balanced_baseline"
     threshold_pct: float = 5.0
-    num_leaves: int = 64
-    min_data_in_leaf: int = 30
-    learning_rate: float = 0.05
-    num_iterations: int = 200
-    early_stopping_rounds: int = 20
     outcome_horizon: tuple[int, ...] = (12,)
     selection: TailtreeSelectionConfig = TailtreeSelectionConfig()
-    trials: tuple[TailtreeTrialConfig, ...] = ()
+    profiles: tuple[TailtreeProfileConfig, ...] = (
+        TailtreeProfileConfig(
+            profile_id="gpd-balanced-fixed",
+            model_tag="tailtree-current",
+            objective="tail_severity_gpd",
+            training=TailtreeFixedTrainingConfig(
+                num_leaves=64,
+                min_data_in_leaf=30,
+                learning_rate=0.05,
+                num_iterations=200,
+                early_stopping_rounds=20,
+            ),
+        ),
+    )
 
     @field_validator("outcome_horizon", mode="before")
     @classmethod
@@ -145,10 +232,10 @@ class TailtreeConfig(BaseModel):
         return horizons or (12,)
 
     @model_validator(mode="after")
-    def require_unique_trial_ids(self) -> TailtreeConfig:
-        trial_ids = [trial.trial_id for trial in self.trials]
-        if len(trial_ids) != len(set(trial_ids)):
-            raise ValueError("tailtree trial_id values must be unique")
+    def require_unique_profile_ids(self) -> TailtreeConfig:
+        profile_ids = [profile.profile_id for profile in self.profiles]
+        if len(profile_ids) != len(set(profile_ids)):
+            raise ValueError("tailtree profile_id values must be unique")
         return self
 
 
@@ -163,27 +250,31 @@ class PotentialConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     output: Path = Path("data/output/potential/report.md")
-    symbols: tuple[str, ...] = ()
     universe: str = "research"
-    bar: str = "1H"
-    timeframes: tuple[str, ...] = ("1H", "4H", "1D")
-    days: int = 60
-    refresh_mode: RefreshMode = "incremental"
+    max_symbols: int = 25
+    max_staleness_hours: int = 24
     fetch_concurrency: int = 3
-    source: SourceConfig = SourceConfig()
+
+    # 7 products, 3 shapes, None = off
+    bars: BarsConfig | None = BarsConfig()
+    books: SnapshotConfig | None = None
+    trades: SnapshotConfig | None = None
+    funding: SnapshotConfig | None = None
+    open_interest: RubikConfig | None = None
+    taker_volume: RubikConfig | None = None
+    long_short: RubikConfig | None = None
+
     transition: TransitionConfig = TransitionConfig()
-    review: ReviewConfig = ReviewConfig()
     evidence: EvidenceConfig = EvidenceConfig()
     profile: ProfileConfig = ProfileConfig()
 
     @model_validator(mode="after")
-    def normalize_paths_and_timeframes(self) -> PotentialConfig:
+    def normalize_paths(self) -> PotentialConfig:
         output = (
             self.output
             if self.output.name == "report.md"
             else self.output / "potential" / "report.md"
         )
-        timeframes = tuple(dict.fromkeys((*self.timeframes, self.bar)))
-        if output == self.output and timeframes == self.timeframes:
+        if output == self.output:
             return self
-        return self.model_copy(update={"output": output, "timeframes": timeframes})
+        return self.model_copy(update={"output": output})

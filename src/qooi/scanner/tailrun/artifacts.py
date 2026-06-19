@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import polars as pl
 
-from qooi.scanner import ReportInputs
 from qooi.scanner.tailrun.types import (
     TAILTREE_RUN_SUMMARY_SCHEMA,
+    ReportInputs,
     TailtreeArtifactMetadata,
     TailtreeArtifactTree,
     TailtreeDirection,
     TailtreeEvidenceResult,
+    TailtreeProfileFeedback,
 )
 
 
@@ -33,12 +34,13 @@ class TailtreeArtifactContext:
     @classmethod
     def from_inputs(cls, inputs: ReportInputs) -> TailtreeArtifactContext:
         tailtree = inputs.config.evidence.tailtree
+        first_profile = tailtree.profiles[0]
         return cls(
-            root=Path(tailtree.model_dir) / tailtree.model_tag,
+            root=Path(tailtree.model_dir) / first_profile.model_tag,
             diagnostics_dir=inputs.artifacts.diagnostics_dir,
             bar=inputs.config.bar,
             threshold_pct=tailtree.threshold_pct,
-            model_tag=tailtree.model_tag,
+            model_tag=first_profile.model_tag,
             horizons=tailtree.outcome_horizon,
         )
 
@@ -68,6 +70,28 @@ def _tailtree_feature_schema_hash(
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_tailtree_profile_runs(
+    output_dir: Path, rows: tuple[TailtreeProfileFeedback, ...]
+) -> None:
+    if not rows:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([asdict(row) for row in rows]).write_csv(output_dir / "tailtree-profile-runs.csv")
+
+
+def write_tailtree_selection_efficiency(
+    output_dir: Path,
+    model_dir: Path,
+    frame: pl.DataFrame,
+) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-selection-efficiency.csv")
+    frame.write_csv(model_dir / "tailtree-selection-efficiency.csv")
 
 
 def _tailtree_artifact_metadata(
@@ -112,15 +136,12 @@ def _tailtree_artifact_paths(context: TailtreeArtifactContext) -> list[Path]:
                 [
                     context.root / f"tail-tree-{suffix}-{direction}.json",
                     context.root / f"potential-leaf-evidence-{suffix}-{direction}.csv",
-                    context.root
-                    / f"potential-score-bucket-evidence-{suffix}-{direction}.csv",
+                    context.root / f"potential-score-bucket-evidence-{suffix}-{direction}.csv",
                     context.diagnostics_dir / f"tail-tree-{suffix}-{direction}.json",
-                    context.diagnostics_dir
-                    / f"potential-leaf-evidence-{suffix}-{direction}.csv",
+                    context.diagnostics_dir / f"potential-leaf-evidence-{suffix}-{direction}.csv",
                     context.diagnostics_dir
                     / f"potential-score-bucket-evidence-{suffix}-{direction}.csv",
-                    context.diagnostics_dir
-                    / f"potential-leaves-selected-{suffix}-{direction}.csv",
+                    context.diagnostics_dir / f"potential-leaves-selected-{suffix}-{direction}.csv",
                 ]
             )
     for direction in ("up", "down"):
@@ -132,8 +153,7 @@ def _tailtree_artifact_paths(context: TailtreeArtifactContext) -> list[Path]:
                 context.root / "tailtree-artifact.json",
                 context.diagnostics_dir / f"tail-tree-{direction}.json",
                 context.diagnostics_dir / f"potential-leaf-evidence-{direction}.csv",
-                context.diagnostics_dir
-                / f"potential-score-bucket-evidence-{direction}.csv",
+                context.diagnostics_dir / f"potential-score-bucket-evidence-{direction}.csv",
                 context.diagnostics_dir / f"potential-leaves-selected-{direction}.csv",
             ]
         )
@@ -188,8 +208,8 @@ def _write_tailtree_artifacts(
 ) -> None:
     context = TailtreeArtifactContext.from_inputs(inputs)
     context.ensure_dirs()
-    removed_count = _cleanup_tailtree_artifacts(inputs) if cleanup else int(
-        removed_stale_file_count or 0
+    removed_count = (
+        _cleanup_tailtree_artifacts(inputs) if cleanup else int(removed_stale_file_count or 0)
     )
     written_model_file_count = 0
     written_evidence_file_count = 0
@@ -260,12 +280,9 @@ def _load_tail_tree_evidence(
         loaded_horizon_model_count = 0
         for direction in ("up", "down"):
             model_path = context.root / f"tail-tree-{suffix}-{direction}.json"
-            leaf_evidence_path = (
-                context.root / f"potential-leaf-evidence-{suffix}-{direction}.csv"
-            )
+            leaf_evidence_path = context.root / f"potential-leaf-evidence-{suffix}-{direction}.csv"
             score_evidence_path = (
-                context.root
-                / f"potential-score-bucket-evidence-{suffix}-{direction}.csv"
+                context.root / f"potential-score-bucket-evidence-{suffix}-{direction}.csv"
             )
             existing_evidence_paths = [
                 path for path in (leaf_evidence_path, score_evidence_path) if path.exists()

@@ -103,9 +103,6 @@ def _leaf_id_vector(pred_leaf: object) -> np.ndarray:
     return leaves.astype("int32").ravel()
 
 
-
-
-
 @dataclass
 class TailTreeModel:
     """Trained tail-detection tree.
@@ -162,7 +159,7 @@ class TailTreeModel:
         )
         if len(utility_values) != len(features):
             raise ValueError(
-                "utility_values length " f"{len(utility_values)} != features length {len(features)}"
+                f"utility_values length {len(utility_values)} != features length {len(features)}"
             )
 
         # 1. Global GPD fit over tail exceedance severity.

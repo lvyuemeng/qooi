@@ -82,7 +82,7 @@ POTENTIAL_EVIDENCE_SCHEMA = {
 }
 
 
-def potential_evidence_frame(
+def evidence(
     observations: pl.DataFrame,
     source_outcomes: pl.DataFrame,
     realized_transitions: pl.DataFrame,
@@ -730,6 +730,6 @@ __all__ = [
     "LadderResult",
     "POTENTIAL_EVIDENCE_SCHEMA",
     "add_potential_parent_gain",
-    "potential_evidence_frame",
+    "evidence",
     "select_potential_evidence_level",
 ]

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import polars as pl
 
-from qooi.scanner import entropy_expr, outcome_bucket_expr, pct_change_expr
+from qooi.scanner import (
+    PotentialScanConfig,
+    entropy_expr,
+    outcome_bucket_expr,
+    pct_change_expr,
+)
 
 KLINE_PATH_HISTORY_SCHEMA = {
     "symbol": pl.String,
@@ -36,13 +41,14 @@ KLINE_PATH_HISTORY_SCHEMA = {
     "full_context": pl.String,
 }
 
-def kline_path_history_frame(
-    config,
+
+def path_histories(
+    config: PotentialScanConfig,
     state_frames: dict[tuple[str, str], pl.DataFrame],
     bar_frames: dict[tuple[str, str], pl.DataFrame],
 ) -> pl.DataFrame:
     histories = []
-    for timeframe in config.timeframes:
+    for timeframe in config.bars.timeframes:
         for (symbol, frame_timeframe), frame in state_frames.items():
             if frame_timeframe != timeframe or frame.is_empty():
                 continue
@@ -230,7 +236,8 @@ SOURCE_EVENT_SCHEMA = {
     "serialization_status": pl.String,
 }
 
-def source_events_frame(
+
+def source_events(
     source_frames: dict[str, pl.DataFrame], bars: pl.DataFrame, bar: str
 ) -> pl.DataFrame:
     prices = _source_price_context_frame(bars)
@@ -686,7 +693,6 @@ def source_state_predictability_frame(
     )
 
 
-
 REALIZED_TRANSITION_SCHEMA = {
     "symbol": pl.String,
     "timeframe": pl.String,
@@ -743,37 +749,6 @@ SOURCE_OUTCOME_HORIZONS = {
 }
 
 
-def _pct_change_value(future: object, current: object) -> float | None:
-    if future is None or current in (None, 0):
-        return None
-    return (float(future) - float(current)) / float(current) * 100.0
-
-
-def _transition_count(values: list[object | None], origin: object | None) -> int:
-    count = 0
-    previous = origin
-    for value in values:
-        if value is None:
-            continue
-        if value != previous:
-            count += 1
-        previous = value
-    return count
-
-
-def _first_change_offset(values: list[object | None], origin: object | None) -> int | None:
-    for offset, value in enumerate(values, start=1):
-        if value is not None and value != origin:
-            return offset
-    return None
-
-
-def _safe_div(numerator: float | None, denominator: float | None) -> float | None:
-    if numerator is None or denominator in (None, 0):
-        return None
-    return numerator / denominator
-
-
 def realized_transition_frame(
     kline_history: pl.DataFrame, horizons: tuple[int, ...]
 ) -> pl.DataFrame:
@@ -783,150 +758,229 @@ def realized_transition_frame(
     if not required <= set(kline_history.columns):
         return pl.DataFrame(schema=REALIZED_TRANSITION_SCHEMA)
 
-    rows: list[dict[str, object]] = []
-    sorted_history = kline_history.sort("symbol", "timeframe", "bar_close_ms")
-    for key, group in sorted_history.group_by("symbol", "timeframe", maintain_order=True):
-        symbol, timeframe = key if isinstance(key, tuple) else (key, None)
-        records = group.to_dicts()
-        for index, row in enumerate(records):
-            close = row.get("close")
-            for horizon in sorted({int(h) for h in horizons if int(h) > 0}):
-                future_rows = records[index + 1 : index + horizon + 1]
-                terminal = records[index + horizon] if index + horizon < len(records) else None
-                future_direction = [r.get("direction_hint") for r in future_rows]
-                future_core = [r.get("core_context") for r in future_rows]
-                future_event = [r.get("event_state") for r in future_rows]
-                terminal_close = terminal.get("close") if terminal else None
-                forward_return = _pct_change_value(terminal_close, close)
-                highs = [float(r["high"]) for r in future_rows if r.get("high") is not None]
-                lows = [float(r["low"]) for r in future_rows if r.get("low") is not None]
-                future_high = max(highs) if highs else None
-                future_low = min(lows) if lows else None
-                forward_max = _pct_change_value(future_high, close)
-                forward_min = _pct_change_value(future_low, close)
-                path_range = (
-                    forward_max - forward_min
-                    if forward_max is not None and forward_min is not None
-                    else None
-                )
-                time_to_max = (
-                    next(
-                        (
-                            offset
-                            for offset, future in enumerate(future_rows, start=1)
-                            if future.get("high") is not None
-                            and float(future["high"]) == future_high
-                        ),
-                        None,
-                    )
-                    if future_high is not None
-                    else None
-                )
-                time_to_min = (
-                    next(
-                        (
-                            offset
-                            for offset, future in enumerate(future_rows, start=1)
-                            if future.get("low") is not None and float(future["low"]) == future_low
-                        ),
-                        None,
-                    )
-                    if future_low is not None
-                    else None
-                )
-                terminal_direction = terminal.get("direction_hint") if terminal else None
-                terminal_core = terminal.get("core_context") if terminal else None
-                terminal_regime = terminal.get("regime_state") if terminal else None
-                terminal_structure = terminal.get("structure_state") if terminal else None
-                terminal_transition = terminal.get("transition_kind") if terminal else None
-                origin_core = row.get("core_context")
-                direction_change_time = _first_change_offset(
-                    future_direction, row.get("direction_hint")
-                )
-                core_change_time = _first_change_offset(future_core, origin_core)
-                close_retention = (
-                    _safe_div(forward_return, forward_max)
-                    if forward_return is not None and forward_return >= 0
-                    else _safe_div(forward_return, forward_min)
-                )
-                post_max_drawdown = (
-                    forward_max - forward_return
-                    if forward_max is not None and forward_return is not None
-                    else None
-                )
-                post_min_rebound = (
-                    forward_return - forward_min
-                    if forward_min is not None and forward_return is not None
-                    else None
-                )
-                out = {
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "bar_close_ms": row.get("bar_close_ms"),
-                    "outcome_horizon": horizon,
-                    "terminal_direction": terminal_direction,
-                    "terminal_regime_state": terminal_regime,
-                    "terminal_structure_state": terminal_structure,
-                    "terminal_core_context": terminal_core,
-                    "terminal_transition_kind": terminal_transition,
-                    "direction_changed": (
-                        terminal_direction != row.get("direction_hint") if terminal else None
-                    ),
-                    "regime_changed": (
-                        terminal_regime != row.get("regime_state") if terminal else None
-                    ),
-                    "structure_changed": (
-                        terminal_structure != row.get("structure_state") if terminal else None
-                    ),
-                    "core_context_changed": terminal_core != origin_core if terminal else None,
-                    "event_fired": any(
-                        event is not None and not str(event).startswith("none")
-                        for event in future_event
-                    ),
-                    "returned_to_origin": bool(
-                        terminal_core == origin_core and core_change_time is not None
-                    )
-                    if terminal
-                    else None,
-                    "time_to_direction_change_bars": direction_change_time,
-                    "time_to_core_change_bars": core_change_time,
-                    "transition_count": _transition_count(future_core, origin_core),
-                    "forward_return_pct": forward_return,
-                    "forward_min_return_pct": forward_min,
-                    "forward_max_return_pct": forward_max,
-                    "path_range_pct": path_range,
-                    "tail_asymmetry_pct": (
-                        forward_max + forward_min
-                        if forward_max is not None and forward_min is not None
-                        else None
-                    ),
-                    "time_to_max_bar": time_to_max,
-                    "time_to_min_bar": time_to_min,
-                    "close_retention_ratio": close_retention,
-                    "post_max_drawdown_pct": post_max_drawdown,
-                    "post_min_rebound_pct": post_min_rebound,
-                    "path_efficiency": (
-                        abs(forward_return) / path_range
-                        if forward_return is not None and path_range not in (None, 0)
-                        else None
-                    ),
-                }
-                rows.append(out)
-    if not rows:
+    valid_horizons = sorted({int(h) for h in horizons if int(h) > 0})
+    if not valid_horizons:
         return pl.DataFrame(schema=REALIZED_TRANSITION_SCHEMA)
-    return pl.DataFrame(rows, schema=REALIZED_TRANSITION_SCHEMA).select(
-        *REALIZED_TRANSITION_SCHEMA.keys()
-    )
+    group_keys = ("symbol", "timeframe")
+    sorted_history = kline_history.sort("symbol", "timeframe", "bar_close_ms")
+    frames = []
+    for horizon in valid_horizons:
+        future_high = pl.concat_list(
+            [pl.col("high").shift(-offset).over(*group_keys) for offset in range(1, horizon + 1)]
+        ).list.max()
+        future_low = pl.concat_list(
+            [pl.col("low").shift(-offset).over(*group_keys) for offset in range(1, horizon + 1)]
+        ).list.min()
+        time_to_max = pl.coalesce(
+            [
+                pl.when(
+                    pl.col("high").shift(-offset).over(*group_keys) == pl.col("future_high")
+                ).then(pl.lit(offset))
+                for offset in range(1, horizon + 1)
+            ]
+        )
+        time_to_min = pl.coalesce(
+            [
+                pl.when(
+                    pl.col("low").shift(-offset).over(*group_keys) == pl.col("future_low")
+                ).then(pl.lit(offset))
+                for offset in range(1, horizon + 1)
+            ]
+        )
+        direction_change_time = pl.coalesce(
+            [
+                pl.when(
+                    pl.col("direction_hint").shift(-offset).over(*group_keys).is_not_null()
+                    & (
+                        pl.col("direction_hint").shift(-offset).over(*group_keys)
+                        != pl.col("direction_hint")
+                    )
+                ).then(pl.lit(offset))
+                for offset in range(1, horizon + 1)
+            ]
+        )
+        core_change_time = pl.coalesce(
+            [
+                pl.when(
+                    pl.col("core_context").shift(-offset).over(*group_keys).is_not_null()
+                    & (
+                        pl.col("core_context").shift(-offset).over(*group_keys)
+                        != pl.col("core_context")
+                    )
+                ).then(pl.lit(offset))
+                for offset in range(1, horizon + 1)
+            ]
+        )
+        transition_count = pl.sum_horizontal(
+            [
+                pl.when(pl.col("core_context").shift(-offset).over(*group_keys).is_null())
+                .then(pl.lit(0))
+                .when(
+                    pl.col("core_context").shift(-offset).over(*group_keys)
+                    != (
+                        pl.col("core_context")
+                        if offset == 1
+                        else pl.col("core_context").shift(-(offset - 1)).over(*group_keys)
+                    )
+                )
+                .then(pl.lit(1))
+                .otherwise(pl.lit(0))
+                for offset in range(1, horizon + 1)
+            ]
+        )
+        event_fired = pl.any_horizontal(
+            [
+                (
+                    pl.col("event_state").shift(-offset).over(*group_keys).is_not_null()
+                    & ~pl.col("event_state")
+                    .shift(-offset)
+                    .over(*group_keys)
+                    .str.starts_with("none")
+                ).fill_null(False)
+                for offset in range(1, horizon + 1)
+            ]
+        )
+        frames.append(
+            sorted_history.with_columns(
+                pl.lit(horizon).alias("outcome_horizon"),
+                pl.col("direction_hint")
+                .shift(-horizon)
+                .over(*group_keys)
+                .alias("terminal_direction"),
+                pl.col("regime_state")
+                .shift(-horizon)
+                .over(*group_keys)
+                .alias("terminal_regime_state"),
+                pl.col("structure_state")
+                .shift(-horizon)
+                .over(*group_keys)
+                .alias("terminal_structure_state"),
+                pl.col("core_context")
+                .shift(-horizon)
+                .over(*group_keys)
+                .alias("terminal_core_context"),
+                pl.col("transition_kind")
+                .shift(-horizon)
+                .over(*group_keys)
+                .alias("terminal_transition_kind"),
+                pl.col("close").shift(-horizon).over(*group_keys).alias("terminal_close"),
+                future_high.alias("future_high"),
+                future_low.alias("future_low"),
+            )
+            .with_columns(
+                (pl.col("terminal_direction") != pl.col("direction_hint")).alias(
+                    "direction_changed"
+                ),
+                (pl.col("terminal_regime_state") != pl.col("regime_state")).alias("regime_changed"),
+                (pl.col("terminal_structure_state") != pl.col("structure_state")).alias(
+                    "structure_changed"
+                ),
+                (pl.col("terminal_core_context") != pl.col("core_context")).alias(
+                    "core_context_changed"
+                ),
+                event_fired.alias("event_fired"),
+                direction_change_time.alias("time_to_direction_change_bars"),
+                core_change_time.alias("time_to_core_change_bars"),
+                transition_count.alias("transition_count"),
+                pct_change_expr("terminal_close", "close").alias("forward_return_pct"),
+                pct_change_expr("future_low", "close").alias("forward_min_return_pct"),
+                pct_change_expr("future_high", "close").alias("forward_max_return_pct"),
+                time_to_max.alias("time_to_max_bar"),
+                time_to_min.alias("time_to_min_bar"),
+            )
+            .with_columns(
+                (
+                    (pl.col("terminal_core_context") == pl.col("core_context"))
+                    & pl.col("time_to_core_change_bars").is_not_null()
+                ).alias("returned_to_origin"),
+                (pl.col("forward_max_return_pct") - pl.col("forward_min_return_pct")).alias(
+                    "path_range_pct"
+                ),
+                (pl.col("forward_max_return_pct") + pl.col("forward_min_return_pct")).alias(
+                    "tail_asymmetry_pct"
+                ),
+            )
+            .with_columns(
+                pl.when(
+                    (pl.col("forward_return_pct") >= 0) & (pl.col("forward_max_return_pct") != 0)
+                )
+                .then(pl.col("forward_return_pct") / pl.col("forward_max_return_pct"))
+                .when((pl.col("forward_return_pct") < 0) & (pl.col("forward_min_return_pct") != 0))
+                .then(pl.col("forward_return_pct") / pl.col("forward_min_return_pct"))
+                .otherwise(None)
+                .alias("close_retention_ratio"),
+                (pl.col("forward_max_return_pct") - pl.col("forward_return_pct")).alias(
+                    "post_max_drawdown_pct"
+                ),
+                (pl.col("forward_return_pct") - pl.col("forward_min_return_pct")).alias(
+                    "post_min_rebound_pct"
+                ),
+                pl.when(pl.col("path_range_pct") != 0)
+                .then(pl.col("forward_return_pct").abs() / pl.col("path_range_pct"))
+                .otherwise(None)
+                .alias("path_efficiency"),
+            )
+            .select(*REALIZED_TRANSITION_SCHEMA.keys())
+        )
+    return pl.concat(frames, how="vertical_relaxed").select(*REALIZED_TRANSITION_SCHEMA.keys())
 
 
 def source_outcomes_frame(source_events: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
     if source_events.is_empty():
         return pl.DataFrame(schema=SOURCE_OUTCOME_SCHEMA)
+    families = [str(family) for family in source_events.get_column("source_family").unique()]
+    horizons = sorted(
+        {
+            int(horizon)
+            for family in families
+            for horizon in SOURCE_OUTCOME_HORIZONS.get(family, (12,))
+        }
+    )
+    bar_outcomes_by_horizon: dict[int, pl.DataFrame] = {}
+    if not bars.is_empty() and {"symbol", "timestamp", "close", "high", "low"} <= set(bars.columns):
+        sorted_bars = bars.sort("symbol", "timestamp")
+        for horizon in horizons:
+            window_high = pl.concat_list(
+                [pl.col("high").shift(-offset).over("symbol") for offset in range(1, horizon + 1)]
+            )
+            window_low = pl.concat_list(
+                [pl.col("low").shift(-offset).over("symbol") for offset in range(1, horizon + 1)]
+            )
+            bar_outcomes_by_horizon[horizon] = (
+                sorted_bars.with_columns(
+                    pl.col("close").shift(-horizon).over("symbol").alias("future_close"),
+                    window_high.list.max().alias("future_high"),
+                    window_low.list.min().alias("future_low"),
+                )
+                .select(
+                    "symbol",
+                    pl.col("timestamp").alias("bar_close_ms"),
+                    pl.col("close").alias("close_at_event"),
+                    "future_close",
+                    pct_change_expr("future_close", "close").alias("forward_return_pct"),
+                    pct_change_expr("future_low", "close").alias("forward_min_return_pct"),
+                    pct_change_expr("future_high", "close").alias("forward_max_return_pct"),
+                )
+                .with_columns(
+                    (pl.col("forward_max_return_pct") - pl.col("forward_min_return_pct")).alias(
+                        "path_range_pct"
+                    ),
+                    (pl.col("forward_max_return_pct") + pl.col("forward_min_return_pct")).alias(
+                        "tail_asymmetry_pct"
+                    ),
+                )
+            )
     frames = []
-    for family in source_events.get_column("source_family").unique().to_list():
-        family_events = source_events.filter(pl.col("source_family") == str(family))
-        for horizon in SOURCE_OUTCOME_HORIZONS.get(str(family), (12,)):
-            frames.append(_source_outcomes_for_horizon(family_events, bars, horizon=horizon))
+    for family in families:
+        family_events = source_events.filter(pl.col("source_family") == family)
+        for horizon in SOURCE_OUTCOME_HORIZONS.get(family, (12,)):
+            frames.append(
+                _source_outcomes_for_horizon(
+                    family_events,
+                    bar_outcomes_by_horizon.get(int(horizon), pl.DataFrame()),
+                    horizon=int(horizon),
+                )
+            )
     frames = [frame for frame in frames if not frame.is_empty()]
     if not frames:
         return pl.DataFrame(schema=SOURCE_OUTCOME_SCHEMA)
@@ -934,9 +988,9 @@ def source_outcomes_frame(source_events: pl.DataFrame, bars: pl.DataFrame) -> pl
 
 
 def _source_outcomes_for_horizon(
-    source_events: pl.DataFrame, bars: pl.DataFrame, *, horizon: int
+    source_events: pl.DataFrame, bar_outcomes: pl.DataFrame, *, horizon: int
 ) -> pl.DataFrame:
-    if bars.is_empty() or not {"symbol", "timestamp", "close", "high", "low"} <= set(bars.columns):
+    if bar_outcomes.is_empty():
         return source_events.with_columns(
             pl.lit(horizon).alias("outcome_horizon"),
             pl.lit(None, dtype=pl.Float64).alias("close_at_event"),
@@ -949,37 +1003,6 @@ def _source_outcomes_for_horizon(
             pl.lit(False).alias("outcome_available"),
             pl.lit("bar_history_missing").alias("outcome_reason"),
         ).select(*SOURCE_OUTCOME_SCHEMA.keys())
-    window_high = pl.concat_list(
-        [pl.col("high").shift(-offset).over("symbol") for offset in range(1, horizon + 1)]
-    )
-    window_low = pl.concat_list(
-        [pl.col("low").shift(-offset).over("symbol") for offset in range(1, horizon + 1)]
-    )
-    bar_outcomes = (
-        bars.sort("symbol", "timestamp")
-        .with_columns(
-            pl.col("close").shift(-horizon).over("symbol").alias("future_close"),
-            window_high.list.max().alias("future_high"),
-            window_low.list.min().alias("future_low"),
-        )
-        .select(
-            "symbol",
-            pl.col("timestamp").alias("bar_close_ms"),
-            pl.col("close").alias("close_at_event"),
-            "future_close",
-            pct_change_expr("future_close", "close").alias("forward_return_pct"),
-            pct_change_expr("future_low", "close").alias("forward_min_return_pct"),
-            pct_change_expr("future_high", "close").alias("forward_max_return_pct"),
-        )
-        .with_columns(
-            (pl.col("forward_max_return_pct") - pl.col("forward_min_return_pct")).alias(
-                "path_range_pct"
-            ),
-            (pl.col("forward_max_return_pct") + pl.col("forward_min_return_pct")).alias(
-                "tail_asymmetry_pct"
-            ),
-        )
-    )
     aligned = (
         source_events.drop("aligned_bar_close_ms")
         .sort("symbol", "known_at_ms")
@@ -1101,13 +1124,12 @@ __all__ = [
     "SOURCE_EVENT_SCHEMA",
     "SOURCE_OUTCOME_SCHEMA",
     "SOURCE_OUTCOME_HORIZONS",
-    "kline_path_history_frame",
+    "path_histories",
     "kline_path_rows",
     "potential_outcome_frame",
     "realized_transition_frame",
-    "source_events_frame",
+    "source_events",
     "source_outcomes_frame",
     "source_state_predictability_frame",
     "source_timeliness_frame",
 ]
-

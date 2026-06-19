@@ -106,6 +106,14 @@ class TailtreeSelectionFeasibilityPolicy(BaseModel):
 
 
 @dataclass(frozen=True)
+class TailtreeSelectionPolicy:
+    """Compact replay policy for one tailtree selection-efficiency pass."""
+
+    budgets: TailtreeSelectionBudgets = TailtreeSelectionBudgets()
+    feasibility: TailtreeSelectionFeasibilityPolicy = TailtreeSelectionFeasibilityPolicy()
+
+
+@dataclass(frozen=True)
 class TailtreeSelectionContext:
     """Opaque replay identity for one tailtree selection-efficiency pass."""
 
@@ -158,6 +166,28 @@ class TailtreeSelectionContext:
         )
 
 
+def with_tailtree_selection_identity(
+    frame: pl.DataFrame, context: TailtreeSelectionContext
+) -> pl.DataFrame:
+    """Attach one run/fold identity to a tailtree artifact frame."""
+    if frame.is_empty():
+        return frame
+    return frame.with_columns(
+        pl.lit(context.trial_id).alias("trial_id"),
+        pl.lit(context.trial_source).alias("trial_source"),
+        pl.lit(context.fold_id).alias("fold_id"),
+        pl.lit(context.evaluation_protocol).alias("evaluation_protocol"),
+        pl.lit(context.train_start_ms, dtype=pl.Int64).alias("train_start_ms"),
+        pl.lit(context.train_end_ms, dtype=pl.Int64).alias("train_end_ms"),
+        pl.lit(context.valid_start_ms, dtype=pl.Int64).alias("valid_start_ms"),
+        pl.lit(context.valid_end_ms, dtype=pl.Int64).alias("valid_end_ms"),
+        pl.lit(context.embargo_bars).alias("embargo_bars"),
+        pl.lit(str(context.model_tag)).alias("model_tag"),
+        pl.lit(str(context.training_profile)).alias("training_profile"),
+        pl.lit(context.objective).alias("objective"),
+    )
+
+
 @dataclass(frozen=True)
 class TailtreeSummaryView:
     """Typed access to one run-summary row; avoids untyped helper access."""
@@ -181,8 +211,10 @@ class TailtreeSummaryView:
             summary = summary.filter(pl.col("outcome_horizon") == int(outcome_horizon))
         if "summary_scope" in summary.columns:
             scoped = summary.filter(pl.col("summary_scope") == direction)
-            summary = scoped if not scoped.is_empty() else summary.filter(
-                pl.col("summary_scope") == "run"
+            summary = (
+                scoped
+                if not scoped.is_empty()
+                else summary.filter(pl.col("summary_scope") == "run")
             )
         return cls(
             summary.row(0, named=True) if not summary.is_empty() else {},
@@ -227,9 +259,7 @@ class TailtreeCandidateReplay:
         profit_sum = float(profit_values.sum() or 0.0) if not profit_values.is_empty() else 0.0
         profit_mean = float(profit_values.mean() or 0.0) if not profit_values.is_empty() else 0.0
         profit_p90 = (
-            float(profit_values.quantile(0.9) or 0.0)
-            if not profit_values.is_empty()
-            else 0.0
+            float(profit_values.quantile(0.9) or 0.0) if not profit_values.is_empty() else 0.0
         )
         utility_p90 = (
             float(utility_p90_values.quantile(0.9) or 0.0)
@@ -366,22 +396,9 @@ class TailtreeCandidateReplay:
 def tailtree_selection_efficiency_frame(
     candidates: pl.DataFrame,
     *,
-    trial_id: str = "primary",
-    trial_source: str = "primary",
-    fold_id: int = 0,
-    evaluation_protocol: str = "single_split",
-    train_start_ms: int | None = None,
-    train_end_ms: int | None = None,
-    valid_start_ms: int | None = None,
-    valid_end_ms: int | None = None,
-    embargo_bars: int = 0,
+    context: TailtreeSelectionContext,
     run_summary: pl.DataFrame,
-    universe_snapshot_id: str,
-    model_tag: str,
-    objective: str,
-    training_profile: str = "balanced_baseline",
-    budgets: TailtreeSelectionBudgets = TailtreeSelectionBudgets(),
-    feasibility: TailtreeSelectionFeasibilityPolicy = TailtreeSelectionFeasibilityPolicy(),
+    policy: TailtreeSelectionPolicy = TailtreeSelectionPolicy(),
 ) -> pl.DataFrame:
     """Replay candidate budgets into canonical profit-selection efficiency rows."""
     if candidates.is_empty() or not {"outcome_horizon", "tree_direction"}.issubset(
@@ -393,21 +410,6 @@ def tailtree_selection_efficiency_frame(
         eligible = eligible.filter(pl.col("candidate_status") == "matched_evidence")
     if eligible.is_empty():
         return pl.DataFrame(schema=TAILTREE_SELECTION_EFFICIENCY_SCHEMA)
-    context = TailtreeSelectionContext.from_strings(
-        trial_id=trial_id,
-        trial_source=trial_source,
-        fold_id=fold_id,
-        evaluation_protocol=evaluation_protocol,
-        train_start_ms=train_start_ms,
-        train_end_ms=train_end_ms,
-        valid_start_ms=valid_start_ms,
-        valid_end_ms=valid_end_ms,
-        embargo_bars=embargo_bars,
-        universe_snapshot_id=universe_snapshot_id,
-        model_tag=model_tag,
-        objective=objective,
-        training_profile=training_profile,
-    )
     rows: list[dict[str, object]] = []
     for key, group in eligible.group_by(["outcome_horizon", "tree_direction"], maintain_order=True):
         outcome_horizon, direction = key if isinstance(key, tuple) else (key, "")
@@ -422,9 +424,11 @@ def tailtree_selection_efficiency_frame(
             context=context,
             outcome_horizon=int(outcome_horizon),
             direction=str(direction),
-            feasibility=feasibility,
+            feasibility=policy.feasibility,
         )
-        rows.extend(replay.row_for_budget(family, value) for family, value in budgets.iter_rows())
+        rows.extend(
+            replay.row_for_budget(family, value) for family, value in policy.budgets.iter_rows()
+        )
     return pl.DataFrame(rows, schema=TAILTREE_SELECTION_EFFICIENCY_SCHEMA)
 
 
@@ -674,9 +678,9 @@ def tailtree_hpo_feedback_frame(selection_efficiency: pl.DataFrame) -> pl.DataFr
         ],
     )
     return sorted_feedback.with_columns(
-        (pl.cum_count("hpo_feedback_score").over(group_cols)).cast(pl.Int64).alias(
-            "hpo_feedback_rank"
-        ),
+        (pl.cum_count("hpo_feedback_score").over(group_cols))
+        .cast(pl.Int64)
+        .alias("hpo_feedback_rank"),
         (pl.col("hpo_feedback_score").max().over(group_cols) - pl.col("hpo_feedback_score"))
         .cast(pl.Float64)
         .alias("hpo_feedback_margin_to_best"),

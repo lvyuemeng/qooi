@@ -1,17 +1,16 @@
 """Potential scanner package shared expressions and contracts."""
 
+# ruff: noqa: E501, E701, E702
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 
 import polars as pl
 
-from qooi.exchange.store import HistoryCoverage
-from qooi.scanner.config import EvidenceConfig, ReviewConfig, SourceConfig, TransitionConfig
+from qooi.scanner.config import BarsConfig, EvidenceConfig
 from qooi.scanner.state import StateDirection
-from qooi.sources.context import SourceContextResult
 
 
 def pct_change_expr(next_col: str, base_col: str) -> pl.Expr:
@@ -43,40 +42,9 @@ DERIVATIVE_FAMILIES = ("funding", "open_interest", "taker_volume", "long_short_r
 
 class PotentialScanConfig(Protocol):
     output: Path
-    symbols: tuple[str, ...]
     universe: str
-    bar: str
-    timeframes: tuple[str, ...]
-    days: int
-    refresh_mode: Literal["incremental", "cache_only", "force"]
-    fetch_concurrency: int
-    source: SourceConfig
-    transition: TransitionConfig
-    review: ReviewConfig
+    bars: BarsConfig | None
     evidence: EvidenceConfig
-
-
-@dataclass(frozen=True)
-class PotentialUniverse:
-    symbols: tuple[str, ...]
-    discovery: pl.DataFrame
-    selection_note: str
-    missing_reason: str
-    eligible_count: int = 0
-
-
-@dataclass(frozen=True)
-class PotentialArtifacts:
-    report: Path
-    diagnostics_dir: Path
-    states_dir: Path
-
-
-@dataclass(frozen=True)
-class BarFetchResult:
-    frames: dict[tuple[str, str], pl.DataFrame]
-    state_frames: dict[tuple[str, str], pl.DataFrame]
-    coverage: tuple[HistoryCoverage, ...]
 
 
 @dataclass(frozen=True)
@@ -164,49 +132,6 @@ class TransitionAnalysis:
     unsupported: tuple[UnsupportedTransitionPath, ...]
 
 
-@dataclass(frozen=True)
-class SymbolStateBundle:
-    symbol: str
-    kline: SourceStateRow
-    transition: SourceStateRow
-    books: SourceStateRow
-    trades: SourceStateRow
-    derivatives: SourceStateRow
-    context: SourceStateRow
-    coverage_notes: tuple[str, ...]
-    transition_patterns: tuple[TransitionPattern, ...] = ()
-
-
-@dataclass(frozen=True)
-class ScanDecision:
-    symbol: str
-    group: str
-    direction: str
-    confidence: str
-    transition_evidence: str
-    structure_evidence: str
-    flow_evidence: str
-    liquidity_evidence: str
-    derivatives_evidence: str
-    context_evidence: str
-    missing_evidence: tuple[str, ...]
-    contradictory_evidence: tuple[str, ...]
-    block_reason: str
-    review_caveat: str
-
-
-@dataclass
-class ReportInputs:
-    config: PotentialScanConfig
-    artifacts: PotentialArtifacts
-    universe: PotentialUniverse
-    bars: BarFetchResult
-    context: SourceContextResult
-    transitions: TransitionAnalysis
-    bundles: tuple[SymbolStateBundle, ...]
-    decisions: tuple[ScanDecision, ...]
-
-
 def missing_state(
     symbol: str, family: str, reason: str, *, blocked: bool = False
 ) -> SourceStateRow:
@@ -292,26 +217,11 @@ def transition_consensus_passes(patterns: tuple[TransitionPattern, ...], directi
     )
 
 
-def _rank_transition_symbols(
+def _unused_rank_transition_symbols(
     config: PotentialScanConfig, transitions: dict[str, TransitionInsight]
 ) -> tuple[str, ...]:
-    ranked = sorted(
-        (
-            insight
-            for insight in transitions.values()
-            if best_transition_pattern(config, insight.patterns) is not None
-        ),
-        key=lambda insight: insight.rank_score,
-        reverse=True,
+    sorted(
+        insight
+        for insight in transitions.values()
+        if best_transition_pattern(config, insight.patterns) is not None
     )
-    return tuple(insight.symbol for insight in ranked[: config.transition.context_limit])
-
-
-def context_symbols(
-    config: PotentialScanConfig,
-    symbols: tuple[str, ...],
-    transitions: dict[str, TransitionInsight],
-) -> tuple[str, ...]:
-    if config.symbols or config.transition.context_scope == "all_scanned":
-        return symbols
-    return _rank_transition_symbols(config, transitions)

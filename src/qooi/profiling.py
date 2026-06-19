@@ -8,7 +8,7 @@ import pstats
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -79,14 +79,6 @@ class ProfileContext:
     @classmethod
     def from_config(cls, config: ProfileConfig | None, root: Path) -> ProfileContext:
         return cls(config or ProfileConfig(), root)
-
-    @classmethod
-    def disabled(cls) -> ProfileContext:
-        return cls(ProfileConfig(mode="off"), Path("."))
-
-    @classmethod
-    def disabled_if_none(cls, profile: ProfileContext | None) -> ProfileContext:
-        return profile if profile is not None else cls.disabled()
 
     @property
     def enabled(self) -> bool:
@@ -205,6 +197,7 @@ class _ProfileStage(AbstractContextManager[None]):
                     status="error" if exc_type else "ok",
                 )
             )
+            self.profile.write()
         return False
 
 
@@ -215,40 +208,49 @@ def _n_unique(frame: pl.DataFrame, column: str) -> int:
 
 
 def _stage_frame(records: list[StageRecord]) -> pl.DataFrame:
-    return pl.DataFrame([record.__dict__ for record in records], schema={
-        "run_id": pl.String,
-        "layer": pl.String,
-        "component": pl.String,
-        "stage": pl.String,
-        "seconds": pl.Float64,
-        "status": pl.String,
-    })
+    return pl.DataFrame(
+        [asdict(record) for record in records],
+        schema={
+            "run_id": pl.String,
+            "layer": pl.String,
+            "component": pl.String,
+            "stage": pl.String,
+            "seconds": pl.Float64,
+            "status": pl.String,
+        },
+    )
 
 
 def _frame_frame(records: list[FrameRecord]) -> pl.DataFrame:
-    return pl.DataFrame([record.__dict__ for record in records], schema={
-        "run_id": pl.String,
-        "layer": pl.String,
-        "component": pl.String,
-        "frame": pl.String,
-        "rows": pl.Int64,
-        "cols": pl.Int64,
-        "symbol_count": pl.Int64,
-        "timeframe_count": pl.Int64,
-        "horizon_count": pl.Int64,
-        "source_family_count": pl.Int64,
-        "decision_timeframe_count": pl.Int64,
-    })
+    return pl.DataFrame(
+        [asdict(record) for record in records],
+        schema={
+            "run_id": pl.String,
+            "layer": pl.String,
+            "component": pl.String,
+            "frame": pl.String,
+            "rows": pl.Int64,
+            "cols": pl.Int64,
+            "symbol_count": pl.Int64,
+            "timeframe_count": pl.Int64,
+            "horizon_count": pl.Int64,
+            "source_family_count": pl.Int64,
+            "decision_timeframe_count": pl.Int64,
+        },
+    )
 
 
 def _native_frame(records: list[NativeProfileRecord]) -> pl.DataFrame:
-    return pl.DataFrame([record.__dict__ for record in records], schema={
-        "run_id": pl.String,
-        "rank": pl.Int64,
-        "function": pl.String,
-        "file": pl.String,
-        "line": pl.Int64,
-        "ncalls": pl.String,
-        "tottime_s": pl.Float64,
-        "cumtime_s": pl.Float64,
-    })
+    return pl.DataFrame(
+        [asdict(record) for record in records],
+        schema={
+            "run_id": pl.String,
+            "rank": pl.Int64,
+            "function": pl.String,
+            "file": pl.String,
+            "line": pl.Int64,
+            "ncalls": pl.String,
+            "tottime_s": pl.Float64,
+            "cumtime_s": pl.Float64,
+        },
+    )

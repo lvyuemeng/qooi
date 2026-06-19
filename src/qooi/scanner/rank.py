@@ -180,7 +180,7 @@ CANDIDATE_HORIZON_CONSISTENCY_SCHEMA: dict[str, PolarsDtype] = {
 }
 
 
-def candidate_horizon_consistency_frame(candidate_rank: pl.DataFrame) -> pl.DataFrame:
+def horizon_consistency(candidate_rank: pl.DataFrame) -> pl.DataFrame:
     """Summarize same-direction horizon agreement without averaging raw scores."""
     if candidate_rank.is_empty() or "tree_direction" not in candidate_rank.columns:
         return pl.DataFrame(schema=CANDIDATE_HORIZON_CONSISTENCY_SCHEMA)
@@ -236,7 +236,8 @@ def candidate_horizon_consistency_frame(candidate_rank: pl.DataFrame) -> pl.Data
         (pl.col("outcome_horizon").max() - pl.col("outcome_horizon").min()).alias(
             "horizon_span_bars"
         ),
-        pl.col("outcome_horizon").sort_by("_rank_score_value", descending=True)
+        pl.col("outcome_horizon")
+        .sort_by("_rank_score_value", descending=True)
         .first()
         .alias("best_outcome_horizon"),
         pl.col("_rank_score_value").max().alias("best_rank_score"),
@@ -271,41 +272,40 @@ def candidate_horizon_consistency_frame(candidate_rank: pl.DataFrame) -> pl.Data
         on=["symbol", "decision_timeframe", "_opposite_tree_direction"],
         how="left",
     )
-    panel = panel.with_columns(
-        pl.col("opposite_direction_count").fill_null(0).cast(pl.UInt32),
-        pl.col("opposite_direction_best_rank_score").fill_null(0.0),
-    ).with_columns(
-        pl.when(pl.col("opposite_direction_best_rank_score") > pl.col("best_rank_score"))
-        .then(pl.col("opposite_direction_best_rank_score") - pl.col("best_rank_score"))
-        .otherwise(0.0)
-        .alias("conflict_penalty_score")
-    ).with_columns(
-        (pl.col("direction_consistency_score") - pl.col("conflict_penalty_score")).alias(
-            "consistency_rank_score"
+    panel = (
+        panel.with_columns(
+            pl.col("opposite_direction_count").fill_null(0).cast(pl.UInt32),
+            pl.col("opposite_direction_best_rank_score").fill_null(0.0),
+        )
+        .with_columns(
+            pl.when(pl.col("opposite_direction_best_rank_score") > pl.col("best_rank_score"))
+            .then(pl.col("opposite_direction_best_rank_score") - pl.col("best_rank_score"))
+            .otherwise(0.0)
+            .alias("conflict_penalty_score")
+        )
+        .with_columns(
+            (pl.col("direction_consistency_score") - pl.col("conflict_penalty_score")).alias(
+                "consistency_rank_score"
+            )
         )
     )
     return _select_schema(
-        panel.drop("_opposite_tree_direction").sort(
-            "consistency_rank_score", descending=True
-        ),
+        panel.drop("_opposite_tree_direction").sort("consistency_rank_score", descending=True),
         CANDIDATE_HORIZON_CONSISTENCY_SCHEMA,
     )
 
 
-def candidate_evidence_frame(
+def ladder_candidates(
     observations: pl.DataFrame,
-    evidence: pl.DataFrame,
+    ladder: pl.DataFrame,
     *,
     latest_only: bool = True,
-    tree_models: Mapping[TailTreeModelKey, TailTreePredictor] | None = None,
 ) -> pl.DataFrame:
-    """Match observation rows to selected evidence rows."""
+    """Match latest observation rows to selected ladder evidence rows."""
     if observations.is_empty():
         return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
-    if tree_models:
-        return _candidate_from_trees(observations, evidence, tree_models, latest_only=latest_only)
     base = _candidate_observations(observations, latest_only=latest_only)
-    selected = _selected_evidence(evidence)
+    selected = _selected_evidence(ladder)
     if selected.is_empty():
         return _unmatched_candidates(base, "no_selected_evidence")
     frames = [
@@ -323,6 +323,19 @@ def candidate_evidence_frame(
     if not unmatched.is_empty():
         matched = pl.concat([matched, unmatched], how="vertical_relaxed")
     return _select_schema(matched, CANDIDATE_EVIDENCE_SCHEMA)
+
+
+def tailtree_candidates(
+    observations: pl.DataFrame,
+    evidence: pl.DataFrame,
+    models: Mapping[TailTreeModelKey, TailTreePredictor],
+    *,
+    latest_only: bool = True,
+) -> pl.DataFrame:
+    """Match latest observation rows to explicit tailtree leaf/score evidence."""
+    if observations.is_empty() or not models:
+        return pl.DataFrame(schema=CANDIDATE_EVIDENCE_SCHEMA)
+    return _candidate_from_trees(observations, evidence, models, latest_only=latest_only)
 
 
 def _candidate_from_trees(
@@ -505,34 +518,44 @@ def _unmatched_candidates(observations: pl.DataFrame, status: str) -> pl.DataFra
     return _select_schema(frame, CANDIDATE_EVIDENCE_SCHEMA)
 
 
-def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
-    """Add transparent review-ordering components to candidate rows.
+def _rank_candidates_for_branch(
+    candidates: pl.DataFrame, *, branch: Literal["ladder", "tailtree"]
+) -> pl.DataFrame:
+    """Add transparent review-ordering components with explicit branch scoring."""
 
-    Detects tail_lift presence → uses tail-first scoring.
-    Falls back to entropy-first scoring for ladder path.
-    """
     if candidates.is_empty():
         return pl.DataFrame(schema=CANDIDATE_RANK_SCHEMA)
     if "outcome_horizon" not in candidates.columns:
         raise ValueError("candidate evidence pipe missing outcome_horizon")
 
-    has_tail_lift = (
-        "tail_lift" in candidates.columns and candidates["tail_lift"].drop_nulls().len() > 0
-    )
-
     ranked = _select_schema(candidates, CANDIDATE_EVIDENCE_SCHEMA)
 
-    if has_tail_lift:
+    if branch == "tailtree":
         ranked = ranked.with_columns(
             pl.col("tail_lift").fill_null(1.0).alias("rank_information_component"),
             pl.lit(0.0).alias("rank_transition_component"),
             pl.max_horizontal(pl.col("tail_lift").fill_null(1.0), pl.lit(1.0)).alias(
                 "rank_tail_component"
             ),
-            (pl.col("tail_lift_stability").fill_null(0.0)).alias("rank_stability_component"),
+            pl.col("tail_lift_stability").fill_null(0.0).alias("rank_stability_component"),
             (pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0)
             .log()
             .alias("rank_path_component"),
+            ((pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log() / 10.0).alias(
+                "rank_quality_component"
+            ),
+            pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0).alias("profit_proxy_score"),
+            pl.col("tail_utility_mean")
+            .fill_null(0.0)
+            .fill_nan(0.0)
+            .alias("profit_proxy_per_selected_obs"),
+            (
+                (pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0) * 1000.0)
+                / pl.max_horizontal(
+                    pl.col("N_total").fill_null(0).cast(pl.Float64),
+                    pl.lit(1.0),
+                )
+            ).alias("profit_proxy_per_1k_observed"),
         )
     else:
         ranked = ranked.with_columns(
@@ -555,29 +578,13 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
                 ),
                 pl.lit(2.0),
             ).alias("rank_stability_component"),
-        )
-
-    ranked = ranked.with_columns(
-        (pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0)
-        .log()
-        .alias("rank_quality_component")
-        if not has_tail_lift
-        else pl.lit(0.0).alias("rank_quality_component"),
-    )
-
-    # Fix: need proper quality component for both paths
-    if has_tail_lift:
-        ranked = ranked.with_columns(
-            ((pl.col("N_tail_exceedances").fill_null(0).cast(pl.Float64) + 1.0).log() / 10.0).alias(
-                "rank_quality_component"
-            ),
-        )
-    else:
-        ranked = ranked.with_columns(
             (
                 (pl.col("conditioned_observations").fill_null(0).cast(pl.Float64) + 1.0).log()
                 + (pl.col("symbol_count").fill_null(0).cast(pl.Float64) + 1.0).log()
             ).alias("rank_quality_component"),
+            pl.lit(0.0).alias("profit_proxy_score"),
+            pl.lit(0.0).alias("profit_proxy_per_selected_obs"),
+            pl.lit(0.0).alias("profit_proxy_per_1k_observed"),
         )
 
     ranked = (
@@ -585,7 +592,6 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
             (
                 pl.col("required_missing_source_count").fill_null(0).cast(pl.Float64) * 2.0
                 + pl.col("required_stale_source_count").fill_null(0).cast(pl.Float64) * 0.3
-                + pl.col("provider_bounded_source_count").fill_null(0).cast(pl.Float64) * 0.0
             ).alias("source_penalty_score")
         )
         .with_columns(
@@ -598,27 +604,6 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
                 .then(pl.lit(2.0))
                 .otherwise(pl.lit(0.0))
             ).alias("rank_penalty_component"),
-        )
-        .with_columns(
-            (
-                pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0)
-                if has_tail_lift
-                else pl.lit(0.0)
-            ).alias("profit_proxy_score"),
-            (
-                pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0)
-                if has_tail_lift
-                else pl.lit(0.0)
-            ).alias("profit_proxy_per_selected_obs"),
-            (
-                (pl.col("tail_utility_mean").fill_null(0.0).fill_nan(0.0) * 1000.0)
-                / pl.max_horizontal(
-                    pl.col("conditioned_observations").fill_null(0).cast(pl.Float64),
-                    pl.lit(1.0),
-                )
-                if has_tail_lift
-                else pl.lit(0.0)
-            ).alias("profit_proxy_per_1k_observed"),
         )
         .with_columns(
             (
@@ -643,11 +628,129 @@ def rank_candidate_evidence(candidates: pl.DataFrame) -> pl.DataFrame:
         )
     )
     ranked = _select_schema(ranked.sort("rank_score", descending=True), CANDIDATE_RANK_SCHEMA)
-    if has_tail_lift and "tree_direction" in ranked.columns:
+    if branch == "tailtree" and "tree_direction" in ranked.columns:
         ranked = ranked.unique(
             subset=["symbol", "tree_direction"], keep="first", maintain_order=True
         )
     return ranked
+
+
+def rank_ladder_candidates(candidates: pl.DataFrame) -> pl.DataFrame:
+    """Rank ladder candidates only; tailtree columns stay nullable and cannot switch scoring."""
+    if candidates.is_empty():
+        return pl.DataFrame(schema=CANDIDATE_RANK_SCHEMA)
+    cleaned = candidates.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("tail_lift"),
+        pl.lit(None, dtype=pl.Float64).alias("tail_lift_stability"),
+        pl.lit(None, dtype=pl.UInt32).alias("N_tail_exceedances"),
+    )
+    return _rank_candidates_for_branch(cleaned, branch="ladder")
+
+
+def rank_tailtree_candidates(candidates: pl.DataFrame) -> pl.DataFrame:
+    """Rank tailtree candidates only; callers must use tailtree_candidates first."""
+    return _rank_candidates_for_branch(candidates, branch="tailtree")
+
+
+CANDIDATE_METRIC_SURFACE_SCHEMA: dict[str, PolarsDtype] = {
+    "branch": pl.String,
+    "symbol": pl.String,
+    "decision_timeframe": pl.String,
+    "decision_bar_close_ms": pl.Int64,
+    "outcome_horizon": pl.Int64,
+    "direction": pl.String,
+    "support_count": pl.Float64,
+    "tail_lift": pl.Float64,
+    "stability": pl.Float64,
+    "utility_proxy": pl.Float64,
+    "rank_score": pl.Float64,
+    "rank_reason": pl.String,
+    "source_freshness": pl.String,
+    "required_missing_source_count": pl.Int64,
+    "required_stale_source_count": pl.Int64,
+}
+
+
+def candidate_metric_surface(
+    *,
+    ladder: pl.DataFrame | None = None,
+    tailtree: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """Project branch-native ranks to one comparable candidate surface."""
+    frames = []
+    if ladder is not None and not ladder.is_empty():
+        frames.append(
+            ladder.with_columns(
+                pl.lit("ladder").alias("branch"),
+                pl.col("statistical_direction").alias("direction"),
+                pl.col("conditioned_observations")
+                .fill_null(0)
+                .cast(pl.Float64)
+                .alias("support_count"),
+                pl.max_horizontal(
+                    pl.col("lift_up").fill_null(0.0),
+                    pl.col("lift_down").fill_null(0.0),
+                ).alias("tail_lift"),
+                pl.max_horizontal(
+                    pl.col("information_stability").fill_null(0.0),
+                    pl.col("transition_information_stability").fill_null(0.0),
+                ).alias("stability"),
+                pl.col("avg_path_range_pct").fill_null(0.0).alias("utility_proxy"),
+            )
+        )
+    if tailtree is not None and not tailtree.is_empty():
+        tailtree_source = tailtree.with_columns(
+            *[
+                pl.lit("unknown").alias("source_freshness")
+                for column in ("source_freshness",)
+                if column not in tailtree.columns
+            ],
+            *[
+                pl.lit(0).alias(column)
+                for column in ("required_missing_source_count", "required_stale_source_count")
+                if column not in tailtree.columns
+            ],
+        )
+        frames.append(
+            tailtree_source.with_columns(
+                pl.lit("tailtree").alias("branch"),
+                pl.col("tree_direction").alias("direction"),
+                pl.col("N_total").fill_null(0).cast(pl.Float64).alias("support_count"),
+                pl.col("tail_lift").fill_null(0.0).alias("tail_lift"),
+                pl.col("tail_lift_stability").fill_null(0.0).alias("stability"),
+                pl.max_horizontal(
+                    pl.col("tail_utility_mean").fill_null(0.0),
+                    pl.col("tail_utility_p90").fill_null(0.0),
+                ).alias("utility_proxy"),
+                pl.col("source_freshness").fill_null("unknown").alias("source_freshness"),
+                pl.col("required_missing_source_count")
+                .fill_null(0)
+                .alias("required_missing_source_count"),
+                pl.col("required_stale_source_count")
+                .fill_null(0)
+                .alias("required_stale_source_count"),
+            )
+        )
+    if not frames:
+        return pl.DataFrame(schema=CANDIDATE_METRIC_SURFACE_SCHEMA)
+    return _select_schema(
+        pl.concat(frames, how="diagonal_relaxed"),
+        CANDIDATE_METRIC_SURFACE_SCHEMA,
+    )
+
+
+def rank_candidates(surface: pl.DataFrame) -> pl.DataFrame:
+    """Rank the comparable metric surface without using objective-native losses."""
+    if surface.is_empty():
+        return pl.DataFrame(schema=CANDIDATE_METRIC_SURFACE_SCHEMA)
+    return surface.with_columns(
+        (
+            pl.col("tail_lift").fill_null(0.0)
+            + pl.col("stability").fill_null(0.0)
+            + (pl.col("support_count").fill_null(0.0) + 1.0).log()
+            + pl.col("utility_proxy").fill_null(0.0) / 10.0
+        ).alias("rank_score")
+    ).sort("rank_score", descending=True)
 
 
 def _select_schema(frame: pl.DataFrame, schema: dict[str, PolarsDtype]) -> pl.DataFrame:
@@ -666,6 +769,12 @@ def _select_schema(frame: pl.DataFrame, schema: dict[str, PolarsDtype]) -> pl.Da
 __all__ = [
     "CANDIDATE_EVIDENCE_SCHEMA",
     "CANDIDATE_RANK_SCHEMA",
-    "candidate_evidence_frame",
-    "rank_candidate_evidence",
+    "CANDIDATE_METRIC_SURFACE_SCHEMA",
+    "candidate_metric_surface",
+    "horizon_consistency",
+    "ladder_candidates",
+    "rank_candidates",
+    "rank_ladder_candidates",
+    "rank_tailtree_candidates",
+    "tailtree_candidates",
 ]

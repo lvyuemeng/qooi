@@ -100,7 +100,7 @@ class KlineClassifier:
                 reason=";".join(f"{column}_missing" for column in missing) or "kline_rows_missing",
             )
             return validate_state_frame(state)
-        state = _classify_kline_state_frame(frame, self.scale)
+        state = classify_states(frame, self.scale)
         return validate_state_frame(state)
 
 
@@ -142,7 +142,7 @@ def classifier_health(frame: pl.DataFrame, *, label: str = "") -> ClassifierHeal
     return ClassifierHealthResult(out, text)
 
 
-def _classify_kline_state_frame(frame: pl.DataFrame, scale: str) -> pl.DataFrame:
+def classify_states(frame: pl.DataFrame, scale: str) -> pl.DataFrame:
     close_prev = pl.col("close").shift(1)
     true_range = pl.max_horizontal(
         (pl.col("high") - pl.col("low")).abs(),
@@ -1091,5 +1091,5 @@ __all__ = [
     "extract_continuous_features",
     "validate_state_frame",
     "POTENTIAL_OBSERVATION_SCHEMA",
-        "potential_observation_frame",
+    "potential_observation_frame",
 ]

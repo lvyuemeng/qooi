@@ -65,7 +65,11 @@ def leaf_evidence_frame(
     leaf_stats = joined.group_by("leaf_id").agg(
         pl.len().cast(pl.UInt32).alias("N_total"),
         pl.col(tail_col).cast(pl.UInt32).sum().alias("N_tail_exceedances"),
-        pl.col(utility_col).filter(pl.col(tail_col)).mean().fill_null(0.0).alias("tail_utility_mean"),
+        pl.col(utility_col)
+        .filter(pl.col(tail_col))
+        .mean()
+        .fill_null(0.0)
+        .alias("tail_utility_mean"),
         pl.col(utility_col)
         .filter(pl.col(tail_col))
         .quantile(0.9)
@@ -203,9 +207,7 @@ def score_bucket_evidence_frame(
         outcome_aggs.append(
             pl.col(utility_col).fill_null(0.0).cast(pl.Float64).max().alias(utility_col)
         )
-    outcome_by_decision = outcomes.group_by("symbol", "decision_bar_close_ms").agg(
-        *outcome_aggs
-    )
+    outcome_by_decision = outcomes.group_by("symbol", "decision_bar_close_ms").agg(*outcome_aggs)
     joined = scored.join(
         outcome_by_decision,
         on=["symbol", "decision_bar_close_ms"],

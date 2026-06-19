@@ -1,137 +1,312 @@
-"""Potential research review report workflow."""
+"""Scanner workflow — load → compute → review → report."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import tomllib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 import polars as pl
 
-from qooi.exchange.discovery import DiscoveryConfig, discover_candidates, empty_discovery_frame
-from qooi.exchange.store import AsyncCacheStore, HistoryCoverage, HistoryRefreshRequest
+from qooi.pipeline import now_ms
+from qooi.pipeline.coverage import CoverageRunPolicy
+from qooi.pipeline.discovery import rank_discovery, select_symbols
+from qooi.pipeline.load import (
+    BarLoadRequest,
+    MarketLoadPolicy,
+    MarketLoadRequest,
+    SourceLoadRequest,
+    SourceName,
+    SourceProductLoadRequest,
+    load_market,
+)
 from qooi.profiling import ProfileContext
-from qooi.scanner import (
-    DERIVATIVE_FAMILIES,
-    BarFetchResult,
-    PotentialArtifacts,
-    PotentialScanConfig,
-    PotentialUniverse,
-    ReportInputs,
-    ScanDecision,
-    SourceStateRow,
-    StateDirection,
-    SymbolStateBundle,
-    TransitionInsight,
-    best_transition_pattern,
-    context_symbols,
-    float_or_none,
-    float_value,
-    fmt,
-    max_timestamp,
-    missing_state,
-    transition_consensus_passes,
-)
 from qooi.scanner.config import PotentialConfig
-from qooi.scanner.diagnostics import write_diagnostics
-from qooi.scanner.report import render_report
-from qooi.scanner.state import KlineClassifier
-from qooi.scanner.transitions import compute_transition_insights
-from qooi.sources.context import (
-    SourceAvailability,
-    SourceContextRequest,
-    SourceContextResult,
-    load_source_context,
+from qooi.scanner.output import MarketReadiness, ScannerRunFrames, render_report, review_decisions
+from qooi.scanner.tailrun.artifacts import (
+    write_tailtree_profile_runs,
+    write_tailtree_selection_efficiency,
 )
-
-
-@dataclass(frozen=True)
-class DiscoveryWorkflowConfig:
-    discovery: DiscoveryConfig
+from qooi.scanner.tailrun.core import run_tailtree
+from qooi.scanner.tailrun.types import (
+    TailtreeArtifactTree,
+    TailtreeDirection,
+    TailtreeInputFrames,
+    TailtreeProfileFeedback,
+)
+from qooi.transport.okx import OkxClient
 
 
 def run(config_path: Path | str) -> Path:
-    config = load_config(Path(config_path))
-    artifacts = PotentialArtifacts(
-        report=config.output,
-        diagnostics_dir=config.output.parent / "diagnostics",
-        states_dir=config.output.parent / "states",
-    )
-    profile = ProfileContext.from_config(config.profile, config.output.parent / "profile")
-    with profile.stage("scanner", "workflow", "resolve_universe"):
-        universe = resolve_universe(config)
-    with profile.stage("scanner", "workflow", "load_bars"):
-        bars = asyncio.run(load_bars(config, universe.symbols))
-    with profile.stage("scanner", "workflow", "compute_kline_states"):
-        kline_states = compute_kline_states(
-            config, universe.symbols, bars.state_frames, bars.frames, bars.coverage
-        )
-    with profile.stage("scanner", "workflow", "compute_transition_insights"):
-        transitions = compute_transition_insights(
-            config, universe.symbols, bars.frames, bars.state_frames
-        )
-    symbols_with_decision_bars = tuple(
-        symbol
-        for symbol in universe.symbols
-        if not bars.frames.get((symbol, config.bar), pl.DataFrame()).is_empty()
-    )
-    with profile.stage("scanner", "workflow", "load_source_context"):
-        context = asyncio.run(
-            load_source_context(
-                source_context_request(
-                    config,
-                    symbols=universe.symbols,
-                    context_symbols=context_symbols(
-                        config, symbols_with_decision_bars, transitions.insights
-                    ),
-                    discovery=universe.discovery,
+    return asyncio.run(_run(config_path))
+
+
+def scanner_market_request(config: PotentialConfig, symbols: tuple[str, ...]) -> MarketLoadRequest:
+    if config.bars is None:
+        raise ValueError("scanner requires bars config")
+    products = []
+    for name, product_config in (
+        ("books", config.books),
+        ("trades", config.trades),
+        ("funding", config.funding),
+        ("open_interest", config.open_interest),
+        ("taker_volume", config.taker_volume),
+        ("long_short_ratios", config.long_short),
+    ):
+        if product_config is not None:
+            products.append(
+                SourceProductLoadRequest(
+                    cast(SourceName, name),
+                    product_config.limit,
+                    getattr(product_config, "period", "1H"),
+                    getattr(product_config, "unit", "2"),
                 )
             )
-        )
-    with profile.stage("scanner", "workflow", "compute_source_states"):
-        bundles = compute_source_states(
-            config, universe.symbols, kline_states, transitions.insights, bars.coverage, context
-        )
-    with profile.stage("scanner", "workflow", "scan_review_decisions"):
-        decisions = tuple(scan_review_decisions(config, bundles))
-
-    log_path = config.output.parent / "scan.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(str(log_path), encoding="utf-8")
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)-5s | %(name)s | %(message)s")
+    target_days = min(config.bars.days, 180)
+    return MarketLoadRequest(
+        bars=BarLoadRequest(
+            symbols=symbols,
+            timeframes=config.bars.timeframes,
+            target_days=target_days,
+            max_staleness_hours=config.max_staleness_hours,
+            refresh_mode=config.bars.refresh_mode,
+        ),
+        sources=SourceLoadRequest(
+            symbols=symbols,
+            products=tuple(products),
+            target_days=target_days,
+            max_staleness_hours=config.max_staleness_hours,
+        ),
     )
-    logger = logging.getLogger("qooi.scanner")
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
 
-    inputs = ReportInputs(
-        config,
-        artifacts,
-        universe,
-        bars,
-        context,
-        transitions,
-        bundles,
-        decisions,
-    )
-    with profile.stage("scanner", "workflow", "write_diagnostics"):
-        diagnostic_frames = profile.native(
-            "scanner.workflow.write_diagnostics",
-            lambda: write_diagnostics(inputs, profile),
+
+def scanner_market_policy(config: PotentialConfig) -> MarketLoadPolicy:
+    return MarketLoadPolicy(
+        coverage=CoverageRunPolicy(
+            max_requests=1000,
+            max_seconds=900,
+            max_requests_per_symbol_product=24,
+            concurrency=max(1, config.fetch_concurrency),
+            allow_partial=True,
         )
-    artifacts.report.parent.mkdir(parents=True, exist_ok=True)
-    with profile.stage("scanner", "workflow", "render_report"):
-        artifacts.report.write_text(render_report(inputs, diagnostic_frames), encoding="utf-8")
-    profile.write()
+    )
 
-    logger.removeHandler(handler)
-    handler.close()
-    return artifacts.report
+
+async def _run(config_path: Path | str) -> Path:
+    config = load_config(Path(config_path))
+    if config.bars is None:
+        raise ValueError("scanner requires bars config")
+
+    profile = ProfileContext.from_config(config.profile, config.output.parent / "profile")
+    try:
+        async with OkxClient() as okx:
+            with profile.stage("scanner", "workflow", "resolve_universe"):
+                instruments = await okx.instruments()
+                tickers = await okx.tickers()
+                discovery = rank_discovery(instruments.frame, tickers.frame)
+                symbols = select_symbols(discovery, top_n=config.max_symbols)
+
+            request = scanner_market_request(config, symbols)
+            policy = scanner_market_policy(config)
+
+            with profile.stage("scanner", "workflow", "load_market"):
+                loaded = await load_market(okx, request, policy, instrument_frame=discovery)
+
+        market = MarketReadiness(
+            symbols=len(symbols),
+            timeframes=len(config.bars.timeframes),
+            target_days=request.bars.target_days,
+            source_products=len(request.sources.products),
+            before=loaded.coverage_before,
+            after=loaded.coverage_after,
+            stats=loaded.stats,
+        )
+
+        bar_frames = loaded.bar_frames
+        bar_df = loaded.products["bars"].frame
+        source_frames = loaded.source_frames
+        source_products = {
+            name: result for name, result in loaded.products.items() if name != "bars"
+        }
+
+        from qooi.scanner.state import (
+            classify_states,
+            continuous_features_frame,
+            potential_observation_frame,
+        )
+
+        with profile.stage("scanner", "workflow", "classify_states"):
+            states: dict[tuple[str, str], pl.DataFrame] = {}
+            for (symbol, timeframe), frame in bar_frames.items():
+                if not frame.is_empty():
+                    states[(symbol, timeframe)] = classify_states(frame, scale=timeframe)
+
+        from qooi.scanner.transitions import transitions
+
+        with profile.stage("scanner", "workflow", "transitions"):
+            transition_analysis = transitions(config, symbols, bar_frames, states)
+
+        from qooi.scanner.outcome import (
+            path_histories,
+            realized_transition_frame,
+            source_events,
+            source_outcomes_frame,
+        )
+
+        with profile.stage("scanner", "workflow", "outcome_frames"):
+            histories = path_histories(config, states, bar_frames) if states else pl.DataFrame()
+            events = (
+                source_events(source_frames, bar_df, config.bars.timeframes[0])
+                if source_frames and not bar_df.is_empty()
+                else pl.DataFrame()
+            )
+            realized = realized_transition_frame(
+                histories, config.evidence.tailtree.outcome_horizon
+            )
+            source_outcomes = source_outcomes_frame(events, bar_df)
+
+        with profile.stage("scanner", "workflow", "continuous_features"):
+            continuous_features = continuous_features_frame(
+                bar_frames,
+                states,
+                source_frames,
+                decision_timeframe=config.bars.timeframes[0],
+            )
+
+        with profile.stage("scanner", "workflow", "observations"):
+            observations = potential_observation_frame(
+                histories,
+                events,
+                continuous_features,
+                decision_timeframe=config.bars.timeframes[0],
+                max_source_staleness_hours=config.max_staleness_hours,
+            )
+        profile.frame("scanner", "workflow", "observations", observations)
+
+        tailtree_config = config.evidence.tailtree
+        ladder = pl.DataFrame()
+        tailtree_evidence = pl.DataFrame()
+        models: dict[tuple[int, TailtreeDirection], TailtreeArtifactTree] = {}
+        trial_feedback: tuple[TailtreeProfileFeedback, ...] = ()
+        selection_efficiency = pl.DataFrame()
+
+        from qooi.scanner.rank import (
+            candidate_metric_surface,
+            horizon_consistency,
+            ladder_candidates,
+            rank_candidates,
+            rank_ladder_candidates,
+            rank_tailtree_candidates,
+            tailtree_candidates,
+        )
+
+        ladder_ranked = pl.DataFrame()
+        tailtree_ranked = pl.DataFrame()
+        consistency = pl.DataFrame()
+
+        if config.evidence.kind == "ladder" and not observations.is_empty():
+            with profile.stage("scanner", "workflow", "evidence_ladder"):
+                from qooi.scanner.ladder import evidence as ladder_evidence
+
+                ladder = ladder_evidence(
+                    observations,
+                    source_outcomes,
+                    realized,
+                    return_threshold_pct=tailtree_config.threshold_pct,
+                )
+                ladder_branch_candidates = ladder_candidates(observations, ladder, latest_only=True)
+                ladder_ranked = rank_ladder_candidates(ladder_branch_candidates)
+
+        if config.evidence.kind == "tailtree" and not observations.is_empty():
+            with profile.stage("scanner", "workflow", "evidence_tailtree"):
+                tailtree_result = run_tailtree(
+                    TailtreeInputFrames(
+                        observations=observations,
+                        source_outcomes=source_outcomes,
+                        realized=realized,
+                        histories=histories,
+                    ),
+                    config=config,
+                    profile=profile,
+                )
+                tailtree_evidence = tailtree_result.evidence
+                models = tailtree_result.models
+                trial_feedback = tailtree_result.profile_runs
+                selection_efficiency = tailtree_result.selection_efficiency
+                if models and not tailtree_evidence.is_empty():
+                    tailtree_branch_candidates = tailtree_candidates(
+                        observations, tailtree_evidence, models, latest_only=True
+                    )
+                    tailtree_ranked = rank_tailtree_candidates(tailtree_branch_candidates)
+                    consistency = horizon_consistency(tailtree_ranked)
+
+        with profile.stage("scanner", "workflow", "rank_review_report"):
+            candidate_surface = candidate_metric_surface(
+                ladder=ladder_ranked, tailtree=tailtree_ranked
+            )
+            ranked = rank_candidates(candidate_surface)
+            profile.frame("scanner", "workflow", "ranked", ranked)
+            write_tailtree_profile_runs(config.output.parent, trial_feedback)
+            write_tailtree_selection_efficiency(
+                config.output.parent,
+                config.evidence.tailtree.model_dir,
+                selection_efficiency,
+            )
+            prediction_freshness = prediction_freshness_frame(ranked, config)
+            decisions = review_decisions(
+                ranked,
+                prediction_freshness,
+                {name: result.health for name, result in source_products.items()},
+                config,
+            )
+            frames = ScannerRunFrames(
+                market=market,
+                products=loaded.products,
+                states=states,
+                transitions=transition_analysis,
+                histories=histories,
+                source_events=events,
+                ladder=ladder,
+                tailtree=tailtree_evidence,
+                ranked=ranked,
+                horizon_consistency=consistency,
+                prediction_freshness=prediction_freshness,
+                decisions=decisions,
+            )
+            report_md = render_report(frames, config)
+            config.output.parent.mkdir(parents=True, exist_ok=True)
+            config.output.write_text(report_md, encoding="utf-8")
+        return config.output
+    finally:
+        profile.write()
+
+
+def prediction_freshness_frame(ranked: pl.DataFrame, config: PotentialConfig) -> pl.DataFrame:
+    if ranked.is_empty() or "decision_bar_close_ms" not in ranked.columns:
+        return pl.DataFrame(
+            schema={
+                "symbol": pl.String,
+                "decision_bar_close_ms": pl.Int64,
+                "prediction_age_hours": pl.Float64,
+                "prediction_freshness": pl.String,
+            }
+        )
+    return (
+        ranked.select("symbol", "decision_bar_close_ms")
+        .unique()
+        .with_columns(
+            ((pl.lit(now_ms()) - pl.col("decision_bar_close_ms")) / 3_600_000).alias(
+                "prediction_age_hours"
+            )
+        )
+        .with_columns(
+            pl.when(pl.col("prediction_age_hours") <= config.max_staleness_hours)
+            .then(pl.lit("fresh"))
+            .otherwise(pl.lit("stale"))
+            .alias("prediction_freshness")
+        )
+    )
 
 
 def load_config(path: Path) -> PotentialConfig:
@@ -139,678 +314,3 @@ def load_config(path: Path) -> PotentialConfig:
         return PotentialConfig()
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     return PotentialConfig.model_validate(data.get("potential", data))
-
-
-def source_context_request(
-    config: PotentialConfig,
-    *,
-    symbols: tuple[str, ...],
-    context_symbols: tuple[str, ...],
-    discovery: pl.DataFrame,
-) -> SourceContextRequest:
-    return SourceContextRequest(
-        output_dir=config.output.parent,
-        symbols=symbols,
-        context_symbols=context_symbols,
-        discovery=discovery,
-        target_days=max(config.days, config.transition.history_days),
-        concurrency=config.fetch_concurrency,
-        refresh_mode=config.refresh_mode,
-        source=config.source,
-    )
-
-
-def target_min_bars(days: int, timeframe: str) -> int:
-    unit = timeframe[-1].lower()
-    value_text = timeframe[:-1]
-    value = int(value_text) if value_text.isdigit() else 1
-    minutes = (
-        value
-        if unit == "m"
-        else value * 60
-        if unit == "h"
-        else value * 60 * 24
-        if unit == "d"
-        else 60
-    )
-    return max(int(days * 24 * 60 / minutes), 120)
-
-
-def resolve_universe(config: PotentialConfig) -> PotentialUniverse:
-    if config.symbols:
-        symbols = tuple(dict.fromkeys(config.symbols))
-        return PotentialUniverse(
-            symbols=symbols,
-            discovery=empty_discovery_frame(),
-            selection_note="explicit symbols override OKX universe discovery",
-            missing_reason="",
-            eligible_count=len(symbols),
-        )
-    try:
-        result = discover_candidates(DiscoveryWorkflowConfig(DiscoveryConfig()))
-    except Exception as exc:
-        return PotentialUniverse(
-            symbols=(),
-            discovery=empty_discovery_frame(),
-            selection_note="okx universe discovery failed",
-            missing_reason=f"{type(exc).__name__}: {exc}",
-        )
-    if result.discovery.is_empty() or "symbol" not in result.discovery.columns:
-        symbols = result.symbols[: config.transition.scan_budget]
-    else:
-        frame = result.discovery.filter(pl.col("symbol").is_in(result.symbols))
-        if "rank_score" in frame.columns:
-            frame = frame.sort("rank_score", descending=True)
-        symbols = tuple(frame.head(config.transition.scan_budget).get_column("symbol").to_list())
-    return PotentialUniverse(
-        symbols=symbols,
-        discovery=result.discovery,
-        selection_note=(
-            "symbols selected from OKX swap universe discovery and transition scan budget"
-        ),
-        missing_reason="" if symbols else "okx discovery returned no eligible symbols",
-        eligible_count=len(result.symbols),
-    )
-
-
-async def load_bars(config: PotentialConfig, symbols: tuple[str, ...]) -> BarFetchResult:
-    if not symbols:
-        return BarFetchResult({}, {}, ())
-    semaphore = asyncio.Semaphore(max(1, config.fetch_concurrency))
-    frames: dict[tuple[str, str], pl.DataFrame] = {}
-    coverage: list[HistoryCoverage] = []
-
-    async with AsyncCacheStore() as store:
-
-        async def load(
-            symbol: str, timeframe: str
-        ) -> tuple[str, str, pl.DataFrame, HistoryCoverage]:
-            request = HistoryRefreshRequest(
-                inst_id=symbol,
-                bar=timeframe,
-                days=max(config.days, config.transition.history_days),
-                min_bars=target_min_bars(
-                    max(config.days, config.transition.history_days), timeframe
-                ),
-                refresh=config.refresh_mode in {"incremental", "force"},
-                incremental=config.refresh_mode != "force",
-                cache_only=config.refresh_mode == "cache_only",
-            )
-            async with semaphore:
-                frame, item = await store.bars(request)
-            return symbol, timeframe, frame, item
-
-        requests = ((symbol, timeframe) for symbol in symbols for timeframe in config.timeframes)
-        for symbol, timeframe, frame, item in await asyncio.gather(
-            *(load(symbol, timeframe) for symbol, timeframe in requests)
-        ):
-            frames[(symbol, timeframe)] = frame
-            coverage.append(item)
-    state_frames = _classify_kline_frames(config, symbols, frames)
-    return BarFetchResult(frames, state_frames, tuple(coverage))
-
-
-def _classify_kline_frames(
-    config: PotentialConfig,
-    symbols: tuple[str, ...],
-    frames: dict[tuple[str, str], pl.DataFrame],
-) -> dict[tuple[str, str], pl.DataFrame]:
-    states: dict[tuple[str, str], pl.DataFrame] = {}
-    jobs = [
-        (symbol, timeframe, frame)
-        for timeframe in config.timeframes
-        for symbol in symbols
-        if not (frame := frames.get((symbol, timeframe), pl.DataFrame())).is_empty()
-    ]
-    workers = min(8, max(1, config.fetch_concurrency * 2))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_classify_kline_frame, symbol, timeframe, frame): (symbol, timeframe)
-            for symbol, timeframe, frame in jobs
-        }
-        for future in as_completed(futures):
-            states[futures[future]] = future.result()
-    return states
-
-
-def _classify_kline_frame(symbol: str, timeframe: str, frame: pl.DataFrame) -> pl.DataFrame:
-    return KlineClassifier(timeframe).classify(frame.with_columns(pl.lit(symbol).alias("symbol")))
-
-
-def compute_kline_states(
-    config: PotentialScanConfig,
-    symbols: tuple[str, ...],
-    state_frames: dict[tuple[str, str], pl.DataFrame],
-    frames: dict[tuple[str, str], pl.DataFrame],
-    coverage: tuple[HistoryCoverage, ...],
-) -> dict[str, SourceStateRow]:
-    coverage_by_symbol = {item.inst_id: item for item in coverage if item.bar == config.bar}
-    states: dict[str, SourceStateRow] = {}
-    for symbol in symbols:
-        frame = frames.get((symbol, config.bar), pl.DataFrame())
-        item = coverage_by_symbol.get(symbol)
-        if frame.is_empty() or item is None or item.actual_bars <= 0:
-            states[symbol] = SourceStateRow(
-                symbol,
-                "kline",
-                None,
-                "missing_bars",
-                "blocked",
-                0.0,
-                "bar frame missing or empty",
-                "bars_missing",
-                False,
-            )
-            continue
-        state_frame = state_frames.get((symbol, config.bar), pl.DataFrame())
-        if state_frame.is_empty():
-            states[symbol] = missing_state(symbol, "kline", "kline_state_missing", blocked=True)
-            continue
-        state_latest = state_frame.tail(1)
-        state_key = str(state_latest.select("state_key").item() or "unknown|unknown")
-        state_parts = state_key.split("|")
-        stage = state_parts[0] if state_parts else "unknown"
-        structure = state_parts[1] if len(state_parts) > 1 else "unknown"
-        range_state = state_parts[2] if len(state_parts) > 2 else "range_unknown"
-        vol_state = state_parts[3] if len(state_parts) > 3 else "vol_unknown"
-        context_event = str(state_latest.select("context_event").item() or "unknown")
-        direction = str(state_latest.select("direction_hint").item() or "missing")
-        confidence = 0.8 if direction in {"bullish", "bearish"} else 0.45
-        evidence = (
-            f"stage={stage}; structure={structure}; event={context_event}; "
-            f"state_key={state_key}; range_state={range_state}; vol_state={vol_state}; "
-            f"close={fmt(frame.tail(1).select('close').item())}"
-        )
-        timestamp = state_latest.select("timestamp").item()
-        states[symbol] = SourceStateRow(
-            symbol,
-            "kline",
-            int(timestamp) if timestamp is not None else None,
-            f"{structure}/{stage}",
-            cast(StateDirection, direction),
-            confidence,
-            evidence,
-            "" if direction != "blocked" else context_event,
-            False,
-        )
-    return states
-
-
-def compute_source_states(
-    config: PotentialScanConfig,
-    symbols: tuple[str, ...],
-    kline_states: dict[str, SourceStateRow],
-    transitions: dict[str, TransitionInsight],
-    coverage: tuple[HistoryCoverage, ...],
-    context: SourceContextResult,
-) -> tuple[SymbolStateBundle, ...]:
-    coverage_notes = {item.inst_id: item.notes for item in coverage}
-    source_frames = _source_frames_by_family_symbol(context)
-    source_availability = {(row.symbol, row.family): row for row in context.availability}
-    bundles: list[SymbolStateBundle] = []
-    for symbol in symbols:
-        insight = transitions.get(
-            symbol,
-            TransitionInsight(
-                symbol, missing_state(symbol, "transition", "transition_pattern_missing"), ()
-            ),
-        )
-        bundles.append(
-            SymbolStateBundle(
-                symbol=symbol,
-                kline=kline_states[symbol],
-                transition=insight.current,
-                books=_book_state(config, symbol, source_frames, source_availability),
-                trades=_trade_state(config, symbol, source_frames, source_availability),
-                derivatives=_derivative_state(config, symbol, source_frames),
-                context=_message_context_state(config, symbol, source_frames),
-                coverage_notes=coverage_notes.get(symbol, ()),
-                transition_patterns=insight.patterns,
-            )
-        )
-    return tuple(bundles)
-
-
-def _source_frames_by_family_symbol(
-    context: SourceContextResult,
-) -> dict[tuple[str, str], pl.DataFrame]:
-    frames: dict[tuple[str, str], pl.DataFrame] = {}
-    for family, frame in context.frames.items():
-        if frame.is_empty() or "symbol" not in frame.columns:
-            continue
-        for key, symbol_frame in frame.partition_by("symbol", as_dict=True).items():
-            symbol = key[0] if isinstance(key, tuple) else key
-            frames[(family, str(symbol))] = symbol_frame
-    return frames
-
-
-def _book_state(
-    config: PotentialScanConfig,
-    symbol: str,
-    source_frames: dict[tuple[str, str], pl.DataFrame],
-    source_availability: dict[tuple[str, str], SourceAvailability],
-) -> SourceStateRow:
-    availability = source_availability.get((symbol, "books"))
-    if availability is not None and availability.status == "disabled":
-        return missing_state(symbol, "books", "books_disabled", blocked=True)
-    frame = source_frames.get(("books", symbol), pl.DataFrame())
-    if frame.is_empty():
-        return missing_state(symbol, "books", "books_missing")
-    row = frame.sort("timestamp").tail(1)
-    bid = float_value(row.select("ob_bid_price").item())
-    ask = float_value(row.select("ob_ask_price").item())
-    mid = (bid + ask) / 2.0 if bid and ask else 0.0
-    spread_bps = ((ask - bid) / mid * 10_000.0) if mid > 0.0 else None
-    imbalance = _first_float(row, ("ob_imbalance_25", "ob_imbalance_10", "ob_imbalance_5"))
-    bid_depth = _first_float(row, ("ob_bid_vol_25", "ob_bid_vol_10", "ob_bid_vol_5", "ob_bid_vol"))
-    ask_depth = _first_float(row, ("ob_ask_vol_25", "ob_ask_vol_10", "ob_ask_vol_5", "ob_ask_vol"))
-    if spread_bps is not None and spread_bps > 80.0:
-        direction: StateDirection = "blocked"
-        state = "liquidity_fragile"
-    elif imbalance is not None and imbalance >= 0.2:
-        direction = "bullish"
-        state = "bid_support"
-    elif imbalance is not None and imbalance <= -0.2:
-        direction = "bearish"
-        state = "ask_pressure"
-    else:
-        direction = "neutral"
-        state = "balanced_book"
-    evidence = (
-        f"imbalance={fmt(imbalance)}; spread_bps={fmt(spread_bps)}; "
-        f"bid_depth={fmt(bid_depth)}; ask_depth={fmt(ask_depth)}"
-    )
-    timestamp = row.select("timestamp").item()
-    return SourceStateRow(
-        symbol,
-        "books",
-        int(timestamp) if timestamp is not None else None,
-        state,
-        direction,
-        0.65,
-        evidence,
-        "",
-        False,
-    )
-
-
-def _trade_state(
-    config: PotentialScanConfig,
-    symbol: str,
-    source_frames: dict[tuple[str, str], pl.DataFrame],
-    source_availability: dict[tuple[str, str], SourceAvailability],
-) -> SourceStateRow:
-    availability = source_availability.get((symbol, "trades"))
-    if availability is not None and availability.status == "disabled":
-        return missing_state(symbol, "trades", "trades_disabled", blocked=True)
-    frame = source_frames.get(("trades", symbol), pl.DataFrame())
-    if frame.is_empty():
-        return missing_state(symbol, "trades", "trades_missing")
-    rows = frame.sort("timestamp").tail(max(20, min(config.source.trade_limit, 100)))
-    buy = _sum_side(rows, "buy")
-    sell = _sum_side(rows, "sell")
-    ratio = buy / sell if sell > 0.0 else (buy if buy > 0.0 else 1.0)
-    if ratio >= 1.25:
-        direction: StateDirection = "bullish"
-        state = "aggressive_buy_dominance"
-    elif ratio <= 0.8:
-        direction = "bearish"
-        state = "aggressive_sell_dominance"
-    else:
-        direction = "neutral"
-        state = "balanced_trade_flow"
-    timestamp = rows.tail(1).select("timestamp").item()
-    evidence = f"buy_notional={buy:.2f}; sell_notional={sell:.2f}; buy_sell_ratio={ratio:.2f}"
-    return SourceStateRow(
-        symbol,
-        "trades",
-        int(timestamp) if timestamp is not None else None,
-        state,
-        direction,
-        0.6,
-        evidence,
-        "",
-        False,
-    )
-
-
-def _derivative_state(
-    config: PotentialScanConfig,
-    symbol: str,
-    source_frames: dict[tuple[str, str], pl.DataFrame],
-) -> SourceStateRow:
-    funding = source_frames.get(("funding", symbol), pl.DataFrame())
-    oi = source_frames.get(("open_interest", symbol), pl.DataFrame())
-    taker = source_frames.get(("taker_volume", symbol), pl.DataFrame())
-    ratios = source_frames.get(("long_short_ratios", symbol), pl.DataFrame())
-    missing = []
-    for family, frame in (
-        ("funding", funding),
-        ("open_interest", oi),
-        ("taker_volume", taker),
-        ("long_short_ratios", ratios),
-    ):
-        if family in config.source.disabled_sources:
-            missing.append(f"{family}_disabled")
-        elif frame.is_empty():
-            missing.append(f"{family}_missing")
-    if len(missing) == len(DERIVATIVE_FAMILIES):
-        return missing_state(symbol, "derivatives", ";".join(missing))
-    funding_latest = _latest_float(funding, "funding_rate")
-    oi_delta = _tail_delta(oi, "open_interest_usd", "open_interest")
-    buy = _latest_float(taker, "taker_buy_volume")
-    sell = _latest_float(taker, "taker_sell_volume")
-    taker_ratio = buy / sell if buy is not None and sell and sell > 0.0 else None
-    position_ratio = _latest_float(ratios, "top_trader_long_short_position_ratio")
-    bullish = (
-        oi_delta is not None and oi_delta > 0.0 and taker_ratio is not None and taker_ratio > 1.1
-    )
-    bearish = (
-        oi_delta is not None and oi_delta > 0.0 and taker_ratio is not None and taker_ratio < 0.9
-    )
-    if bullish:
-        direction: StateDirection = "bullish"
-        state = "oi_expansion_buy_pressure"
-    elif bearish:
-        direction = "bearish"
-        state = "oi_expansion_sell_pressure"
-    else:
-        direction = "neutral"
-        state = "mixed_derivatives"
-    evidence = (
-        f"funding={fmt(funding_latest)}; oi_delta={fmt(oi_delta)}; "
-        f"taker_buy_sell_ratio={fmt(taker_ratio)}; top_position_ratio={fmt(position_ratio)}; "
-        f"missing={','.join(missing) if missing else 'none'}"
-    )
-    timestamp = max(
-        (
-            ts
-            for ts in (
-                max_timestamp(funding),
-                max_timestamp(oi),
-                max_timestamp(taker),
-                max_timestamp(ratios),
-            )
-            if ts is not None
-        ),
-        default=None,
-    )
-    return SourceStateRow(
-        symbol, "derivatives", timestamp, state, direction, 0.55, evidence, ";".join(missing), False
-    )
-
-
-def _message_context_state(
-    config: PotentialScanConfig,
-    symbol: str,
-    source_frames: dict[tuple[str, str], pl.DataFrame],
-) -> SourceStateRow:
-    if "messages" in config.source.disabled_sources:
-        return missing_state(symbol, "context", "messages_disabled", blocked=True)
-    messages = source_frames.get(("messages", symbol), pl.DataFrame())
-    classifications = source_frames.get(("message_classifications", symbol), pl.DataFrame())
-    if messages.is_empty() and classifications.is_empty():
-        return missing_state(symbol, "context", "messages_missing")
-    rows = classifications if not classifications.is_empty() else messages
-    latest = rows.sort("timestamp").tail(1)
-    timestamp = latest.select("timestamp").item()
-    counts = (
-        value_counts(classifications, "message_type")
-        if not classifications.is_empty()
-        else "unclassified"
-    )
-    return SourceStateRow(
-        symbol,
-        "context",
-        int(timestamp) if timestamp is not None else None,
-        "context_available",
-        "neutral",
-        0.4,
-        f"messages={messages.height}; classifications={classifications.height}; types={counts}",
-        "",
-        False,
-    )
-
-
-def scan_review_decisions(
-    config: PotentialScanConfig, bundles: tuple[SymbolStateBundle, ...]
-) -> list[ScanDecision]:
-    decisions: list[ScanDecision] = []
-    for bundle in bundles:
-        transition_state = bundle.transition
-        best_pattern = best_transition_pattern(config, bundle.transition_patterns)
-        transition_supported = best_pattern is not None and transition_state.direction in {
-            "bullish",
-            "bearish",
-        }
-        consensus_supported = transition_supported and transition_consensus_passes(
-            bundle.transition_patterns, transition_state.direction
-        )
-        families = (bundle.kline, bundle.books, bundle.trades, bundle.derivatives, bundle.context)
-        missing = tuple(row.family for row in families if row.direction in {"missing", "blocked"})
-        contradictions = _contradictions(bundle)
-
-        kline_blocked = bundle.kline.direction in {"missing", "blocked"}
-        transition_missing = transition_state.direction in {"missing", "neutral"}
-        unsupported_dir = (
-            bundle.transition.direction in {"bullish", "bearish"} and not transition_supported
-        )
-        no_consensus = transition_supported and not consensus_supported
-        many_conflicts = len(contradictions) >= 2
-        context_required = config.review.require_context and bundle.context.direction == "missing"
-
-        source_families = (bundle.books, bundle.trades, bundle.derivatives, bundle.context)
-        confirming = [row for row in source_families if row.direction == transition_state.direction]
-        fully_supported = (
-            consensus_supported
-            and transition_state.direction in {"bullish", "bearish"}
-            and confirming
-        )
-
-        rules = (
-            (
-                kline_blocked,
-                _D(
-                    group="watch" if bundle.kline.direction == "missing" else "blocked",
-                    direction="undecided" if bundle.kline.direction == "missing" else "blocked",
-                    confidence="low" if bundle.kline.direction == "missing" else "blocked",
-                    reason=bundle.kline.missing_reason or "kline_state_missing",
-                ),
-            ),
-            (transition_missing, _D(reason="transition_path_missing_or_neutral")),
-            (
-                unsupported_dir,
-                _D(
-                    direction=bundle.transition.direction,
-                    reason="transition_quality_below_threshold",
-                ),
-            ),
-            (
-                no_consensus,
-                _D(
-                    direction=bundle.transition.direction,
-                    reason="transition_consensus_missing_or_contradicted",
-                ),
-            ),
-            (
-                many_conflicts,
-                _D(
-                    group="blocked",
-                    direction="blocked",
-                    confidence="blocked",
-                    reason="contradictory_source_evidence",
-                ),
-            ),
-            (
-                bool(contradictions),
-                _D(
-                    direction=transition_state.direction,
-                    reason="contradictory_source_evidence",
-                ),
-            ),
-            (
-                context_required,
-                _D(
-                    direction=transition_state.direction,
-                    reason="context_missing",
-                ),
-            ),
-            (
-                fully_supported,
-                _D(
-                    group=transition_state.direction,
-                    direction=transition_state.direction,
-                    confidence=confidence(confirming, missing),
-                    reason="",
-                ),
-            ),
-            (
-                len(missing) >= len(families),
-                _D(
-                    group="blocked",
-                    direction="blocked",
-                    confidence="blocked",
-                    reason="all_non_kline_sources_missing",
-                ),
-            ),
-            (
-                transition_state.direction in {"bullish", "bearish"},
-                _D(
-                    direction=transition_state.direction,
-                    reason="needs_source_confirmation",
-                ),
-            ),
-            (
-                True,
-                _D(
-                    direction="undecided",
-                    reason="needs_directional_confirmation",
-                ),
-            ),
-        )
-        for condition, d in rules:
-            if condition:
-                decisions.append(
-                    _decision(
-                        bundle,
-                        d.group,
-                        d.direction,
-                        d.confidence,
-                        missing,
-                        contradictions,
-                        d.reason,
-                    )
-                )
-                break
-    return decisions
-
-
-@dataclass(frozen=True)
-class _D:
-    group: str = "watch"
-    direction: str = "undecided"
-    confidence: str = "low"
-    reason: str = ""
-
-
-def confidence(confirming: list[SourceStateRow], missing: tuple[str, ...]) -> str:
-    if len(confirming) >= 2 and len(missing) <= 1:
-        return "high"
-    if confirming:
-        return "medium"
-    return "low"
-
-
-def _sum_side(frame: pl.DataFrame, side: str) -> float:
-    if frame.is_empty() or "side" not in frame.columns:
-        return 0.0
-    value_col = "notional_usd" if "notional_usd" in frame.columns else "size"
-    if value_col not in frame.columns:
-        return 0.0
-    value = frame.filter(pl.col("side") == side).get_column(value_col).drop_nulls().sum()
-    return float(value or 0.0)
-
-
-def _latest_float(frame: pl.DataFrame, column: str) -> float | None:
-    if frame.is_empty() or column not in frame.columns:
-        return None
-    return float_or_none(frame.sort("timestamp").tail(1).get_column(column)[0])
-
-
-def _tail_delta(frame: pl.DataFrame, preferred: str, fallback: str) -> float | None:
-    column = (
-        preferred if preferred in frame.columns else fallback if fallback in frame.columns else ""
-    )
-    if frame.is_empty() or not column:
-        return None
-    values = frame.sort("timestamp").tail(2).get_column(column).drop_nulls().to_list()
-    if len(values) < 2:
-        return None
-    return float_value(values[-1]) - float_value(values[0])
-
-
-def _first_float(row: pl.DataFrame, columns: tuple[str, ...]) -> float | None:
-    for column in columns:
-        if column in row.columns:
-            value = float_or_none(row.select(column).item())
-            if value is not None:
-                return value
-    return None
-
-
-def value_counts(frame: pl.DataFrame, column: str) -> str:
-    if frame.is_empty() or column not in frame.columns:
-        return "none"
-    counted = frame.group_by(column).len().sort("len", descending=True).head(3)
-    return ",".join(
-        f"{counted.select(column).row(index)[0]}={counted.select('len').row(index)[0]}"
-        for index in range(counted.height)
-    )
-
-
-def _contradictions(bundle: SymbolStateBundle) -> tuple[str, ...]:
-    thesis = (
-        bundle.transition if bundle.transition.direction in {"bullish", "bearish"} else bundle.kline
-    )
-    if thesis.direction not in {"bullish", "bearish"}:
-        return ()
-    opposite = "bearish" if thesis.direction == "bullish" else "bullish"
-    return tuple(
-        row.family
-        for row in (bundle.books, bundle.trades, bundle.derivatives, bundle.context)
-        if row.direction == opposite
-    )
-
-
-def _decision(
-    bundle: SymbolStateBundle,
-    group: str,
-    direction: str,
-    confidence_bucket: str,
-    missing: tuple[str, ...],
-    contradictions: tuple[str, ...],
-    block_reason: str,
-) -> ScanDecision:
-    review_caveat = "blocked until required research evidence is current"
-    if direction == "bullish":
-        review_caveat = "bullish evidence weakens below latest classified range support"
-    elif direction == "bearish":
-        review_caveat = "bearish evidence weakens above latest classified range resistance"
-    elif group == "watch":
-        review_caveat = "confirmation required before research follow-up"
-    return ScanDecision(
-        symbol=bundle.symbol,
-        group=group,
-        direction=direction,
-        confidence=confidence_bucket,
-        transition_evidence=bundle.transition.evidence,
-        structure_evidence=bundle.kline.evidence,
-        flow_evidence=bundle.trades.evidence,
-        liquidity_evidence=bundle.books.evidence,
-        derivatives_evidence=bundle.derivatives.evidence,
-        context_evidence=bundle.context.evidence,
-        missing_evidence=missing,
-        contradictory_evidence=contradictions,
-        block_reason=block_reason,
-        review_caveat=review_caveat,
-    )

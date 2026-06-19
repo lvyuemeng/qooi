@@ -28,7 +28,9 @@ ml = [
     "torch>=2.3",
 ]
 tailtree = [
+    "colorlog>=6.0",
     "lightgbm>=4.0",
+    "optuna>=4.0",
     "scipy>=1.11",
 ]
 
@@ -45,6 +47,12 @@ extend-safe-fixes = ["E402"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/qooi/exchange/trading.py" = ["E402"]
+"src/qooi/pipeline/plan.py" = ["E501", "E702", "E402"]
+"src/qooi/pipeline/discovery.py" = ["E501"]
+"src/qooi/transport/okx.py" = ["E701", "E702"]
+"src/qooi/scanner/__init__.py" = ["E501"]
+"src/qooi/scanner/workflow.py" = ["E501", "E701"]
+"src/qooi/products.py" = ["I001", "E702"]
 
 [tool.ruff.format]
 quote-style = "double"
