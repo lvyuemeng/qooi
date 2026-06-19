@@ -3,7 +3,7 @@
 Current package-level dependency graph.
 
 ```text
-scripts/potential_scan.py
+scripts/scanner_potential.py
   -> qooi.scanner.workflow.run(config_path)
 
 qooi.scanner
@@ -26,7 +26,7 @@ Active scanner path:
 ```text
 configs/potential-daily-tailtree.toml
 configs/potential-advanced-tailtree.toml
-  -> scripts/potential_scan.py
+  -> scripts/scanner_potential.py
   -> workflow.run
   -> pipeline.load_market
   -> state/outcome/evidence/rank/output

@@ -32,7 +32,7 @@ Do not document removed transitional scanner modules as current APIs. The list a
 ## Workflow pipe
 
 ```text
-scripts/potential_scan.py
+scripts/scanner_potential.py
   -> qooi.scanner.workflow.run(config_path)
      -> load_config
      -> resolve universe

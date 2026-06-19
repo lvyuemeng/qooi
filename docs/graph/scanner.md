@@ -5,7 +5,7 @@ Implementation-facing graph for the current scanner code.
 ## CLI
 
 ```text
-scripts/potential_scan.py
+scripts/scanner_potential.py
   -> qooi.scanner.workflow.run(config_path: Path | str) -> Path
 ```
 

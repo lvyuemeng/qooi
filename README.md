@@ -9,13 +9,13 @@ The active product is the **potential scanner**: it builds known-at-close market
 Daily fast scan:
 
 ```bash
-uv run python scripts/potential_scan.py --config configs/potential-daily-tailtree.toml
+uv run python scripts/scanner_potential.py --config configs/potential-daily-tailtree.toml
 ```
 
 Advanced Optuna/walkforward scan:
 
 ```bash
-uv run python scripts/potential_scan.py --config configs/potential-advanced-tailtree.toml
+uv run python scripts/scanner_potential.py --config configs/potential-advanced-tailtree.toml
 ```
 
 Primary outputs:
@@ -46,7 +46,7 @@ Operational defaults:
 
 ```bash
 uv sync
-uv run ruff check src tests scripts/gather_scanner_backfill.py
+uv run ruff check src tests scripts/scanner_backfill.py
 uv run ty check
 uv run pytest tests/ -q -m "not integration"
 ```

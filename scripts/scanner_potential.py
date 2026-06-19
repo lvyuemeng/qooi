@@ -7,8 +7,8 @@ from qooi.scanner.workflow import run
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Write the potential research report")
-    parser.add_argument("--config", default="configs/potential.toml")
+    parser = argparse.ArgumentParser(description="Run the potential scanner")
+    parser.add_argument("--config", default="configs/potential-daily-tailtree.toml")
     return parser.parse_args()
 
 
