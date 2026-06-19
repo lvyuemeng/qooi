@@ -1,67 +1,44 @@
-# Overview Module Graph
+# Overview Graph
+
+Current package-level dependency graph.
 
 ```text
-scripts/
-  potential_scan.py
-    -> qooi.scanner.workflow.run(config_path)
-  classifier_states.py
-    -> qooi.research.reports.run_reports(...)
-  learned_states.py
-    -> qooi.dynamic + qooi.research prepared frames
+scripts/potential_scan.py
+  -> qooi.scanner.workflow.run(config_path)
 
-qooi.exchange
-  -> market/cache/universe/trading IO
-qooi.sources
-  -> provider/source artifacts
 qooi.scanner
-  -> deterministic potential scanner reports
-qooi.profiling
-  -> injected native stage/frame profiling context
-qooi.research
-  -> deterministic research artifacts
-qooi.strategies
-  -> signal columns
-qooi.core
-  -> basket proposals, backtest/live execution, evaluation
-qooi.dynamic
-  -> isolated AI research labels and diagnostics
+  -> qooi.pipeline
+  -> qooi.transport.OkxClient
+  -> qooi.profiling
+
+qooi.pipeline
+  -> qooi.transport client methods supplied by caller
+
+qooi.transport
+  -> external provider APIs
+
+qooi.strategies / qooi.core / qooi.dynamic
+  -> separate boundaries; scanner output does not authorize them
 ```
 
-Default active path:
+Active scanner path:
 
 ```text
-configs/potential*.toml
+configs/potential-daily-tailtree.toml
+configs/potential-advanced-tailtree.toml
   -> scripts/potential_scan.py
-  -> qooi.scanner.workflow.run()
-  -> docs/report-style Markdown + CSV diagnostics
+  -> workflow.run
+  -> pipeline.load_market
+  -> state/outcome/evidence/rank/output
+  -> data/output/potential/<run>/report.md
 ```
 
-Composable config graph:
+Docs by implementation family:
 
 ```text
-PotentialConfig.refresh_mode
-  -> scanner.workflow.load_bars
-  -> exchange.store.HistoryRefreshRequest
-  -> scanner.workflow.source_context_request
-  -> sources.context.SourceContextRequest
-  -> sources.collect.SourceCollectRequest
-
-PotentialConfig.source
-  -> sources provider limits, staleness, disabled demand
-
-PotentialConfig.evidence.kind
-  -> scanner.diagnostics evidence dispatch
-
-PotentialConfig.evidence.tailtree.lifecycle
-  -> scanner.tailrun train/load_predict lifecycle
-
-PotentialConfig.profile
-  -> qooi.profiling.ProfileConfig
-  -> qooi.profiling.ProfileContext injected into workflow/module calls
-```
-
-No compatibility graph:
-
-```text
-removed aliases/wrappers -> update callers -> delete old names
+docs/graph/pipeline.md
+docs/graph/transport.md
+docs/graph/scanner.md
+docs/graph/tailtree.md
+docs/graph/profiling.md
 ```

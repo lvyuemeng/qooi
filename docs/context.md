@@ -18,6 +18,7 @@ Use `uv` for environment and command management:
 uv sync
 uv run ruff check src tests scripts
 uv run pytest
+uv run ty check
 ```
 
 Use narrower checks when iterating, but finish code changes with the relevant lint and tests. Missing data, shallow data, stale data, and unavailable optional dependencies must be explicit in diagnostics or test output.
