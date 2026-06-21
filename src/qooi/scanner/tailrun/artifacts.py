@@ -34,11 +34,13 @@ class TailtreeArtifactContext:
     @classmethod
     def from_inputs(cls, inputs: ReportInputs) -> TailtreeArtifactContext:
         tailtree = inputs.config.evidence.tailtree
+        bars = inputs.config.bars
+        bar = bars.timeframes[0] if bars is not None and bars.timeframes else "1H"
         first_profile = tailtree.profiles[0]
         return cls(
             root=Path(tailtree.model_dir) / first_profile.model_tag,
             diagnostics_dir=inputs.artifacts.diagnostics_dir,
-            bar=inputs.config.bar,
+            bar=bar,
             threshold_pct=tailtree.threshold_pct,
             model_tag=first_profile.model_tag,
             horizons=tailtree.outcome_horizon,
@@ -92,6 +94,20 @@ def write_tailtree_selection_efficiency(
     model_dir.mkdir(parents=True, exist_ok=True)
     frame.write_csv(output_dir / "tailtree-selection-efficiency.csv")
     frame.write_csv(model_dir / "tailtree-selection-efficiency.csv")
+
+
+def write_tailtree_action_surface(output_dir: Path, frame: pl.DataFrame) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-action-surface.csv")
+
+
+def write_tailtree_label_distribution(output_dir: Path, frame: pl.DataFrame) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-label-distribution.csv")
 
 
 def _tailtree_artifact_metadata(

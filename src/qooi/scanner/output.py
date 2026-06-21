@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import log1p
 from typing import Literal
 
 import polars as pl
@@ -56,6 +57,7 @@ class ScannerRunFrames:
     tailtree: pl.DataFrame
     ranked: pl.DataFrame
     horizon_consistency: pl.DataFrame
+    action_surface: pl.DataFrame
     prediction_freshness: pl.DataFrame
     decisions: list[ReviewDecision]
 
@@ -114,19 +116,23 @@ def review_decisions(
     tailtree_selection = (
         config.evidence.tailtree.selection if config.evidence.kind == "tailtree" else None
     )
-    rows = ranked.to_dicts()
-    best_direction_by_symbol: dict[str, str] = {}
-    best_score_by_symbol: dict[str, float] = {}
+    raw_rows = ranked.to_dicts()
+    conflict_symbols = _material_conflict_symbols(raw_rows, tailtree_selection)
+    best_row_by_symbol: dict[str, dict[str, object]] = {}
+    best_quality_by_symbol: dict[str, float] = {}
     directions_by_symbol: dict[str, set[str]] = {}
-    for row in rows:
+    for row in raw_rows:
         symbol = str(row.get("symbol", "?"))
         direction = str(row.get("direction") or "")
-        score = float(row.get("rank_score") or 0.0)
         if direction:
             directions_by_symbol.setdefault(symbol, set()).add(direction)
-        if symbol not in best_score_by_symbol or score > best_score_by_symbol[symbol]:
-            best_score_by_symbol[symbol] = score
-            best_direction_by_symbol[symbol] = direction
+        quality = _side_quality_score(row)
+        if symbol not in best_quality_by_symbol or quality > best_quality_by_symbol[symbol]:
+            best_quality_by_symbol[symbol] = quality
+            best_row_by_symbol[symbol] = row
+
+    rows = list(best_row_by_symbol.values())
+    rows.sort(key=lambda row: float(row.get("rank_score") or 0.0), reverse=True)
 
     promote_limit = len(rows)
     if tailtree_selection is not None and tailtree_selection.top_k:
@@ -137,13 +143,13 @@ def review_decisions(
     for row in rows:
         symbol = str(row.get("symbol", "?"))
         direction = str(row.get("direction") or "")
-        score = float(row.get("rank_score") or 0.0)
-        support = float(row.get("support_count") or 0.0)
-        tail_lift = float(row.get("tail_lift") or 0.0)
-        utility = float(row.get("utility_proxy") or 0.0)
+        score = _float_value(row.get("rank_score"))
+        support = _float_value(row.get("support_count"))
+        tail_lift = _float_value(row.get("tail_lift"))
+        utility = _float_value(row.get("utility_proxy"))
         source_freshness = str(row.get("source_freshness") or "")
-        missing_sources = int(row.get("required_missing_source_count") or 0)
-        stale_sources = int(row.get("required_stale_source_count") or 0)
+        missing_sources = _int_value(row.get("required_missing_source_count"))
+        stale_sources = _int_value(row.get("required_stale_source_count"))
         horizon = _int_or_none(row.get("outcome_horizon"))
         fresh_status, age_hours = freshness_by_symbol.get(symbol, ("", None))
         comparable_surface = "branch" in row and "support_count" in row
@@ -192,11 +198,15 @@ def review_decisions(
                     )
                 )
                 continue
-        if len(
-            directions_by_symbol.get(symbol, set())
-        ) > 1 and direction != best_direction_by_symbol.get(symbol):
+        dropped_directions = sorted(directions_by_symbol.get(symbol, set()) - {direction})
+        if symbol in conflict_symbols:
+            directions = " vs ".join(sorted(directions_by_symbol.get(symbol, set())))
             results.append(
-                _with_decision(decision, "watch", f"conflicting weaker {direction} direction")
+                _with_decision(
+                    decision,
+                    "watch",
+                    f"direction conflict: {directions}; abstain from promotion",
+                )
             )
             continue
         if promoted >= promote_limit:
@@ -207,8 +217,53 @@ def review_decisions(
         action: Literal["promote", "watch", "skip"] = "promote" if score > 0.0 else "watch"
         if action == "promote":
             promoted += 1
-        results.append(_with_decision(decision, action, _action_reason(decision)))
+        reason = _action_reason(decision)
+        if dropped_directions:
+            reason = f"{reason}; resolved opposite direction: {', '.join(dropped_directions)}"
+        results.append(_with_decision(decision, action, reason))
     return results if results else [ReviewDecision("*", "skip", "no candidates")]
+
+
+def _material_conflict_symbols(rows: list[dict[str, object]], selection: object | None) -> set[str]:
+    min_support = 0.0
+    min_tail_lift = 1.0
+    if selection is not None:
+        min_support = float(getattr(selection, "min_selected_observation_count", 0.0))
+        min_tail_lift = float(getattr(selection, "min_valid_tail_lift", 1.0))
+    material: dict[str, set[str]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol", "?"))
+        direction = str(row.get("direction") or "")
+        if not direction:
+            continue
+        if _float_value(row.get("rank_score")) <= 0.0:
+            continue
+        if _float_value(row.get("support_count")) < min_support:
+            continue
+        if _float_value(row.get("tail_lift")) < min_tail_lift:
+            continue
+        material.setdefault(symbol, set()).add(direction)
+    return {symbol for symbol, directions in material.items() if len(directions) > 1}
+
+
+def _side_quality_score(row: dict[str, object]) -> float:
+    """Promotion-side tie breaker for same-symbol opposite-direction rows."""
+    tail_lift = _float_value(row.get("tail_lift"))
+    support = _float_value(row.get("support_count"))
+    utility = _float_value(row.get("utility_proxy"))
+    return tail_lift + log1p(max(support, 0.0)) + utility
+
+
+def _float_value(value: object) -> float:
+    if isinstance(value, int | float | str):
+        return float(value)
+    return 0.0
+
+
+def _int_value(value: object) -> int:
+    if isinstance(value, int | float | str):
+        return int(value)
+    return 0
 
 
 def _status_counts(plan: CoveragePlan | None) -> dict[str, int]:
@@ -402,6 +457,82 @@ def _watch_reasons(decisions: list[ReviewDecision]) -> list[str]:
     ]
 
 
+def _tailtree_action_surface_lines(frame: pl.DataFrame) -> list[str]:
+    if frame.is_empty():
+        return [f"{BULLET} no tailtree action surface"]
+    action_rows = frame.group_by("actionability").agg(pl.len().alias("rows")).sort("actionability")
+    side_rows = (
+        frame.group_by("action_side", "actionability")
+        .agg(pl.len().alias("rows"))
+        .sort("action_side", "actionability")
+    )
+    blocker_rows = (
+        frame.filter(pl.col("blocker_reason") != "")
+        .group_by("action_side", "blocker_reason")
+        .agg(pl.len().alias("rows"))
+        .sort("action_side", "blocker_reason")
+    )
+    state_rows = (
+        frame.group_by("action_side", "best_path_state")
+        .agg(pl.len().alias("rows"))
+        .sort("action_side", "best_path_state")
+    )
+    total = max(frame.height, 1)
+    lines = [f"{BULLET} action surface rows={frame.height:_}"]
+    for row in action_rows.to_dicts():
+        rows = int(row["rows"])
+        lines.append(
+            f"{BULLET} actionability {row['actionability']}: rows={rows:_} rate={rows / total:.3f}"
+        )
+    lines.append("Side/action split:")
+    for row in side_rows.to_dicts():
+        lines.append(
+            f"{BULLET} {row['action_side']} {row['actionability']}: rows={int(row['rows']):_}"
+        )
+    if not blocker_rows.is_empty():
+        lines.append("Blockers:")
+        for row in blocker_rows.to_dicts():
+            lines.append(
+                f"{BULLET} {row['action_side']} {row['blocker_reason']}: rows={int(row['rows']):_}"
+            )
+    lines.append("Path-state profile:")
+    for row in state_rows.to_dicts():
+        lines.append(
+            f"{BULLET} {row['action_side']} {row['best_path_state']}: rows={int(row['rows']):_}"
+        )
+    return lines
+
+
+def _tailtree_promotion_gate_lines(frame: pl.DataFrame) -> list[str]:
+    if frame.is_empty():
+        return [f"{BULLET} promotion gates: no action surface"]
+    rows: list[str] = []
+    for side in ("up", "down"):
+        side_frame = frame.filter(pl.col("action_side") == side)
+        trade_count = side_frame.filter(pl.col("actionability") == "trade_candidate").height
+        mean_side_margin = (
+            float(side_frame.select(pl.col("calibrated_side_margin").mean()).item())
+            if not side_frame.is_empty() and "calibrated_side_margin" in side_frame.columns
+            else 0.0
+        )
+        false_count = (
+            int(side_frame.select(pl.col("false_direction_int").fill_null(0).sum()).item())
+            if not side_frame.is_empty() and "false_direction_int" in side_frame.columns
+            else 0
+        )
+        false_rate = false_count / side_frame.height if not side_frame.is_empty() else 0.0
+        promoted = trade_count > 0 and mean_side_margin > 0.0 and false_rate < 0.20
+        status = "candidate annotation" if promoted else "market-state only"
+        if side == "down" and not promoted:
+            status = "market-state only; do not promote short"
+        rows.append(
+            f"{BULLET} {side}: {status} | trade_candidates={trade_count:_} "
+            f"mean_calibrated_side_margin={mean_side_margin:.3f} "
+            f"false_direction_rate={false_rate:.3f}"
+        )
+    return rows
+
+
 def render_report(frames: ScannerRunFrames, config: PotentialConfig) -> str:
     lines = ["# Scanner Report", f"Generated from: {config.output}\n"]
 
@@ -491,6 +622,14 @@ def render_report(frames: ScannerRunFrames, config: PotentialConfig) -> str:
     lines.append(
         "Risk note: scanner output is research evidence only; it is not live-trading authorization."
     )
+    lines.append("")
+
+    lines.append(SEP)
+    lines.append("## Tailtree Action Surface")
+    lines.append(SEP)
+    lines.extend(_tailtree_action_surface_lines(frames.action_surface))
+    lines.append("Promotion gates:")
+    lines.extend(_tailtree_promotion_gate_lines(frames.action_surface))
     lines.append("")
 
     lines.append(SEP)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, Self, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
@@ -24,7 +24,7 @@ class BaseHttpClient:
         self.proxy = proxy
         self._client: httpx.AsyncClient | None = None
 
-    async def __aenter__(self) -> BaseHttpClient:
+    async def __aenter__(self) -> Self:
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self.timeout,

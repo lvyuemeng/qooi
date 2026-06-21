@@ -159,10 +159,6 @@ def leaf_evidence_frame(
     )
 
 
-def _score_bucket_name(score_quantile: float) -> str:
-    return f"top_{int(round((1.0 - score_quantile) * 100))}pct"
-
-
 def score_bucket_evidence_frame(
     tree: TailTreeModel,
     observations: pl.DataFrame,
@@ -239,7 +235,7 @@ def score_bucket_evidence_frame(
         utility_p90 = float(utilities.quantile(0.9) or 0.0) if not utilities.is_empty() else 0.0
         rows.append(
             {
-                "score_bucket": _score_bucket_name(quantile),
+                "score_bucket": f"top_{int(round((1.0 - quantile) * 100))}pct",
                 "score_quantile": float(quantile),
                 "score_min": threshold,
                 "score_max": score_max,

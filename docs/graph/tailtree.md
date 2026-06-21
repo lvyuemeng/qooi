@@ -78,19 +78,25 @@ TailtreeRunOutput
 
 ```text
 outcome.potential_outcome_frame(...)
-  -> tailtree.model.label_tail_exceedances(...)
+  -> tailtree.model.label_tail_paths(...)
   -> tailtree.model.tailtree_training_frame(...)
   -> TailTreeModel.train(...)
 ```
 
-Tail labels:
+Tail path labels:
 
 ```text
-up:   forward_max_return_pct >= threshold_pct
-down: forward_min_return_pct <= -threshold_pct
+tail_touch_up      = forward_max_return_pct > threshold_pct
+tail_touch_down    = forward_min_return_pct < -threshold_pct
+tail_touch_both    = both touches inside the same horizon
+first_touch_side   = up | down | tie | none from time_to_max/min
+path_state         = none | clean_up | clean_down | up_first_both | down_first_both | chop_both | late_up | late_down
+path_actionability = tradable_up | tradable_down | reversal_watch | gray_zone | no_action
 ```
 
-Training population is tail rows. Validation/evidence population is outcome-known rows for the split/fold.
+Current `tail_up`, `tail_down`, `tail_any`, `tail_both`, and `tail_state` remain compatibility excursion columns for existing training/evidence paths. The semantic center is `path_state` + `path_actionability`.
+
+Training population is tail/path rows. Validation/evidence population is outcome-known rows for the split/fold.
 
 ## Evidence graph
 
@@ -149,6 +155,7 @@ Feedback artifacts:
 ```text
 tailtree-profile-runs.csv
 tailtree-selection-efficiency.csv
+tailtree-action-surface.csv
 models/tailtree-selection-efficiency.csv
 ```
 
@@ -159,6 +166,34 @@ profile/stages.csv
 profile/frames.csv
 profile/summary.md
 ```
+
+## Selection/action surface grain
+
+`tailtree-action-surface.csv` row grain:
+
+```text
+profile/trial/fold × symbol × decision_bar_close_ms × action_side × entry_horizon × score_bucket
+```
+
+Core columns:
+
+```text
+action_side
+entry_horizon
+max_valid_horizon
+actionability
+path_state_profile
+best_path_state
+best_utility_margin
+clean_horizon_count
+chop_horizon_count
+reversal_horizon_count
+contradicting_horizon_count
+calibrated_side_margin
+blocker_reason
+```
+
+This is the canonical semantic candidate/action surface. It absorbs selected-behavior and horizon-panel diagnostics instead of adding peer artifacts.
 
 ## Selection-efficiency grain
 
@@ -195,8 +230,9 @@ This artifact is the scanner's canonical opportunity-selection feedback surface.
 ## Public tailtree/tailrun calls
 
 ```text
-qooi.scanner.tailtree.model.label_tail_exceedances
+qooi.scanner.tailtree.model.label_tail_paths
 qooi.scanner.tailtree.model.tailtree_training_frame
+qooi.scanner.tailtree.model.tailtree_target_training_values
 qooi.scanner.tailtree.model.TailTreeModel
 qooi.scanner.tailtree.evidence.leaf_evidence_frame
 qooi.scanner.tailtree.evidence.score_bucket_evidence_frame
@@ -204,5 +240,7 @@ qooi.scanner.tailrun.core.run_tailtree
 qooi.scanner.tailrun.core.load_predict
 qooi.scanner.tailrun.core.run_frame_split
 qooi.scanner.tailrun.artifacts.write_tailtree_profile_runs
+qooi.scanner.tailrun.artifacts.write_tailtree_action_surface
 qooi.scanner.tailrun.artifacts.write_tailtree_selection_efficiency
+qooi.scanner.tailrun.selection.tailtree_action_surface_frame
 ```

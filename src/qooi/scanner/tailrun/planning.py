@@ -1,10 +1,9 @@
-"""Tailtree runtime planning: profile runs, folds, frame splits, selection context."""
+"""Tailtree runtime planning: profile runs, folds, frame splits."""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import polars as pl
@@ -13,17 +12,14 @@ from qooi.scanner.config import (
     PotentialConfig,
     TailtreeConfig,
     TailtreeFixedTrainingConfig,
+    TailtreeObjective,
     TailtreeOptunaTrainingConfig,
     TailtreeProfileConfig,
 )
-from qooi.scanner.tailrun.selection import (
-    TailtreeSelectionBudgets,
-    TailtreeSelectionContext,
-    TailtreeSelectionFeasibilityPolicy,
-    TailtreeSelectionPolicy,
-)
 from qooi.scanner.tailrun.types import (
+    TailtreeDirection,
     TailtreeFrameSplit,
+    TailtreeObjectiveJob,
     TailtreeSingleSplitFold,
     TailtreeTimeWindow,
     TailtreeWalkforwardFold,
@@ -38,8 +34,18 @@ class TailtreeProfileRun:
     run_id: str
     run_source: Literal["fixed", "optuna"]
     model_tag: str
-    objective: str
+    objective: TailtreeObjective
     training: TailtreeTrialParams
+
+    @property
+    def trial_id(self) -> str:
+        return self.run_id.rsplit("-t", 1)[0] if self.run_source == "optuna" else self.run_id
+
+    def for_fold(self, fold_id: int) -> TailtreeProfileRun:
+        if fold_id == 0:
+            return self
+        suffix = f"-f{fold_id:02d}"
+        return replace(self, run_id=f"{self.run_id}{suffix}", model_tag=f"{self.model_tag}{suffix}")
 
 
 @dataclass(frozen=True)
@@ -67,44 +73,6 @@ class TailtreeWalkforwardSpec:
     protocol: Literal["walkforward"] = "walkforward"
 
 
-@dataclass(frozen=True)
-class TailtreeExecutionContext:
-    run: TailtreeProfileRun
-    fold: TailtreeSingleSplitFold | TailtreeWalkforwardFold
-    tailtree: TailtreeConfig
-    selection: TailtreeSelectionPolicy
-    universe_snapshot_id: str
-
-    def selection_context(self) -> TailtreeSelectionContext:
-        if isinstance(self.fold, TailtreeSingleSplitFold):
-            return TailtreeSelectionContext.from_strings(
-                trial_id=self.run.run_id,
-                trial_source=self.run.run_source,
-                fold_id=self.fold.fold_id,
-                evaluation_protocol=self.fold.protocol,
-                embargo_bars=self.fold.embargo_bars,
-                universe_snapshot_id=self.universe_snapshot_id,
-                model_tag=self.run.model_tag,
-                objective=self.run.objective,
-                training_profile=self.run.profile_id,
-            )
-        return TailtreeSelectionContext.from_strings(
-            trial_id=self.run.run_id,
-            trial_source=self.run.run_source,
-            fold_id=self.fold.fold_id,
-            evaluation_protocol=self.fold.protocol,
-            train_start_ms=self.fold.train_window.start_ms,
-            train_end_ms=self.fold.train_window.end_ms,
-            valid_start_ms=self.fold.valid_window.start_ms,
-            valid_end_ms=self.fold.valid_window.end_ms,
-            embargo_bars=self.fold.embargo_bars,
-            universe_snapshot_id=self.universe_snapshot_id,
-            model_tag=self.run.model_tag,
-            objective=self.run.objective,
-            training_profile=self.run.profile_id,
-        )
-
-
 def _bar_ms(bar: str) -> int:
     match = re.fullmatch(r"(\d+)([mhdMHD])", bar.strip())
     if not match:
@@ -124,24 +92,6 @@ def _time_filter(frame: pl.DataFrame, window: TailtreeTimeWindow) -> pl.DataFram
     return frame.filter(
         (pl.col("decision_bar_close_ms") >= window.start_ms)
         & (pl.col("decision_bar_close_ms") < window.end_ms)
-    )
-
-
-def tailtree_selection_policy(tailtree: TailtreeConfig) -> TailtreeSelectionPolicy:
-    selection = tailtree.selection
-    return TailtreeSelectionPolicy(
-        budgets=TailtreeSelectionBudgets(
-            top_k=selection.top_k,
-            top_pct=selection.top_pct,
-            score_gate=selection.score_gate,
-        ),
-        feasibility=TailtreeSelectionFeasibilityPolicy(
-            min_selected_observation_count=selection.min_selected_observation_count,
-            min_selected_symbol_count=selection.min_selected_symbol_count,
-            min_selected_tail_count=selection.min_selected_tail_count,
-            min_valid_tail_lift=selection.min_valid_tail_lift,
-            min_profit_proxy_per_selected_obs=selection.min_profit_proxy_per_selected_obs,
-        ),
     )
 
 
@@ -198,13 +148,37 @@ def tailtree_optuna_profiles(config: PotentialConfig) -> tuple[TailtreeProfileCo
     )
 
 
+def tailtree_objective_jobs(
+    run: TailtreeProfileRun,
+    *,
+    fold_id: int,
+    tailtree: TailtreeConfig,
+) -> tuple[TailtreeObjectiveJob, ...]:
+    jobs: list[TailtreeObjectiveJob] = []
+    for outcome_horizon in tailtree.outcome_horizon:
+        for direction in ("up", "down"):
+            horizon = int(outcome_horizon)
+            direction_value: TailtreeDirection = direction
+            jobs.append(
+                TailtreeObjectiveJob(
+                    run=run,
+                    fold_id=int(fold_id),
+                    outcome_horizon=horizon,
+                    direction=direction_value,
+                    model_path=tailtree.model_dir / f"{run.model_tag}_{horizon}_{direction}.json",
+                    label=f"{run.run_id}.h{horizon}.{direction}",
+                )
+            )
+    return tuple(jobs)
+
+
 def tailtree_fold_specs(
     evaluation: TailtreeSingleSplitSpec | TailtreeWalkforwardSpec,
     *,
     observations: pl.DataFrame,
     bar: str,
 ) -> tuple[TailtreeSingleSplitFold | TailtreeWalkforwardFold, ...]:
-    if evaluation.protocol == "single_split":
+    if isinstance(evaluation, TailtreeSingleSplitSpec):
         return (
             TailtreeSingleSplitFold(
                 fold_id=0,
@@ -216,9 +190,12 @@ def tailtree_fold_specs(
         raise ValueError(
             "tailtree walkforward requires non-empty decision_bar_close_ms observations"
         )
-    timestamps = observations.get_column("decision_bar_close_ms")
-    start = int(timestamps.min())
-    end = int(timestamps.max())
+    start_value = observations.select(pl.col("decision_bar_close_ms").cast(pl.Int64).min()).item()
+    end_value = observations.select(pl.col("decision_bar_close_ms").cast(pl.Int64).max()).item()
+    if start_value is None or end_value is None:
+        raise ValueError("tailtree walkforward requires non-null decision_bar_close_ms")
+    start = int(start_value)
+    end = int(end_value)
     train_ms = int(evaluation.train_days) * _MS_PER_DAY
     valid_ms = int(evaluation.valid_days) * _MS_PER_DAY
     step_ms = int(evaluation.step_days) * _MS_PER_DAY
@@ -253,46 +230,6 @@ def tailtree_fold_specs(
             embargo_bars=fold.embargo_bars,
         )
         for index, fold in enumerate(newest)
-    )
-
-
-def tailtree_execution_contexts(
-    config: PotentialConfig,
-    *,
-    observations: pl.DataFrame,
-    universe_snapshot_id: str,
-) -> tuple[TailtreeExecutionContext, ...]:
-    if config.bars is None:
-        return ()
-    bar = config.bars.timeframes[0]
-    fold = TailtreeSingleSplitFold(fold_id=0, validation_fraction=0.0, embargo_bars=0)
-    return tuple(
-        tailtree_execution_context(
-            run, fold, tailtree=config.evidence.tailtree, universe_snapshot_id=universe_snapshot_id
-        )
-        for run in tailtree_profile_runs(config)
-        if not observations.is_empty() or bar
-    )
-
-
-def tailtree_execution_context(
-    run: TailtreeProfileRun,
-    fold: TailtreeSingleSplitFold | TailtreeWalkforwardFold,
-    *,
-    tailtree: TailtreeConfig,
-    universe_snapshot_id: str,
-) -> TailtreeExecutionContext:
-    context_tailtree = tailtree
-    if isinstance(fold, TailtreeWalkforwardFold):
-        context_tailtree = tailtree.model_copy(
-            update={"model_dir": Path(tailtree.model_dir) / run.run_id / f"fold-{fold.fold_id:02d}"}
-        )
-    return TailtreeExecutionContext(
-        run=run,
-        fold=fold,
-        tailtree=context_tailtree,
-        selection=tailtree_selection_policy(tailtree),
-        universe_snapshot_id=universe_snapshot_id,
     )
 
 

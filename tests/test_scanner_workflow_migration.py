@@ -108,6 +108,40 @@ def test_review_skips_zero_support_candidates() -> None:
     assert decisions[0].reason == "no matching evidence"
 
 
+def test_review_abstains_on_material_direction_conflict() -> None:
+    config = PotentialConfig(max_staleness_hours=24)
+    ranked = pl.DataFrame(
+        {
+            "symbol": ["RE-USDT-SWAP", "RE-USDT-SWAP"],
+            "branch": ["tailtree", "tailtree"],
+            "direction": ["down", "up"],
+            "outcome_horizon": [24, 24],
+            "rank_score": [53.9, 42.7],
+            "support_count": [4378.0, 2189.0],
+            "tail_lift": [44.2, 33.2],
+            "utility_proxy": [3.1, 30.0],
+            "source_freshness": ["fresh", "fresh"],
+            "required_missing_source_count": [0, 0],
+            "required_stale_source_count": [0, 0],
+        }
+    )
+    freshness = pl.DataFrame(
+        {
+            "symbol": ["RE-USDT-SWAP"],
+            "prediction_age_hours": [1.0],
+            "prediction_freshness": ["fresh"],
+        }
+    )
+
+    decisions = review_decisions(ranked, freshness, {}, config)
+
+    assert len(decisions) == 1
+    assert decisions[0].symbol == "RE-USDT-SWAP"
+    assert decisions[0].direction == "up"
+    assert decisions[0].action == "watch"
+    assert decisions[0].reason == "direction conflict: down vs up; abstain from promotion"
+
+
 def test_potential_config_has_nested_tailtree_only() -> None:
     config = PotentialConfig()
 

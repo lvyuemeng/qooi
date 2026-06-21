@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 import polars as pl
 
@@ -15,6 +15,9 @@ from qooi.scanner import (
     TransitionAnalysis,
     TransitionPattern,
 )
+
+if TYPE_CHECKING:
+    from qooi.scanner.tailrun.planning import TailtreeProfileRun
 
 
 @dataclass(frozen=True)
@@ -82,15 +85,24 @@ class ReportInputs:
     decisions: tuple[ScanDecision, ...]
 
 
+TailtreeDirection = Literal["up", "down"]
+
+
 class TailtreeModelMetadata(Protocol):
-    categorical_features: list[str]
-    continuous_features: list[str]
+    @property
+    def direction(self) -> TailtreeDirection: ...
+    @property
+    def categorical_features(self) -> list[str]: ...
+    @property
+    def continuous_features(self) -> list[str]: ...
 
 
 class TailtreeArtifactTree(Protocol):
-    metadata: TailtreeModelMetadata
+    @property
+    def metadata(self) -> TailtreeModelMetadata: ...
 
     def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame: ...
+    def predict_score(self, features: pl.DataFrame) -> pl.DataFrame: ...
     def to_json(self, path: Path) -> None: ...
 
 
@@ -153,9 +165,6 @@ TAILTREE_RUN_SUMMARY_SCHEMA = {
 }
 
 
-TailtreeDirection = Literal["up", "down"]
-
-
 @dataclass(frozen=True)
 class TailtreeTimeWindow:
     start_ms: int
@@ -194,18 +203,6 @@ def _rate(numerator: int, denominator: int) -> float:
 
 
 @dataclass(frozen=True)
-class TailtreeResult:
-    """Tailtree path pipeline result. Every field has a concrete type."""
-
-    evidence: pl.DataFrame
-    candidates: pl.DataFrame
-    ranked: pl.DataFrame
-    selection_efficiency: pl.DataFrame
-    models: dict[tuple[int, TailtreeDirection], TailtreeArtifactTree]
-    sections: tuple
-
-
-@dataclass(frozen=True)
 class TailtreeEvidenceResult:
     """Tailtree evidence/model build result before candidate matching."""
 
@@ -233,6 +230,24 @@ class TailtreePreparedFrames:
     continuous_features: list[str]
     score_observations: pl.DataFrame | None = None
     score_labeled_outcomes: pl.DataFrame | None = None
+
+
+@dataclass(frozen=True)
+class TailtreeObjectiveJob:
+    run: TailtreeProfileRun
+    fold_id: int
+    outcome_horizon: int
+    direction: TailtreeDirection
+    model_path: Path
+    label: str
+
+
+@dataclass(frozen=True)
+class TailtreeJobResult:
+    job: TailtreeObjectiveJob
+    evidence: pl.DataFrame
+    scored_candidates: pl.DataFrame
+    model: TailtreeArtifactTree | None
 
 
 @dataclass(frozen=True)
@@ -300,6 +315,8 @@ class TailtreeRunOutput:
     models: dict[tuple[int, TailtreeDirection], TailtreeArtifactTree]
     profile_runs: tuple[TailtreeProfileFeedback, ...]
     selection_efficiency: pl.DataFrame
+    label_distribution: pl.DataFrame
+    action_surface: pl.DataFrame
 
 
 @dataclass(frozen=True)
@@ -368,8 +385,14 @@ class TailtreeDirectionQuality:
         utility_col = f"tail_utility_{direction}"
         if not selected.is_empty() and utility_col in selected.columns:
             utilities = selected.filter(pl.col(tail_col).fill_null(False)).get_column(utility_col)
-            utility_mean = float(utilities.mean() or 0.0) if not utilities.is_empty() else 0.0
-            utility_p90 = float(utilities.quantile(0.9) or 0.0) if not utilities.is_empty() else 0.0
+            value = utilities.to_frame().select(pl.col(utility_col).cast(pl.Float64).mean()).item()
+            utility_mean = float(value) if value is not None else 0.0
+            p90 = (
+                utilities.to_frame()
+                .select(pl.col(utility_col).cast(pl.Float64).quantile(0.9))
+                .item()
+            )
+            utility_p90 = float(p90) if p90 is not None else 0.0
         else:
             utility_mean = 0.0
             utility_p90 = 0.0

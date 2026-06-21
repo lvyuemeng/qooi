@@ -46,7 +46,13 @@ class RubikConfig(BaseModel):
 
 EvidenceKind = Literal["ladder", "tailtree"]
 TailtreeLifecycle = Literal["train", "load_predict"]
-TailtreeObjective = Literal["tail_severity_gpd", "tail_utility_quantile"]
+TailtreeObjective = Literal[
+    "tail_severity_gpd",
+    "tail_utility_quantile",
+    "tail_event_lift",
+    "tail_any_event",
+    "tail_side_only",
+]
 TailtreeTrainingKind = Literal["fixed", "optuna"]
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import tomllib
 from pathlib import Path
-from typing import cast
 
 import polars as pl
 
@@ -17,7 +16,6 @@ from qooi.pipeline.load import (
     MarketLoadPolicy,
     MarketLoadRequest,
     SourceLoadRequest,
-    SourceName,
     SourceProductLoadRequest,
     load_market,
 )
@@ -25,6 +23,8 @@ from qooi.profiling import ProfileContext
 from qooi.scanner.config import PotentialConfig
 from qooi.scanner.output import MarketReadiness, ScannerRunFrames, render_report, review_decisions
 from qooi.scanner.tailrun.artifacts import (
+    write_tailtree_action_surface,
+    write_tailtree_label_distribution,
     write_tailtree_profile_runs,
     write_tailtree_selection_efficiency,
 )
@@ -50,6 +50,18 @@ def scanner_market_request(config: PotentialConfig, symbols: tuple[str, ...]) ->
         ("books", config.books),
         ("trades", config.trades),
         ("funding", config.funding),
+    ):
+        if product_config is not None:
+            products.append(
+                SourceProductLoadRequest(
+                    name,
+                    product_config.limit,
+                    "1H",
+                    "2",
+                    product_config.max_staleness_hours,
+                )
+            )
+    for name, product_config in (
         ("open_interest", config.open_interest),
         ("taker_volume", config.taker_volume),
         ("long_short_ratios", config.long_short),
@@ -57,10 +69,10 @@ def scanner_market_request(config: PotentialConfig, symbols: tuple[str, ...]) ->
         if product_config is not None:
             products.append(
                 SourceProductLoadRequest(
-                    cast(SourceName, name),
+                    name,
                     product_config.limit,
-                    getattr(product_config, "period", "1H"),
-                    getattr(product_config, "unit", "2"),
+                    product_config.period,
+                    product_config.unit,
                     product_config.max_staleness_hours,
                 )
             )
@@ -192,6 +204,8 @@ async def _run(config_path: Path | str) -> Path:
         models: dict[tuple[int, TailtreeDirection], TailtreeArtifactTree] = {}
         trial_feedback: tuple[TailtreeProfileFeedback, ...] = ()
         selection_efficiency = pl.DataFrame()
+        label_distribution = pl.DataFrame()
+        action_surface = pl.DataFrame()
 
         from qooi.scanner.rank import (
             candidate_metric_surface,
@@ -236,6 +250,8 @@ async def _run(config_path: Path | str) -> Path:
                 models = tailtree_result.models
                 trial_feedback = tailtree_result.profile_runs
                 selection_efficiency = tailtree_result.selection_efficiency
+                label_distribution = tailtree_result.label_distribution
+                action_surface = tailtree_result.action_surface
                 if models and not tailtree_evidence.is_empty():
                     tailtree_branch_candidates = tailtree_candidates(
                         observations, tailtree_evidence, models, latest_only=True
@@ -250,6 +266,8 @@ async def _run(config_path: Path | str) -> Path:
             ranked = rank_candidates(candidate_surface)
             profile.frame("scanner", "workflow", "ranked", ranked)
             write_tailtree_profile_runs(config.output.parent, trial_feedback)
+            write_tailtree_label_distribution(config.output.parent, label_distribution)
+            write_tailtree_action_surface(config.output.parent, action_surface)
             write_tailtree_selection_efficiency(
                 config.output.parent,
                 config.evidence.tailtree.model_dir,
@@ -273,6 +291,7 @@ async def _run(config_path: Path | str) -> Path:
                 tailtree=tailtree_evidence,
                 ranked=ranked,
                 horizon_consistency=consistency,
+                action_surface=action_surface,
                 prediction_freshness=prediction_freshness,
                 decisions=decisions,
             )

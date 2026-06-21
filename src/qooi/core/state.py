@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -85,7 +86,7 @@ class EvaluatedBasketState:
 
 
 class StateProvider(Protocol):
-    def load(self, pairs: list[PairConfig], strategy_id: str = "default") -> list[Basket]:
+    def load(self, pairs: Sequence[PairConfig], strategy_id: str = "default") -> list[Basket]:
         """Load basket state for a pipeline run."""
 
     def save_soft(self, baskets: list[Basket]) -> None:
@@ -137,7 +138,7 @@ class BacktestStateProvider:
     def __init__(self, baskets: list[Basket] | None = None):
         self.baskets = baskets if baskets is not None else []
 
-    def load(self, pairs: list[PairConfig], strategy_id: str = "default") -> list[Basket]:
+    def load(self, pairs: Sequence[PairConfig], strategy_id: str = "default") -> list[Basket]:
         return self.baskets
 
     def save_soft(self, baskets: list[Basket]) -> None:
@@ -151,7 +152,7 @@ class OkxStateProvider:
         self._tc = trading_client
         self._soft_store = soft_store
 
-    def load(self, pairs: list[PairConfig], strategy_id: str = "default") -> list[Basket]:
+    def load(self, pairs: Sequence[PairConfig], strategy_id: str = "default") -> list[Basket]:
         positions = self._fetch_positions()
         sources: dict[str, BasketStateSource] = {}
 

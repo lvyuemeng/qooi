@@ -1,0 +1,112 @@
+[potential]
+output = "data/output/potential/paired-replay-test/report.md"
+universe = "research"
+max_symbols = 80
+max_staleness_hours = 24
+fetch_concurrency = 8
+
+[potential.bars]
+timeframes = ["1H", "4H", "1D"]
+days = 180
+refresh_mode = "incremental"
+latest_staleness_hours = 2
+
+[potential.books]
+limit = 25
+max_staleness_hours = 1
+
+[potential.trades]
+limit = 100
+max_staleness_hours = 1
+
+[potential.funding]
+limit = 100
+max_staleness_hours = 8
+
+[potential.open_interest]
+period = "1H"
+limit = 100
+unit = "2"
+max_staleness_hours = 2
+
+[potential.taker_volume]
+period = "1H"
+limit = 100
+unit = "2"
+max_staleness_hours = 2
+
+[potential.long_short]
+period = "1H"
+limit = 100
+unit = "2"
+max_staleness_hours = 2
+
+[potential.transition]
+scan_budget = 80
+history_days = 180
+context_scope = "all_scanned"
+context_limit = 80
+ngram_length = 4
+horizon = 24
+mae_mfe_horizon = 24
+min_count = 24
+recent_window = 720
+long_window = 4320
+return_threshold_pct = 0.0
+min_probability = 0.05
+min_directional_probability = 0.55
+min_probability_delta = -0.1
+min_reward_risk = 1.0
+max_tail_loss_pct = 20.0
+min_information_bits = 0.001
+
+[potential.profile]
+mode = "hotpath"
+top_n = 80
+
+[potential.evidence]
+kind = "tailtree"
+
+[potential.evidence.tailtree]
+lifecycle = "train"
+model_dir = "data/output/potential/paired-replay-test/models"
+threshold_pct = 30.0
+outcome_horizon = [24, 48]
+
+[potential.evidence.tailtree.selection]
+top_k = [1, 3, 5, 10, 20]
+top_pct = [0.01, 0.03, 0.05, 0.10]
+score_gate = []
+min_selected_observation_count = 500
+min_selected_symbol_count = 1
+min_selected_tail_count = 20
+min_valid_tail_lift = 3.0
+min_profit_proxy_per_selected_obs = 0.0
+
+[[potential.evidence.tailtree.profiles]]
+profile_id = "paired-replay-diagnostic-test"
+model_tag = "tailtree-event-lift-paired-replay-test"
+objective = "tail_event_lift"
+
+[potential.evidence.tailtree.profiles.training]
+kind = "optuna"
+max_trials = 1
+seed = 43
+num_leaves = 40
+min_data_in_leaf = 447
+learning_rate = 0.04
+num_iterations = 460
+early_stopping_rounds = 30
+num_leaves_range = [16, 96]
+min_data_in_leaf_range = [120, 500]
+learning_rate_range = [0.02, 0.08]
+num_iterations_range = [180, 320]
+early_stopping_rounds_range = [15, 35]
+
+[potential.evidence.tailtree.profiles.evaluation]
+protocol = "walkforward"
+train_days = 90
+valid_days = 21
+step_days = 21
+max_folds = 1
+embargo_bars = 24

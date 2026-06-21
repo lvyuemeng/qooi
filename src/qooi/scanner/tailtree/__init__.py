@@ -16,7 +16,8 @@ from qooi.scanner.tailtree.model import (
     _gpd_xi_objective,
     _leaf_id_vector,
     _tailtree_outcome_by_decision,
-    label_tail_exceedances,
+    label_tail_paths,
+    tailtree_target_training_values,
     tailtree_training_frame,
 )
 
@@ -30,7 +31,8 @@ __all__ = [
     "_gpd_xi_objective",
     "_leaf_id_vector",
     "_tailtree_outcome_by_decision",
-    "label_tail_exceedances",
+    "label_tail_paths",
+    "tailtree_target_training_values",
     "tailtree_training_frame",
     "leaf_context_frame",
     "leaf_evidence_frame",

@@ -150,6 +150,7 @@ Current artifacts:
 report.md
 tailtree-profile-runs.csv
 tailtree-selection-efficiency.csv
+tailtree-action-surface.csv
 models/*.json
 models/tailtree-selection-efficiency.csv
 profile/stages.csv

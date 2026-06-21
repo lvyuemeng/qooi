@@ -23,8 +23,8 @@ src/qooi/scanner/
 ├── rank.py         # candidate matching, comparable surface, ranking
 ├── output.py       # market readiness, review decisions, markdown report
 ├── transitions.py  # transition-pattern analysis
-├── tailtree/       # LightGBM/GPD model and evidence products
-└── tailrun/        # tailtree lifecycle, profiles, Optuna, artifacts, typed run records
+├── tailtree/       # labels, LightGBM/GPD model, prediction/evidence products
+└── tailrun/        # tailtree lifecycle, profiles, Optuna, selection metrics, artifacts
 ```
 
 Do not document removed transitional scanner modules as current APIs. The list above is the current source-of-truth layout.
@@ -144,12 +144,36 @@ TailtreeRunOutput(
 )
 ```
 
+Tailtree internal ownership:
+
+```text
+tailtree/model.py     -> label_tail_paths, label distribution, target/training values, TailTreeModel
+tailtree/evidence.py  -> leaf/score-bucket evidence frames
+tailrun/planning.py   -> profile runs, trial params, fold specs, objective jobs
+tailrun/core.py       -> train/load/score lifecycle and profile artifact frames
+tailrun/selection.py  -> score-bucket candidates, paired replay, selection/HPO metrics
+tailrun/types.py      -> cross-module run/result dataclasses only
+```
+
+Tailtree label vocabulary uses fixed-horizon path semantics:
+
+```text
+tail_touch_up/down   # threshold touch facts
+first_touch_side     # up/down/tie/none from time_to_max/min
+path_state           # none/clean_up/clean_down/up_first_both/down_first_both/chop_both/late_up/late_down
+path_actionability   # tradable_up/tradable_down/reversal_watch/gray_zone/no_action
+```
+
+Current `tail_up`, `tail_down`, `tail_any`, `tail_both`, and `tail_state` remain compatibility excursion columns during migration, but final scanner suggestions should use `path_state` and actionability, not raw up/down touch flags.
+
 Artifacts:
 
 ```text
 report.md
 tailtree-profile-runs.csv
+tailtree-label-distribution.csv
 tailtree-selection-efficiency.csv
+tailtree-action-surface.csv
 models/*.json
 profile/*.csv
 ```

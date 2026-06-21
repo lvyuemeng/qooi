@@ -70,7 +70,7 @@ kind = "tailtree"
 [potential.evidence.tailtree]
 lifecycle = "train"
 model_dir = "data/output/potential/daily-tailtree/models"
-threshold_pct = 8.0
+threshold_pct = 30.0
 outcome_horizon = [24]
 
 [potential.evidence.tailtree.selection]
@@ -86,7 +86,7 @@ min_profit_proxy_per_selected_obs = 0.0
 [[potential.evidence.tailtree.profiles]]
 profile_id = "quantile-daily-h24"
 model_tag = "tailtree-daily-h24-quantile"
-objective = "tail_utility_quantile"
+objective = "tail_event_lift"
 
 [potential.evidence.tailtree.profiles.training]
 kind = "fixed"

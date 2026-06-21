@@ -137,7 +137,7 @@ def classifier_health(frame: pl.DataFrame, *, label: str = "") -> ClassifierHeal
     text = f"{label}\n" if label else ""
     text += format_table(
         ["Health check", "Status", "Reason"],
-        [[row["health_check"], row["status"], row["reason"]] for row in rows],
+        [[str(row["health_check"]), str(row["status"]), str(row["reason"])] for row in rows],
     )
     return ClassifierHealthResult(out, text)
 
@@ -437,9 +437,9 @@ def extract_continuous_features(
     """Extract continuous features from OHLCV and source frames.
 
     Returns one frame with columns: symbol, timestamp,
-    atr_percentile, range_width_atr, imbalance_value, buy_sell_ratio,
-    oi_delta, funding_rate, taker_buy_sell_ratio, return_1bar, return_4bar,
-    return_24bar, vol_anomaly, spread_bps, close_to_range_high_ratio.
+    atr_percentile, range_width_atr, source pressure/freshness values,
+    and normalized bar/source features such as bar_return_24h_pct,
+    bar_return_24h_per_vol_7d, funding_rate_bps, and oi_change_pct.
     Source event/snapshot rows are aligned as known-at-close values by symbol
     with backward as-of joins; raw source timestamps are not overwritten.
     """
@@ -494,23 +494,47 @@ def _kline_continuous_features(
         if "range_width_atr" in state.columns:
             range_width = state.select("timestamp", pl.col("range_width_atr")).sort("timestamp")
 
-        # Returns
-        work = work.with_columns(
-            ((pl.col("close") - pl.col("close").shift(1)) / pl.col("close").shift(1) * 100.0).alias(
-                "return_1bar"
-            ),
-            ((pl.col("close") - pl.col("close").shift(4)) / pl.col("close").shift(4) * 100.0).alias(
-                "return_4bar"
-            ),
-            (
-                (pl.col("close") - pl.col("close").shift(24)) / pl.col("close").shift(24) * 100.0
-            ).alias("return_24bar"),
+        # Returns. Keep raw returns, then add volatility-scaled aliases for
+        # cross-symbol comparability.
+        work = (
+            work.with_columns(
+                (
+                    (pl.col("close") - pl.col("close").shift(1)) / pl.col("close").shift(1) * 100.0
+                ).alias("bar_return_1h_pct"),
+                (
+                    (pl.col("close") - pl.col("close").shift(4)) / pl.col("close").shift(4) * 100.0
+                ).alias("bar_return_4h_pct"),
+                (
+                    (pl.col("close") - pl.col("close").shift(24))
+                    / pl.col("close").shift(24)
+                    * 100.0
+                ).alias("bar_return_24h_pct"),
+            )
+            .with_columns(
+                pl.col("bar_return_1h_pct")
+                .rolling_std(168, min_samples=24)
+                .alias("bar_return_vol_7d")
+            )
+            .with_columns(
+                (
+                    pl.col("bar_return_4h_pct")
+                    / pl.when(pl.col("bar_return_vol_7d") > 0.0)
+                    .then(pl.col("bar_return_vol_7d"))
+                    .otherwise(None)
+                ).alias("bar_return_4h_per_vol_7d"),
+                (
+                    pl.col("bar_return_24h_pct")
+                    / pl.when(pl.col("bar_return_vol_7d") > 0.0)
+                    .then(pl.col("bar_return_vol_7d"))
+                    .otherwise(None)
+                ).alias("bar_return_24h_per_vol_7d"),
+            )
         )
 
         # Volume anomaly
         work = work.with_columns(
             (pl.col("volume") / pl.col("volume").rolling_mean(20, min_samples=5)).alias(
-                "vol_anomaly"
+                "bar_volume_1h_to_ma_20h"
             ),
         )
 
@@ -522,17 +546,19 @@ def _kline_continuous_features(
             (
                 (pl.col("close") - pl.col("range_low_48"))
                 / (pl.col("range_high_48") - pl.col("range_low_48"))
-            ).alias("close_to_range_high_ratio"),
+            ).alias("bar_close_position_48h"),
         )
 
         cols = [
             "symbol",
             "timestamp",
-            "return_1bar",
-            "return_4bar",
-            "return_24bar",
-            "vol_anomaly",
-            "close_to_range_high_ratio",
+            "bar_return_1h_pct",
+            "bar_return_4h_pct",
+            "bar_return_24h_pct",
+            "bar_return_4h_per_vol_7d",
+            "bar_return_24h_per_vol_7d",
+            "bar_volume_1h_to_ma_20h",
+            "bar_close_position_48h",
         ]
         out = work.select(pl.lit(symbol).alias("symbol"), *cols[1:])
 
@@ -553,11 +579,13 @@ def _kline_continuous_features(
             schema={
                 "symbol": pl.String,
                 "timestamp": pl.Int64,
-                "return_1bar": pl.Float64,
-                "return_4bar": pl.Float64,
-                "return_24bar": pl.Float64,
-                "vol_anomaly": pl.Float64,
-                "close_to_range_high_ratio": pl.Float64,
+                "bar_return_1h_pct": pl.Float64,
+                "bar_return_4h_pct": pl.Float64,
+                "bar_return_24h_pct": pl.Float64,
+                "bar_return_4h_per_vol_7d": pl.Float64,
+                "bar_return_24h_per_vol_7d": pl.Float64,
+                "bar_volume_1h_to_ma_20h": pl.Float64,
+                "bar_close_position_48h": pl.Float64,
                 "atr_percentile": pl.Float64,
                 "range_width_atr": pl.Float64,
             }
@@ -753,7 +781,10 @@ def _funding_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame
     if "funding_rate" in frame.columns:
         return work.join(
             frame.select(
-                "symbol", "timestamp", pl.col("funding_rate").cast(pl.Float64).alias("funding_rate")
+                "symbol",
+                "timestamp",
+                pl.col("funding_rate").cast(pl.Float64).alias("funding_rate_raw"),
+                (pl.col("funding_rate").cast(pl.Float64) * 10000.0).alias("funding_rate_bps"),
             ),
             on=["symbol", "timestamp"],
             how="left",
@@ -769,11 +800,19 @@ def _oi_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
     oi = frame.select(
         "symbol", "timestamp", pl.col(value_col).cast(pl.Float64).alias("oi_value")
     ).sort(["symbol", "timestamp"])
+    previous_oi = pl.col("oi_value").shift(1).over("symbol")
     oi = oi.with_columns(
-        (pl.col("oi_value") - pl.col("oi_value").shift(1).over("symbol")).alias("oi_delta")
+        (pl.col("oi_value") - previous_oi).alias("oi_change_raw"),
+        (
+            (pl.col("oi_value") - previous_oi)
+            / pl.when(previous_oi > 0.0).then(previous_oi).otherwise(None)
+            * 100.0
+        ).alias("oi_change_pct"),
     )
     return work.join(
-        oi.select("symbol", "timestamp", "oi_delta"), on=["symbol", "timestamp"], how="left"
+        oi.select("symbol", "timestamp", "oi_change_raw", "oi_change_pct"),
+        on=["symbol", "timestamp"],
+        how="left",
     )
 
 
@@ -792,10 +831,16 @@ def _taker_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
             / pl.when(pl.col("taker_sell_volume") > 0)
             .then(pl.col("taker_sell_volume"))
             .otherwise(None)
-        ).alias("taker_buy_sell_ratio")
+        ).alias("taker_buy_sell_ratio_raw"),
+        (
+            (pl.col("taker_buy_volume") - pl.col("taker_sell_volume"))
+            / pl.when((pl.col("taker_buy_volume") + pl.col("taker_sell_volume")) > 0.0)
+            .then(pl.col("taker_buy_volume") + pl.col("taker_sell_volume"))
+            .otherwise(None)
+        ).alias("taker_buy_pressure"),
     )
     return work.join(
-        taker.select("symbol", "timestamp", "taker_buy_sell_ratio"),
+        taker.select("symbol", "timestamp", "taker_buy_sell_ratio_raw", "taker_buy_pressure"),
         on=["symbol", "timestamp"],
         how="left",
     )
@@ -813,7 +858,10 @@ def _lsr_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
     if ratio_col:
         return work.join(
             frame.select(
-                "symbol", "timestamp", pl.col(ratio_col).cast(pl.Float64).alias("long_short_ratio")
+                "symbol",
+                "timestamp",
+                pl.col(ratio_col).cast(pl.Float64).alias("lsr_ratio_raw"),
+                pl.col(ratio_col).cast(pl.Float64).log().alias("lsr_log_ratio"),
             ),
             on=["symbol", "timestamp"],
             how="left",

@@ -6,27 +6,14 @@ All imports are lazy; import this module directly only when evidence="tailtree".
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal
 
 import numpy as np
 import polars as pl
 from pydantic import BaseModel, Field
-
-
-class LightGbmBooster(Protocol):
-    def predict(self, data: np.ndarray, *, pred_leaf: bool = False) -> np.ndarray: ...
-    def feature_importance(self, *, importance_type: str) -> np.ndarray: ...
-    def model_to_string(self) -> str: ...
-    def num_trees(self) -> int: ...
-
-
-class LightGbmDataset(Protocol):
-    def get_label(self) -> np.ndarray: ...
-
 
 # ── pydantic models ──────────────────────────────────────────────────────────
 
@@ -34,7 +21,13 @@ class LightGbmDataset(Protocol):
 class TrainConfig(BaseModel):
     """Training hyperparameters. Validated on construction."""
 
-    objective: Literal["tail_severity_gpd", "tail_utility_quantile"] = "tail_severity_gpd"
+    objective: Literal[
+        "tail_severity_gpd",
+        "tail_utility_quantile",
+        "tail_event_lift",
+        "tail_any_event",
+        "tail_side_only",
+    ] = "tail_severity_gpd"
     num_leaves: int = Field(default=64, ge=8, le=256)
     min_data_in_leaf: int = Field(default=30, ge=10, le=500)
     learning_rate: float = Field(default=0.05, gt=0, le=1.0)
@@ -66,6 +59,13 @@ class TreeMetadata(BaseModel):
     train_timestamp: str
     train_n_observations: int
     train_n_exceedances: int
+
+
+class TailTreePayload(BaseModel):
+    """JSON artifact payload for one serialized tailtree model."""
+
+    lightgbm_model: str
+    metadata: TreeMetadata
 
 
 @dataclass(frozen=True)
@@ -162,13 +162,25 @@ class TailTreeModel:
                 f"utility_values length {len(utility_values)} != features length {len(features)}"
             )
 
-        # 1. Global GPD fit over tail exceedance severity.
-        xi_global, _, sigma_global = scipy.stats.genpareto.fit(exceedance_values, floc=0)
+        is_binary_objective = config.objective in {
+            "tail_event_lift",
+            "tail_any_event",
+            "tail_side_only",
+        }
+        event_count = (
+            int(np.sum(exceedance_values > 0.0))
+            if is_binary_objective
+            else len(exceedance_values)
+        )
+
+        # 1. Global tail baseline. Event-lift uses binary labels, not a severity GPD.
+        if is_binary_objective:
+            xi_global, sigma_global = 0.0, 1.0
+        else:
+            xi_global, _, sigma_global = scipy.stats.genpareto.fit(exceedance_values, floc=0)
         train_n_observations = train_n_observations or len(features)
         global_tail_rate = (
-            global_tail_rate
-            if global_tail_rate is not None
-            else len(exceedance_values) / len(features)
+            global_tail_rate if global_tail_rate is not None else event_count / len(features)
         )
         global_baseline = GPDParams(
             xi=float(np.clip(xi_global, -0.2, 0.6)),
@@ -194,11 +206,12 @@ class TailTreeModel:
 
         n_valid = max(1, int(len(x) * config.validation_fraction))
         x_train, x_valid = x[:-n_valid], x[-n_valid:]
-        target_values = (
-            np.log1p(np.maximum(utility_values, 0.0))
-            if config.objective == "tail_utility_quantile"
-            else exceedance_values
-        )
+        if is_binary_objective:
+            target_values = (exceedance_values > 0.0).astype(float)
+        elif config.objective == "tail_utility_quantile":
+            target_values = np.log1p(np.maximum(utility_values, 0.0))
+        else:
+            target_values = exceedance_values
         y_train, y_valid = target_values[:-n_valid], target_values[-n_valid:]
 
         train_data = lgb.Dataset(
@@ -216,8 +229,12 @@ class TailTreeModel:
         # 3. Train LightGBM
         is_gpd_objective = config.objective == "tail_severity_gpd"
         params = {
-            "objective": _gpd_xi_objective if is_gpd_objective else "quantile",
-            "metric": "None" if is_gpd_objective else "quantile",
+            "objective": "binary"
+            if is_binary_objective
+            else (_gpd_xi_objective if is_gpd_objective else "quantile"),
+            "metric": "binary_logloss"
+            if is_binary_objective
+            else ("None" if is_gpd_objective else "quantile"),
             "alpha": 0.8,
             "num_leaves": config.num_leaves,
             "min_data_in_leaf": config.min_data_in_leaf,
@@ -246,7 +263,9 @@ class TailTreeModel:
         for lid in np.unique(leaf_ids):
             mask = leaf_ids == lid
             leaf_y = y_train[mask]
-            if len(leaf_y) >= 10:
+            if is_binary_objective:
+                xi_l, sigma_l = 0.0, 1.0
+            elif len(leaf_y) >= 10:
                 xi_l, _, sigma_l = scipy.stats.genpareto.fit(leaf_y, floc=0)
             else:
                 xi_l, sigma_l = xi_global, sigma_global
@@ -280,43 +299,43 @@ class TailTreeModel:
                 train_config=config,
                 train_timestamp=datetime.now(UTC).isoformat(),
                 train_n_observations=train_n_observations,
-                train_n_exceedances=len(exceedance_values),
+                train_n_exceedances=event_count,
             ),
         )
 
     # ── prediction ───────────────────────────────────────────────────────────
 
     @property
-    def _booster(self) -> LightGbmBooster:
+    def _booster(self) -> Any:
         """Reconstruct lightgbm Booster from stored model string."""
         import lightgbm as lgb
 
         return lgb.Booster(model_str=self.booster)
 
-    def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame:
-        """Assign each row to a leaf. Returns features + 'leaf_id' (Int32)."""
+    def _feature_matrix(self, features: pl.DataFrame) -> np.ndarray:
         all_cols = self.metadata.categorical_features + self.metadata.continuous_features
         present = [c for c in all_cols if c in features.columns]
         x = features.select(present).to_numpy()
         for col in self.metadata.categorical_features:
             if col in features.columns and features[col].dtype == pl.String:
                 codes = features.get_column(col).cast(pl.Categorical).to_physical().to_numpy()
-                idx = present.index(col)
-                x[:, idx] = codes.astype(np.float64)
-        leaf_ids = _leaf_id_vector(self._booster.predict(x, pred_leaf=True))
+                x[:, present.index(col)] = codes.astype(np.float64)
+        return x
+
+    def predict_leaf(self, features: pl.DataFrame) -> pl.DataFrame:
+        """Assign each row to a leaf. Returns features + 'leaf_id' (Int32)."""
+        leaf_ids = _leaf_id_vector(
+            self._booster.predict(self._feature_matrix(features), pred_leaf=True)
+        )
         return features.with_columns(pl.Series("leaf_id", leaf_ids))
 
     def predict_score(self, features: pl.DataFrame) -> pl.DataFrame:
         """Score each row with the full boosted model ensemble."""
-        all_cols = self.metadata.categorical_features + self.metadata.continuous_features
-        present = [c for c in all_cols if c in features.columns]
-        x = features.select(present).to_numpy()
-        for col in self.metadata.categorical_features:
-            if col in features.columns and features[col].dtype == pl.String:
-                codes = features.get_column(col).cast(pl.Categorical).to_physical().to_numpy()
-                idx = present.index(col)
-                x[:, idx] = codes.astype(np.float64)
-        scores = np.asarray(self._booster.predict(x)).astype(float).ravel()
+        scores = (
+            np.asarray(self._booster.predict(self._feature_matrix(features)))
+            .astype(float)
+            .ravel()
+        )
         return features.with_columns(pl.Series("tailtree_score", scores))
 
     def predict_leaf_params(self, features: pl.DataFrame) -> pl.DataFrame:
@@ -341,20 +360,14 @@ class TailTreeModel:
 
     def to_json(self, path: str | Path) -> None:
         """Serialize booster + metadata as one JSON file."""
-        data = {
-            "lightgbm_model": self.booster,
-            "metadata": self.metadata.model_dump(mode="json"),
-        }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+        payload = TailTreePayload(lightgbm_model=self.booster, metadata=self.metadata)
+        Path(path).write_text(payload.model_dump_json(indent=2), encoding="utf-8")
 
     @classmethod
     def from_json(cls, path: str | Path) -> TailTreeModel:
         """Load from JSON. pydantic validates metadata on construction."""
-        with open(path) as f:
-            data = json.load(f)
-        metadata = TreeMetadata.model_validate(data["metadata"])
-        return TailTreeModel(booster=data["lightgbm_model"], metadata=metadata)
+        payload = TailTreePayload.model_validate_json(Path(path).read_text(encoding="utf-8"))
+        return TailTreeModel(booster=payload.lightgbm_model, metadata=payload.metadata)
 
 
 # ── LightGBM custom objective ────────────────────────────────────────────────
@@ -362,7 +375,7 @@ class TailTreeModel:
 
 def _gpd_xi_objective(
     preds: np.ndarray,
-    train_data: LightGbmDataset,
+    train_data: Any,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Custom LightGBM objective: GPD NLL gradient w.r.t. xi.
 
@@ -397,7 +410,7 @@ def _gpd_xi_objective(
 
 def _gpd_nll_eval(
     preds: np.ndarray,
-    train_data: LightGbmDataset,
+    train_data: Any,
 ) -> tuple[str, float, bool]:
     """LightGBM eval metric for early stopping."""
     y = train_data.get_label()
@@ -418,12 +431,16 @@ def _gpd_nll_eval(
 # ── evidence functions ───────────────────────────────────────────────────────
 
 
-def label_tail_exceedances(
+def label_tail_paths(
     outcome_frame: pl.DataFrame,
     *,
     threshold_pct: float = 5.0,
+    utility_floor: float = 0.0,
+    margin_floor: float = 0.0,
+    path_efficiency_floor: float = 0.0,
+    late_bar_ratio: float | None = None,
 ) -> pl.DataFrame:
-    """Label tail exceedances in the outcome frame."""
+    """Label fixed-horizon path behavior and side utility."""
     has_max = "forward_max_return_pct" in outcome_frame.columns
     has_min = "forward_min_return_pct" in outcome_frame.columns
 
@@ -511,7 +528,154 @@ def label_tail_exceedances(
     if not exprs:
         return outcome_frame
 
-    return outcome_frame.with_columns(exprs)
+    labeled = outcome_frame.with_columns(exprs)
+    if "tail_up" not in labeled.columns or "tail_down" not in labeled.columns:
+        return labeled
+
+    up = pl.col("tail_up").fill_null(False).cast(pl.Boolean)
+    down = pl.col("tail_down").fill_null(False).cast(pl.Boolean)
+    up_utility = pl.col("tail_utility_up").fill_null(0.0).cast(pl.Float64)
+    down_utility = pl.col("tail_utility_down").fill_null(0.0).cast(pl.Float64)
+    up_margin = up_utility - down_utility
+    down_margin = down_utility - up_utility
+    if "time_to_max_bar" in labeled.columns:
+        time_to_max = pl.col("time_to_max_bar").cast(pl.Float64).fill_null(0.0)
+    else:
+        time_to_max = pl.lit(0.0)
+    if "time_to_min_bar" in labeled.columns:
+        time_to_min = pl.col("time_to_min_bar").cast(pl.Float64).fill_null(0.0)
+    else:
+        time_to_min = pl.lit(0.0)
+    if "path_efficiency" in labeled.columns:
+        efficient_path = (
+            pl.col("path_efficiency").cast(pl.Float64).fill_null(0.0) >= path_efficiency_floor
+        )
+    else:
+        efficient_path = pl.lit(True)
+    horizon = (
+        pl.col("outcome_horizon").cast(pl.Float64).fill_null(0.0)
+        if "outcome_horizon" in labeled.columns
+        else pl.lit(0.0)
+    )
+    late_limit = pl.lit(None) if late_bar_ratio is None else horizon * float(late_bar_ratio)
+    late_up = up & ~down & late_limit.is_not_null() & (time_to_max > late_limit)
+    late_down = down & ~up & late_limit.is_not_null() & (time_to_min > late_limit)
+    first_up = up & (~down | (time_to_max < time_to_min))
+    first_down = down & (~up | (time_to_min < time_to_max))
+    first_touch = (
+        pl.when(first_up)
+        .then(pl.lit("up"))
+        .when(first_down)
+        .then(pl.lit("down"))
+        .when(up & down)
+        .then(pl.lit("tie"))
+        .otherwise(pl.lit("none"))
+    )
+    clean_up = up & ~down & efficient_path & (up_utility >= utility_floor)
+    clean_down = down & ~up & efficient_path & (down_utility >= utility_floor)
+    weak_both = up & down & (
+        ~efficient_path | ((up_margin.abs() < margin_floor) & (down_margin.abs() < margin_floor))
+    )
+    path_state = (
+        pl.when(late_up)
+        .then(pl.lit("late_up"))
+        .when(late_down)
+        .then(pl.lit("late_down"))
+        .when(clean_up)
+        .then(pl.lit("clean_up"))
+        .when(clean_down)
+        .then(pl.lit("clean_down"))
+        .when(weak_both)
+        .then(pl.lit("chop_both"))
+        .when(up & down & first_up)
+        .then(pl.lit("up_first_both"))
+        .when(up & down & first_down)
+        .then(pl.lit("down_first_both"))
+        .otherwise(pl.lit("none"))
+    )
+    path_actionability = (
+        pl.when(clean_up & (up_margin >= margin_floor))
+        .then(pl.lit("tradable_up"))
+        .when(clean_down & (down_margin >= margin_floor))
+        .then(pl.lit("tradable_down"))
+        .when(up & down)
+        .then(pl.lit("reversal_watch"))
+        .when(up | down)
+        .then(pl.lit("gray_zone"))
+        .otherwise(pl.lit("no_action"))
+    )
+    return labeled.with_columns(
+        up.alias("tail_any_up"),
+        down.alias("tail_any_down"),
+        up.alias("tail_touch_up"),
+        down.alias("tail_touch_down"),
+        (up | down).alias("tail_any"),
+        (up | down).alias("tail_touch_any"),
+        (up & down).alias("tail_both"),
+        (up & down).alias("tail_touch_both"),
+        pl.when(up & down)
+        .then(pl.lit("both"))
+        .when(up)
+        .then(pl.lit("up"))
+        .when(down)
+        .then(pl.lit("down"))
+        .otherwise(pl.lit("none"))
+        .alias("tail_state"),
+        first_touch.alias("first_touch_side"),
+        path_state.alias("path_state"),
+        path_actionability.alias("path_actionability"),
+        pl.when(path_actionability == "no_action")
+        .then(pl.lit("no_tail_touch"))
+        .when(path_actionability == "gray_zone")
+        .then(pl.lit("weak_path_utility"))
+        .when(path_actionability == "reversal_watch")
+        .then(pl.lit("both_or_mixed_path"))
+        .otherwise(pl.lit(""))
+        .alias("path_blocker"),
+        up_utility.alias("path_utility_up"),
+        down_utility.alias("path_utility_down"),
+        up_margin.alias("tail_utility_margin_up"),
+        down_margin.alias("tail_utility_margin_down"),
+        up_margin.alias("path_utility_margin_up"),
+        down_margin.alias("path_utility_margin_down"),
+    )
+
+
+def tailtree_label_distribution_frame(labeled_outcomes: pl.DataFrame) -> pl.DataFrame:
+    """Summarize orthogonal tail-state prevalence by horizon."""
+    if labeled_outcomes.is_empty() or "tail_state" not in labeled_outcomes.columns:
+        return pl.DataFrame()
+    total_by_horizon = labeled_outcomes.group_by("outcome_horizon").agg(
+        pl.len().alias("horizon_row_count")
+    )
+    return (
+        labeled_outcomes.group_by("outcome_horizon", "tail_state")
+        .agg(
+            pl.len().alias("row_count"),
+            pl.col("tail_up").fill_null(False).sum().alias("tail_up_count"),
+            pl.col("tail_down").fill_null(False).sum().alias("tail_down_count"),
+            pl.col("tail_any").fill_null(False).sum().alias("tail_any_count"),
+            pl.col("tail_both").fill_null(False).sum().alias("tail_both_count"),
+            (pl.col("tail_state") == "up").sum().alias("tail_state_up_count"),
+            (pl.col("tail_state") == "down").sum().alias("tail_state_down_count"),
+            pl.col("tail_utility_up")
+            .fill_null(0.0)
+            .mean()
+            .alias("tail_utility_up_mean"),
+            pl.col("tail_utility_down")
+            .fill_null(0.0)
+            .mean()
+            .alias("tail_utility_down_mean"),
+            pl.col("tail_utility_margin_up")
+            .fill_null(0.0)
+            .mean()
+            .alias("tail_utility_margin_up_mean"),
+        )
+        .join(total_by_horizon, on="outcome_horizon", how="left")
+        .with_columns((pl.col("row_count") / pl.col("horizon_row_count")).alias("class_rate"))
+        .drop("horizon_row_count")
+        .sort("outcome_horizon", "tail_state")
+    )
 
 
 def tailtree_training_frame(
@@ -594,6 +758,65 @@ def tailtree_training_frame(
         utility_values=utility_values,
         global_tail_rate=global_tail_rate,
     )
+
+
+TailtreeBinaryTarget = Literal["tail_event_lift", "tail_any_event", "tail_side_only"]
+
+
+def tailtree_target_training_values(
+    observations: pl.DataFrame,
+    labeled_outcomes: pl.DataFrame,
+    *,
+    target: TailtreeBinaryTarget,
+    direction: Literal["up", "down"],
+) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
+    """Build target-specific binary labels through one training surface."""
+    if observations.is_empty() or labeled_outcomes.is_empty():
+        return observations.head(0), np.array([], dtype=float), np.array([], dtype=float)
+
+    if target == "tail_event_lift":
+        label_col = f"tail_{direction}"
+        utility_col = f"tail_utility_{direction}"
+        if label_col not in labeled_outcomes.columns:
+            return observations.head(0), np.array([], dtype=float), np.array([], dtype=float)
+        utility_expr = (
+            pl.col(utility_col).fill_null(0.0).cast(pl.Float64).max().alias(utility_col)
+            if utility_col in labeled_outcomes.columns
+            else pl.lit(0.0).alias(utility_col)
+        )
+        outcome = labeled_outcomes.group_by("symbol", "decision_bar_close_ms").agg(
+            pl.col(label_col).fill_null(False).cast(pl.Boolean).max().alias(label_col),
+            utility_expr,
+        )
+    elif target == "tail_any_event":
+        label_col = "tail_any"
+        utility_col = "tail_utility_any"
+        if label_col not in labeled_outcomes.columns:
+            return observations.head(0), np.array([], dtype=float), np.array([], dtype=float)
+        outcome = labeled_outcomes.group_by("symbol", "decision_bar_close_ms").agg(
+            pl.col(label_col).fill_null(False).cast(pl.Boolean).max().alias(label_col),
+            pl.max_horizontal(
+                pl.col("tail_utility_up").fill_null(0.0),
+                pl.col("tail_utility_down").fill_null(0.0),
+            ).max().alias(utility_col),
+        )
+    else:
+        label_col = f"tail_side_only_{direction}"
+        utility_col = f"tail_utility_margin_{direction}"
+        state_col = "path_state" if "path_state" in labeled_outcomes.columns else "tail_state"
+        if state_col not in labeled_outcomes.columns or utility_col not in labeled_outcomes.columns:
+            return observations.head(0), np.array([], dtype=float), np.array([], dtype=float)
+        outcome = labeled_outcomes.group_by("symbol", "decision_bar_close_ms").agg(
+            pl.col(state_col).is_in([direction, f"clean_{direction}"]).max().alias(label_col),
+            pl.col(utility_col).fill_null(0.0).clip(0.0, None).max().alias(utility_col),
+        )
+
+    joined = observations.join(outcome, on=["symbol", "decision_bar_close_ms"], how="inner").sort(
+        "decision_bar_close_ms"
+    )
+    labels = joined.get_column(label_col).fill_null(False).cast(pl.Int8).to_numpy().astype(float)
+    utilities = joined.get_column(utility_col).fill_null(0.0).to_numpy().astype(float)
+    return joined.drop(label_col, utility_col), labels, utilities
 
 
 def _tailtree_outcome_by_decision(outcomes: pl.DataFrame) -> pl.DataFrame:
