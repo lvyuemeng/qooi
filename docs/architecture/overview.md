@@ -45,8 +45,51 @@ config -> load market data -> state -> outcome -> tailtree evidence -> rank -> r
 Current preferred scanner profiles:
 
 ```text
-configs/potential-daily-tailtree.toml      # fast fixed h24 daily scan
-configs/potential-advanced-tailtree.toml   # h24 Optuna + walkforward research scan
+configs/potential-tailtree-train.toml     # train + score h24 Optuna/walkforward current frontier
+configs/potential-tailtree-predict.toml   # load existing model JSONs by model_id and score/report
 ```
 
-Empirical scanner reports live under `docs/report/`. Architecture docs should not duplicate run results.
+## Current tailtree example
+
+The current advanced tailtree choice is:
+
+```text
+known-at-close observation/source state
+  -> h24 tail_event_lift stage-1 LightGBM evidence
+  -> candidate-local promoter model
+  -> opposite-direction guard model
+  -> weak/no-tail path guard model
+  -> candidate_dual_guard final selection-efficiency/frontier rows
+```
+
+Parameter/objective choice:
+
+```text
+horizon: h24
+model target: tail_event_lift
+validation: walkforward
+search: Optuna
+source input: 17 persistent funding/LSR/OI/taker state, transition, run-length, and divergence columns
+final objective surface: candidate_dual_guard
+```
+
+Reason:
+
+```text
+tail_event_lift keeps the broad extreme-opportunity evidence signal;
+candidate_dual_guard adds promoter + opposite guard + weak/no-tail guard safety;
+source-context inputs are folded into the single active feature set because the best observed source-feature run improved selected count, precision, false-direction, and utility;
+lower-performance competing objective rows were removed instead of kept as active alternatives.
+```
+
+Recent advanced smoke surface:
+
+```text
+tailtree-selection-efficiency.csv: 3504 rows = candidate_dual_guard 3456 + tail_event_lift 48
+tailtree-frontier-benchmark.csv: 2107 rows = candidate_dual_guard only
+predict-only selection-efficiency.csv: 8 rows = loaded tail_event_lift only
+forbidden objective rows: 0 for source_blended, candidate_conditional_promoter, candidate_opposite_guard, continuous_guard_curve, two_model_guard
+best inspected frontier rows: precision about 0.56-0.60, false-direction about 0.12-0.36, utility about 3.55-5.30
+```
+
+Empirical scanner reports live under `docs/report/`. Architecture docs should only summarize durable current choices and point to reports for run-level evidence.

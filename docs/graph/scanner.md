@@ -16,15 +16,14 @@ qooi.scanner.workflow.load_config(path: Path) -> PotentialConfig
 qooi.scanner.config.PotentialConfig
 qooi.scanner.config.TailtreeConfig
 qooi.scanner.config.TailtreeProfileConfig
+qooi.scanner.config.TailtreeModelRefConfig
 ```
 
 Shipped scanner configs:
 
 ```text
-configs/potential-daily-tailtree.toml
-configs/potential-advanced-tailtree.toml
-configs/potential-smoke.toml
-configs/potential-optuna-direct-smoke.toml
+configs/potential-tailtree-train.toml
+configs/potential-tailtree-predict.toml
 ```
 
 ## Market load boundary

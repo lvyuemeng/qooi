@@ -57,37 +57,122 @@ scripts/scanner_potential.py
 
 ## Config profiles
 
-Daily scanner profile:
+Public scanner configs are reduced to two files:
 
 ```text
-configs/potential-daily-tailtree.toml
+configs/potential-tailtree-train.toml
+configs/potential-tailtree-predict.toml
 ```
 
-Role:
+Train config role:
 
 ```text
-fixed h24 tail_utility_quantile profile
-bounded symbols/depth
-fast daily review surface
-```
-
-Advanced scanner profile:
-
-```text
-configs/potential-advanced-tailtree.toml
-```
-
-Role:
-
-```text
-h24 tail_utility_quantile
+h24 tail_event_lift stage-1 evidence
+source-context candidate_dual_guard final selection
 Optuna training
 walkforward evaluation
-larger 80-symbol research surface
-selection-efficiency feedback
+larger 160-symbol research surface
+selection-efficiency/frontier feedback
 ```
 
-The scanner currently prefers one horizon, `h24`, because daily prediction freshness often approaches the 24h boundary and h24 has stronger tail-label support than shorter horizons.
+Predict config role:
+
+```text
+load existing model JSONs by model_id
+score/report current observations
+no fixed-parameter training profile
+no candidate-local model training
+```
+
+The scanner currently prefers one horizon, `h24`, because daily prediction freshness often approaches the 24h boundary and h24 has stronger tail-label support than shorter horizons. The train config should not train h12/h48 by default while the current frontier and reporting policy are h24-specific.
+
+## Current tailtree objective and parameters
+
+Current tailtree frontier:
+
+```text
+stage-1 evidence objective: tail_event_lift
+final selection objective: candidate_dual_guard
+horizon: h24
+validation: walkforward
+search: Optuna
+source input: active feature set includes 17 persistent source-context columns
+artifact frontier: tailtree-frontier-benchmark.csv
+```
+
+The final `candidate_dual_guard` row family means:
+
+```text
+candidate-local promoter score
+  + opposite-direction guard score
+  + weak/no-tail path guard score
+```
+
+The internal guard models remain implementation ingredients. They are not emitted as final competing objectives.
+
+Current source-context inputs:
+
+```text
+funding_level_state
+funding_level_transition
+funding_price_divergence_24h
+funding_direction_run_length
+lsr_level_state
+lsr_level_transition
+lsr_price_divergence_24h
+lsr_direction_run_length
+lsr_log_ratio_change_24h
+oi_flow_state
+oi_flow_transition
+oi_flow_run_length
+oi_change_pct_24h
+taker_pressure_state
+taker_pressure_transition
+taker_pressure_run_length
+taker_buy_pressure_24h_mean
+```
+
+Excluded high-cardinality source paths:
+
+```text
+funding_path_24h
+lsr_path_24h
+oi_price_flow_path_24h
+taker_pressure_path_24h
+```
+
+Reason for the current choice:
+
+```text
+tail_event_lift keeps the broad extreme-opportunity model target;
+pure clean/actionable labels and standalone guard objectives benchmarked worse or unstable;
+source-feature input showed the best observed row as candidate_dual_guard_source_blended with selected=75, precision=0.613, false-direction=0.133, utility=3.377 versus fair control candidate_opposite_guard selected=50, precision=0.600, false-direction=0.140, utility=2.991;
+the suffix branch was normalized away by folding source-context columns into the single active feature set;
+lower-performance output objectives were deleted rather than preserved as active alternatives.
+```
+
+Recent verified advanced smoke after row-builder cleanup:
+
+```text
+tailtree-selection-efficiency.csv shape: (3504, 78)
+selection objectives: candidate_dual_guard=3456, tail_event_lift=48
+tailtree-frontier-benchmark.csv shape: (2107, 86)
+frontier objective: candidate_dual_guard only
+forbidden objective rows: 0 for source_blended, candidate_conditional_promoter, candidate_opposite_guard, continuous_guard_curve, two_model_guard
+fresh model metadata: 17 source-context input columns
+predict-only selection-efficiency.csv shape: (8, 71), loaded tail_event_lift only
+```
+
+Top inspected frontier rows from that smoke:
+
+| objective | selected | precision | false-dir | utility | action |
+|---|---:|---:|---:|---:|---|
+| candidate_dual_guard | 50 | 0.600 | 0.340 | 5.297 | promote_candidate_frontier |
+| candidate_dual_guard | 50 | 0.580 | 0.120 | 3.652 | promote_candidate_frontier |
+| candidate_dual_guard | 50 | 0.580 | 0.160 | 3.574 | promote_candidate_frontier |
+| candidate_dual_guard | 50 | 0.560 | 0.120 | 3.551 | promote_candidate_frontier |
+
+Architecture docs summarize current choice only. Full empirical reports and failed objective histories stay under `docs/report/`.
 
 ## Data and freshness boundaries
 
@@ -141,18 +226,23 @@ TailtreeRunOutput(
   models,
   profile_runs,
   selection_efficiency,
+  action_surface,
+  selection_error_anatomy,
+  boundary_anatomy,
+  contradiction_audit,
 )
 ```
 
 Tailtree internal ownership:
 
 ```text
-tailtree/model.py     -> label_tail_paths, label distribution, target/training values, TailTreeModel
+tailtree/labels.py    -> TailEventPolicy, reference fitting, path labels, label distribution
+tailtree/model.py     -> target/training values, TailTreeModel
 tailtree/evidence.py  -> leaf/score-bucket evidence frames
 tailrun/planning.py   -> profile runs, trial params, fold specs, objective jobs
-tailrun/core.py       -> train/load/score lifecycle and profile artifact frames
-tailrun/selection.py  -> score-bucket candidates, paired replay, selection/HPO metrics
-tailrun/types.py      -> cross-module run/result dataclasses only
+tailrun/core.py       -> train/load/score lifecycle, feature-set selection, local model specs, profile artifact frames
+tailrun/selection.py  -> score-bucket candidates, paired replay, selection/HPO metrics, frontier rows
+tailrun/types.py      -> cross-module run/result dataclasses and Pydantic artifact-row serialization types
 ```
 
 Tailtree label vocabulary uses fixed-horizon path semantics:
@@ -173,7 +263,13 @@ report.md
 tailtree-profile-runs.csv
 tailtree-label-distribution.csv
 tailtree-selection-efficiency.csv
+tailtree-frontier-benchmark.csv
 tailtree-action-surface.csv
+tailtree-selection-error-anatomy.csv
+tailtree-dual-guard-boundary-anatomy.csv
+tailtree-actionability-contradiction-audit.csv
+tailtree-source-timeseries-features.csv
+tailtree-feature-pack-stability.csv
 models/*.json
 profile/*.csv
 ```
@@ -202,4 +298,4 @@ Promote/watch/skip rows are research review decisions, not execution instruction
 - state -> future outcome columns;
 - outcome -> model/evidence internals;
 - report/output code reading CSV artifacts back as an internal transport;
-- opaque row probing in model/report boundaries when a typed frame or dataclass exists.
+- opaque row probing in model/report boundaries when a typed frame or dataclass/Pydantic row exists.

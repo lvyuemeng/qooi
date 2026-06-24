@@ -24,8 +24,8 @@ qooi.strategies / qooi.core / qooi.dynamic
 Active scanner path:
 
 ```text
-configs/potential-daily-tailtree.toml
-configs/potential-advanced-tailtree.toml
+configs/potential-tailtree-train.toml
+configs/potential-tailtree-predict.toml
   -> scripts/scanner_potential.py
   -> workflow.run
   -> pipeline.load_market
