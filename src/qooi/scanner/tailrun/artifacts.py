@@ -110,6 +110,27 @@ def write_tailtree_label_distribution(output_dir: Path, frame: pl.DataFrame) -> 
     frame.write_csv(output_dir / "tailtree-label-distribution.csv")
 
 
+def write_tailtree_selection_error_anatomy(output_dir: Path, frame: pl.DataFrame) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-selection-error-anatomy.csv")
+
+
+def write_tailtree_boundary_anatomy(output_dir: Path, frame: pl.DataFrame) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-dual-guard-boundary-anatomy.csv")
+
+
+def write_tailtree_actionability_audit(output_dir: Path, frame: pl.DataFrame) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-actionability-contradiction-audit.csv")
+
+
 def _tailtree_artifact_metadata(
     context: TailtreeArtifactContext,
     tree_up: TailtreeArtifactTree | None,
@@ -358,3 +379,26 @@ def _load_tail_tree_evidence(
             summary_path.read_text(encoding="utf-8"), encoding="utf-8"
         )
     return TailtreeEvidenceResult(evidence, models)
+
+
+def write_tailtree_source_timeseries_features(output_dir: Path, frame: pl.DataFrame) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-source-timeseries-features.csv")
+
+
+def write_tailtree_feature_pack_stability(output_dir: Path, frame: pl.DataFrame) -> None:
+    if frame.is_empty():
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(output_dir / "tailtree-feature-pack-stability.csv")
+
+
+def write_tailtree_frontier_benchmark(output_dir: Path, frame: pl.DataFrame) -> None:
+    path = output_dir / "tailtree-frontier-benchmark.csv"
+    if frame.is_empty():
+        path.unlink(missing_ok=True)
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(path)

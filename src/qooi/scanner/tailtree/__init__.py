@@ -6,6 +6,7 @@ from qooi.scanner.tailtree.evidence import (
     score_bucket_evidence_frame,
     select_tail_leaves,
 )
+from qooi.scanner.tailtree.labels import TailEventPolicy, tailtree_label_distribution_frame
 from qooi.scanner.tailtree.model import (
     GPDParams,
     TailTreeModel,
@@ -16,13 +17,13 @@ from qooi.scanner.tailtree.model import (
     _gpd_xi_objective,
     _leaf_id_vector,
     _tailtree_outcome_by_decision,
-    label_tail_paths,
     tailtree_target_training_values,
     tailtree_training_frame,
 )
 
 __all__ = [
     "GPDParams",
+    "TailEventPolicy",
     "TailTreeModel",
     "TailtreeTrainingFrame",
     "TrainConfig",
@@ -31,7 +32,7 @@ __all__ = [
     "_gpd_xi_objective",
     "_leaf_id_vector",
     "_tailtree_outcome_by_decision",
-    "label_tail_paths",
+    "tailtree_label_distribution_frame",
     "tailtree_target_training_values",
     "tailtree_training_frame",
     "leaf_context_frame",

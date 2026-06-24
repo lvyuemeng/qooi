@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from math import ceil
 from pathlib import Path
 from typing import Literal
 
@@ -46,6 +47,23 @@ class BarLoadRequest:
     max_staleness_hours: int
     latest_staleness_hours: int | None = None
     refresh_mode: LoadMode = "incremental"
+
+    def rows_per_day(self, timeframe: str) -> float:
+        normalized = timeframe.strip().upper()
+        if normalized.endswith("H"):
+            hours = int(normalized[:-1] or "1")
+            return 24.0 / max(1, hours)
+        if normalized.endswith("D"):
+            days = int(normalized[:-1] or "1")
+            return 1.0 / max(1, days)
+        return 24.0
+
+    def target_rows_for(self, timeframe: str) -> int:
+        per_symbol = max(1, ceil(self.target_days * self.rows_per_day(timeframe)))
+        return per_symbol * len(self.symbols)
+
+    def target_rows_total(self) -> int:
+        return sum(self.target_rows_for(timeframe) for timeframe in self.timeframes)
 
 
 @dataclass(frozen=True)
@@ -119,7 +137,7 @@ async def load_market(
             timeframe: {symbol: pl.DataFrame() for symbol in request.bars.symbols}
             for timeframe in request.bars.timeframes
         }
-    source_cache = {
+    source_cache: dict[str, pl.DataFrame] = {
         product.name: _load_source_cache(policy.cache_root, product.name)
         for product in request.sources.products
     }
@@ -248,7 +266,9 @@ async def _execute_source_jobs(
     bounded: set[tuple[str, str, str]],
 ) -> tuple[dict[str, pl.DataFrame], dict[str, int]]:
     pages_by_product: dict[str, int] = {}
-    product_by_name = {product.name: product for product in request.products}
+    product_by_name: dict[str, SourceProductLoadRequest] = {
+        product.name: product for product in request.products
+    }
     for name, plan in plans.items():
         if name == "bars" or name not in product_by_name:
             continue
@@ -567,9 +587,31 @@ def _bars_product(
         pl.col("timestamp").n_unique().alias("unique_rows"),
         pl.col("timestamp").max().alias("latest_ts"),
     )
-    target_rows = request.target_days * 24 * len(request.symbols) * len(request.timeframes)
-    latest_ts = int(grouped.get_column("latest_ts").max())
+    target_rows = request.target_rows_total()
+    latest_value = grouped.get_column("latest_ts").max()
+    if not isinstance(latest_value, int | float | str):
+        raise TypeError(f"expected integer-like scalar, got {type(latest_value).__name__}")
+    latest_ts = int(latest_value)
     age_hours = max(0.0, (now_ms() - latest_ts) / HOUR_MS)
+    by_timeframe = grouped.group_by("timeframe").agg(pl.col("rows").sum().alias("rows"))
+    coverage_notes = []
+    for timeframe in request.timeframes:
+        target = request.target_rows_for(timeframe)
+        actual_frame = by_timeframe.filter(pl.col("timeframe") == timeframe)
+        actual = int(actual_frame.get_column("rows").sum()) if not actual_frame.is_empty() else 0
+        coverage = min(100.0, actual / target * 100.0) if target else 0.0
+        coverage_notes.append(
+            f"bar_coverage:{timeframe}:actual={actual}:target={target}:coverage={coverage:.1f}"
+        )
+    decision_timeframe = request.timeframes[0] if request.timeframes else ""
+    if decision_timeframe:
+        target = request.target_rows_for(decision_timeframe)
+        actual_frame = by_timeframe.filter(pl.col("timeframe") == decision_timeframe)
+        actual = int(actual_frame.get_column("rows").sum()) if not actual_frame.is_empty() else 0
+        coverage = min(100.0, actual / target * 100.0) if target else 0.0
+        coverage_notes.append(
+            f"decision_timeframe:{decision_timeframe}:actual={actual}:target={target}:coverage={coverage:.1f}"
+        )
     return ProductResult(
         "bars",
         frame,
@@ -583,6 +625,7 @@ def _bars_product(
             age_hours=age_hours,
             status="fresh" if age_hours <= request.max_staleness_hours else "stale",
             duplicates=int((grouped.get_column("rows") - grouped.get_column("unique_rows")).sum()),
+            notes=tuple(coverage_notes),
         ),
     )
 
@@ -622,14 +665,22 @@ def _earliest(frame: pl.DataFrame) -> int | None:
     if frame.is_empty() or "timestamp" not in frame.columns:
         return None
     value = frame.get_column("timestamp").min()
-    return int(value) if value is not None else None
+    if value is None:
+        return None
+    if isinstance(value, int | float | str):
+        return int(value)
+    return None
 
 
 def _latest(frame: pl.DataFrame) -> int | None:
     if frame.is_empty() or "timestamp" not in frame.columns:
         return None
     value = frame.get_column("timestamp").max()
-    return int(value) if value is not None else None
+    if value is None:
+        return None
+    if isinstance(value, int | float | str):
+        return int(value)
+    return None
 
 
 def _merge_symbol(existing: pl.DataFrame, page: pl.DataFrame) -> pl.DataFrame:

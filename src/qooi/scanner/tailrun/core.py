@@ -4,15 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
+import numpy as np
 import polars as pl
+from pydantic import BaseModel, ConfigDict
 
 from qooi.profiling import ProfileContext
-from qooi.scanner.config import PotentialConfig, TailtreeOptunaTrainingConfig
+from qooi.scanner.config import (
+    ExtremeTailConfig,
+    PotentialConfig,
+    TailtreeOptunaTrainingConfig,
+)
 from qooi.scanner.tailrun.types import (
     TailtreeArtifactTree,
+    TailtreeCandidateGateSpec,
     TailtreeDirection,
+    TailtreeFeatureSelection,
+    TailtreeFeatureSet,
     TailtreeInputFrames,
     TailtreeJobResult,
     TailtreeObjectiveJob,
@@ -22,7 +31,7 @@ from qooi.scanner.tailrun.types import (
 )
 
 if TYPE_CHECKING:
-    from qooi.scanner.tailrun.planning import TailtreeProfileRun
+    from qooi.scanner.tailrun.planning import TailtreeProfileRun, TailtreeTrialParams
 
 _TAILTREE_CATEGORICAL_TRAIN_FEATURES = (
     "background_regime",
@@ -31,7 +40,7 @@ _TAILTREE_CATEGORICAL_TRAIN_FEATURES = (
     "decision_transition",
     "decision_direction",
 )
-_TAILTREE_CONTINUOUS_TRAIN_FEATURES = (
+_TAILTREE_BASE_TRAIN_FEATURES = (
     "atr_percentile",
     "range_width_atr",
     "bar_return_1h_pct",
@@ -55,16 +64,155 @@ _TAILTREE_CONTINUOUS_TRAIN_FEATURES = (
     "lsr_age_ms",
 )
 
+_TAILTREE_PROMOTER_EXTRA_FEATURES = (
+    "return_sign_flip_rate_6h",
+    "return_sign_flip_rate_24h",
+    "body_to_range_mean_24h",
+    "range_expansion_24h_to_7d",
+    "close_position_24h",
+    "prior_runup_6h",
+    "prior_drawdown_6h",
+    "return_efficiency_24h",
+    "market_return_1h_median",
+    "market_return_4h_median",
+    "market_return_24h_median",
+    "market_abs_return_24h_median",
+    "market_dispersion_24h",
+    "market_positive_return_24h_share",
+    "symbol_vs_market_return_24h",
+    "symbol_vs_market_return_4h",
+    "symbol_abs_return_vs_market_24h",
+)
 
-def _tailtree_training_features(observations: pl.DataFrame) -> tuple[list[str], list[str]]:
-    """Select persistent known-at-close features allowed for tailtree training.
+_TAILTREE_PROMOTER_TRAIN_FEATURES = (
+    *_TAILTREE_BASE_TRAIN_FEATURES,
+    *_TAILTREE_PROMOTER_EXTRA_FEATURES,
+)
 
-    Ephemeral current-review/cost features may exist in the observation frame, but
-    column presence alone does not make them historical model inputs.
-    """
-    categorical = [c for c in _TAILTREE_CATEGORICAL_TRAIN_FEATURES if c in observations.columns]
-    continuous = [c for c in _TAILTREE_CONTINUOUS_TRAIN_FEATURES if c in observations.columns]
-    return categorical, continuous
+_SOURCE_CONTEXT_CATEGORICAL_FEATURES = (
+    "funding_level_state",
+    "funding_level_transition",
+    "funding_price_divergence_24h",
+    "lsr_level_state",
+    "lsr_level_transition",
+    "lsr_price_divergence_24h",
+    "oi_flow_state",
+    "oi_flow_transition",
+    "taker_pressure_state",
+    "taker_pressure_transition",
+)
+_SOURCE_CONTEXT_CONTINUOUS_FEATURES = (
+    "funding_direction_run_length",
+    "lsr_direction_run_length",
+    "lsr_log_ratio_change_24h",
+    "oi_flow_run_length",
+    "oi_change_pct_24h",
+    "taker_pressure_run_length",
+    "taker_buy_pressure_24h_mean",
+)
+
+TailtreeFeatureRole = Literal["opportunity", "candidate"]
+
+_BASE_TAILTREE_FEATURE_SET = TailtreeFeatureSet(
+    categorical=(*_TAILTREE_CATEGORICAL_TRAIN_FEATURES, *_SOURCE_CONTEXT_CATEGORICAL_FEATURES),
+    continuous=(*_TAILTREE_BASE_TRAIN_FEATURES, *_SOURCE_CONTEXT_CONTINUOUS_FEATURES),
+)
+_PROMOTER_FEATURE_SET = TailtreeFeatureSet(
+    categorical=(*_TAILTREE_CATEGORICAL_TRAIN_FEATURES, *_SOURCE_CONTEXT_CATEGORICAL_FEATURES),
+    continuous=(*_TAILTREE_PROMOTER_TRAIN_FEATURES, *_SOURCE_CONTEXT_CONTINUOUS_FEATURES),
+)
+_CANDIDATE_PROMOTER_GATES = (
+    TailtreeCandidateGateSpec("score_pct", 0.5),
+    TailtreeCandidateGateSpec("score_pct", 1.0),
+    TailtreeCandidateGateSpec("score_pct", 2.0),
+    TailtreeCandidateGateSpec("top_k", 200.0),
+    TailtreeCandidateGateSpec("top_k", 500.0),
+    TailtreeCandidateGateSpec("top_k", 1000.0),
+)
+
+
+def train_features(
+    observations: pl.DataFrame,
+    *,
+    role: TailtreeFeatureRole,
+) -> TailtreeFeatureSelection:
+    """Select known-at-close tailtree training features by training role."""
+    return (
+        _PROMOTER_FEATURE_SET if role == "candidate" else _BASE_TAILTREE_FEATURE_SET
+    ).select(observations)
+
+
+class LocalModelSpec(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label_column: str
+    weight_column: str
+    score_column: str
+    objective: Literal["tail_event_lift", "path_guard"]
+
+
+@dataclass(frozen=True)
+class CandidateLocalProduct:
+    efficiency: pl.DataFrame
+    selection_error_anatomy: pl.DataFrame
+    boundary_anatomy: pl.DataFrame
+    contradiction_audit: pl.DataFrame
+
+
+def _fit_local_model_scores(
+    spec: LocalModelSpec,
+    *,
+    gate_id: object,
+    train_targets: pl.DataFrame,
+    score_features: pl.DataFrame,
+    observations: pl.DataFrame,
+    training: TailtreeTrialParams,
+    join_keys: list[str],
+) -> pl.DataFrame:
+    from qooi.scanner.tailtree.model import TailTreeModel, TrainConfig
+
+    gate_train = train_targets.filter(
+        (pl.col("candidate_gate_id") == gate_id)
+        & pl.col("in_candidate_gate")
+        & pl.col(spec.label_column).is_not_null()
+    )
+    if gate_train.height < 30 or gate_train.get_column(spec.label_column).n_unique() < 2:
+        return pl.DataFrame()
+    train_frame = observations.join(
+        gate_train.select(*join_keys, spec.label_column, spec.weight_column),
+        on=join_keys,
+        how="inner",
+    ).sort("decision_bar_close_ms")
+    if train_frame.height < 30:
+        return pl.DataFrame()
+    labels = train_frame.get_column(spec.label_column).to_numpy().astype(float)
+    weights = train_frame.get_column(spec.weight_column).fill_null(1.0).to_numpy().astype(float)
+    features = train_features(train_frame, role="candidate")
+    min_leaf = min(training.min_data_in_leaf, max(10, train_frame.height // 5))
+    try:
+        model = TailTreeModel.train(
+            train_frame,
+            labels,
+            config=TrainConfig(
+                objective=spec.objective,
+                num_leaves=min(training.num_leaves, 64),
+                min_data_in_leaf=min_leaf,
+                learning_rate=training.learning_rate,
+                num_iterations=training.num_iterations,
+                early_stopping_rounds=training.early_stopping_rounds,
+            ),
+            categorical_features=features.categorical_list(),
+            continuous_features=features.continuous_list(),
+            direction="up",
+            global_tail_rate=float(np.mean(labels)),
+            train_n_observations=train_frame.height,
+            utility_values=weights,
+        )
+    except ValueError:
+        return pl.DataFrame()
+    return model.predict_score(score_features).select(
+        *join_keys, pl.col("tailtree_score").alias(spec.score_column)
+    ).unique(subset=join_keys, maintain_order=True)
 
 
 @dataclass(frozen=True)
@@ -74,6 +222,11 @@ class TailtreeFoldRunResult:
     feedback: TailtreeProfileFeedback
     selection_efficiency: pl.DataFrame
     action_surface: pl.DataFrame
+    selection_error_anatomy: pl.DataFrame
+    boundary_anatomy: pl.DataFrame
+    contradiction_audit: pl.DataFrame
+    candidate_replay: pl.DataFrame
+    candidate_population: pl.DataFrame
     score: float
 
 
@@ -86,12 +239,14 @@ def run_tailtree(
     from qooi.scanner.outcome import potential_outcome_frame
     from qooi.scanner.tailrun import planning
     from qooi.scanner.tailrun.search import optuna_module, suggest_tailtree_trial_params
-    from qooi.scanner.tailtree.model import (
-        label_tail_paths,
-        tailtree_label_distribution_frame,
-    )
+    from qooi.scanner.tailtree.labels import TailEventPolicy, tailtree_label_distribution_frame
 
     tailtree = config.evidence.tailtree
+    tail_policy = TailEventPolicy(
+        tailtree.extreme
+        if tailtree.extreme is not None
+        else ExtremeTailConfig(method="fixed_pct", material_floor_pct=tailtree.threshold_pct)
+    )
     with profile.stage("scanner", "tailtree", "potential_outcome_frame"):
         outcome_frame = potential_outcome_frame(
             frames.observations,
@@ -102,12 +257,12 @@ def run_tailtree(
     profile.frame("scanner", "tailtree", "tailtree_outcomes", outcome_frame)
 
     with profile.stage("scanner", "tailtree", "label_tail_paths"):
-        labeled = label_tail_paths(outcome_frame, threshold_pct=tailtree.threshold_pct)
+        labeled = tail_policy.label_paths(outcome_frame)
     profile.frame("scanner", "tailtree", "labeled_tailtree_outcomes", labeled)
     label_distribution = tailtree_label_distribution_frame(labeled)
     profile.frame("scanner", "tailtree", "tailtree_label_distribution", label_distribution)
 
-    categorical, continuous = _tailtree_training_features(frames.observations)
+    base_features = train_features(frames.observations, role="opportunity")
     prepared = TailtreePreparedFrames(
         observations=frames.observations,
         source_outcomes=frames.source_outcomes,
@@ -115,8 +270,8 @@ def run_tailtree(
         histories=frames.histories,
         outcomes=outcome_frame,
         labeled_outcomes=labeled,
-        categorical_features=categorical,
-        continuous_features=continuous,
+        categorical_features=base_features.categorical_list(),
+        continuous_features=base_features.continuous_list(),
     )
     tailtree.model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,29 +280,57 @@ def run_tailtree(
     feedback: list[TailtreeProfileFeedback] = []
     efficiency_frames: list[pl.DataFrame] = []
     action_frames: list[pl.DataFrame] = []
+    anatomy_frames: list[pl.DataFrame] = []
+    boundary_frames: list[pl.DataFrame] = []
+    audit_frames: list[pl.DataFrame] = []
 
-    for profile_config in config.evidence.tailtree.profiles:
-        if isinstance(profile_config.training, TailtreeOptunaTrainingConfig):
-            continue
-        run = planning.tailtree_fixed_run(profile_config)
-        for fold_id, fold_prepared in _profile_prepared_frames(
-            prepared,
-            profile_config,
-            config=config,
-            profile=profile,
-            potential_outcome_frame=potential_outcome_frame,
-            label_tail_paths=label_tail_paths,
-        ):
-            result = run_tailtree_fold(
-                run, fold_id, fold_prepared, config=config, profile=profile
-            )
-            feedback.append(result.feedback)
-            efficiency_frames.append(result.selection_efficiency)
-            if not result.action_surface.is_empty():
-                action_frames.append(result.action_surface)
-            if not result.evidence.is_empty():
-                all_evidence.append(result.evidence)
-            models.update(result.models)
+    if tailtree.lifecycle == "load_predict":
+        result = run_tailtree_fold(
+            planning.tailtree_predict_run(tailtree), 0, prepared, config=config, profile=profile
+        )
+        feedback.append(result.feedback)
+        efficiency_frames.append(result.selection_efficiency)
+        if not result.action_surface.is_empty():
+            action_frames.append(result.action_surface)
+        if not result.selection_error_anatomy.is_empty():
+            anatomy_frames.append(result.selection_error_anatomy)
+        if not result.boundary_anatomy.is_empty():
+            boundary_frames.append(result.boundary_anatomy)
+        if not result.contradiction_audit.is_empty():
+            audit_frames.append(result.contradiction_audit)
+        if not result.evidence.is_empty():
+            all_evidence.append(result.evidence)
+        models.update(result.models)
+
+    if tailtree.lifecycle == "train":
+        for profile_config in config.evidence.tailtree.profiles:
+            if isinstance(profile_config.training, TailtreeOptunaTrainingConfig):
+                continue
+            run = planning.tailtree_fixed_run(profile_config)
+            for fold_id, fold_prepared in _profile_prepared_frames(
+                prepared,
+                profile_config,
+                config=config,
+                profile=profile,
+                potential_outcome_frame=potential_outcome_frame,
+                tail_policy=tail_policy,
+            ):
+                result = run_tailtree_fold(
+                    run, fold_id, fold_prepared, config=config, profile=profile
+                )
+                feedback.append(result.feedback)
+                efficiency_frames.append(result.selection_efficiency)
+                if not result.action_surface.is_empty():
+                    action_frames.append(result.action_surface)
+                if not result.selection_error_anatomy.is_empty():
+                    anatomy_frames.append(result.selection_error_anatomy)
+                if not result.boundary_anatomy.is_empty():
+                    boundary_frames.append(result.boundary_anatomy)
+                if not result.contradiction_audit.is_empty():
+                    audit_frames.append(result.contradiction_audit)
+                if not result.evidence.is_empty():
+                    all_evidence.append(result.evidence)
+                models.update(result.models)
 
     if tailtree.lifecycle == "train":
         for profile_config in planning.tailtree_optuna_profiles(config):
@@ -169,7 +352,7 @@ def run_tailtree(
                 config=config,
                 profile=profile,
                 potential_outcome_frame=potential_outcome_frame,
-                label_tail_paths=label_tail_paths,
+                tail_policy=tail_policy,
             )
             for trial_index in range(max_trials):
                 optuna_trial = study.ask()
@@ -187,6 +370,12 @@ def run_tailtree(
                     efficiency_frames.append(result.selection_efficiency)
                     if not result.action_surface.is_empty():
                         action_frames.append(result.action_surface)
+                    if not result.selection_error_anatomy.is_empty():
+                        anatomy_frames.append(result.selection_error_anatomy)
+                    if not result.boundary_anatomy.is_empty():
+                        boundary_frames.append(result.boundary_anatomy)
+                    if not result.contradiction_audit.is_empty():
+                        audit_frames.append(result.contradiction_audit)
                     if not result.evidence.is_empty():
                         all_evidence.append(result.evidence)
                     models.update(result.models)
@@ -204,10 +393,26 @@ def run_tailtree(
     action_surface = (
         pl.concat(action_frames, how="diagonal_relaxed") if action_frames else pl.DataFrame()
     )
+    error_anatomy = (
+        pl.concat(anatomy_frames, how="diagonal_relaxed") if anatomy_frames else pl.DataFrame()
+    )
+    boundary_anatomy = (
+        pl.concat(boundary_frames, how="diagonal_relaxed") if boundary_frames else pl.DataFrame()
+    )
+    contradiction_audit = (
+        pl.concat(audit_frames, how="diagonal_relaxed") if audit_frames else pl.DataFrame()
+    )
+
     profile.frame("scanner", "tailtree", "tailtree_evidence", evidence)
     profile.frame("scanner", "tailtree", "tailtree_selection_efficiency", efficiency)
     if not action_surface.is_empty():
         profile.frame("scanner", "tailtree", "tailtree_action_surface", action_surface)
+    if not error_anatomy.is_empty():
+        profile.frame("scanner", "tailtree", "tailtree_selection_error_anatomy", error_anatomy)
+    if not boundary_anatomy.is_empty():
+        profile.frame("scanner", "tailtree", "tailtree_boundary_anatomy", boundary_anatomy)
+    if not contradiction_audit.is_empty():
+        profile.frame("scanner", "tailtree", "tailtree_contradiction_audit", contradiction_audit)
     return TailtreeRunOutput(
         evidence=evidence,
         models=models,
@@ -215,6 +420,9 @@ def run_tailtree(
         selection_efficiency=efficiency,
         label_distribution=label_distribution,
         action_surface=action_surface,
+        selection_error_anatomy=error_anatomy,
+        boundary_anatomy=boundary_anatomy,
+        contradiction_audit=contradiction_audit,
     )
 
 
@@ -225,7 +433,7 @@ def _profile_prepared_frames(
     config: PotentialConfig,
     profile: ProfileContext,
     potential_outcome_frame,
-    label_tail_paths,
+    tail_policy,
 ) -> tuple[tuple[int, TailtreePreparedFrames], ...]:
     from qooi.scanner.tailrun import planning
 
@@ -262,9 +470,8 @@ def _profile_prepared_frames(
                 split.train_realized_transitions,
                 return_threshold_pct=config.transition.return_threshold_pct,
             )
-            train_labeled = label_tail_paths(
-                train_outcomes, threshold_pct=config.evidence.tailtree.threshold_pct
-            )
+            tail_reference = tail_policy.reference_frame(train_outcomes)
+            train_labeled = tail_policy.label_paths(train_outcomes, reference=tail_reference)
         with profile.stage(
             "scanner", "tailtree", f"walkforward_valid_outcomes.f{fold.fold_id:02d}"
         ):
@@ -274,9 +481,7 @@ def _profile_prepared_frames(
                 split.valid_realized_transitions,
                 return_threshold_pct=config.transition.return_threshold_pct,
             )
-            valid_labeled = label_tail_paths(
-                valid_outcomes, threshold_pct=config.evidence.tailtree.threshold_pct
-            )
+            valid_labeled = tail_policy.label_paths(valid_outcomes, reference=tail_reference)
         fold_frames.append(
             (
                 fold.fold_id,
@@ -304,8 +509,12 @@ def run_tailtree_job(
     config: PotentialConfig,
     profile: ProfileContext,
 ) -> TailtreeJobResult:
-    from qooi.scanner.tailrun.selection import score_bucket_candidate_frame
+    from qooi.scanner.tailrun.selection import (
+        score_bucket_candidate_frame,
+        score_bucket_population_frame,
+    )
     from qooi.scanner.tailtree.evidence import leaf_evidence_frame, score_bucket_evidence_frame
+    from qooi.scanner.tailtree.labels import TailEventPolicy
     from qooi.scanner.tailtree.model import (
         TailTreeModel,
         TrainConfig,
@@ -343,6 +552,21 @@ def run_tailtree_job(
         if "outcome_horizon" in score_labeled.columns
         else score_labeled
     )
+    tail_policy = TailEventPolicy(
+        tailtree.extreme
+        if tailtree.extreme is not None
+        else ExtremeTailConfig(method="fixed_pct", material_floor_pct=tailtree.threshold_pct)
+    )
+    training_behavior_targets = (
+        tail_policy.behavior_target_frame(horizon_labeled, direction=job.direction)
+        if job.direction == "up"
+        else None
+    )
+    score_behavior_targets = (
+        tail_policy.behavior_target_frame(horizon_score_labeled, direction=job.direction)
+        if job.direction == "up"
+        else None
+    )
     tree: TailTreeModel | None = None
 
     if tailtree.lifecycle == "load_predict" and job.model_path.exists():
@@ -360,27 +584,26 @@ def run_tailtree_job(
                 train_features = training.tail_observations
                 train_values = training.exceedance_values
                 train_utilities = training.utility_values
-                if run.objective == "tail_event_lift":
+                model_global_tail_rate = training.global_tail_rate
+                model_train_n_observations = training.train_n_observations
+                if run.objective in {
+                    "tail_event_lift",
+                    "tail_any_event",
+                    "tail_side_only",
+                    "path_guard",
+                    "path_guard_blocker",
+                    "path_guard_tradability",
+                    "path_guard_full",
+                }:
                     train_features, train_values, train_utilities = tailtree_target_training_values(
                         prepared.observations,
                         horizon_labeled,
-                        target="tail_event_lift",
+                        target=run.objective,
                         direction=job.direction,
+                        behavior_targets=training_behavior_targets,
                     )
-                elif run.objective == "tail_any_event":
-                    train_features, train_values, train_utilities = tailtree_target_training_values(
-                        prepared.observations,
-                        horizon_labeled,
-                        target="tail_any_event",
-                        direction=job.direction,
-                    )
-                elif run.objective == "tail_side_only":
-                    train_features, train_values, train_utilities = tailtree_target_training_values(
-                        prepared.observations,
-                        horizon_labeled,
-                        target="tail_side_only",
-                        direction=job.direction,
-                    )
+                    model_global_tail_rate = None
+                    model_train_n_observations = len(train_features)
                 return TailTreeModel.train(
                     train_features,
                     train_values,
@@ -388,8 +611,8 @@ def run_tailtree_job(
                     categorical_features=prepared.categorical_features,
                     continuous_features=prepared.continuous_features,
                     direction=job.direction,
-                    global_tail_rate=training.global_tail_rate,
-                    train_n_observations=training.train_n_observations,
+                    global_tail_rate=model_global_tail_rate,
+                    train_n_observations=model_train_n_observations,
                     utility_values=train_utilities,
                 )
 
@@ -398,11 +621,24 @@ def run_tailtree_job(
             tree.to_json(job.model_path)
 
     if tree is None:
-        return TailtreeJobResult(job, pl.DataFrame(), pl.DataFrame(), None)
+        return TailtreeJobResult(job, pl.DataFrame(), pl.DataFrame(), pl.DataFrame(), None)
 
     with profile.stage("scanner", "tailtree", f"score.{job.label}"):
         scored = score_bucket_candidate_frame(
-            tree, score_observations, horizon_score_labeled, job.outcome_horizon
+            tree,
+            score_observations,
+            horizon_score_labeled,
+            job.outcome_horizon,
+            behavior_targets=score_behavior_targets,
+            objective=run.objective,
+        )
+        scored_population = score_bucket_population_frame(
+            tree,
+            score_observations,
+            horizon_score_labeled,
+            job.outcome_horizon,
+            behavior_targets=score_behavior_targets,
+            objective=run.objective,
         )
     if not scored.is_empty():
         profile.frame("scanner", "tailtree", f"scores_{job.label}", scored)
@@ -411,11 +647,20 @@ def run_tailtree_job(
         evidence = (
             score_bucket_evidence_frame(tree, score_observations, horizon_score_labeled)
             if run.objective
-            in {"tail_utility_quantile", "tail_event_lift", "tail_any_event", "tail_side_only"}
+            in {
+                "tail_utility_quantile",
+                "tail_event_lift",
+                "tail_any_event",
+                "tail_side_only",
+                "path_guard",
+                "path_guard_blocker",
+                "path_guard_tradability",
+                "path_guard_full",
+            }
             else leaf_evidence_frame(tree, score_observations, horizon_score_labeled)
         )
     if evidence.is_empty():
-        return TailtreeJobResult(job, pl.DataFrame(), scored, tree)
+        return TailtreeJobResult(job, pl.DataFrame(), scored, scored_population, tree)
 
     evidence = evidence.with_columns(
         pl.lit(job.outcome_horizon).alias("outcome_horizon"),
@@ -431,7 +676,196 @@ def run_tailtree_job(
         pl.lit(run.training.early_stopping_rounds).alias("early_stopping_rounds"),
     )
     profile.frame("scanner", "tailtree", f"evidence_{job.label}", evidence)
-    return TailtreeJobResult(job, evidence, scored, tree)
+    return TailtreeJobResult(job, evidence, scored, scored_population, tree)
+
+
+def candidate_conditional_promoter_efficiency_frame(
+    run: TailtreeProfileRun,
+    opportunity_tree: TailtreeArtifactTree,
+    prepared: TailtreePreparedFrames,
+    *,
+    config: PotentialConfig,
+) -> CandidateLocalProduct:
+    """Train candidate-gated promoter/guard products from a tail_event_lift tree."""
+    empty = CandidateLocalProduct(
+        efficiency=pl.DataFrame(),
+        selection_error_anatomy=pl.DataFrame(),
+        boundary_anatomy=pl.DataFrame(),
+        contradiction_audit=pl.DataFrame(),
+    )
+    if (
+        config.evidence.tailtree.lifecycle != "train"
+        or run.objective != "tail_event_lift"
+        or 24 not in config.evidence.tailtree.outcome_horizon
+    ):
+        return empty
+
+    from qooi.scanner.tailrun.selection import (
+        actionability_contradiction_audit_frame,
+        candidate_gate_frame,
+        dual_guard_boundary_anatomy_frame,
+        dual_guarded_promotion_selection_metrics_frame,
+        guarded_selection_error_anatomy_frame,
+        opposite_guard_target_frame,
+        promoter_target_frame,
+        score_bucket_population_frame,
+        selection_error_anatomy_frame,
+        weak_path_guard_target_frame,
+    )
+    from qooi.scanner.tailtree.labels import TailEventPolicy
+
+    train_labeled = prepared.labeled_outcomes.filter(pl.col("outcome_horizon") == 24)
+    score_labeled_source = (
+        prepared.score_labeled_outcomes
+        if prepared.score_labeled_outcomes is not None
+        else prepared.labeled_outcomes
+    )
+    score_labeled = score_labeled_source.filter(pl.col("outcome_horizon") == 24)
+    score_observations = (
+        prepared.score_observations
+        if prepared.score_observations is not None
+        else prepared.observations
+    )
+    tail_policy = TailEventPolicy(
+        config.evidence.tailtree.extreme
+        if config.evidence.tailtree.extreme is not None
+        else ExtremeTailConfig(
+            method="fixed_pct", material_floor_pct=config.evidence.tailtree.threshold_pct
+        )
+    )
+    train_behavior = tail_policy.behavior_target_frame(train_labeled, direction="up")
+    score_behavior = tail_policy.behavior_target_frame(score_labeled, direction="up")
+    train_population = score_bucket_population_frame(
+        opportunity_tree,
+        prepared.observations,
+        train_labeled,
+        24,
+        behavior_targets=train_behavior,
+        objective="tail_event_lift",
+        score_quantiles=(0.0,),
+    )
+    score_population = score_bucket_population_frame(
+        opportunity_tree,
+        score_observations,
+        score_labeled,
+        24,
+        behavior_targets=score_behavior,
+        objective="tail_event_lift",
+        score_quantiles=(0.0,),
+    )
+    train_targets = weak_path_guard_target_frame(
+        opposite_guard_target_frame(
+            promoter_target_frame(candidate_gate_frame(train_population, _CANDIDATE_PROMOTER_GATES))
+        )
+    )
+    score_targets = weak_path_guard_target_frame(
+        opposite_guard_target_frame(
+            promoter_target_frame(candidate_gate_frame(score_population, _CANDIDATE_PROMOTER_GATES))
+        )
+    )
+    if train_targets.is_empty() or score_targets.is_empty():
+        return empty
+
+    rows: list[pl.DataFrame] = []
+    guarded_rows: list[pl.DataFrame] = []
+    dual_guarded_rows: list[pl.DataFrame] = []
+    join_keys = ["symbol", "decision_bar_close_ms"]
+    for gate_id in train_targets.get_column("candidate_gate_id").unique().to_list():
+        gate_score = score_targets.filter(
+            (pl.col("candidate_gate_id") == gate_id) & pl.col("in_candidate_gate")
+        )
+        if gate_score.is_empty():
+            continue
+        gate_score = gate_score.unique(subset=join_keys, maintain_order=True)
+        score_features = score_observations.join(
+            gate_score.select(*join_keys).unique(subset=join_keys, maintain_order=True),
+            on=join_keys,
+            how="inner",
+        )
+        promotion_scores = _fit_local_model_scores(
+            LocalModelSpec(
+                label_column="promoter_label",
+                weight_column="promoter_weight",
+                score_column="promotion_score",
+                objective="tail_event_lift",
+            ),
+            gate_id=gate_id,
+            train_targets=train_targets,
+            score_features=score_features,
+            observations=prepared.observations,
+            training=run.training,
+            join_keys=join_keys,
+        )
+        if promotion_scores.is_empty():
+            continue
+        scored_gate = gate_score.join(promotion_scores, on=join_keys, how="inner")
+        rows.append(scored_gate)
+
+        guard_scores = _fit_local_model_scores(
+            LocalModelSpec(
+                label_column="opposite_guard_label",
+                weight_column="opposite_guard_weight",
+                score_column="opposite_guard_score",
+                objective="path_guard",
+            ),
+            gate_id=gate_id,
+            train_targets=train_targets,
+            score_features=score_features,
+            observations=prepared.observations,
+            training=run.training,
+            join_keys=join_keys,
+        )
+        if guard_scores.is_empty():
+            continue
+        guarded_gate = scored_gate.join(guard_scores, on=join_keys, how="inner")
+        guarded_rows.append(guarded_gate)
+
+        weak_scores = _fit_local_model_scores(
+            LocalModelSpec(
+                label_column="weak_path_guard_label",
+                weight_column="weak_path_guard_weight",
+                score_column="weak_path_guard_score",
+                objective="path_guard",
+            ),
+            gate_id=gate_id,
+            train_targets=train_targets,
+            score_features=score_features,
+            observations=prepared.observations,
+            training=run.training,
+            join_keys=join_keys,
+        )
+        if weak_scores.is_empty():
+            continue
+        dual_guarded_rows.append(guarded_gate.join(weak_scores, on=join_keys, how="inner"))
+    if not rows:
+        return empty
+    promoter_selection = pl.concat(rows, how="diagonal_relaxed")
+    if guarded_rows:
+        guarded_selection = pl.concat(guarded_rows, how="diagonal_relaxed")
+        anatomy_frames = [
+            selection_error_anatomy_frame(promoter_selection),
+            guarded_selection_error_anatomy_frame(guarded_selection),
+        ]
+    else:
+        anatomy_frames = [selection_error_anatomy_frame(promoter_selection)]
+    if dual_guarded_rows:
+        dual_guarded_selection = pl.concat(dual_guarded_rows, how="diagonal_relaxed")
+        efficiency = dual_guarded_promotion_selection_metrics_frame(dual_guarded_selection)
+        boundary_anatomy = dual_guard_boundary_anatomy_frame(dual_guarded_selection)
+        contradiction_audit = actionability_contradiction_audit_frame(dual_guarded_selection)
+    else:
+        efficiency = pl.DataFrame()
+        boundary_anatomy = pl.DataFrame()
+        contradiction_audit = pl.DataFrame()
+    anatomy = pl.concat(
+        [frame for frame in anatomy_frames if not frame.is_empty()], how="diagonal_relaxed"
+    )
+    return CandidateLocalProduct(
+        efficiency=efficiency,
+        selection_error_anatomy=anatomy,
+        boundary_anatomy=boundary_anatomy,
+        contradiction_audit=contradiction_audit,
+    )
 
 
 def run_tailtree_fold(
@@ -464,12 +898,22 @@ def run_tailtree_fold(
         for result in results
         if not result.scored_candidates.is_empty()
     ]
+    population_frames = [
+        result.scored_population
+        for result in results
+        if not result.scored_population.is_empty()
+    ]
     evidence = (
         pl.concat(evidence_frames, how="diagonal_relaxed")
         if evidence_frames
         else pl.DataFrame()
     )
     scored = pl.concat(score_frames, how="diagonal_relaxed") if score_frames else pl.DataFrame()
+    population = (
+        pl.concat(population_frames, how="diagonal_relaxed")
+        if population_frames
+        else pl.DataFrame()
+    )
     models = {
         (result.job.outcome_horizon, result.job.direction): result.model
         for result in results
@@ -499,14 +943,31 @@ def run_tailtree_fold(
         )
     seconds = perf_counter() - started
     selection_efficiency = tailtree_selection_metrics_frame(
-        fold_run, evidence, prepared, models, seconds, candidate_replay
+        fold_run, evidence, prepared, models, seconds, candidate_replay, population
     )
+    selection_anatomy = pl.DataFrame()
+    boundary_anatomy = pl.DataFrame()
+    contradiction_audit = pl.DataFrame()
+    opportunity_tree = models.get((24, "up"))
+    if opportunity_tree is not None:
+        candidate_local = candidate_conditional_promoter_efficiency_frame(
+            fold_run, opportunity_tree, prepared, config=config
+        )
+        selection_anatomy = candidate_local.selection_error_anatomy
+        boundary_anatomy = candidate_local.boundary_anatomy
+        contradiction_audit = candidate_local.contradiction_audit
+        if not candidate_local.efficiency.is_empty():
+            selection_efficiency = pl.concat(
+                [selection_efficiency, candidate_local.efficiency], how="diagonal_relaxed"
+            )
+    selection_efficiency = selection_efficiency.with_columns(pl.lit("base").alias("feature_set"))
+
     if (
         not selection_efficiency.is_empty()
-        and "objective_hpo_score" in selection_efficiency.columns
+        and "behavior_hpo_score" in selection_efficiency.columns
     ):
         score_value = selection_efficiency.select(
-            pl.col("objective_hpo_score").cast(pl.Float64).max()
+            pl.col("behavior_hpo_score").cast(pl.Float64).max()
         ).item()
         score = float(score_value) if score_value is not None else -1_000_000_000.0
     elif evidence.is_empty():
@@ -551,6 +1012,11 @@ def run_tailtree_fold(
         feedback=feedback,
         selection_efficiency=selection_efficiency,
         action_surface=action_surface,
+        selection_error_anatomy=selection_anatomy,
+        boundary_anatomy=boundary_anatomy,
+        contradiction_audit=contradiction_audit,
+        candidate_replay=candidate_replay,
+        candidate_population=population,
         score=score,
     )
 

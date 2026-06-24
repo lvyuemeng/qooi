@@ -538,6 +538,75 @@ def _kline_continuous_features(
             ),
         )
 
+        # Pre-entry cleanliness features. These use only current/prior OHLCV rows
+        # available at the decision close and target chop, exhaustion, and path
+        # efficiency rather than generic tail magnitude.
+        work = (
+            work.with_columns(
+                (pl.col("high") - pl.col("low")).alias("bar_range_1h"),
+                (pl.col("close") - pl.col("open")).abs().alias("bar_body_1h"),
+                pl.col("bar_return_1h_pct").sign().alias("bar_return_sign"),
+            )
+            .with_columns(
+                (
+                    pl.col("bar_return_sign") * pl.col("bar_return_sign").shift(1) < 0
+                )
+                .cast(pl.Float64)
+                .alias("return_sign_flip"),
+                (
+                    pl.col("bar_body_1h")
+                    / pl.when(pl.col("bar_range_1h") > 0.0)
+                    .then(pl.col("bar_range_1h"))
+                    .otherwise(None)
+                ).alias("body_to_range_1h"),
+            )
+            .with_columns(
+                pl.col("return_sign_flip")
+                .rolling_mean(6, min_samples=3)
+                .alias("return_sign_flip_rate_6h"),
+                pl.col("return_sign_flip")
+                .rolling_mean(24, min_samples=12)
+                .alias("return_sign_flip_rate_24h"),
+                pl.col("body_to_range_1h")
+                .rolling_mean(24, min_samples=12)
+                .alias("body_to_range_mean_24h"),
+                (
+                    pl.col("bar_range_1h").rolling_mean(24, min_samples=12)
+                    / pl.when(pl.col("bar_range_1h").rolling_mean(168, min_samples=24) > 0.0)
+                    .then(pl.col("bar_range_1h").rolling_mean(168, min_samples=24))
+                    .otherwise(None)
+                ).alias("range_expansion_24h_to_7d"),
+                (
+                    (pl.col("close") - pl.col("low").shift(1).rolling_min(24))
+                    / (
+                        pl.col("high").shift(1).rolling_max(24)
+                        - pl.col("low").shift(1).rolling_min(24)
+                    )
+                ).alias("close_position_24h"),
+                (
+                    (pl.col("close").shift(1) - pl.col("low").shift(1).rolling_min(6))
+                    / pl.col("close").shift(1)
+                    * 100.0
+                ).alias("prior_runup_6h"),
+                (
+                    (pl.col("high").shift(1).rolling_max(6) - pl.col("close").shift(1))
+                    / pl.col("close").shift(1)
+                    * 100.0
+                ).alias("prior_drawdown_6h"),
+                (
+                    (pl.col("close") - pl.col("close").shift(24)).abs()
+                    / pl.when(
+                        pl.col("bar_return_1h_pct")
+                        .abs()
+                        .rolling_sum(24, min_samples=12)
+                        > 0.0
+                    )
+                    .then(pl.col("bar_return_1h_pct").abs().rolling_sum(24, min_samples=12))
+                    .otherwise(None)
+                ).alias("return_efficiency_24h"),
+            )
+        )
+
         # Close-to-range ratio (from OHLCV directly: 48-bar range)
         work = work.with_columns(
             pl.col("high").shift(1).rolling_max(48).alias("range_high_48"),
@@ -558,6 +627,14 @@ def _kline_continuous_features(
             "bar_return_4h_per_vol_7d",
             "bar_return_24h_per_vol_7d",
             "bar_volume_1h_to_ma_20h",
+            "return_sign_flip_rate_6h",
+            "return_sign_flip_rate_24h",
+            "body_to_range_mean_24h",
+            "range_expansion_24h_to_7d",
+            "close_position_24h",
+            "prior_runup_6h",
+            "prior_drawdown_6h",
+            "return_efficiency_24h",
             "bar_close_position_48h",
         ]
         out = work.select(pl.lit(symbol).alias("symbol"), *cols[1:])
@@ -585,12 +662,64 @@ def _kline_continuous_features(
                 "bar_return_4h_per_vol_7d": pl.Float64,
                 "bar_return_24h_per_vol_7d": pl.Float64,
                 "bar_volume_1h_to_ma_20h": pl.Float64,
+                "return_sign_flip_rate_6h": pl.Float64,
+                "return_sign_flip_rate_24h": pl.Float64,
+                "body_to_range_mean_24h": pl.Float64,
+                "range_expansion_24h_to_7d": pl.Float64,
+                "close_position_24h": pl.Float64,
+                "prior_runup_6h": pl.Float64,
+                "prior_drawdown_6h": pl.Float64,
+                "return_efficiency_24h": pl.Float64,
                 "bar_close_position_48h": pl.Float64,
                 "atr_percentile": pl.Float64,
                 "range_width_atr": pl.Float64,
             }
         )
-    return pl.concat(frames, how="vertical_relaxed")
+    return _market_context_features(pl.concat(frames, how="vertical_relaxed"))
+
+
+def _market_context_features(kline_features: pl.DataFrame) -> pl.DataFrame:
+    """Attach known-at-close cross-symbol market context to kline features."""
+    schema = {
+        "symbol": pl.String,
+        "timestamp": pl.Int64,
+        "market_return_1h_median": pl.Float64,
+        "market_return_4h_median": pl.Float64,
+        "market_return_24h_median": pl.Float64,
+        "market_abs_return_24h_median": pl.Float64,
+        "market_dispersion_24h": pl.Float64,
+        "market_positive_return_24h_share": pl.Float64,
+        "symbol_vs_market_return_24h": pl.Float64,
+        "symbol_vs_market_return_4h": pl.Float64,
+        "symbol_abs_return_vs_market_24h": pl.Float64,
+    }
+    if kline_features.is_empty():
+        return pl.DataFrame(schema=schema)
+    required = {"symbol", "timestamp", "bar_return_4h_pct", "bar_return_24h_pct"}
+    if not required.issubset(kline_features.columns):
+        return kline_features
+    market = kline_features.group_by("timestamp").agg(
+        pl.col("bar_return_1h_pct").median().alias("market_return_1h_median"),
+        pl.col("bar_return_4h_pct").median().alias("market_return_4h_median"),
+        pl.col("bar_return_24h_pct").median().alias("market_return_24h_median"),
+        pl.col("bar_return_24h_pct").abs().median().alias("market_abs_return_24h_median"),
+        pl.col("bar_return_24h_pct").std().alias("market_dispersion_24h"),
+        (pl.col("bar_return_24h_pct") > 0.0)
+        .cast(pl.Float64)
+        .mean()
+        .alias("market_positive_return_24h_share"),
+    )
+    return kline_features.join(market, on="timestamp", how="left").with_columns(
+        (pl.col("bar_return_24h_pct") - pl.col("market_return_24h_median")).alias(
+            "symbol_vs_market_return_24h"
+        ),
+        (pl.col("bar_return_4h_pct") - pl.col("market_return_4h_median")).alias(
+            "symbol_vs_market_return_4h"
+        ),
+        (pl.col("bar_return_24h_pct").abs() - pl.col("market_abs_return_24h_median")).alias(
+            "symbol_abs_return_vs_market_24h"
+        ),
+    )
 
 
 def _source_continuous_features(
@@ -647,6 +776,291 @@ def _source_continuous_features(
             )
 
     return result
+
+
+def source_time_series_features_frame(
+    source_frames: dict[str, pl.DataFrame],
+    bars: pl.DataFrame,
+    decision_keys: pl.DataFrame,
+) -> pl.DataFrame:
+    """Build kline-like source state/path features aligned to decision bars."""
+    if decision_keys.is_empty() or not {"symbol", "timestamp"}.issubset(decision_keys.columns):
+        return pl.DataFrame()
+    frames = [
+        _funding_time_series_features(source_frames.get("funding", pl.DataFrame()), bars),
+        _lsr_time_series_features(source_frames.get("long_short_ratios", pl.DataFrame()), bars),
+        _oi_time_series_features(source_frames.get("open_interest", pl.DataFrame()), bars),
+        _taker_time_series_features(source_frames.get("taker_volume", pl.DataFrame())),
+    ]
+    aligned = decision_keys.select("symbol", "timestamp").unique().sort(["symbol", "timestamp"])
+    for frame in frames:
+        if frame.is_empty():
+            continue
+        value_cols = [column for column in frame.columns if column not in ("symbol", "timestamp")]
+        if not value_cols:
+            continue
+        aligned = aligned.join_asof(
+            frame.sort(["symbol", "timestamp"]),
+            on="timestamp",
+            by="symbol",
+            strategy="backward",
+            check_sortedness=False,
+        )
+    return aligned
+
+
+def _price_return_context(bars: pl.DataFrame) -> pl.DataFrame:
+    if bars.is_empty() or not {"symbol", "timestamp", "close"}.issubset(bars.columns):
+        return pl.DataFrame(
+            schema={"symbol": pl.String, "timestamp": pl.Int64, "price_return_pct": pl.Float64}
+        )
+    return (
+        bars.sort("symbol", "timestamp")
+        .with_columns(pl.col("close").shift(1).over("symbol").alias("previous_close"))
+        .select(
+            "symbol",
+            "timestamp",
+            (
+                (pl.col("close") - pl.col("previous_close"))
+                / pl.col("previous_close")
+                * 100.0
+            ).alias("price_return_pct"),
+        )
+    )
+
+
+def _state_path_expr(column: str, window: int = 24) -> pl.Expr:
+    return pl.concat_str(
+        [pl.col(column).shift(offset).over("symbol") for offset in range(window - 1, 0, -1)]
+        + [pl.col(column)],
+        separator=" -> ",
+        ignore_nulls=True,
+    )
+
+
+def _source_state_run_columns(frame: pl.DataFrame, state_col: str, prefix: str) -> pl.DataFrame:
+    changed = (pl.col(state_col) != pl.col(state_col).shift(1).over("symbol")).fill_null(True)
+    run_col = f"{prefix}_run"
+    age_col = f"{prefix}_age_bars"
+    transition_col = f"{prefix}_transition"
+    transition_root = prefix.split("_")[0]
+    return (
+        frame.sort("symbol", "timestamp")
+        .with_columns(changed.alias("_state_changed"))
+        .with_columns(
+            pl.col("_state_changed").cast(pl.Int64).cum_sum().over("symbol").alias(run_col)
+        )
+        .with_columns(
+            pl.cum_count(state_col).over("symbol", run_col).cast(pl.UInt32).alias(age_col)
+        )
+        .with_columns(
+            pl.when(pl.col(state_col).str.ends_with("missing"))
+            .then(pl.lit(f"{transition_root}_missing"))
+            .when(pl.col(age_col) == 1)
+            .then(pl.lit(f"{transition_root}_flip"))
+            .when(pl.col(age_col) > 1)
+            .then(pl.lit(f"{transition_root}_persistence"))
+            .otherwise(pl.lit(f"{transition_root}_initial"))
+            .alias(transition_col)
+        )
+        .drop("_state_changed", run_col)
+    )
+
+
+def _funding_time_series_features(frame: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty() or not {"symbol", "timestamp", "funding_rate"}.issubset(frame.columns):
+        return pl.DataFrame()
+    work = (
+        frame.select("symbol", "timestamp", pl.col("funding_rate").cast(pl.Float64, strict=False))
+        .sort("symbol", "timestamp")
+        .join(_price_return_context(bars), on=["symbol", "timestamp"], how="left")
+        .with_columns(
+            pl.when(pl.col("funding_rate") > 0.0)
+            .then(pl.lit("funding_positive"))
+            .when(pl.col("funding_rate") < 0.0)
+            .then(pl.lit("funding_negative"))
+            .when(pl.col("funding_rate").is_null())
+            .then(pl.lit("funding_missing"))
+            .otherwise(pl.lit("funding_neutral"))
+            .alias("funding_level_state")
+        )
+    )
+    work = _source_state_run_columns(work, "funding_level_state", "funding_level")
+    return work.with_columns(
+        pl.col("funding_level_age_bars").alias("funding_direction_run_length"),
+        _state_path_expr("funding_level_state").alias("funding_path_24h"),
+        pl.when((pl.col("funding_rate") > 0.0) & (pl.col("price_return_pct") < 0.0))
+        .then(pl.lit("positive_funding_price_down"))
+        .when((pl.col("funding_rate") < 0.0) & (pl.col("price_return_pct") > 0.0))
+        .then(pl.lit("negative_funding_price_up"))
+        .when(pl.col("price_return_pct").is_null())
+        .then(pl.lit("funding_price_flat_or_missing"))
+        .otherwise(pl.lit("funding_price_aligned"))
+        .alias("funding_price_divergence_24h"),
+    ).select(
+        "symbol",
+        "timestamp",
+        "funding_level_state",
+        "funding_level_age_bars",
+        "funding_level_transition",
+        "funding_direction_run_length",
+        "funding_path_24h",
+        "funding_price_divergence_24h",
+    )
+
+
+def _lsr_time_series_features(frame: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
+    ratio_col = _first_float_col(
+        frame,
+        (
+            "top_trader_long_short_position_ratio",
+            "top_trader_long_short_account_ratio",
+            "long_short_account_ratio",
+        ),
+    )
+    if frame.is_empty() or ratio_col is None or not {"symbol", "timestamp"}.issubset(frame.columns):
+        return pl.DataFrame()
+    work = (
+        frame.select(
+            "symbol",
+            "timestamp",
+            pl.col(ratio_col).cast(pl.Float64, strict=False).log().alias("lsr_log_ratio"),
+        )
+        .sort("symbol", "timestamp")
+        .join(_price_return_context(bars), on=["symbol", "timestamp"], how="left")
+        .with_columns(
+            (pl.col("lsr_log_ratio") - pl.col("lsr_log_ratio").shift(24).over("symbol")).alias(
+                "lsr_log_ratio_change_24h"
+            )
+        )
+        .with_columns(
+            pl.when(pl.col("lsr_log_ratio") > 0.0)
+            .then(pl.lit("lsr_long_crowding"))
+            .when(pl.col("lsr_log_ratio") < 0.0)
+            .then(pl.lit("lsr_short_crowding"))
+            .when(pl.col("lsr_log_ratio").is_null())
+            .then(pl.lit("lsr_missing"))
+            .otherwise(pl.lit("lsr_neutral"))
+            .alias("lsr_level_state")
+        )
+    )
+    work = _source_state_run_columns(work, "lsr_level_state", "lsr_level")
+    return work.with_columns(
+        pl.col("lsr_level_age_bars").alias("lsr_direction_run_length"),
+        _state_path_expr("lsr_level_state").alias("lsr_path_24h"),
+        pl.when((pl.col("lsr_log_ratio") > 0.0) & (pl.col("price_return_pct") < 0.0))
+        .then(pl.lit("long_crowding_price_down"))
+        .when((pl.col("lsr_log_ratio") < 0.0) & (pl.col("price_return_pct") > 0.0))
+        .then(pl.lit("short_crowding_price_up"))
+        .when(pl.col("price_return_pct").is_null())
+        .then(pl.lit("lsr_price_flat_or_missing"))
+        .otherwise(pl.lit("lsr_price_aligned"))
+        .alias("lsr_price_divergence_24h"),
+    ).select(
+        "symbol",
+        "timestamp",
+        "lsr_level_state",
+        "lsr_level_age_bars",
+        "lsr_level_transition",
+        "lsr_direction_run_length",
+        "lsr_path_24h",
+        "lsr_log_ratio_change_24h",
+        "lsr_price_divergence_24h",
+    )
+
+
+def _oi_time_series_features(frame: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
+    value_col = _first_float_col(frame, ("open_interest_usd", "open_interest"))
+    if frame.is_empty() or value_col is None or not {"symbol", "timestamp"}.issubset(frame.columns):
+        return pl.DataFrame()
+    work = (
+        frame.select(
+            "symbol",
+            "timestamp",
+            pl.col(value_col).cast(pl.Float64, strict=False).alias("oi_value"),
+        )
+        .sort("symbol", "timestamp")
+        .join(_price_return_context(bars), on=["symbol", "timestamp"], how="left")
+        .with_columns(
+            (
+                (pl.col("oi_value") - pl.col("oi_value").shift(24).over("symbol"))
+                / pl.col("oi_value").shift(24).over("symbol")
+                * 100.0
+            ).alias("oi_change_pct_24h"),
+            (
+                (pl.col("oi_value") - pl.col("oi_value").shift(1).over("symbol"))
+                / pl.col("oi_value").shift(1).over("symbol")
+                * 100.0
+            ).alias("_oi_step_change_pct"),
+        )
+        .with_columns(
+            pl.when(pl.col("_oi_step_change_pct") > 0.0)
+            .then(pl.lit("oi_build"))
+            .when(pl.col("_oi_step_change_pct") < 0.0)
+            .then(pl.lit("oi_unwind"))
+            .when(pl.col("_oi_step_change_pct").is_null())
+            .then(pl.lit("oi_missing"))
+            .otherwise(pl.lit("oi_flat"))
+            .alias("oi_flow_state")
+        )
+    )
+    work = _source_state_run_columns(work, "oi_flow_state", "oi_flow")
+    return work.with_columns(
+        pl.col("oi_flow_age_bars").alias("oi_flow_run_length"),
+        _state_path_expr("oi_flow_state").alias("oi_price_flow_path_24h"),
+    ).select(
+        "symbol",
+        "timestamp",
+        "oi_flow_state",
+        "oi_flow_age_bars",
+        "oi_flow_transition",
+        "oi_flow_run_length",
+        "oi_change_pct_24h",
+        "oi_price_flow_path_24h",
+    )
+
+
+def _taker_time_series_features(frame: pl.DataFrame) -> pl.DataFrame:
+    required = {"symbol", "timestamp", "taker_buy_volume", "taker_sell_volume"}
+    if frame.is_empty() or not required.issubset(frame.columns):
+        return pl.DataFrame()
+    buy = pl.col("taker_buy_volume").cast(pl.Float64, strict=False)
+    sell = pl.col("taker_sell_volume").cast(pl.Float64, strict=False)
+    pressure = (buy - sell) / pl.when((buy + sell) > 0.0).then(buy + sell).otherwise(None)
+    work = (
+        frame.select("symbol", "timestamp", pressure.alias("taker_buy_pressure"))
+        .sort("symbol", "timestamp")
+        .with_columns(
+            pl.col("taker_buy_pressure")
+            .rolling_mean(24, min_samples=1)
+            .over("symbol")
+            .alias("taker_buy_pressure_24h_mean")
+        )
+        .with_columns(
+            pl.when(pl.col("taker_buy_pressure") > 0.2)
+            .then(pl.lit("taker_buy_pressure"))
+            .when(pl.col("taker_buy_pressure") < -0.2)
+            .then(pl.lit("taker_sell_pressure"))
+            .when(pl.col("taker_buy_pressure").is_null())
+            .then(pl.lit("taker_missing"))
+            .otherwise(pl.lit("taker_balanced"))
+            .alias("taker_pressure_state")
+        )
+    )
+    work = _source_state_run_columns(work, "taker_pressure_state", "taker_pressure")
+    return work.with_columns(
+        pl.col("taker_pressure_age_bars").alias("taker_pressure_run_length"),
+        _state_path_expr("taker_pressure_state").alias("taker_pressure_path_24h"),
+    ).select(
+        "symbol",
+        "timestamp",
+        "taker_pressure_state",
+        "taker_pressure_age_bars",
+        "taker_pressure_transition",
+        "taker_pressure_run_length",
+        "taker_buy_pressure_24h_mean",
+        "taker_pressure_path_24h",
+    )
 
 
 def _align_source_family_to_decision_keys(
@@ -1137,6 +1551,7 @@ __all__ = [
     "StructureState",
     "classifier_health",
     "extract_continuous_features",
+    "source_time_series_features_frame",
     "validate_state_frame",
     "POTENTIAL_OBSERVATION_SCHEMA",
     "potential_observation_frame",

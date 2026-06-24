@@ -52,8 +52,35 @@ TailtreeObjective = Literal[
     "tail_event_lift",
     "tail_any_event",
     "tail_side_only",
+    "path_guard",
+    "path_guard_blocker",
+    "path_guard_tradability",
+    "path_guard_full",
 ]
 TailtreeTrainingKind = Literal["fixed", "optuna"]
+ExtremeTailMethod = Literal["fixed_pct", "empirical_quantile", "hybrid"]
+ExtremeTailReferenceScope = Literal["universe_horizon"]
+
+
+class ExtremeTailConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    method: ExtremeTailMethod = "fixed_pct"
+    material_floor_pct: float = 5.0
+    quantile: float = 0.95
+    min_event_rate: float = 0.001
+    max_event_rate: float = 0.10
+    reference_scope: ExtremeTailReferenceScope = "universe_horizon"
+
+    @model_validator(mode="after")
+    def validate_extreme_tail_config(self) -> ExtremeTailConfig:
+        if self.material_floor_pct < 0.0:
+            raise ValueError("tailtree extreme material_floor_pct must be non-negative")
+        if not 0.0 < self.quantile <= 1.0:
+            raise ValueError("tailtree extreme quantile must be in (0, 1]")
+        if self.min_event_rate < 0.0 or self.max_event_rate < self.min_event_rate:
+            raise ValueError("tailtree extreme event-rate bounds are invalid")
+        return self
 
 
 class TransitionConfig(BaseModel):
@@ -206,14 +233,53 @@ class TailtreeProfileConfig(BaseModel):
         return cleaned
 
 
+class TailtreeModelRefConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model_id: str
+    objective: TailtreeObjective = "tail_event_lift"
+
+    @field_validator("model_id")
+    @classmethod
+    def nonempty_model_id(cls, value: str) -> str:
+        cleaned = value.removesuffix(".json").strip()
+        if not cleaned:
+            raise ValueError("tailtree model_id must not be empty")
+        parts = cleaned.rsplit("_", 2)
+        if len(parts) != 3 or parts[2] not in {"up", "down"}:
+            raise ValueError("tailtree model_id must end with _<horizon>_<up|down>")
+        try:
+            horizon = int(parts[1])
+        except ValueError as error:
+            raise ValueError("tailtree model_id horizon suffix must be an integer") from error
+        if horizon <= 0:
+            raise ValueError("tailtree model_id horizon suffix must be positive")
+        return cleaned
+
+    @property
+    def model_tag(self) -> str:
+        return self.model_id.rsplit("_", 2)[0]
+
+    @property
+    def outcome_horizon(self) -> int:
+        return int(self.model_id.rsplit("_", 2)[1])
+
+    @property
+    def direction(self) -> Literal["up", "down"]:
+        value = self.model_id.rsplit("_", 2)[2]
+        return "up" if value == "up" else "down"
+
+
 class TailtreeConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     lifecycle: TailtreeLifecycle = "train"
     model_dir: Path = Path("data/output/potential/models")
     threshold_pct: float = 5.0
+    extreme: ExtremeTailConfig | None = None
     outcome_horizon: tuple[int, ...] = (12,)
     selection: TailtreeSelectionConfig = TailtreeSelectionConfig()
+    models: tuple[TailtreeModelRefConfig, ...] = ()
     profiles: tuple[TailtreeProfileConfig, ...] = (
         TailtreeProfileConfig(
             profile_id="gpd-balanced-fixed",
@@ -252,6 +318,13 @@ class TailtreeConfig(BaseModel):
 
     @model_validator(mode="after")
     def require_unique_profile_ids(self) -> TailtreeConfig:
+        if self.lifecycle == "load_predict":
+            if not self.models:
+                raise ValueError("tailtree load_predict requires explicit model ids")
+            if self.profiles:
+                raise ValueError("tailtree load_predict uses models, not training profiles")
+        elif self.models:
+            raise ValueError("tailtree train lifecycle must not include predict model ids")
         profile_ids = [profile.profile_id for profile in self.profiles]
         if len(profile_ids) != len(set(profile_ids)):
             raise ValueError("tailtree profile_id values must be unique")

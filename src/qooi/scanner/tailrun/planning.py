@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -32,7 +33,7 @@ _MS_PER_DAY = 24 * 60 * 60 * 1000
 class TailtreeProfileRun:
     profile_id: str
     run_id: str
-    run_source: Literal["fixed", "optuna"]
+    run_source: Literal["fixed", "optuna", "loaded"]
     model_tag: str
     objective: TailtreeObjective
     training: TailtreeTrialParams
@@ -132,6 +133,37 @@ def tailtree_fixed_run(profile: TailtreeProfileConfig) -> TailtreeProfileRun:
     )
 
 
+def _loaded_trial_params(path) -> TailtreeTrialParams:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"tailtree model metadata missing: {path}")
+    train_config = metadata.get("train_config")
+    if not isinstance(train_config, dict):
+        raise ValueError(f"tailtree model train_config missing: {path}")
+    return TailtreeTrialParams(
+        num_leaves=int(train_config["num_leaves"]),
+        min_data_in_leaf=int(train_config["min_data_in_leaf"]),
+        learning_rate=float(train_config["learning_rate"]),
+        num_iterations=int(train_config["num_iterations"]),
+        early_stopping_rounds=int(train_config["early_stopping_rounds"]),
+    )
+
+
+def tailtree_predict_run(tailtree: TailtreeConfig) -> TailtreeProfileRun:
+    if not tailtree.models:
+        raise ValueError("tailtree load_predict requires explicit model ids")
+    first = tailtree.models[0]
+    return TailtreeProfileRun(
+        profile_id="loaded-tailtree-models",
+        run_id="loaded-tailtree-models",
+        run_source="loaded",
+        model_tag=first.model_tag,
+        objective=first.objective,
+        training=_loaded_trial_params(tailtree.model_dir / f"{first.model_id}.json"),
+    )
+
+
 def tailtree_profile_runs(config: PotentialConfig) -> tuple[TailtreeProfileRun, ...]:
     runs = []
     for profile in config.evidence.tailtree.profiles:
@@ -155,8 +187,22 @@ def tailtree_objective_jobs(
     tailtree: TailtreeConfig,
 ) -> tuple[TailtreeObjectiveJob, ...]:
     jobs: list[TailtreeObjectiveJob] = []
+    if tailtree.lifecycle == "load_predict":
+        for model in tailtree.models:
+            jobs.append(
+                TailtreeObjectiveJob(
+                    run=run,
+                    fold_id=int(fold_id),
+                    outcome_horizon=model.outcome_horizon,
+                    direction=model.direction,
+                    model_path=tailtree.model_dir / f"{model.model_id}.json",
+                    label=f"{model.model_id}.loaded",
+                )
+            )
+        return tuple(jobs)
+    directions = ("up",) if run.objective.startswith("path_guard") else ("up", "down")
     for outcome_horizon in tailtree.outcome_horizon:
-        for direction in ("up", "down"):
+        for direction in directions:
             horizon = int(outcome_horizon)
             direction_value: TailtreeDirection = direction
             jobs.append(

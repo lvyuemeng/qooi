@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 import polars as pl
+from pydantic import BaseModel, ConfigDict
 
 from qooi.pipeline.types import FrameHealth, ProductResult
 from qooi.scanner import (
@@ -86,6 +87,33 @@ class ReportInputs:
 
 
 TailtreeDirection = Literal["up", "down"]
+
+
+class TailtreeFeatureSelection(BaseModel):
+    categorical: tuple[str, ...]
+    continuous: tuple[str, ...]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.categorical and not self.continuous
+
+    def categorical_list(self) -> list[str]:
+        return list(self.categorical)
+
+    def continuous_list(self) -> list[str]:
+        return list(self.continuous)
+
+
+class TailtreeFeatureSet(BaseModel):
+    categorical: tuple[str, ...] = ()
+    continuous: tuple[str, ...] = ()
+
+    def select(self, observations: pl.DataFrame) -> TailtreeFeatureSelection:
+        columns = set(observations.columns)
+        return TailtreeFeatureSelection(
+            categorical=tuple(feature for feature in self.categorical if feature in columns),
+            continuous=tuple(feature for feature in self.continuous if feature in columns),
+        )
 
 
 class TailtreeModelMetadata(Protocol):
@@ -243,10 +271,22 @@ class TailtreeObjectiveJob:
 
 
 @dataclass(frozen=True)
+class TailtreeCandidateGateSpec:
+    family: Literal["score_pct", "top_k"]
+    value: float
+
+    @property
+    def gate_id(self) -> str:
+        value = int(self.value) if float(self.value).is_integer() else self.value
+        return f"{self.family}_{value}"
+
+
+@dataclass(frozen=True)
 class TailtreeJobResult:
     job: TailtreeObjectiveJob
     evidence: pl.DataFrame
     scored_candidates: pl.DataFrame
+    scored_population: pl.DataFrame
     model: TailtreeArtifactTree | None
 
 
@@ -269,8 +309,9 @@ class TailtreeProfileFeedback:
     seconds: float
 
 
-@dataclass(frozen=True)
-class TailtreeSelectionEfficiencyRow:
+class TailtreeSelectionEfficiencyRow(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     universe_snapshot_id: str
     model_tag: str
     objective: str
@@ -317,6 +358,9 @@ class TailtreeRunOutput:
     selection_efficiency: pl.DataFrame
     label_distribution: pl.DataFrame
     action_surface: pl.DataFrame
+    selection_error_anatomy: pl.DataFrame
+    boundary_anatomy: pl.DataFrame
+    contradiction_audit: pl.DataFrame
 
 
 @dataclass(frozen=True)

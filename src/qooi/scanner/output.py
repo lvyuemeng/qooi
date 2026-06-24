@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import log1p
 from typing import Literal
 
 import polars as pl
@@ -87,6 +86,7 @@ def review_decisions(
     freshness: pl.DataFrame,
     source_health: dict[str, FrameHealth],
     config: PotentialConfig,
+    action_surface: pl.DataFrame | None = None,
 ) -> list[ReviewDecision]:
     """Promote/watch/skip; only latest prediction rows are freshness-gated."""
     freshness_by_symbol = _freshness_by_symbol(freshness)
@@ -116,23 +116,64 @@ def review_decisions(
     tailtree_selection = (
         config.evidence.tailtree.selection if config.evidence.kind == "tailtree" else None
     )
+    side_gate_frame = pl.DataFrame()
+    if action_surface is not None and not action_surface.is_empty():
+        side_gate_frame = action_surface.group_by("action_side").agg(
+            (pl.col("actionability") == "trade_candidate").sum().alias("trade_count"),
+            pl.col("calibrated_side_margin").mean().alias("mean_side_margin"),
+            pl.col("false_direction_int").fill_null(0).mean().alias("false_rate"),
+        ).with_columns(
+            (
+                (pl.col("trade_count") > 0)
+                & (pl.col("mean_side_margin") > 0.0)
+                & (pl.col("false_rate") < 0.20)
+            ).alias("side_gate_pass")
+        ).with_columns(
+            pl.when(pl.col("side_gate_pass"))
+            .then(pl.lit("side gate passed"))
+            .when(pl.col("action_side") == "down")
+            .then(pl.lit("side gate blocked: market-state only; do not promote short"))
+            .otherwise(pl.lit("side gate blocked: market-state only"))
+            .alias("side_gate_reason")
+        ).select("action_side", "side_gate_pass", "side_gate_reason")
+    if not side_gate_frame.is_empty() and "direction" in ranked.columns:
+        ranked = ranked.join(
+            side_gate_frame, left_on="direction", right_on="action_side", how="left"
+        )
+    if {"direction", "outcome_horizon"}.issubset(ranked.columns):
+        primary_horizon = None
+        if config.evidence.kind == "tailtree" and config.evidence.tailtree.outcome_horizon:
+            primary_horizon = min(config.evidence.tailtree.outcome_horizon)
+        if "side_gate_pass" not in ranked.columns:
+            ranked = ranked.with_columns(pl.lit(True).alias("side_gate_pass"))
+        horizon_expr = pl.col("outcome_horizon")
+        primary_expr = (
+            horizon_expr == primary_horizon if primary_horizon is not None else pl.lit(False)
+        )
+        side_gate_expr = pl.col("side_gate_pass").fill_null(True)
+        ranked = ranked.with_columns(
+            pl.when((pl.col("direction") == "up") & primary_expr & side_gate_expr)
+            .then(pl.lit(0))
+            .when((pl.col("direction") == "up") & side_gate_expr)
+            .then(pl.lit(1))
+            .when(side_gate_expr)
+            .then(pl.lit(2))
+            .otherwise(pl.lit(3))
+            .alias("_promotion_policy_rank")
+        ).sort(
+            ["_promotion_policy_rank", "rank_score"],
+            descending=[False, True],
+        )
     raw_rows = ranked.to_dicts()
     conflict_symbols = _material_conflict_symbols(raw_rows, tailtree_selection)
-    best_row_by_symbol: dict[str, dict[str, object]] = {}
-    best_quality_by_symbol: dict[str, float] = {}
     directions_by_symbol: dict[str, set[str]] = {}
     for row in raw_rows:
         symbol = str(row.get("symbol", "?"))
         direction = str(row.get("direction") or "")
         if direction:
             directions_by_symbol.setdefault(symbol, set()).add(direction)
-        quality = _side_quality_score(row)
-        if symbol not in best_quality_by_symbol or quality > best_quality_by_symbol[symbol]:
-            best_quality_by_symbol[symbol] = quality
-            best_row_by_symbol[symbol] = row
 
-    rows = list(best_row_by_symbol.values())
-    rows.sort(key=lambda row: float(row.get("rank_score") or 0.0), reverse=True)
+    rows = ranked.unique(subset=["symbol"], keep="first", maintain_order=True).to_dicts()
 
     promote_limit = len(rows)
     if tailtree_selection is not None and tailtree_selection.top_k:
@@ -198,6 +239,9 @@ def review_decisions(
                     )
                 )
                 continue
+        if row.get("side_gate_pass") is False:
+            results.append(_with_decision(decision, "watch", str(row.get("side_gate_reason"))))
+            continue
         dropped_directions = sorted(directions_by_symbol.get(symbol, set()) - {direction})
         if symbol in conflict_symbols:
             directions = " vs ".join(sorted(directions_by_symbol.get(symbol, set())))
@@ -238,20 +282,14 @@ def _material_conflict_symbols(rows: list[dict[str, object]], selection: object 
             continue
         if _float_value(row.get("rank_score")) <= 0.0:
             continue
+        if row.get("side_gate_pass") is False:
+            continue
         if _float_value(row.get("support_count")) < min_support:
             continue
         if _float_value(row.get("tail_lift")) < min_tail_lift:
             continue
         material.setdefault(symbol, set()).add(direction)
     return {symbol for symbol, directions in material.items() if len(directions) > 1}
-
-
-def _side_quality_score(row: dict[str, object]) -> float:
-    """Promotion-side tie breaker for same-symbol opposite-direction rows."""
-    tail_lift = _float_value(row.get("tail_lift"))
-    support = _float_value(row.get("support_count"))
-    utility = _float_value(row.get("utility_proxy"))
-    return tail_lift + log1p(max(support, 0.0)) + utility
 
 
 def _float_value(value: object) -> float:
@@ -560,6 +598,7 @@ def render_report(frames: ScannerRunFrames, config: PotentialConfig) -> str:
             f"age={bar_health.age_hours:.1f}h | gaps={bar_health.gaps} | "
             f"duplicates={bar_health.duplicates} | status={check_bar_health(bar_health)}"
         )
+        lines.extend(bar_health.bar_coverage_lines(BULLET))
     lines.append("")
 
     lines.append(SEP)

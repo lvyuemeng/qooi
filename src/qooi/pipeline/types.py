@@ -22,6 +22,28 @@ class FrameHealth:
     duplicates: int = 0
     notes: tuple[str, ...] = ()
 
+    def bar_coverage_lines(self, bullet: str = "-") -> list[str]:
+        rows: list[str] = []
+        for note in self.notes:
+            parts = note.split(":")
+            if len(parts) != 5:
+                continue
+            kind, timeframe, actual, target, coverage = parts
+            actual_value = actual.removeprefix("actual=")
+            target_value = target.removeprefix("target=")
+            coverage_value = coverage.removeprefix("coverage=")
+            if kind == "bar_coverage":
+                rows.append(
+                    f"{bullet} bar coverage {timeframe}: rows={actual_value} "
+                    f"target={target_value} coverage={coverage_value}%"
+                )
+            elif kind == "decision_timeframe":
+                rows.append(
+                    f"{bullet} decision timeframe {timeframe}: rows={actual_value} "
+                    f"target={target_value} coverage={coverage_value}%"
+                )
+        return rows
+
     @classmethod
     def from_frame(
         cls,

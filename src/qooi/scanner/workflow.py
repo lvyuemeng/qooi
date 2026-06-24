@@ -24,9 +24,15 @@ from qooi.scanner.config import PotentialConfig
 from qooi.scanner.output import MarketReadiness, ScannerRunFrames, render_report, review_decisions
 from qooi.scanner.tailrun.artifacts import (
     write_tailtree_action_surface,
+    write_tailtree_actionability_audit,
+    write_tailtree_boundary_anatomy,
+    write_tailtree_feature_pack_stability,
+    write_tailtree_frontier_benchmark,
     write_tailtree_label_distribution,
     write_tailtree_profile_runs,
     write_tailtree_selection_efficiency,
+    write_tailtree_selection_error_anatomy,
+    write_tailtree_source_timeseries_features,
 )
 from qooi.scanner.tailrun.core import run_tailtree
 from qooi.scanner.tailrun.types import (
@@ -148,6 +154,7 @@ async def _run(config_path: Path | str) -> Path:
             classify_states,
             continuous_features_frame,
             potential_observation_frame,
+            source_time_series_features_frame,
         )
 
         with profile.stage("scanner", "workflow", "classify_states"):
@@ -187,6 +194,18 @@ async def _run(config_path: Path | str) -> Path:
                 source_frames,
                 decision_timeframe=config.bars.timeframes[0],
             )
+            source_timeseries_features = source_time_series_features_frame(
+                source_frames,
+                bar_df,
+                continuous_features.select("symbol", "timestamp"),
+            )
+            if not source_timeseries_features.is_empty():
+                continuous_features = continuous_features.join(
+                    source_timeseries_features,
+                    on=["symbol", "timestamp"],
+                    how="left",
+                    coalesce=True,
+                )
 
         with profile.stage("scanner", "workflow", "observations"):
             observations = potential_observation_frame(
@@ -204,8 +223,13 @@ async def _run(config_path: Path | str) -> Path:
         models: dict[tuple[int, TailtreeDirection], TailtreeArtifactTree] = {}
         trial_feedback: tuple[TailtreeProfileFeedback, ...] = ()
         selection_efficiency = pl.DataFrame()
+        selection_error_anatomy = pl.DataFrame()
+        boundary_anatomy = pl.DataFrame()
+        contradiction_audit = pl.DataFrame()
         label_distribution = pl.DataFrame()
         action_surface = pl.DataFrame()
+        feature_pack_stability = pl.DataFrame()
+        frontier_benchmark = pl.DataFrame()
 
         from qooi.scanner.rank import (
             candidate_metric_surface,
@@ -250,6 +274,9 @@ async def _run(config_path: Path | str) -> Path:
                 models = tailtree_result.models
                 trial_feedback = tailtree_result.profile_runs
                 selection_efficiency = tailtree_result.selection_efficiency
+                selection_error_anatomy = tailtree_result.selection_error_anatomy
+                boundary_anatomy = tailtree_result.boundary_anatomy
+                contradiction_audit = tailtree_result.contradiction_audit
                 label_distribution = tailtree_result.label_distribution
                 action_surface = tailtree_result.action_surface
                 if models and not tailtree_evidence.is_empty():
@@ -273,12 +300,37 @@ async def _run(config_path: Path | str) -> Path:
                 config.evidence.tailtree.model_dir,
                 selection_efficiency,
             )
+            write_tailtree_selection_error_anatomy(config.output.parent, selection_error_anatomy)
+            write_tailtree_boundary_anatomy(config.output.parent, boundary_anatomy)
+            write_tailtree_actionability_audit(config.output.parent, contradiction_audit)
+            write_tailtree_source_timeseries_features(
+                config.output.parent, source_timeseries_features
+            )
+            from qooi.scanner.tailrun.selection import frontier_benchmark_frame
+
+            if not source_timeseries_features.is_empty() and not action_surface.is_empty():
+                from qooi.scanner.tailrun.selection import (
+                    decision_key_action_surface_frame,
+                    feature_pack_stability_frame,
+                )
+
+                decision_key_surface = decision_key_action_surface_frame(action_surface)
+                feature_pack_stability = feature_pack_stability_frame(
+                    source_timeseries_features,
+                    decision_key_surface,
+                )
+            frontier_benchmark = frontier_benchmark_frame(selection_efficiency)
+            write_tailtree_feature_pack_stability(
+                config.output.parent, feature_pack_stability
+            )
+            write_tailtree_frontier_benchmark(config.output.parent, frontier_benchmark)
             prediction_freshness = prediction_freshness_frame(ranked, config)
             decisions = review_decisions(
                 ranked,
                 prediction_freshness,
                 {name: result.health for name, result in source_products.items()},
                 config,
+                action_surface,
             )
             frames = ScannerRunFrames(
                 market=market,

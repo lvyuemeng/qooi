@@ -27,6 +27,10 @@ class TrainConfig(BaseModel):
         "tail_event_lift",
         "tail_any_event",
         "tail_side_only",
+        "path_guard",
+        "path_guard_blocker",
+        "path_guard_tradability",
+        "path_guard_full",
     ] = "tail_severity_gpd"
     num_leaves: int = Field(default=64, ge=8, le=256)
     min_data_in_leaf: int = Field(default=30, ge=10, le=500)
@@ -166,6 +170,10 @@ class TailTreeModel:
             "tail_event_lift",
             "tail_any_event",
             "tail_side_only",
+            "path_guard",
+            "path_guard_blocker",
+            "path_guard_tradability",
+            "path_guard_full",
         }
         event_count = (
             int(np.sum(exceedance_values > 0.0))
@@ -431,253 +439,6 @@ def _gpd_nll_eval(
 # ── evidence functions ───────────────────────────────────────────────────────
 
 
-def label_tail_paths(
-    outcome_frame: pl.DataFrame,
-    *,
-    threshold_pct: float = 5.0,
-    utility_floor: float = 0.0,
-    margin_floor: float = 0.0,
-    path_efficiency_floor: float = 0.0,
-    late_bar_ratio: float | None = None,
-) -> pl.DataFrame:
-    """Label fixed-horizon path behavior and side utility."""
-    has_max = "forward_max_return_pct" in outcome_frame.columns
-    has_min = "forward_min_return_pct" in outcome_frame.columns
-
-    retention = (
-        pl.col("close_retention_ratio").cast(pl.Float64).clip(0.0, 1.0)
-        if "close_retention_ratio" in outcome_frame.columns
-        else pl.lit(1.0)
-    )
-    efficiency = (
-        pl.col("path_efficiency").cast(pl.Float64).clip(0.0, 1.0)
-        if "path_efficiency" in outcome_frame.columns
-        else pl.lit(1.0)
-    )
-    max_speed = (
-        1.0 / (1.0 + pl.col("time_to_max_bar").cast(pl.Float64).fill_null(0.0)).sqrt()
-        if "time_to_max_bar" in outcome_frame.columns
-        else pl.lit(1.0)
-    )
-    min_speed = (
-        1.0 / (1.0 + pl.col("time_to_min_bar").cast(pl.Float64).fill_null(0.0)).sqrt()
-        if "time_to_min_bar" in outcome_frame.columns
-        else pl.lit(1.0)
-    )
-    max_drawdown_penalty = (
-        pl.col("post_max_drawdown_pct").cast(pl.Float64).fill_null(0.0).clip(0.0, None)
-        if "post_max_drawdown_pct" in outcome_frame.columns
-        else pl.lit(0.0)
-    )
-    min_rebound_penalty = (
-        pl.col("post_min_rebound_pct").cast(pl.Float64).fill_null(0.0).clip(0.0, None)
-        if "post_min_rebound_pct" in outcome_frame.columns
-        else pl.lit(0.0)
-    )
-
-    exprs = []
-    if has_max:
-        exprs.extend(
-            [
-                (pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct).alias(
-                    "tail_up"
-                ),
-                pl.when(pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct)
-                .then(pl.col("forward_max_return_pct").cast(pl.Float64) - threshold_pct)
-                .otherwise(None)
-                .alias("tail_exceedance_value_up"),
-                pl.when(pl.col("forward_max_return_pct").cast(pl.Float64) > threshold_pct)
-                .then(
-                    (
-                        (pl.col("forward_max_return_pct").cast(pl.Float64) - threshold_pct)
-                        * retention
-                        * efficiency
-                        * max_speed
-                        - 0.1 * max_drawdown_penalty
-                    ).clip(0.0, None)
-                )
-                .otherwise(0.0)
-                .alias("tail_utility_up"),
-            ]
-        )
-    if has_min:
-        exprs.extend(
-            [
-                (pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct).alias(
-                    "tail_down"
-                ),
-                pl.when(pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct)
-                .then(pl.col("forward_min_return_pct").cast(pl.Float64).abs() - threshold_pct)
-                .otherwise(None)
-                .alias("tail_exceedance_value_down"),
-                pl.when(pl.col("forward_min_return_pct").cast(pl.Float64) < -threshold_pct)
-                .then(
-                    (
-                        (pl.col("forward_min_return_pct").cast(pl.Float64).abs() - threshold_pct)
-                        * retention
-                        * efficiency
-                        * min_speed
-                        - 0.1 * min_rebound_penalty
-                    ).clip(0.0, None)
-                )
-                .otherwise(0.0)
-                .alias("tail_utility_down"),
-            ]
-        )
-
-    if not exprs:
-        return outcome_frame
-
-    labeled = outcome_frame.with_columns(exprs)
-    if "tail_up" not in labeled.columns or "tail_down" not in labeled.columns:
-        return labeled
-
-    up = pl.col("tail_up").fill_null(False).cast(pl.Boolean)
-    down = pl.col("tail_down").fill_null(False).cast(pl.Boolean)
-    up_utility = pl.col("tail_utility_up").fill_null(0.0).cast(pl.Float64)
-    down_utility = pl.col("tail_utility_down").fill_null(0.0).cast(pl.Float64)
-    up_margin = up_utility - down_utility
-    down_margin = down_utility - up_utility
-    if "time_to_max_bar" in labeled.columns:
-        time_to_max = pl.col("time_to_max_bar").cast(pl.Float64).fill_null(0.0)
-    else:
-        time_to_max = pl.lit(0.0)
-    if "time_to_min_bar" in labeled.columns:
-        time_to_min = pl.col("time_to_min_bar").cast(pl.Float64).fill_null(0.0)
-    else:
-        time_to_min = pl.lit(0.0)
-    if "path_efficiency" in labeled.columns:
-        efficient_path = (
-            pl.col("path_efficiency").cast(pl.Float64).fill_null(0.0) >= path_efficiency_floor
-        )
-    else:
-        efficient_path = pl.lit(True)
-    horizon = (
-        pl.col("outcome_horizon").cast(pl.Float64).fill_null(0.0)
-        if "outcome_horizon" in labeled.columns
-        else pl.lit(0.0)
-    )
-    late_limit = pl.lit(None) if late_bar_ratio is None else horizon * float(late_bar_ratio)
-    late_up = up & ~down & late_limit.is_not_null() & (time_to_max > late_limit)
-    late_down = down & ~up & late_limit.is_not_null() & (time_to_min > late_limit)
-    first_up = up & (~down | (time_to_max < time_to_min))
-    first_down = down & (~up | (time_to_min < time_to_max))
-    first_touch = (
-        pl.when(first_up)
-        .then(pl.lit("up"))
-        .when(first_down)
-        .then(pl.lit("down"))
-        .when(up & down)
-        .then(pl.lit("tie"))
-        .otherwise(pl.lit("none"))
-    )
-    clean_up = up & ~down & efficient_path & (up_utility >= utility_floor)
-    clean_down = down & ~up & efficient_path & (down_utility >= utility_floor)
-    weak_both = up & down & (
-        ~efficient_path | ((up_margin.abs() < margin_floor) & (down_margin.abs() < margin_floor))
-    )
-    path_state = (
-        pl.when(late_up)
-        .then(pl.lit("late_up"))
-        .when(late_down)
-        .then(pl.lit("late_down"))
-        .when(clean_up)
-        .then(pl.lit("clean_up"))
-        .when(clean_down)
-        .then(pl.lit("clean_down"))
-        .when(weak_both)
-        .then(pl.lit("chop_both"))
-        .when(up & down & first_up)
-        .then(pl.lit("up_first_both"))
-        .when(up & down & first_down)
-        .then(pl.lit("down_first_both"))
-        .otherwise(pl.lit("none"))
-    )
-    path_actionability = (
-        pl.when(clean_up & (up_margin >= margin_floor))
-        .then(pl.lit("tradable_up"))
-        .when(clean_down & (down_margin >= margin_floor))
-        .then(pl.lit("tradable_down"))
-        .when(up & down)
-        .then(pl.lit("reversal_watch"))
-        .when(up | down)
-        .then(pl.lit("gray_zone"))
-        .otherwise(pl.lit("no_action"))
-    )
-    return labeled.with_columns(
-        up.alias("tail_any_up"),
-        down.alias("tail_any_down"),
-        up.alias("tail_touch_up"),
-        down.alias("tail_touch_down"),
-        (up | down).alias("tail_any"),
-        (up | down).alias("tail_touch_any"),
-        (up & down).alias("tail_both"),
-        (up & down).alias("tail_touch_both"),
-        pl.when(up & down)
-        .then(pl.lit("both"))
-        .when(up)
-        .then(pl.lit("up"))
-        .when(down)
-        .then(pl.lit("down"))
-        .otherwise(pl.lit("none"))
-        .alias("tail_state"),
-        first_touch.alias("first_touch_side"),
-        path_state.alias("path_state"),
-        path_actionability.alias("path_actionability"),
-        pl.when(path_actionability == "no_action")
-        .then(pl.lit("no_tail_touch"))
-        .when(path_actionability == "gray_zone")
-        .then(pl.lit("weak_path_utility"))
-        .when(path_actionability == "reversal_watch")
-        .then(pl.lit("both_or_mixed_path"))
-        .otherwise(pl.lit(""))
-        .alias("path_blocker"),
-        up_utility.alias("path_utility_up"),
-        down_utility.alias("path_utility_down"),
-        up_margin.alias("tail_utility_margin_up"),
-        down_margin.alias("tail_utility_margin_down"),
-        up_margin.alias("path_utility_margin_up"),
-        down_margin.alias("path_utility_margin_down"),
-    )
-
-
-def tailtree_label_distribution_frame(labeled_outcomes: pl.DataFrame) -> pl.DataFrame:
-    """Summarize orthogonal tail-state prevalence by horizon."""
-    if labeled_outcomes.is_empty() or "tail_state" not in labeled_outcomes.columns:
-        return pl.DataFrame()
-    total_by_horizon = labeled_outcomes.group_by("outcome_horizon").agg(
-        pl.len().alias("horizon_row_count")
-    )
-    return (
-        labeled_outcomes.group_by("outcome_horizon", "tail_state")
-        .agg(
-            pl.len().alias("row_count"),
-            pl.col("tail_up").fill_null(False).sum().alias("tail_up_count"),
-            pl.col("tail_down").fill_null(False).sum().alias("tail_down_count"),
-            pl.col("tail_any").fill_null(False).sum().alias("tail_any_count"),
-            pl.col("tail_both").fill_null(False).sum().alias("tail_both_count"),
-            (pl.col("tail_state") == "up").sum().alias("tail_state_up_count"),
-            (pl.col("tail_state") == "down").sum().alias("tail_state_down_count"),
-            pl.col("tail_utility_up")
-            .fill_null(0.0)
-            .mean()
-            .alias("tail_utility_up_mean"),
-            pl.col("tail_utility_down")
-            .fill_null(0.0)
-            .mean()
-            .alias("tail_utility_down_mean"),
-            pl.col("tail_utility_margin_up")
-            .fill_null(0.0)
-            .mean()
-            .alias("tail_utility_margin_up_mean"),
-        )
-        .join(total_by_horizon, on="outcome_horizon", how="left")
-        .with_columns((pl.col("row_count") / pl.col("horizon_row_count")).alias("class_rate"))
-        .drop("horizon_row_count")
-        .sort("outcome_horizon", "tail_state")
-    )
-
-
 def tailtree_training_frame(
     observations: pl.DataFrame,
     labeled_outcomes: pl.DataFrame,
@@ -760,15 +521,59 @@ def tailtree_training_frame(
     )
 
 
-TailtreeBinaryTarget = Literal["tail_event_lift", "tail_any_event", "tail_side_only"]
+def _path_guard_target_frame(
+    behavior_targets: pl.DataFrame,
+    target: str,
+    label_col: str,
+    utility_col: str,
+) -> pl.DataFrame:
+    obvious_guard = (
+        pl.col("behavior_false_direction").fill_null(False).cast(pl.Boolean)
+        | pl.col("behavior_blocker")
+        .fill_null("")
+        .is_in(["opposite_clean_path", "opposite_tail_dominates"])
+        | (pl.col("behavior_path_state").fill_null("none") == "clean_down")
+    )
+    blocker_guard = obvious_guard | (pl.col("behavior_blocker").fill_null("") != "")
+    tradability_guard = obvious_guard | (
+        pl.col("behavior_actionability").fill_null("none") != "tradable_up"
+    )
+    full_guard = (
+        blocker_guard
+        | tradability_guard
+        | (pl.col("behavior_utility_margin").fill_null(0.0).cast(pl.Float64) <= 0.0)
+    )
+    guard = (
+        full_guard
+        if target == "path_guard_full"
+        else tradability_guard
+        if target == "path_guard_tradability"
+        else blocker_guard
+        if target == "path_guard_blocker"
+        else obvious_guard
+    )
+    return behavior_targets.with_columns(
+        guard.alias(label_col),
+        pl.when(guard)
+        .then(
+            1.0
+            + pl.col("behavior_utility_margin").fill_null(0.0).cast(pl.Float64).abs()
+        )
+        .otherwise(1.0)
+        .alias(utility_col),
+    ).group_by("symbol", "decision_bar_close_ms").agg(
+        pl.col(label_col).fill_null(False).cast(pl.Boolean).max().alias(label_col),
+        pl.col(utility_col).fill_null(1.0).cast(pl.Float64).max().alias(utility_col),
+    )
 
 
 def tailtree_target_training_values(
     observations: pl.DataFrame,
     labeled_outcomes: pl.DataFrame,
     *,
-    target: TailtreeBinaryTarget,
+    target: str,
     direction: Literal["up", "down"],
+    behavior_targets: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
     """Build target-specific binary labels through one training surface."""
     if observations.is_empty() or labeled_outcomes.is_empty():
@@ -800,7 +605,7 @@ def tailtree_target_training_values(
                 pl.col("tail_utility_down").fill_null(0.0),
             ).max().alias(utility_col),
         )
-    else:
+    elif target == "tail_side_only":
         label_col = f"tail_side_only_{direction}"
         utility_col = f"tail_utility_margin_{direction}"
         state_col = "path_state" if "path_state" in labeled_outcomes.columns else "tail_state"
@@ -810,6 +615,14 @@ def tailtree_target_training_values(
             pl.col(state_col).is_in([direction, f"clean_{direction}"]).max().alias(label_col),
             pl.col(utility_col).fill_null(0.0).clip(0.0, None).max().alias(utility_col),
         )
+    elif target.startswith("path_guard"):
+        label_col = "behavior_guard"
+        utility_col = "behavior_guard_weight"
+        if direction != "up" or behavior_targets is None or behavior_targets.is_empty():
+            return observations.head(0), np.array([], dtype=float), np.array([], dtype=float)
+        outcome = _path_guard_target_frame(behavior_targets, target, label_col, utility_col)
+    else:
+        return observations.head(0), np.array([], dtype=float), np.array([], dtype=float)
 
     joined = observations.join(outcome, on=["symbol", "decision_bar_close_ms"], how="inner").sort(
         "decision_bar_close_ms"
