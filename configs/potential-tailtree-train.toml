@@ -1,7 +1,7 @@
 [potential]
-output = "data/output/potential/paired-replay-test/report.md"
+output = "data/output/potential/tailtree-train/report.md"
 universe = "research"
-max_symbols = 80
+max_symbols = 160
 max_staleness_hours = 24
 fetch_concurrency = 8
 
@@ -69,9 +69,17 @@ kind = "tailtree"
 
 [potential.evidence.tailtree]
 lifecycle = "train"
-model_dir = "data/output/potential/paired-replay-test/models"
+model_dir = "data/output/potential/tailtree/models"
 threshold_pct = 30.0
-outcome_horizon = [24, 48]
+outcome_horizon = [24]
+
+[potential.evidence.tailtree.extreme]
+method = "hybrid"
+material_floor_pct = 20.0
+quantile = 0.95
+min_event_rate = 0.001
+max_event_rate = 0.10
+reference_scope = "universe_horizon"
 
 [potential.evidence.tailtree.selection]
 top_k = [1, 3, 5, 10, 20]
@@ -84,13 +92,13 @@ min_valid_tail_lift = 3.0
 min_profit_proxy_per_selected_obs = 0.0
 
 [[potential.evidence.tailtree.profiles]]
-profile_id = "paired-replay-diagnostic-test"
-model_tag = "tailtree-event-lift-paired-replay-test"
+profile_id = "event-lift-walkforward-optuna-hybrid-f20-q95-h24-current-frontier"
+model_tag = "tailtree-event-lift-current-frontier"
 objective = "tail_event_lift"
 
 [potential.evidence.tailtree.profiles.training]
 kind = "optuna"
-max_trials = 1
+max_trials = 2
 seed = 43
 num_leaves = 40
 min_data_in_leaf = 447
@@ -108,5 +116,5 @@ protocol = "walkforward"
 train_days = 90
 valid_days = 21
 step_days = 21
-max_folds = 1
+max_folds = 3
 embargo_bars = 24

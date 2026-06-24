@@ -1,5 +1,5 @@
 [potential]
-output = "data/output/potential/advanced-tailtree/report.md"
+output = "data/output/potential/tailtree-predict/report.md"
 universe = "research"
 max_symbols = 160
 max_staleness_hours = 24
@@ -68,10 +68,19 @@ top_n = 80
 kind = "tailtree"
 
 [potential.evidence.tailtree]
-lifecycle = "train"
-model_dir = "data/output/potential/advanced-tailtree/models"
+lifecycle = "load_predict"
+model_dir = "data/output/potential/tailtree/models"
+profiles = []
 threshold_pct = 30.0
-outcome_horizon = [12, 24, 48]
+outcome_horizon = [24]
+
+[potential.evidence.tailtree.extreme]
+method = "hybrid"
+material_floor_pct = 20.0
+quantile = 0.95
+min_event_rate = 0.001
+max_event_rate = 0.10
+reference_scope = "universe_horizon"
 
 [potential.evidence.tailtree.selection]
 top_k = [1, 3, 5, 10, 20]
@@ -83,30 +92,10 @@ min_selected_tail_count = 20
 min_valid_tail_lift = 3.0
 min_profit_proxy_per_selected_obs = 0.0
 
-[[potential.evidence.tailtree.profiles]]
-profile_id = "event-lift-walkforward-optuna-h12-h24-h48"
-model_tag = "tailtree-event-lift-advanced-wf-optuna-h12-h24-h48"
+[[potential.evidence.tailtree.models]]
+model_id = "tailtree-event-lift-current-frontier-t0001-f02_24_up"
 objective = "tail_event_lift"
 
-[potential.evidence.tailtree.profiles.training]
-kind = "optuna"
-max_trials = 2
-seed = 43
-num_leaves = 40
-min_data_in_leaf = 447
-learning_rate = 0.04
-num_iterations = 460
-early_stopping_rounds = 30
-num_leaves_range = [16, 96]
-min_data_in_leaf_range = [120, 500]
-learning_rate_range = [0.02, 0.08]
-num_iterations_range = [180, 320]
-early_stopping_rounds_range = [15, 35]
-
-[potential.evidence.tailtree.profiles.evaluation]
-protocol = "walkforward"
-train_days = 90
-valid_days = 21
-step_days = 21
-max_folds = 3
-embargo_bars = 24
+[[potential.evidence.tailtree.models]]
+model_id = "tailtree-event-lift-current-frontier-t0001-f02_24_down"
+objective = "tail_event_lift"
