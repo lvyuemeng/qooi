@@ -52,7 +52,7 @@ horizon:          h24
 source inputs:    persistent funding/LSR/OI/taker context features
 ```
 
-### Predict-only from model ids
+### Predict from existing two-stage model graph
 
 Use this when you want to score/report with existing model JSONs and avoid training during the scan:
 
@@ -65,8 +65,9 @@ This workflow:
 ```text
 load market/source data
 -> build known-at-close state rows
--> load configured model JSONs by model_id
--> emit loaded tail_event_lift evidence/report artifacts
+-> load configured stage-1 opportunity model JSONs by model_id
+-> load candidate-local promoter/opposite/weak guard model JSONs
+-> emit candidate_dual_guard candidate selection/report artifacts
 ```
 
 Expected report root:
@@ -75,7 +76,22 @@ Expected report root:
 data/output/potential/tailtree-predict/report.md
 ```
 
-Predict-only intentionally does **not** train candidate-local promoter/opposite/weak guard models. Therefore it does not emit `candidate_dual_guard` frontier rows unless those guard models are made loadable in a future design slice.
+Predict intentionally does **not** train either model stage. It loads the existing two-stage model graph and fails loudly if a required candidate-local model JSON is missing.
+
+Current candidate report:
+
+```text
+data/output/potential/tailtree-predict/report.md
+```
+
+Primary sections:
+
+```text
+## Candidate Board
+## Tailtree Action Surface
+```
+
+The benchmark frontier validates the `candidate_dual_guard` selection surface over historical/evaluation rows. The Candidate Board applies the same loaded two-stage surface to fresh/current observations, then applies report-time top-k and action-side gates. It is aligned with the benchmark family, but it is not a literal copy of the top frontier benchmark rows.
 
 ## Current workflow shape
 
@@ -94,7 +110,7 @@ Operational defaults:
 - public configs are limited to `potential-tailtree-train.toml` and `potential-tailtree-predict.toml`;
 - preferred scanner horizon is `h24` on `1H` bars;
 - train mode uses Optuna + walkforward for model-quality research;
-- predict mode resolves model JSONs by `model_id` and carries no fixed training profile;
+- predict mode resolves stage-1 and candidate-local model JSONs and carries no fixed training profile;
 - current best-performance train path is `tail_event_lift` stage-1 evidence plus source-context `candidate_dual_guard` final selection;
 - low-performance or stale objective surfaces are removed instead of preserved as compatibility branches.
 
@@ -114,11 +130,11 @@ For scanner/tailtree changes, finish with the relevant real smoke command from [
 Start here:
 
 - `docs/context.md` — project rules and durable constraints.
+- `docs/introduction.md` — paper-style current tailtree scanner research introduction.
 - `docs/architecture/overview.md` — package boundaries and current scanner/tailtree example.
 - `docs/architecture/scanner.md` — scanner ownership, tailtree objective choice, and artifact semantics.
 - `docs/graph/scanner.md` — current scanner call graph.
 - `docs/graph/tailtree.md` — tailtree/tailrun model lifecycle graph.
-- `docs/report/` — empirical run reports, plans, and migration decisions.
 
 ## Status
 

@@ -86,8 +86,9 @@ Recent advanced smoke surface:
 
 ```text
 tailtree-selection-efficiency.csv: 3504 rows = candidate_dual_guard 3456 + tail_event_lift 48
-tailtree-frontier-benchmark.csv: 2107 rows = candidate_dual_guard only
-predict-only selection-efficiency.csv: 8 rows = loaded tail_event_lift only
+tailtree-frontier-benchmark.csv: 2119 rows = candidate_dual_guard only
+predict-only selection-efficiency.csv: 584 rows = candidate_dual_guard 576 + tail_event_lift 8
+predict-only frontier-benchmark.csv: 392 rows = candidate_dual_guard only
 forbidden objective rows: 0 for source_blended, candidate_conditional_promoter, candidate_opposite_guard, continuous_guard_curve, two_model_guard
 best inspected frontier rows: precision about 0.56-0.60, false-direction about 0.12-0.36, utility about 3.55-5.30
 ```

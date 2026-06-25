@@ -156,11 +156,12 @@ Recent verified advanced smoke after row-builder cleanup:
 ```text
 tailtree-selection-efficiency.csv shape: (3504, 78)
 selection objectives: candidate_dual_guard=3456, tail_event_lift=48
-tailtree-frontier-benchmark.csv shape: (2107, 86)
+tailtree-frontier-benchmark.csv shape: (2119, 86)
 frontier objective: candidate_dual_guard only
 forbidden objective rows: 0 for source_blended, candidate_conditional_promoter, candidate_opposite_guard, continuous_guard_curve, two_model_guard
 fresh model metadata: 17 source-context input columns
-predict-only selection-efficiency.csv shape: (8, 71), loaded tail_event_lift only
+predict-only selection-efficiency.csv shape: (584, 78), candidate_dual_guard 576 + tail_event_lift 8
+predict-only frontier-benchmark.csv shape: (392, 86), candidate_dual_guard only
 ```
 
 Top inspected frontier rows from that smoke:

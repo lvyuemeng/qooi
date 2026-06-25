@@ -140,7 +140,7 @@ Public config split:
 
 ```text
 potential-tailtree-train.toml    # trains/scans current frontier, emits candidate_dual_guard
-potential-tailtree-predict.toml  # loads JSON models by model_id, emits loaded tail_event_lift evidence
+potential-tailtree-predict.toml  # loads stage-1 + candidate-local JSON models, emits candidate_dual_guard
 ```
 
 Graph:
@@ -152,12 +152,12 @@ tail_event_lift tree evidence
   -> promoter_target_frame(...)
   -> opposite_guard_target_frame(...)
   -> weak_path_guard_target_frame(...)
-  -> LocalModelSpec(promoter_label, promoter_weight, promotion_score, tail_event_lift)
-  -> _fit_local_model_scores(...)
-  -> LocalModelSpec(opposite_guard_label, opposite_guard_weight, opposite_guard_score, path_guard)
-  -> _fit_local_model_scores(...)
-  -> LocalModelSpec(weak_path_guard_label, weak_path_guard_weight, weak_path_guard_score, path_guard)
-  -> _fit_local_model_scores(...)
+  -> LocalModelSpec(promoter, promoter_label, promoter_weight, promotion_score, tail_event_lift)
+  -> _fit_local_model_scores(train -> save JSON | load_predict -> load JSON)
+  -> LocalModelSpec(opposite_guard, opposite_guard_label, opposite_guard_weight, opposite_guard_score, path_guard)
+  -> _fit_local_model_scores(train -> save JSON | load_predict -> load JSON)
+  -> LocalModelSpec(weak_path_guard, weak_path_guard_label, weak_path_guard_weight, weak_path_guard_score, path_guard)
+  -> _fit_local_model_scores(train -> save JSON | load_predict -> load JSON)
   -> dual_guarded_promotion_selection_metrics_frame(...)
   -> frontier_benchmark_frame(...)
 ```
@@ -208,9 +208,12 @@ Predict config currently resolves:
 TailtreeModelRefConfig.model_id -> {model_dir}/{model_id}.json
 model_id suffix -> horizon + direction
 model JSON metadata.train_config -> profile feedback params
+TailtreePredictProfileConfig.profile_id -> parent id for candidate-local models
+TailtreePredictProfileConfig.candidate_model_roles -> promoter/opposite_guard/weak_path_guard
+candidate-local model ref -> {parent_model_id}_{role}_{gate_slug}.json
 ```
 
-Predict-only does not carry fixed training parameters and does not train candidate-local promoter/guard models.
+Predict does not train candidate-local promoter/guard models. It loads them from JSON and fails if a required gate model is missing.
 
 ## Artifact graph
 
@@ -218,7 +221,12 @@ Model artifacts:
 
 ```text
 models/<model_tag>_<horizon>_<direction>.json
+models/<parent_model_id>_promoter_<gate_slug>.json
+models/<parent_model_id>_opposite_guard_<gate_slug>.json
+models/<parent_model_id>_weak_path_guard_<gate_slug>.json
 ```
+
+`parent_model_id` is the stage-1 opportunity model id, currently `tailtree-event-lift-current-frontier-t0001-f02_24_up` for candidate-local up-side scoring.
 
 Feedback artifacts:
 
@@ -330,18 +338,20 @@ Verified train smoke:
 ```text
 tailtree-selection-efficiency.csv shape: (3504, 78)
 selection objectives: candidate_dual_guard=3456, tail_event_lift=48
-tailtree-frontier-benchmark.csv shape: (2107, 86)
+tailtree-frontier-benchmark.csv shape: (2119, 86)
 frontier objective: candidate_dual_guard only
 forbidden objective rows: 0 for source_blended, candidate_conditional_promoter, candidate_opposite_guard, continuous_guard_curve, two_model_guard
 fresh model metadata: 17 source-context feature columns
+candidate-local model JSONs: promoter=36, opposite_guard=36, weak_path_guard=36
 ```
 
 Verified predict-only smoke:
 
 ```text
-tailtree-selection-efficiency.csv shape: (8, 71)
-selection objective: loaded tail_event_lift only
-frontier benchmark: absent because candidate-local guard models are not trained in predict-only mode
+tailtree-selection-efficiency.csv shape: (584, 78)
+selection objectives: candidate_dual_guard=576, tail_event_lift=8
+tailtree-frontier-benchmark.csv shape: (392, 86)
+frontier objective: candidate_dual_guard only
 ```
 
 ## Public tailtree/tailrun calls
