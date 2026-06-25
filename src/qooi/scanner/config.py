@@ -215,6 +215,62 @@ class TailtreeWalkforwardEvaluationConfig(BaseModel):
 TailtreeEvaluationConfig = TailtreeSingleSplitEvaluationConfig | TailtreeWalkforwardEvaluationConfig
 
 
+TailtreeCandidateModelRole = Literal["promoter", "opposite_guard", "weak_path_guard"]
+
+
+class TailtreePredictProfileConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    profile_id: str
+    horizon: int = 24
+    opportunity_model_ids: tuple[str, str]
+    candidate_model_roles: tuple[TailtreeCandidateModelRole, ...] = (
+        "promoter",
+        "opposite_guard",
+        "weak_path_guard",
+    )
+    candidate_model_side: Literal["up", "down"] = "up"
+
+    @field_validator("profile_id")
+    @classmethod
+    def nonempty_profile_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("tailtree predict profile_id must not be empty")
+        return cleaned
+
+    @field_validator("opportunity_model_ids", mode="before")
+    @classmethod
+    def normalize_model_ids(cls, value: object) -> tuple[str, str]:
+        if isinstance(value, str):
+            values = (value,)
+        elif isinstance(value, Iterable):
+            values = tuple(value)
+        else:
+            values = ()
+        cleaned = tuple(str(item).removesuffix(".json").strip() for item in values if item)
+        if len(cleaned) != 2:
+            raise ValueError("tailtree predict_profile requires two opportunity_model_ids")
+        return (cleaned[0], cleaned[1])
+
+    @model_validator(mode="after")
+    def validate_predict_profile(self) -> TailtreePredictProfileConfig:
+        expected_roles = ("promoter", "opposite_guard", "weak_path_guard")
+        if self.candidate_model_roles != expected_roles:
+            raise ValueError(
+                "tailtree predict_profile candidate_model_roles must be "
+                "['promoter', 'opposite_guard', 'weak_path_guard']"
+            )
+        directions = {model_id.rsplit("_", 2)[-1] for model_id in self.opportunity_model_ids}
+        horizons = {model_id.rsplit("_", 2)[-2] for model_id in self.opportunity_model_ids}
+        if directions != {"up", "down"} or horizons != {str(self.horizon)}:
+            raise ValueError(
+                "tailtree predict_profile opportunity_model_ids must contain one "
+                "_<horizon>_up and one _<horizon>_down model"
+            )
+        return self
+
+
 class TailtreeProfileConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -280,6 +336,7 @@ class TailtreeConfig(BaseModel):
     outcome_horizon: tuple[int, ...] = (12,)
     selection: TailtreeSelectionConfig = TailtreeSelectionConfig()
     models: tuple[TailtreeModelRefConfig, ...] = ()
+    predict_profile: TailtreePredictProfileConfig | None = None
     profiles: tuple[TailtreeProfileConfig, ...] = (
         TailtreeProfileConfig(
             profile_id="gpd-balanced-fixed",
@@ -323,8 +380,18 @@ class TailtreeConfig(BaseModel):
                 raise ValueError("tailtree load_predict requires explicit model ids")
             if self.profiles:
                 raise ValueError("tailtree load_predict uses models, not training profiles")
+            if self.predict_profile is None:
+                raise ValueError("tailtree load_predict requires predict_profile")
+            if {model.model_id for model in self.models} != set(
+                self.predict_profile.opportunity_model_ids
+            ):
+                raise ValueError(
+                    "tailtree predict_profile opportunity_model_ids must match models"
+                )
         elif self.models:
             raise ValueError("tailtree train lifecycle must not include predict model ids")
+        elif self.predict_profile is not None:
+            raise ValueError("tailtree train lifecycle must not include predict_profile")
         profile_ids = [profile.profile_id for profile in self.profiles]
         if len(profile_ids) != len(set(profile_ids)):
             raise ValueError("tailtree profile_id values must be unique")

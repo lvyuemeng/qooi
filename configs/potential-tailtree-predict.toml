@@ -74,6 +74,16 @@ profiles = []
 threshold_pct = 30.0
 outcome_horizon = [24]
 
+[potential.evidence.tailtree.predict_profile]
+profile_id = "tailtree-event-lift-current-frontier-t0001-f02"
+horizon = 24
+opportunity_model_ids = [
+  "tailtree-event-lift-current-frontier-t0001-f02_24_up",
+  "tailtree-event-lift-current-frontier-t0001-f02_24_down",
+]
+candidate_model_roles = ["promoter", "opposite_guard", "weak_path_guard"]
+candidate_model_side = "up"
+
 [potential.evidence.tailtree.extreme]
 method = "hybrid"
 material_floor_pct = 20.0

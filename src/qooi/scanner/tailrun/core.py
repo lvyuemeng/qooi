@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Literal
 
@@ -19,6 +20,7 @@ from qooi.scanner.config import (
 from qooi.scanner.tailrun.types import (
     TailtreeArtifactTree,
     TailtreeCandidateGateSpec,
+    TailtreeCandidateLocalModelRef,
     TailtreeDirection,
     TailtreeFeatureSelection,
     TailtreeFeatureSet,
@@ -145,6 +147,7 @@ def train_features(
 class LocalModelSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    role: Literal["promoter", "opposite_guard", "weak_path_guard"]
     label_column: str
     weight_column: str
     score_column: str
@@ -159,6 +162,27 @@ class CandidateLocalProduct:
     contradiction_audit: pl.DataFrame
 
 
+def _model_id_slug(value: object) -> str:
+    text = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value))
+    return "_".join(part for part in text.split("_") if part)
+
+
+def _local_model_ref(
+    *,
+    model_dir: str | Path,
+    parent_model_id: str,
+    role: Literal["promoter", "opposite_guard", "weak_path_guard"],
+    gate_id: object,
+) -> TailtreeCandidateLocalModelRef:
+    gate_slug = _model_id_slug(gate_id)
+    return TailtreeCandidateLocalModelRef(
+        parent_model_id=parent_model_id,
+        role=role,
+        gate_id=str(gate_id),
+        model_path=Path(model_dir) / f"{parent_model_id}_{role}_{gate_slug}.json",
+    )
+
+
 def _fit_local_model_scores(
     spec: LocalModelSpec,
     *,
@@ -168,8 +192,28 @@ def _fit_local_model_scores(
     observations: pl.DataFrame,
     training: TailtreeTrialParams,
     join_keys: list[str],
+    lifecycle: Literal["train", "load_predict"],
+    model_dir: str | Path,
+    parent_model_id: str,
 ) -> pl.DataFrame:
     from qooi.scanner.tailtree.model import TailTreeModel, TrainConfig
+
+    model_ref = _local_model_ref(
+        model_dir=model_dir,
+        parent_model_id=parent_model_id,
+        role=spec.role,
+        gate_id=gate_id,
+    )
+
+    if lifecycle == "load_predict":
+        if not model_ref.model_path.exists():
+            raise FileNotFoundError(
+                f"tailtree candidate-local model missing: {model_ref.model_path}"
+            )
+        model = TailTreeModel.from_json(model_ref.model_path)
+        return model.predict_score(score_features).select(
+            *join_keys, pl.col("tailtree_score").alias(spec.score_column)
+        ).unique(subset=join_keys, maintain_order=True)
 
     gate_train = train_targets.filter(
         (pl.col("candidate_gate_id") == gate_id)
@@ -210,6 +254,8 @@ def _fit_local_model_scores(
         )
     except ValueError:
         return pl.DataFrame()
+    model_ref.model_path.parent.mkdir(parents=True, exist_ok=True)
+    model.to_json(model_ref.model_path)
     return model.predict_score(score_features).select(
         *join_keys, pl.col("tailtree_score").alias(spec.score_column)
     ).unique(subset=join_keys, maintain_order=True)
@@ -693,11 +739,7 @@ def candidate_conditional_promoter_efficiency_frame(
         boundary_anatomy=pl.DataFrame(),
         contradiction_audit=pl.DataFrame(),
     )
-    if (
-        config.evidence.tailtree.lifecycle != "train"
-        or run.objective != "tail_event_lift"
-        or 24 not in config.evidence.tailtree.outcome_horizon
-    ):
+    if run.objective != "tail_event_lift" or 24 not in config.evidence.tailtree.outcome_horizon:
         return empty
 
     from qooi.scanner.tailrun.selection import (
@@ -763,14 +805,17 @@ def candidate_conditional_promoter_efficiency_frame(
             promoter_target_frame(candidate_gate_frame(score_population, _CANDIDATE_PROMOTER_GATES))
         )
     )
-    if train_targets.is_empty() or score_targets.is_empty():
+    if score_targets.is_empty() or (
+        config.evidence.tailtree.lifecycle == "train" and train_targets.is_empty()
+    ):
         return empty
 
     rows: list[pl.DataFrame] = []
     guarded_rows: list[pl.DataFrame] = []
     dual_guarded_rows: list[pl.DataFrame] = []
     join_keys = ["symbol", "decision_bar_close_ms"]
-    for gate_id in train_targets.get_column("candidate_gate_id").unique().to_list():
+    parent_model_id = f"{run.model_tag}_24_up"
+    for gate_id in score_targets.get_column("candidate_gate_id").unique().to_list():
         gate_score = score_targets.filter(
             (pl.col("candidate_gate_id") == gate_id) & pl.col("in_candidate_gate")
         )
@@ -784,6 +829,7 @@ def candidate_conditional_promoter_efficiency_frame(
         )
         promotion_scores = _fit_local_model_scores(
             LocalModelSpec(
+                role="promoter",
                 label_column="promoter_label",
                 weight_column="promoter_weight",
                 score_column="promotion_score",
@@ -795,6 +841,9 @@ def candidate_conditional_promoter_efficiency_frame(
             observations=prepared.observations,
             training=run.training,
             join_keys=join_keys,
+            lifecycle=config.evidence.tailtree.lifecycle,
+            model_dir=config.evidence.tailtree.model_dir,
+            parent_model_id=parent_model_id,
         )
         if promotion_scores.is_empty():
             continue
@@ -803,6 +852,7 @@ def candidate_conditional_promoter_efficiency_frame(
 
         guard_scores = _fit_local_model_scores(
             LocalModelSpec(
+                role="opposite_guard",
                 label_column="opposite_guard_label",
                 weight_column="opposite_guard_weight",
                 score_column="opposite_guard_score",
@@ -814,6 +864,9 @@ def candidate_conditional_promoter_efficiency_frame(
             observations=prepared.observations,
             training=run.training,
             join_keys=join_keys,
+            lifecycle=config.evidence.tailtree.lifecycle,
+            model_dir=config.evidence.tailtree.model_dir,
+            parent_model_id=parent_model_id,
         )
         if guard_scores.is_empty():
             continue
@@ -822,6 +875,7 @@ def candidate_conditional_promoter_efficiency_frame(
 
         weak_scores = _fit_local_model_scores(
             LocalModelSpec(
+                role="weak_path_guard",
                 label_column="weak_path_guard_label",
                 weight_column="weak_path_guard_weight",
                 score_column="weak_path_guard_score",
@@ -833,6 +887,9 @@ def candidate_conditional_promoter_efficiency_frame(
             observations=prepared.observations,
             training=run.training,
             join_keys=join_keys,
+            lifecycle=config.evidence.tailtree.lifecycle,
+            model_dir=config.evidence.tailtree.model_dir,
+            parent_model_id=parent_model_id,
         )
         if weak_scores.is_empty():
             continue

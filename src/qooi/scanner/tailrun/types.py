@@ -351,6 +351,18 @@ class TailtreeSelectionEfficiencyRow(BaseModel):
 
 
 @dataclass(frozen=True)
+class TailtreeCandidateLocalModelRef:
+    parent_model_id: str
+    role: Literal["promoter", "opposite_guard", "weak_path_guard"]
+    gate_id: str
+    model_path: Path
+
+    @property
+    def model_id(self) -> str:
+        return self.model_path.stem
+
+
+@dataclass(frozen=True)
 class TailtreeRunOutput:
     evidence: pl.DataFrame
     models: dict[tuple[int, TailtreeDirection], TailtreeArtifactTree]
