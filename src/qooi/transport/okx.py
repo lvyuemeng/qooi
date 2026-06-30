@@ -426,6 +426,37 @@ class OkxClient(BaseHttpClient):
                 ),
             )
 
+    async def _fetch_required_frame(
+        self,
+        *,
+        endpoint: str,
+        params: dict[str, str],
+        source: str,
+        normalizer: Callable[[list[dict[str, Any]]], pl.DataFrame],
+    ) -> SourceResult:
+        raw = await self.request(endpoint, params=params)
+        data = raw.get("data", [])
+        frame_data = data if isinstance(data, list) else ([data] if data else [])
+        frame = normalizer(frame_data)
+        if frame.is_empty():
+            raise ValueError(f"OKX required source {source} returned 0 rows from {endpoint}")
+        return SourceResult(
+            frame,
+            TRANSPORT_MANIFEST.frame(
+                [
+                    TRANSPORT_MANIFEST.row(
+                        symbol="*",
+                        source=source,
+                        phase="collect-market",
+                        status="ok",
+                        backend="okx",
+                        endpoint=endpoint,
+                        rows=frame.height,
+                    )
+                ]
+            ),
+        )
+
     # ── Bars ──
 
     async def bars(
@@ -601,20 +632,18 @@ class OkxClient(BaseHttpClient):
         )
 
     async def instruments(self, inst_type: str = "SWAP") -> SourceResult:
-        return await self._fetch_frame(
+        return await self._fetch_required_frame(
             endpoint="/api/v5/public/instruments",
             params={"instType": inst_type},
             source="discovery",
-            symbol="*",
             normalizer=_normalize_instruments,
         )
 
     async def tickers(self, inst_type: str = "SWAP") -> SourceResult:
-        return await self._fetch_frame(
+        return await self._fetch_required_frame(
             endpoint="/api/v5/market/tickers",
             params={"instType": inst_type},
             source="discovery",
-            symbol="*",
             normalizer=_normalize_tickers,
         )
 
