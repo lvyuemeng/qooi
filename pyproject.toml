@@ -2,7 +2,7 @@
 name = "qooi"
 version = "0.1.0"
 description = "Crypto quantitative trading toolkit — OKX market data, backtesting, evaluation"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27,<0.28",
     "matplotlib>=3.10",
@@ -22,21 +22,21 @@ dev = [
     "ruff>=0.15.12",
     "ty>=0.0.1",
 ]
-ml = [
-    "torch>=2.3",
-]
 tailtree = [
     "lightgbm>=4.0",
     "optuna>=4.0",
     "scipy>=1.11",
 ]
+feature-research = [
+    "pandas>=2.3",
+    "tsflex>=0.4.1",
+    "scikit-learn>=1.4",
+    "shap>=0.45",
+]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 100
-
-[[tool.uv.index]]
-url = "https://download.pytorch.org/whl/cu128"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
@@ -52,7 +52,7 @@ extend-safe-fixes = ["E402"]
 quote-style = "double"
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.12"
 root = ["./src"]
 
 [tool.ty.src]
