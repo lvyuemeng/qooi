@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -10,17 +9,13 @@ from typing import Literal
 import polars as pl
 
 from qooi.scanner.config import (
-    PotentialConfig,
-    TailtreeConfig,
-    TailtreeFixedTrainingConfig,
-    TailtreeObjective,
-    TailtreeOptunaTrainingConfig,
-    TailtreeProfileConfig,
+    Config,
+    FixedTrainingConfig,
+    Objective,
 )
 from qooi.scanner.tailrun.types import (
-    TailtreeDirection,
+    ObjectiveJob,
     TailtreeFrameSplit,
-    TailtreeObjectiveJob,
     TailtreeSingleSplitFold,
     TailtreeTimeWindow,
     TailtreeWalkforwardFold,
@@ -35,7 +30,7 @@ class TailtreeProfileRun:
     run_id: str
     run_source: Literal["fixed", "optuna", "loaded"]
     model_tag: str
-    objective: TailtreeObjective
+    objective: Objective
     training: TailtreeTrialParams
 
     @property
@@ -97,32 +92,32 @@ def _time_filter(frame: pl.DataFrame, window: TailtreeTimeWindow) -> pl.DataFram
 
 
 def tailtree_trial_run(
-    profile: TailtreeProfileConfig,
+    tailtree: Config,
     params: TailtreeTrialParams,
     *,
     trial_number: int,
 ) -> TailtreeProfileRun:
-    run_id = f"{profile.profile_id}-t{trial_number:04d}"
+    run_id = f"path-prototype-fixed-t{trial_number:04d}"
     return TailtreeProfileRun(
-        profile_id=profile.profile_id,
+        profile_id="path-prototype-fixed",
         run_id=run_id,
         run_source="optuna",
-        model_tag=f"{profile.model_tag}-t{trial_number:04d}",
-        objective=profile.objective,
+        model_tag=f"tailtree-path-t{trial_number:04d}",
+        objective="path_prototype",
         training=params,
     )
 
 
-def tailtree_fixed_run(profile: TailtreeProfileConfig) -> TailtreeProfileRun:
-    training = profile.training
-    if not isinstance(training, TailtreeFixedTrainingConfig):
+def tailtree_fixed_run(tailtree: Config) -> TailtreeProfileRun:
+    training = tailtree.training
+    if not isinstance(training, FixedTrainingConfig):
         raise ValueError("tailtree_fixed_run requires fixed training")
     return TailtreeProfileRun(
-        profile_id=profile.profile_id,
-        run_id=profile.profile_id,
+        profile_id="path-prototype-fixed",
+        run_id="path-prototype-fixed",
         run_source="fixed",
-        model_tag=profile.model_tag,
-        objective=profile.objective,
+        model_tag="tailtree-path",
+        objective="path_prototype",
         training=TailtreeTrialParams(
             num_leaves=training.num_leaves,
             min_data_in_leaf=training.min_data_in_leaf,
@@ -134,49 +129,26 @@ def tailtree_fixed_run(profile: TailtreeProfileConfig) -> TailtreeProfileRun:
 
 
 def _loaded_trial_params(path) -> TailtreeTrialParams:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    metadata = data.get("metadata")
-    if not isinstance(metadata, dict):
-        raise ValueError(f"tailtree model metadata missing: {path}")
-    train_config = metadata.get("train_config")
-    if not isinstance(train_config, dict):
-        raise ValueError(f"tailtree model train_config missing: {path}")
+    from qooi.scanner.path_model import TailTreeModel
+
+    train_config = TailTreeModel.from_json(path).metadata.train_config
     return TailtreeTrialParams(
-        num_leaves=int(train_config["num_leaves"]),
-        min_data_in_leaf=int(train_config["min_data_in_leaf"]),
-        learning_rate=float(train_config["learning_rate"]),
-        num_iterations=int(train_config["num_iterations"]),
-        early_stopping_rounds=int(train_config["early_stopping_rounds"]),
+        num_leaves=int(train_config.num_leaves),
+        min_data_in_leaf=int(train_config.min_data_in_leaf),
+        learning_rate=float(train_config.learning_rate),
+        num_iterations=int(train_config.num_iterations),
+        early_stopping_rounds=int(train_config.early_stopping_rounds),
     )
 
 
-def tailtree_predict_run(tailtree: TailtreeConfig) -> TailtreeProfileRun:
-    if not tailtree.models:
-        raise ValueError("tailtree load_predict requires explicit model ids")
-    first = tailtree.models[0]
+def tailtree_predict_run(tailtree: Config) -> TailtreeProfileRun:
     return TailtreeProfileRun(
         profile_id="loaded-tailtree-models",
         run_id="loaded-tailtree-models",
         run_source="loaded",
-        model_tag=first.model_tag,
-        objective=first.objective,
-        training=_loaded_trial_params(tailtree.model_dir / f"{first.model_id}.json"),
-    )
-
-
-def tailtree_profile_runs(config: PotentialConfig) -> tuple[TailtreeProfileRun, ...]:
-    runs = []
-    for profile in config.evidence.tailtree.profiles:
-        if isinstance(profile.training, TailtreeFixedTrainingConfig):
-            runs.append(tailtree_fixed_run(profile))
-    return tuple(runs)
-
-
-def tailtree_optuna_profiles(config: PotentialConfig) -> tuple[TailtreeProfileConfig, ...]:
-    return tuple(
-        profile
-        for profile in config.evidence.tailtree.profiles
-        if isinstance(profile.training, TailtreeOptunaTrainingConfig)
+        model_tag=tailtree.model_id.removesuffix("_path"),
+        objective="path_prototype",
+        training=_loaded_trial_params(tailtree.model_dir / f"{tailtree.model_id}.json"),
     )
 
 
@@ -184,38 +156,29 @@ def tailtree_objective_jobs(
     run: TailtreeProfileRun,
     *,
     fold_id: int,
-    tailtree: TailtreeConfig,
-) -> tuple[TailtreeObjectiveJob, ...]:
-    jobs: list[TailtreeObjectiveJob] = []
+    tailtree: Config,
+) -> tuple[ObjectiveJob, ...]:
     if tailtree.lifecycle == "load_predict":
-        for model in tailtree.models:
-            jobs.append(
-                TailtreeObjectiveJob(
-                    run=run,
-                    fold_id=int(fold_id),
-                    outcome_horizon=model.outcome_horizon,
-                    direction=model.direction,
-                    model_path=tailtree.model_dir / f"{model.model_id}.json",
-                    label=f"{model.model_id}.loaded",
-                )
-            )
-        return tuple(jobs)
-    directions = ("up",) if run.objective.startswith("path_guard") else ("up", "down")
-    for outcome_horizon in tailtree.outcome_horizon:
-        for direction in directions:
-            horizon = int(outcome_horizon)
-            direction_value: TailtreeDirection = direction
-            jobs.append(
-                TailtreeObjectiveJob(
-                    run=run,
-                    fold_id=int(fold_id),
-                    outcome_horizon=horizon,
-                    direction=direction_value,
-                    model_path=tailtree.model_dir / f"{run.model_tag}_{horizon}_{direction}.json",
-                    label=f"{run.run_id}.h{horizon}.{direction}",
-                )
-            )
-    return tuple(jobs)
+        return (
+            ObjectiveJob(
+                run=run,
+                fold_id=int(fold_id),
+                outcome_horizon=0,
+                direction="path",
+                model_path=tailtree.model_dir / f"{tailtree.model_id}.json",
+                label=f"{tailtree.model_id}.loaded",
+            ),
+        )
+    return (
+        ObjectiveJob(
+            run=run,
+            fold_id=int(fold_id),
+            outcome_horizon=0,
+            direction="path",
+            model_path=tailtree.model_dir / f"{run.model_tag}_path.json",
+            label=f"{run.run_id}.path",
+        ),
+    )
 
 
 def tailtree_fold_specs(
@@ -276,6 +239,46 @@ def tailtree_fold_specs(
             embargo_bars=fold.embargo_bars,
         )
         for index, fold in enumerate(newest)
+    )
+
+
+def _require_columns(frame: pl.DataFrame, *, name: str, columns: set[str]) -> None:
+    missing = sorted(columns - set(frame.columns))
+    if missing:
+        raise ValueError(f"{name} missing required columns: {', '.join(missing)}")
+
+
+def make_horizon_samples(
+    observations: pl.DataFrame,
+    path_labels: pl.DataFrame,
+    *,
+    horizons: tuple[int, ...],
+) -> pl.DataFrame:
+    """Join observations to path labels at symbol × decision × horizon grain."""
+    observation_keys = {"symbol", "decision_bar_close_ms"}
+    label_keys = observation_keys | {"horizon_hours"}
+    _require_columns(observations, name="observations", columns=observation_keys)
+    _require_columns(path_labels, name="path_labels", columns=label_keys)
+    horizon_values = [int(horizon) for horizon in horizons]
+    if not horizon_values or observations.is_empty() or path_labels.is_empty():
+        return observations.head(0).join(
+            path_labels.head(0),
+            on=["symbol", "decision_bar_close_ms"],
+            how="inner",
+        )
+    labels = path_labels.filter(pl.col("horizon_hours").is_in(horizon_values))
+    duplicate_count = (
+        labels.group_by("symbol", "decision_bar_close_ms", "horizon_hours")
+        .len()
+        .filter(pl.col("len") > 1)
+        .height
+    )
+    if duplicate_count:
+        raise ValueError(
+            "duplicate path label grain: symbol × decision_bar_close_ms × horizon_hours"
+        )
+    return observations.join(labels, on=["symbol", "decision_bar_close_ms"], how="inner").sort(
+        "decision_bar_close_ms", "symbol", "horizon_hours"
     )
 
 
