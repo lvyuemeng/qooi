@@ -105,6 +105,51 @@ class ProductCoverageSpec:
     page_limit: int
     max_staleness_hours: int
 
+    def timestamp_bounds(self, frame: pl.DataFrame) -> tuple[int | None, int | None]:
+        if frame.is_empty() or "timestamp" not in frame.columns:
+            return None, None
+        values = frame.get_column("timestamp")
+        earliest = values.min()
+        latest = values.max()
+        return (
+            int(earliest) if earliest is not None else None,
+            int(latest) if latest is not None else None,
+        )
+
+    def span_days(self, earliest: int | None, latest: int | None) -> float:
+        if earliest is None or latest is None or latest < earliest:
+            return 0.0
+        return (latest - earliest) / (24 * HOUR_MS)
+
+    def is_fresh(self, latest: int | None) -> bool:
+        return latest is not None and (now_ms() - latest) <= self.max_staleness_hours * HOUR_MS
+
+    def max_possible_rows(
+        self, effective_start_ms: int | None, *, latest_ms: int | None = None
+    ) -> int:
+        if self.interval_ms is None:
+            return self.target_rows
+        start = (
+            effective_start_ms
+            if effective_start_ms is not None
+            else now_ms() - self.target_days * 24 * HOUR_MS
+        )
+        completed_end = (now_ms() // self.interval_ms) * self.interval_ms
+        possible_end = min(completed_end, latest_ms) if latest_ms is not None else completed_end
+        aligned_start = ((start + self.interval_ms - 1) // self.interval_ms) * self.interval_ms
+        if possible_end < aligned_start:
+            return 0
+        return max(0, (possible_end - aligned_start) // self.interval_ms + 1)
+
+    def cursor(self, earliest_ms: int | None) -> str | None:
+        if earliest_ms is None:
+            return None
+        if self.cursor_kind in {"bars_after", "funding_after"}:
+            return str(earliest_ms)
+        if self.cursor_kind == "rubik_end":
+            return str(earliest_ms - 1)
+        return None
+
 
 @dataclass(frozen=True)
 class CoverageState:
@@ -149,6 +194,50 @@ class CoverageState:
             pages,
         )
 
+    def fetch_priority(self) -> int:
+        if self.status == "stale":
+            return 0
+        if self.product == "bars":
+            return 1
+        if self.product in {"open_interest", "taker_volume", "long_short_ratios"}:
+            return 2
+        return 3
+
+    def candidate_job(
+        self, spec: ProductCoverageSpec, policy: CoverageRunPolicy
+    ) -> CoverageJob | None:
+        if self.status not in {"fetch_more", "missing", "stale"} and not (
+            self.status == "current_only" and self.missing_pages > 0
+        ):
+            return None
+        kind: NeedKind = "current_snapshot" if self.status == "current_only" else "older_backfill"
+        if self.status == "stale":
+            kind = "latest_refresh"
+        return CoverageJob(
+            symbol=self.symbol,
+            product=self.product,
+            timeframe=self.timeframe,
+            kind=kind,
+            max_pages=max(1, min(self.missing_pages, policy.max_requests_per_symbol_product)),
+            cursor_kind=spec.cursor_kind,
+            first_cursor=spec.cursor(self.cache_earliest_ms),
+            limit=spec.page_limit,
+            priority=self.fetch_priority(),
+            reason=self.reason,
+        )
+
+    def with_allocation(self, pages: int) -> CoverageState:
+        if pages > 0:
+            status: CoverageStatus = (
+                "current_refresh" if self.status == "current_only" else "allocated"
+            )
+            return self.allocate(pages, status)
+        if self.status in {"fetch_more", "missing", "stale"} or (
+            self.status == "current_only" and self.missing_pages > 0
+        ):
+            return self.allocate(0, "deferred_by_budget")
+        return self
+
 
 @dataclass(frozen=True)
 class CoverageJob:
@@ -173,7 +262,12 @@ class CoveragePlan:
     def with_allocation(self, jobs: tuple[CoverageJob, ...]) -> CoveragePlan:
         pages_by_key = {(job.symbol, job.product, job.timeframe): job.max_pages for job in jobs}
         return CoveragePlan(
-            states=tuple(_allocated_state(state, pages_by_key) for state in self.states),
+            states=tuple(
+                state.with_allocation(
+                    pages_by_key.get((state.symbol, state.product, state.timeframe), 0)
+                )
+                for state in self.states
+            ),
             jobs=jobs,
             estimated_pages=self.estimated_pages,
         )
@@ -244,7 +338,13 @@ def plan_product_coverage(
         )
         for symbol in symbols
     )
-    jobs = _candidate_jobs_for_states(spec, states, policy)
+    jobs = tuple(
+        job
+        for state in sorted(
+            states, key=lambda item: (item.fetch_priority(), item.cache_span_days, item.symbol)
+        )
+        if (job := state.candidate_job(spec, policy)) is not None
+    )
     return CoveragePlan(
         states=states,
         jobs=jobs,
@@ -287,15 +387,14 @@ def coverage_state(
     provider_bounded: bool = False,
 ) -> CoverageState:
     rows = frame.height
-    earliest = _timestamp_min(frame)
-    latest = _timestamp_max(frame)
+    earliest, latest = spec.timestamp_bounds(frame)
     target_start = now_ms() - spec.target_days * 24 * HOUR_MS if spec.interval_ms else None
     effective_start = (
         max(v for v in (target_start, coin_listed_ms) if v is not None)
         if (target_start or coin_listed_ms)
         else target_start
     )
-    fresh = _fresh(latest, spec.max_staleness_hours)
+    fresh = spec.is_fresh(latest)
     latest_possible_end = (
         latest
         if fresh
@@ -304,11 +403,11 @@ def coverage_state(
         and coin_listed_ms > target_start
         else None
     )
-    max_possible_rows = _max_possible_rows(spec, effective_start, latest_ms=latest_possible_end)
+    max_possible_rows = spec.max_possible_rows(effective_start, latest_ms=latest_possible_end)
     required_rows = (
         min(spec.target_rows, max_possible_rows) if spec.endpoint_kind == "historical" else 1
     )
-    span_days = _span_days(earliest, latest)
+    span_days = spec.span_days(earliest, latest)
     deep_enough = rows >= required_rows and (
         effective_start is None or (earliest is not None and earliest <= effective_start)
     )
@@ -471,45 +570,6 @@ def coin_list_times(frame: pl.DataFrame) -> dict[str, int]:
     }
 
 
-def _candidate_jobs_for_states(
-    spec: ProductCoverageSpec,
-    states: tuple[CoverageState, ...],
-    policy: CoverageRunPolicy,
-) -> tuple[CoverageJob, ...]:
-    jobs: list[CoverageJob] = []
-    candidates = sorted(
-        (
-            state
-            for state in states
-            if state.status in {"fetch_more", "missing", "stale"}
-            or (state.status == "current_only" and state.missing_pages > 0)
-        ),
-        key=lambda s: (_priority(s), s.cache_span_days, s.symbol),
-    )
-    for state in candidates:
-        pages = min(max(1, state.missing_pages), policy.max_requests_per_symbol_product)
-        if pages <= 0:
-            continue
-        kind: NeedKind = "current_snapshot" if state.status == "current_only" else "older_backfill"
-        if state.status == "stale":
-            kind = "latest_refresh"
-        jobs.append(
-            CoverageJob(
-                symbol=state.symbol,
-                product=state.product,
-                timeframe=state.timeframe,
-                kind=kind,
-                max_pages=pages,
-                cursor_kind=spec.cursor_kind,
-                first_cursor=_cursor(spec, state.cache_earliest_ms),
-                limit=spec.page_limit,
-                priority=_priority(state),
-                reason=state.reason,
-            )
-        )
-    return tuple(jobs)
-
-
 def _allocate_jobs(jobs: list[CoverageJob], budget: int) -> list[CoverageJob]:
     remaining = max(0, budget)
     allocated: list[CoverageJob] = []
@@ -535,42 +595,6 @@ def _allocate_jobs(jobs: list[CoverageJob], budget: int) -> list[CoverageJob]:
         )
         remaining -= pages
     return allocated
-
-
-def _allocated_state(
-    state: CoverageState, pages_by_key: dict[tuple[str, str, str], int]
-) -> CoverageState:
-    pages = pages_by_key.get((state.symbol, state.product, state.timeframe), 0)
-    if pages > 0:
-        status: CoverageStatus = (
-            "current_refresh" if state.status == "current_only" else "allocated"
-        )
-        return state.allocate(pages, status)
-    if state.status in {"fetch_more", "missing", "stale"} or (
-        state.status == "current_only" and state.missing_pages > 0
-    ):
-        return state.allocate(0, "deferred_by_budget")
-    return state
-
-
-def _priority(state: CoverageState) -> int:
-    if state.status == "stale":
-        return 0
-    if state.product == "bars":
-        return 1
-    if state.product in {"open_interest", "taker_volume", "long_short_ratios"}:
-        return 2
-    return 3
-
-
-def _cursor(spec: ProductCoverageSpec, earliest_ms: int | None) -> str | None:
-    if earliest_ms is None:
-        return None
-    if spec.cursor_kind in {"bars_after", "funding_after"}:
-        return str(earliest_ms)
-    if spec.cursor_kind == "rubik_end":
-        return str(earliest_ms - 1)
-    return None
 
 
 def _state(
@@ -611,30 +635,6 @@ def _state(
     )
 
 
-def _timestamp_min(frame: pl.DataFrame) -> int | None:
-    if frame.is_empty() or "timestamp" not in frame.columns:
-        return None
-    value = frame.get_column("timestamp").min()
-    return int(value) if value is not None else None
-
-
-def _timestamp_max(frame: pl.DataFrame) -> int | None:
-    if frame.is_empty() or "timestamp" not in frame.columns:
-        return None
-    value = frame.get_column("timestamp").max()
-    return int(value) if value is not None else None
-
-
-def _span_days(earliest: int | None, latest: int | None) -> float:
-    if earliest is None or latest is None or latest < earliest:
-        return 0.0
-    return (latest - earliest) / (24 * HOUR_MS)
-
-
-def _fresh(latest: int | None, max_staleness_hours: int) -> bool:
-    return latest is not None and (now_ms() - latest) <= max_staleness_hours * HOUR_MS
-
-
 def _covers_coin_life(
     *,
     rows: int,
@@ -649,21 +649,3 @@ def _covers_coin_life(
     if not fresh or earliest is None or effective_start is None or interval_ms is None:
         return False
     return rows >= max(0, max_possible_rows - 1) and earliest <= effective_start + interval_ms
-
-
-def _max_possible_rows(
-    spec: ProductCoverageSpec, effective_start_ms: int | None, *, latest_ms: int | None = None
-) -> int:
-    if spec.interval_ms is None:
-        return spec.target_rows
-    start = (
-        effective_start_ms
-        if effective_start_ms is not None
-        else now_ms() - spec.target_days * 24 * HOUR_MS
-    )
-    completed_end = (now_ms() // spec.interval_ms) * spec.interval_ms
-    possible_end = min(completed_end, latest_ms) if latest_ms is not None else completed_end
-    aligned_start = ((start + spec.interval_ms - 1) // spec.interval_ms) * spec.interval_ms
-    if possible_end < aligned_start:
-        return 0
-    return max(0, (possible_end - aligned_start) // spec.interval_ms + 1)

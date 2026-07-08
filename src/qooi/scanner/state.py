@@ -7,8 +7,6 @@ from typing import Literal
 
 import polars as pl
 
-from qooi.core.evaluate import format_table
-
 
 class StructureState:
     UPTREND = "uptrend"
@@ -31,133 +29,96 @@ class MarketStage:
     UNKNOWN = StructureState.UNKNOWN
 
 
-class ClassifierColumn:
-    STRUCTURE_TREND_STATE = "structure_trend_state"
-    MARKET_STAGE = "market_stage"
-    RANGE_WIDTH_ATR = "range_width_atr"
-
-
 StateDirection = Literal["bullish", "bearish", "neutral", "blocked", "missing"]
-KLINE_REQUIRED_COLUMNS = ("symbol", "timestamp", "open", "high", "low", "close", "volume")
-KLINE_MIN_ROWS = 20
-
-STATE_FRAME_COLUMNS = (
+KLINE_VALUE_COLUMNS = ("timestamp", "open", "high", "low", "close", "volume")
+KLINE_REQUIRED_COLUMNS = ("symbol", *KLINE_VALUE_COLUMNS)
+KLINE_CONTINUOUS_COLUMNS = (
     "symbol",
     "timestamp",
-    "source_family",
-    "scale",
-    "state_key",
-    "context_event",
-    "direction_hint",
-    "quality_weight",
-    "missing_flag",
-    "stale_flag",
+    "bar_return_1h_pct",
+    "bar_return_4h_pct",
+    "bar_return_24h_pct",
+    "bar_return_4h_per_vol_7d",
+    "bar_return_24h_per_vol_7d",
+    "bar_volume_1h_to_ma_20h",
+    "return_skew_12h",
+    "high_skew_12h",
+    "low_skew_12h",
+    "volume_skew_12h",
+    "high_max_rel_12h",
+    "range_kurtosis_12h",
+    "volume_volatility_4h",
+    "return_sign_flip_rate_6h",
+    "return_sign_flip_rate_24h",
+    "body_to_range_mean_24h",
+    "range_expansion_24h_to_7d",
+    "close_position_24h",
+    "prior_runup_6h",
+    "prior_drawdown_6h",
+    "return_efficiency_24h",
+    "bar_close_position_48h",
 )
-STATE_FRAME_SCHEMA = {
-    "symbol": pl.String,
-    "timestamp": pl.Int64,
-    "source_family": pl.String,
-    "scale": pl.String,
-    "state_key": pl.String,
-    "context_event": pl.String,
-    "direction_hint": pl.String,
-    "quality_weight": pl.Float64,
-    "missing_flag": pl.Boolean,
-    "stale_flag": pl.Boolean,
-}
-
-CLASSIFIER_HEALTH_SCHEMA = {
-    "artifact": pl.Utf8,
-    "label": pl.Utf8,
-    "health_check": pl.Utf8,
-    "status": pl.Utf8,
-    "value": pl.Float64,
-    "threshold": pl.Float64,
-    "reason": pl.Utf8,
-}
+KLINE_MIN_ROWS = 20
 
 
 @dataclass(frozen=True)
-class ClassifierHealthResult:
-    frame: pl.DataFrame
-    text: str
+class PotentialStateRole:
+    prefix: str
+    include_direction: bool = False
+    include_structure: bool = False
+    include_event: bool = False
+    include_transition: bool = False
 
-
-@dataclass(frozen=True)
-class KlineClassifier:
-    scale: str
-
-    def classify(self, frame: pl.DataFrame) -> pl.DataFrame:
-        if "volume" not in frame.columns and "vol" in frame.columns:
-            frame = frame.with_columns(pl.col("vol").alias("volume"))
-        missing = [column for column in KLINE_REQUIRED_COLUMNS if column not in frame.columns]
-        if missing or frame.height < KLINE_MIN_ROWS:
-            symbol = _state_frame_symbol(frame)
-            state = _missing_state_frame(
-                symbol=symbol,
-                family="kline",
-                scale=self.scale,
-                reason=";".join(f"{column}_missing" for column in missing) or "kline_rows_missing",
+    def frame(self, source: pl.DataFrame) -> pl.DataFrame:
+        frame = source
+        transition = f"{self.prefix}_transition"
+        if self.include_transition:
+            frame = frame.with_columns(
+                pl.concat_str("core_context", "transition_kind", separator="|").alias(transition)
             )
-            return validate_state_frame(state)
-        state = classify_states(frame, self.scale)
-        return validate_state_frame(state)
-
-
-def classifier_health(frame: pl.DataFrame, *, label: str = "") -> ClassifierHealthResult:
-    required = ("structure_trend_state", "market_stage", "structure_reason", "stage_unknown_reason")
-    present = [column for column in required if column in frame.columns]
-    rows = [
-        {
-            "artifact": "classifier-health",
-            "label": label,
-            "health_check": "required_classifier_columns",
-            "status": "pass" if len(present) == len(required) else "fail",
-            "value": len(present) / max(len(required), 1) * 100.0,
-            "threshold": 100.0,
-            "reason": f"present={len(present)}/{len(required)} rows={frame.height}",
-        }
-    ]
-    for column in ("market_stage", "structure_trend_state", "liquidity_event_type"):
-        if column in frame.columns and frame.height:
-            unique = int(frame.select(pl.col(column).n_unique()).item() or 0)
-            threshold = max(20, frame.height // 5)
-            rows.append(
-                {
-                    "artifact": "classifier-health",
-                    "label": label,
-                    "health_check": f"{column}_cardinality",
-                    "status": "warn" if unique > threshold else "pass",
-                    "value": float(unique),
-                    "threshold": float(threshold),
-                    "reason": f"unique={unique}",
-                }
+        columns = ["symbol", "bar_close_ms"]
+        if self.include_direction:
+            columns.append(pl.col("direction_hint").alias(f"{self.prefix}_direction"))
+        columns.append(pl.col("regime_state").alias(f"{self.prefix}_regime"))
+        if self.include_structure:
+            columns.append(pl.col("structure_state").alias(f"{self.prefix}_structure"))
+        else:
+            columns.append(pl.col("core_context").alias(f"{self.prefix}_core"))
+        columns.append(pl.col("range_state").alias(f"{self.prefix}_range"))
+        if self.include_direction or self.include_structure:
+            columns.append(pl.col("vol_state").alias(f"{self.prefix}_vol"))
+        if self.include_event:
+            columns.extend(
+                [
+                    pl.col("event_state").alias(f"{self.prefix}_event"),
+                    pl.col("event_age_bucket").alias(f"{self.prefix}_event_age_bucket"),
+                ]
             )
-    out = pl.DataFrame(rows, schema=CLASSIFIER_HEALTH_SCHEMA)
-    text = f"{label}\n" if label else ""
-    text += format_table(
-        ["Health check", "Status", "Reason"],
-        [[str(row["health_check"]), str(row["status"]), str(row["reason"])] for row in rows],
-    )
-    return ClassifierHealthResult(out, text)
+        if self.include_transition:
+            columns.append(transition)
+        return frame.select(*columns)
 
 
-def classify_states(frame: pl.DataFrame, scale: str) -> pl.DataFrame:
-    close_prev = pl.col("close").shift(1)
-    true_range = pl.max_horizontal(
-        (pl.col("high") - pl.col("low")).abs(),
-        (pl.col("high") - close_prev).abs(),
-        (pl.col("low") - close_prev).abs(),
-    )
-    atr_14 = true_range.rolling_mean(14)
-    atr_rank = atr_14.rolling_rank(window_size=100)
-    atr_count = atr_14.is_not_null().cast(pl.Int64).rolling_sum(window_size=100)
+POTENTIAL_STATE_ROLES = {
+    "background": PotentialStateRole("background", include_structure=True),
+    "swing": PotentialStateRole("swing", include_transition=True),
+    "intraday": PotentialStateRole("intraday", include_direction=True, include_transition=True),
+    "decision": PotentialStateRole(
+        "decision", include_direction=True, include_event=True, include_transition=True
+    ),
+}
+
+
+def kline_state_frame(frame: pl.DataFrame, *, scale: str) -> pl.DataFrame:
+    missing = [column for column in KLINE_REQUIRED_COLUMNS if column not in frame.columns]
+    if missing or frame.height < KLINE_MIN_ROWS:
+        return _missing_state_frame(
+            symbol=_state_frame_symbol(frame),
+            family="kline",
+            scale=scale,
+            reason=";".join(f"{column}_missing" for column in missing) or "kline_rows_missing",
+        )
     frame = frame.with_columns(
-        atr_14.alias("atr_14"),
-        pl.when(atr_count > 1)
-        .then((atr_rank - 1) / (atr_count - 1) * 100.0)
-        .otherwise(None)
-        .alias("atr_percentile_100"),
         pl.col("high").shift(2).rolling_max(5).alias("prior_high_window"),
         pl.col("low").shift(2).rolling_min(5).alias("prior_low_window"),
         pl.col("high").shift(1).rolling_max(48).alias("range_high"),
@@ -165,7 +126,7 @@ def classify_states(frame: pl.DataFrame, scale: str) -> pl.DataFrame:
         pl.col("high").shift(1).rolling_max(20).alias("prior_liquidity_high"),
         pl.col("low").shift(1).rolling_min(20).alias("prior_liquidity_low"),
     )
-    safe_atr = pl.when(pl.col("atr_14").abs() > 1e-10).then(pl.col("atr_14")).otherwise(None)
+    bar_range = (pl.col("high") - pl.col("low")).abs()
     swing_high = pl.col("prior_high_window").is_not_null() & (
         pl.col("high").shift(1) >= pl.col("prior_high_window")
     )
@@ -175,9 +136,12 @@ def classify_states(frame: pl.DataFrame, scale: str) -> pl.DataFrame:
     frame = frame.with_columns(
         pl.when(swing_high).then(pl.col("high").shift(1)).otherwise(None).alias("swing_high_value"),
         pl.when(swing_low).then(pl.col("low").shift(1)).otherwise(None).alias("swing_low_value"),
-        ((pl.col("range_high") - pl.col("range_low")) / safe_atr).alias(
-            ClassifierColumn.RANGE_WIDTH_ATR
-        ),
+        (
+            (pl.col("range_high") - pl.col("range_low"))
+            / pl.when(pl.col("close").abs() > 1e-10).then(pl.col("close").abs()).otherwise(None)
+            * 100.0
+        ).alias("range_width_pct"),
+        bar_range.alias("bar_range_1h"),
     ).with_columns(
         pl.col("swing_high_value").forward_fill().alias("last_swing_high"),
         pl.col("swing_low_value").forward_fill().alias("last_swing_low"),
@@ -210,14 +174,12 @@ def classify_states(frame: pl.DataFrame, scale: str) -> pl.DataFrame:
     uptrend = (hh_count > 0) & (hl_count > 0) & (hh_count + hl_count >= lh_count + ll_count)
     downtrend = (lh_count > 0) & (ll_count > 0) & (lh_count + ll_count >= hh_count + hl_count)
     trend_conflict = (uptrend & downtrend).fill_null(False)
-    range_compression = (range_ready & (pl.col(ClassifierColumn.RANGE_WIDTH_ATR) <= 8.0)).fill_null(
-        False
-    )
+    range_compression = (range_ready & (pl.col("range_width_pct") <= 8.0)).fill_null(False)
     near_range_high = (
-        range_ready & ((pl.col("range_high") - pl.col("close")).abs() <= safe_atr)
+        range_ready & ((pl.col("range_high") - pl.col("close")).abs() <= pl.col("bar_range_1h"))
     ).fill_null(False)
     near_range_low = (
-        range_ready & ((pl.col("close") - pl.col("range_low")).abs() <= safe_atr)
+        range_ready & ((pl.col("close") - pl.col("range_low")).abs() <= pl.col("bar_range_1h"))
     ).fill_null(False)
     markup = ((pl.col("close") > pl.col("range_high")) & uptrend & ~trend_conflict).fill_null(False)
     markdown = ((pl.col("close") < pl.col("range_low")) & downtrend & ~trend_conflict).fill_null(
@@ -288,50 +250,43 @@ def classify_states(frame: pl.DataFrame, scale: str) -> pl.DataFrame:
         .otherwise(pl.lit("none"))
     )
     frame = frame.with_columns(
-        market_stage.alias(ClassifierColumn.MARKET_STAGE),
-        structure.alias(ClassifierColumn.STRUCTURE_TREND_STATE),
+        market_stage.alias("market_stage"),
+        structure.alias("structure_trend_state"),
         liquidity_event.alias("liquidity_event_type"),
     )
     direction = (
         pl.when(
-            pl.col(ClassifierColumn.MARKET_STAGE).is_in(
-                [MarketStage.ACCUMULATION, MarketStage.MARKUP]
-            )
-            | (pl.col(ClassifierColumn.STRUCTURE_TREND_STATE) == StructureState.UPTREND)
+            pl.col("market_stage").is_in([MarketStage.ACCUMULATION, MarketStage.MARKUP])
+            | (pl.col("structure_trend_state") == StructureState.UPTREND)
         )
         .then(pl.lit("bullish"))
         .when(
-            pl.col(ClassifierColumn.MARKET_STAGE).is_in(
+            pl.col("market_stage").is_in(
                 [MarketStage.DISTRIBUTION_OR_REVERSAL, MarketStage.MARKDOWN]
             )
-            | (pl.col(ClassifierColumn.STRUCTURE_TREND_STATE) == StructureState.DOWNTREND)
+            | (pl.col("structure_trend_state") == StructureState.DOWNTREND)
         )
         .then(pl.lit("bearish"))
-        .when(
-            pl.col(ClassifierColumn.MARKET_STAGE).is_in(
-                [MarketStage.DATA_ERROR, MarketStage.WARMUP]
-            )
-        )
+        .when(pl.col("market_stage").is_in([MarketStage.DATA_ERROR, MarketStage.WARMUP]))
         .then(pl.lit("blocked"))
         .otherwise(pl.lit("neutral"))
     )
     return frame.with_columns(
         pl.concat_str(
             [
-                pl.col(ClassifierColumn.MARKET_STAGE).cast(pl.String),
-                pl.col(ClassifierColumn.STRUCTURE_TREND_STATE).cast(pl.String),
-                _bucket_range_width_expr(),
-                _bucket_volatility_expr(),
+                pl.col("market_stage").cast(pl.String),
+                pl.col("structure_trend_state").cast(pl.String),
+                pl.col("liquidity_event_type").cast(pl.String),
             ],
             separator="|",
         ).alias("state_key"),
         pl.when(pl.col("liquidity_event_type") != "none")
         .then(pl.col("liquidity_event_type"))
-        .when(pl.col(ClassifierColumn.MARKET_STAGE).cast(pl.String).str.contains("accumulation"))
+        .when(pl.col("market_stage").cast(pl.String).str.contains("accumulation"))
         .then(pl.lit("none_in_accumulation"))
-        .when(pl.col(ClassifierColumn.MARKET_STAGE).cast(pl.String).str.contains("distribution"))
+        .when(pl.col("market_stage").cast(pl.String).str.contains("distribution"))
         .then(pl.lit("none_in_distribution"))
-        .when(pl.col(ClassifierColumn.STRUCTURE_TREND_STATE).cast(pl.String).str.contains("trend"))
+        .when(pl.col("structure_trend_state").cast(pl.String).str.contains("trend"))
         .then(pl.lit("none_in_trend"))
         .otherwise(pl.lit("none_in_compression"))
         .alias("context_event"),
@@ -367,20 +322,19 @@ def _missing_state_frame(*, symbol: str, family: str, scale: str, reason: str) -
             "missing_flag": [True],
             "stale_flag": [False],
         },
-        schema=STATE_FRAME_SCHEMA,
+        schema={
+            "symbol": pl.String,
+            "timestamp": pl.Int64,
+            "source_family": pl.String,
+            "scale": pl.String,
+            "state_key": pl.String,
+            "context_event": pl.String,
+            "direction_hint": pl.String,
+            "quality_weight": pl.Float64,
+            "missing_flag": pl.Boolean,
+            "stale_flag": pl.Boolean,
+        },
     )
-
-
-def validate_state_frame(frame: pl.DataFrame) -> pl.DataFrame:
-    missing = [column for column in STATE_FRAME_COLUMNS if column not in frame.columns]
-    if missing:
-        raise ValueError(f"source state frame missing columns: {', '.join(missing)}")
-    return frame.with_columns(
-        *(
-            pl.col(column).cast(dtype, strict=False).alias(column)
-            for column, dtype in STATE_FRAME_SCHEMA.items()
-        )
-    ).select(STATE_FRAME_COLUMNS)
 
 
 def _state_frame_symbol(frame: pl.DataFrame) -> str:
@@ -388,32 +342,6 @@ def _state_frame_symbol(frame: pl.DataFrame) -> str:
         return "*"
     value = frame.select("symbol").drop_nulls().head(1)
     return "*" if value.is_empty() else str(value.item())
-
-
-def _bucket_range_width_expr() -> pl.Expr:
-    value = pl.col(ClassifierColumn.RANGE_WIDTH_ATR).cast(pl.Float64, strict=False)
-    return (
-        pl.when(value.is_null())
-        .then(pl.lit("range_unknown"))
-        .when(value < 1.0)
-        .then(pl.lit("range_tight"))
-        .when(value < 3.0)
-        .then(pl.lit("range_normal"))
-        .otherwise(pl.lit("range_wide"))
-    )
-
-
-def _bucket_volatility_expr() -> pl.Expr:
-    value = pl.col("atr_percentile_100").cast(pl.Float64, strict=False)
-    return (
-        pl.when(value.is_null())
-        .then(pl.lit("vol_unknown"))
-        .when(value < 25.0)
-        .then(pl.lit("vol_low"))
-        .when(value < 75.0)
-        .then(pl.lit("vol_normal"))
-        .otherwise(pl.lit("vol_high"))
-    )
 
 
 HOUR_MS = 60 * 60 * 1000
@@ -437,8 +365,7 @@ def extract_continuous_features(
     """Extract continuous features from OHLCV and source frames.
 
     Returns one frame with columns: symbol, timestamp,
-    atr_percentile, range_width_atr, source pressure/freshness values,
-    and normalized bar/source features such as bar_return_24h_pct,
+    source pressure/freshness values and normalized bar/source features such as bar_return_24h_pct,
     bar_return_24h_per_vol_7d, funding_rate_bps, and oi_change_pct.
     Source event/snapshot rows are aligned as known-at-close values by symbol
     with backward as-of joins; raw source timestamps are not overwritten.
@@ -476,23 +403,10 @@ def _kline_continuous_features(
         if state is None or state.is_empty():
             continue
 
-        required = {"timestamp", "open", "high", "low", "close", "volume"}
-        if not required.issubset(frame.columns):
+        if any(column not in frame.columns for column in KLINE_VALUE_COLUMNS):
             continue
 
-        work = frame.select("timestamp", "open", "high", "low", "close", "volume").sort("timestamp")
-
-        # ATR percentile from classifier state frame (already computed)
-        atr_pct = None
-        if "atr_percentile_100" in state.columns:
-            atr_pct = state.select(
-                "timestamp", pl.col("atr_percentile_100").alias("atr_percentile")
-            ).sort("timestamp")
-
-        # Range width from classifier state frame
-        range_width = None
-        if "range_width_atr" in state.columns:
-            range_width = state.select("timestamp", pl.col("range_width_atr")).sort("timestamp")
+        work = frame.select(*KLINE_VALUE_COLUMNS).sort("timestamp")
 
         # Returns. Keep raw returns, then add volatility-scaled aliases for
         # cross-symbol comparability.
@@ -536,6 +450,13 @@ def _kline_continuous_features(
             (pl.col("volume") / pl.col("volume").rolling_mean(20, min_samples=5)).alias(
                 "bar_volume_1h_to_ma_20h"
             ),
+            pl.col("bar_return_1h_pct").rolling_skew(12).alias("return_skew_12h"),
+            pl.col("high").rolling_skew(12).alias("high_skew_12h"),
+            pl.col("low").rolling_skew(12).alias("low_skew_12h"),
+            pl.col("volume").rolling_skew(12).alias("volume_skew_12h"),
+            (pl.col("high").rolling_max(12) / pl.col("close") - 1.0).alias("high_max_rel_12h"),
+            (pl.col("high") - pl.col("low")).rolling_kurtosis(12).alias("range_kurtosis_12h"),
+            pl.col("volume").rolling_std(4).alias("volume_volatility_4h"),
         )
 
         # Pre-entry cleanliness features. These use only current/prior OHLCV rows
@@ -548,9 +469,7 @@ def _kline_continuous_features(
                 pl.col("bar_return_1h_pct").sign().alias("bar_return_sign"),
             )
             .with_columns(
-                (
-                    pl.col("bar_return_sign") * pl.col("bar_return_sign").shift(1) < 0
-                )
+                (pl.col("bar_return_sign") * pl.col("bar_return_sign").shift(1) < 0)
                 .cast(pl.Float64)
                 .alias("return_sign_flip"),
                 (
@@ -596,10 +515,7 @@ def _kline_continuous_features(
                 (
                     (pl.col("close") - pl.col("close").shift(24)).abs()
                     / pl.when(
-                        pl.col("bar_return_1h_pct")
-                        .abs()
-                        .rolling_sum(24, min_samples=12)
-                        > 0.0
+                        pl.col("bar_return_1h_pct").abs().rolling_sum(24, min_samples=12) > 0.0
                     )
                     .then(pl.col("bar_return_1h_pct").abs().rolling_sum(24, min_samples=12))
                     .otherwise(None)
@@ -618,61 +534,21 @@ def _kline_continuous_features(
             ).alias("bar_close_position_48h"),
         )
 
-        cols = [
-            "symbol",
-            "timestamp",
-            "bar_return_1h_pct",
-            "bar_return_4h_pct",
-            "bar_return_24h_pct",
-            "bar_return_4h_per_vol_7d",
-            "bar_return_24h_per_vol_7d",
-            "bar_volume_1h_to_ma_20h",
-            "return_sign_flip_rate_6h",
-            "return_sign_flip_rate_24h",
-            "body_to_range_mean_24h",
-            "range_expansion_24h_to_7d",
-            "close_position_24h",
-            "prior_runup_6h",
-            "prior_drawdown_6h",
-            "return_efficiency_24h",
-            "bar_close_position_48h",
-        ]
-        out = work.select(pl.lit(symbol).alias("symbol"), *cols[1:])
-
-        if atr_pct is not None:
-            out = out.join(atr_pct, on="timestamp", how="left")
-        else:
-            out = out.with_columns(pl.lit(None, dtype=pl.Float64).alias("atr_percentile"))
-
-        if range_width is not None:
-            out = out.join(range_width, on="timestamp", how="left")
-        else:
-            out = out.with_columns(pl.lit(None, dtype=pl.Float64).alias("range_width_atr"))
+        out = work.select(pl.lit(symbol).alias("symbol"), *KLINE_CONTINUOUS_COLUMNS[1:])
 
         frames.append(out)
 
     if not frames:
         return pl.DataFrame(
             schema={
-                "symbol": pl.String,
-                "timestamp": pl.Int64,
-                "bar_return_1h_pct": pl.Float64,
-                "bar_return_4h_pct": pl.Float64,
-                "bar_return_24h_pct": pl.Float64,
-                "bar_return_4h_per_vol_7d": pl.Float64,
-                "bar_return_24h_per_vol_7d": pl.Float64,
-                "bar_volume_1h_to_ma_20h": pl.Float64,
-                "return_sign_flip_rate_6h": pl.Float64,
-                "return_sign_flip_rate_24h": pl.Float64,
-                "body_to_range_mean_24h": pl.Float64,
-                "range_expansion_24h_to_7d": pl.Float64,
-                "close_position_24h": pl.Float64,
-                "prior_runup_6h": pl.Float64,
-                "prior_drawdown_6h": pl.Float64,
-                "return_efficiency_24h": pl.Float64,
-                "bar_close_position_48h": pl.Float64,
-                "atr_percentile": pl.Float64,
-                "range_width_atr": pl.Float64,
+                column: (
+                    pl.String
+                    if column == "symbol"
+                    else pl.Int64
+                    if column == "timestamp"
+                    else pl.Float64
+                )
+                for column in KLINE_CONTINUOUS_COLUMNS
             }
         )
     return _market_context_features(pl.concat(frames, how="vertical_relaxed"))
@@ -688,6 +564,7 @@ def _market_context_features(kline_features: pl.DataFrame) -> pl.DataFrame:
         "market_return_24h_median": pl.Float64,
         "market_abs_return_24h_median": pl.Float64,
         "market_dispersion_24h": pl.Float64,
+        "market_dispersion_rank_24h": pl.Float64,
         "market_positive_return_24h_share": pl.Float64,
         "symbol_vs_market_return_24h": pl.Float64,
         "symbol_vs_market_return_4h": pl.Float64,
@@ -698,16 +575,29 @@ def _market_context_features(kline_features: pl.DataFrame) -> pl.DataFrame:
     required = {"symbol", "timestamp", "bar_return_4h_pct", "bar_return_24h_pct"}
     if not required.issubset(kline_features.columns):
         return kline_features
-    market = kline_features.group_by("timestamp").agg(
-        pl.col("bar_return_1h_pct").median().alias("market_return_1h_median"),
-        pl.col("bar_return_4h_pct").median().alias("market_return_4h_median"),
-        pl.col("bar_return_24h_pct").median().alias("market_return_24h_median"),
-        pl.col("bar_return_24h_pct").abs().median().alias("market_abs_return_24h_median"),
-        pl.col("bar_return_24h_pct").std().alias("market_dispersion_24h"),
-        (pl.col("bar_return_24h_pct") > 0.0)
-        .cast(pl.Float64)
-        .mean()
-        .alias("market_positive_return_24h_share"),
+    market = (
+        kline_features.group_by("timestamp")
+        .agg(
+            pl.col("bar_return_1h_pct").median().alias("market_return_1h_median"),
+            pl.col("bar_return_4h_pct").median().alias("market_return_4h_median"),
+            pl.col("bar_return_24h_pct").median().alias("market_return_24h_median"),
+            pl.col("bar_return_24h_pct").abs().median().alias("market_abs_return_24h_median"),
+            pl.col("bar_return_24h_pct").std().alias("market_dispersion_24h"),
+            (pl.col("bar_return_24h_pct") > 0.0)
+            .cast(pl.Float64)
+            .mean()
+            .alias("market_positive_return_24h_share"),
+        )
+        .sort("timestamp")
+        .with_columns(
+            (
+                pl.col("market_dispersion_24h").rolling_rank(168, min_samples=24)
+                / pl.col("market_dispersion_24h")
+                .is_not_null()
+                .cast(pl.Float64)
+                .rolling_sum(168, min_samples=24)
+            ).alias("market_dispersion_rank_24h")
+        )
     )
     return kline_features.join(market, on="timestamp", how="left").with_columns(
         (pl.col("bar_return_24h_pct") - pl.col("market_return_24h_median")).alias(
@@ -775,7 +665,37 @@ def _source_continuous_features(
                 coalesce=True,
             )
 
-    return result
+    source_values = [
+        column
+        for column in (
+            "funding_rate_bps",
+            "oi_change_pct",
+            "taker_buy_pressure",
+            "lsr_log_ratio",
+        )
+        if column in result.columns
+    ]
+    source_ages = [
+        column
+        for column in ("funding_age_ms", "oi_age_ms", "taker_age_ms", "lsr_age_ms")
+        if column in result.columns
+    ]
+    return result.with_columns(
+        (
+            pl.any_horizontal(
+                [pl.col(column).is_finite().fill_null(False) for column in source_values]
+            )
+            if source_values
+            else pl.lit(False)
+        )
+        .cast(pl.Float64)
+        .alias("source_any_present"),
+        (
+            pl.min_horizontal([pl.col(column).cast(pl.Int64) for column in source_ages])
+            if source_ages
+            else pl.lit(None, dtype=pl.Int64)
+        ).alias("source_min_age_ms"),
+    )
 
 
 def source_time_series_features_frame(
@@ -820,11 +740,9 @@ def _price_return_context(bars: pl.DataFrame) -> pl.DataFrame:
         .select(
             "symbol",
             "timestamp",
-            (
-                (pl.col("close") - pl.col("previous_close"))
-                / pl.col("previous_close")
-                * 100.0
-            ).alias("price_return_pct"),
+            ((pl.col("close") - pl.col("previous_close")) / pl.col("previous_close") * 100.0).alias(
+                "price_return_pct"
+            ),
         )
     )
 
@@ -910,21 +828,17 @@ def _funding_time_series_features(frame: pl.DataFrame, bars: pl.DataFrame) -> pl
 
 
 def _lsr_time_series_features(frame: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
-    ratio_col = _first_float_col(
-        frame,
-        (
-            "top_trader_long_short_position_ratio",
-            "top_trader_long_short_account_ratio",
-            "long_short_account_ratio",
-        ),
-    )
+    ratio_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["long_short_ratio"])
     if frame.is_empty() or ratio_col is None or not {"symbol", "timestamp"}.issubset(frame.columns):
         return pl.DataFrame()
     work = (
         frame.select(
             "symbol",
             "timestamp",
-            pl.col(ratio_col).cast(pl.Float64, strict=False).log().alias("lsr_log_ratio"),
+            pl.when(pl.col(ratio_col).cast(pl.Float64, strict=False) > 0.0)
+            .then(pl.col(ratio_col).cast(pl.Float64, strict=False).log())
+            .otherwise(None)
+            .alias("lsr_log_ratio"),
         )
         .sort("symbol", "timestamp")
         .join(_price_return_context(bars), on=["symbol", "timestamp"], how="left")
@@ -970,7 +884,7 @@ def _lsr_time_series_features(frame: pl.DataFrame, bars: pl.DataFrame) -> pl.Dat
 
 
 def _oi_time_series_features(frame: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
-    value_col = _first_float_col(frame, ("open_interest_usd", "open_interest"))
+    value_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["open_interest"])
     if frame.is_empty() or value_col is None or not {"symbol", "timestamp"}.issubset(frame.columns):
         return pl.DataFrame()
     work = (
@@ -1112,15 +1026,30 @@ def _align_source_family_to_decision_keys(
     return aligned.drop("source_timestamp_ms")
 
 
+SOURCE_FAMILY_PREFIX = {
+    "books": "book",
+    "trades": "trade",
+    "funding": "funding",
+    "open_interest": "oi",
+    "taker_volume": "taker",
+    "long_short_ratios": "lsr",
+}
+SOURCE_VALUE_CANDIDATES = {
+    "book_imbalance": ("ob_imbalance_25", "ob_imbalance_10", "ob_imbalance_5"),
+    "book_bid": ("ob_bid_price",),
+    "book_ask": ("ob_ask_price",),
+    "trade_value": ("notional_usd", "notional", "size"),
+    "open_interest": ("open_interest_usd", "open_interest"),
+    "long_short_ratio": (
+        "top_trader_long_short_position_ratio",
+        "top_trader_long_short_account_ratio",
+        "long_short_account_ratio",
+    ),
+}
+
+
 def _source_family_prefix(family: str) -> str:
-    return {
-        "books": "book",
-        "trades": "trade",
-        "funding": "funding",
-        "open_interest": "oi",
-        "taker_volume": "taker",
-        "long_short_ratios": "lsr",
-    }.get(family, family)
+    return SOURCE_FAMILY_PREFIX.get(family, family)
 
 
 def _first_float_col(frame: pl.DataFrame, candidates: tuple[str, ...]) -> str | None:
@@ -1131,11 +1060,9 @@ def _first_float_col(frame: pl.DataFrame, candidates: tuple[str, ...]) -> str | 
 
 
 def _book_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
-    imbalance_col = _first_float_col(
-        frame, ("ob_imbalance_25", "ob_imbalance_10", "ob_imbalance_5")
-    )
-    bid_col = _first_float_col(frame, ("ob_bid_price",))
-    ask_col = _first_float_col(frame, ("ob_ask_price",))
+    imbalance_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["book_imbalance"])
+    bid_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["book_bid"])
+    ask_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["book_ask"])
 
     needed = [c for c in (imbalance_col, bid_col, ask_col) if c]
     if not needed:
@@ -1169,7 +1096,7 @@ def _trade_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
     if "side" not in frame.columns:
         return work
 
-    value_col = _first_float_col(frame, ("notional_usd", "notional", "size"))
+    value_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["trade_value"])
     if not value_col:
         return work
 
@@ -1207,7 +1134,7 @@ def _funding_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame
 
 
 def _oi_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
-    value_col = _first_float_col(frame, ("open_interest_usd", "open_interest"))
+    value_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["open_interest"])
     if not value_col:
         return work
 
@@ -1261,41 +1188,22 @@ def _taker_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def _lsr_continuous(work: pl.DataFrame, frame: pl.DataFrame) -> pl.DataFrame:
-    ratio_col = _first_float_col(
-        frame,
-        (
-            "top_trader_long_short_position_ratio",
-            "top_trader_long_short_account_ratio",
-            "long_short_account_ratio",
-        ),
-    )
+    ratio_col = _first_float_col(frame, SOURCE_VALUE_CANDIDATES["long_short_ratio"])
     if ratio_col:
         return work.join(
             frame.select(
                 "symbol",
                 "timestamp",
                 pl.col(ratio_col).cast(pl.Float64).alias("lsr_ratio_raw"),
-                pl.col(ratio_col).cast(pl.Float64).log().alias("lsr_log_ratio"),
+                pl.when(pl.col(ratio_col).cast(pl.Float64, strict=False) > 0.0)
+                .then(pl.col(ratio_col).cast(pl.Float64, strict=False).log())
+                .otherwise(None)
+                .alias("lsr_log_ratio"),
             ),
             on=["symbol", "timestamp"],
             how="left",
         )
     return work
-
-
-def continuous_features_frame(
-    bars: dict[tuple[str, str], pl.DataFrame],
-    state_frames: dict[tuple[str, str], pl.DataFrame],
-    source_frames: dict[str, pl.DataFrame],
-    *,
-    decision_timeframe: str = "1H",
-) -> pl.DataFrame:
-    return extract_continuous_features(
-        bars,
-        state_frames,
-        source_frames,
-        decision_timeframe=decision_timeframe,
-    )
 
 
 POTENTIAL_OBSERVATION_SCHEMA = {
@@ -1306,6 +1214,12 @@ POTENTIAL_OBSERVATION_SCHEMA = {
     "background_structure": pl.String,
     "background_range": pl.String,
     "background_vol": pl.String,
+    "intraday_direction": pl.String,
+    "intraday_regime": pl.String,
+    "intraday_core": pl.String,
+    "intraday_range": pl.String,
+    "intraday_vol": pl.String,
+    "intraday_transition": pl.String,
     "swing_regime": pl.String,
     "swing_core": pl.String,
     "swing_range": pl.String,
@@ -1329,6 +1243,24 @@ POTENTIAL_OBSERVATION_SCHEMA = {
     "risk_context": pl.String,
 }
 
+POTENTIAL_STATE_COLUMNS = {
+    "background": (
+        "background_regime",
+        "background_structure",
+        "background_range",
+        "background_vol",
+    ),
+    "intraday": (
+        "intraday_direction",
+        "intraday_regime",
+        "intraday_core",
+        "intraday_range",
+        "intraday_vol",
+        "intraday_transition",
+    ),
+    "swing": ("swing_regime", "swing_core", "swing_range", "swing_transition"),
+}
+
 
 def potential_observation_frame(
     kline_history: pl.DataFrame,
@@ -1336,6 +1268,7 @@ def potential_observation_frame(
     continuous_features: pl.DataFrame | None = None,
     *,
     decision_timeframe: str,
+    context_roles: dict[str, str] | None = None,
     max_source_staleness_hours: int,
 ) -> pl.DataFrame:
     if (
@@ -1349,13 +1282,14 @@ def potential_observation_frame(
     if decision.is_empty():
         return pl.DataFrame(schema=POTENTIAL_OBSERVATION_SCHEMA)
     observations = decision.with_columns(pl.lit(decision_timeframe).alias("decision_timeframe"))
-    for timeframe, prefix in (("4H", "swing"), ("1D", "background")):
+    roles = context_roles or {"swing": "4H", "background": "1D"}
+    for prefix, timeframe in roles.items():
         state = _potential_state_columns(kline_history, timeframe, prefix)
         if state.is_empty():
             observations = observations.with_columns(
                 *[
                     pl.lit(None, dtype=pl.String).alias(column)
-                    for column in _potential_state_output_columns(prefix)
+                    for column in POTENTIAL_STATE_COLUMNS.get(prefix, ())
                 ]
             )
             continue
@@ -1367,6 +1301,19 @@ def potential_observation_frame(
             strategy="backward",
             check_sortedness=False,
         )
+        if "bar_close_ms_right" in observations.columns:
+            observations = observations.drop("bar_close_ms_right")
+    missing_context_columns = [
+        column
+        for prefix in ("background", "intraday", "swing")
+        for column in POTENTIAL_STATE_COLUMNS.get(prefix, ())
+        if column not in observations.columns
+    ]
+    if missing_context_columns:
+        observations = observations.with_columns(
+            *[pl.lit(None, dtype=pl.String).alias(column) for column in missing_context_columns]
+        )
+
     observations = observations.with_columns(
         pl.when(pl.col("background_regime") == pl.col("swing_regime"))
         .then(pl.lit("background_swing_aligned"))
@@ -1432,7 +1379,9 @@ def potential_observation_frame(
             *POTENTIAL_OBSERVATION_SCHEMA.keys()
         )
 
-    return _join_continuous_features(result, continuous_features)
+    return _join_continuous_features(result, continuous_features).unique(
+        subset=["symbol", "decision_bar_close_ms"], keep="first", maintain_order=True
+    )
 
 
 def _join_continuous_features(
@@ -1482,77 +1431,18 @@ def _potential_state_columns(
     frame = kline_history.filter(pl.col("timeframe") == timeframe)
     if frame.is_empty():
         return pl.DataFrame()
-    if prefix == "background":
-        return frame.select(
-            "symbol",
-            "bar_close_ms",
-            pl.col("regime_state").alias("background_regime"),
-            pl.col("structure_state").alias("background_structure"),
-            pl.col("range_state").alias("background_range"),
-            pl.col("vol_state").alias("background_vol"),
-        )
-    if prefix == "swing":
-        return frame.with_columns(
-            pl.concat_str("core_context", "transition_kind", separator="|").alias(
-                "swing_transition"
-            )
-        ).select(
-            "symbol",
-            "bar_close_ms",
-            pl.col("regime_state").alias("swing_regime"),
-            pl.col("core_context").alias("swing_core"),
-            pl.col("range_state").alias("swing_range"),
-            "swing_transition",
-        )
-    return frame.with_columns(
-        pl.concat_str("core_context", "transition_kind", separator="|").alias("decision_transition")
-    ).select(
-        "symbol",
-        "bar_close_ms",
-        pl.col("direction_hint").alias("decision_direction"),
-        pl.col("regime_state").alias("decision_regime"),
-        pl.col("core_context").alias("decision_core"),
-        pl.col("range_state").alias("decision_range"),
-        pl.col("vol_state").alias("decision_vol"),
-        pl.col("event_state").alias("decision_event"),
-        pl.col("event_age_bucket").alias("decision_event_age_bucket"),
-        "decision_transition",
-    )
-
-
-def _potential_state_output_columns(prefix: str) -> tuple[str, ...]:
-    if prefix == "background":
-        return ("background_regime", "background_structure", "background_range", "background_vol")
-    if prefix == "swing":
-        return ("swing_regime", "swing_core", "swing_range", "swing_transition")
-    return (
-        "decision_direction",
-        "decision_regime",
-        "decision_core",
-        "decision_range",
-        "decision_vol",
-        "decision_event",
-        "decision_event_age_bucket",
-        "decision_transition",
-    )
+    return POTENTIAL_STATE_ROLES.get(prefix, POTENTIAL_STATE_ROLES["decision"]).frame(frame)
 
 
 __all__ = [
-    "CLASSIFIER_HEALTH_SCHEMA",
-    "ClassifierColumn",
-    "ClassifierHealthResult",
     "KLINE_REQUIRED_COLUMNS",
-    "KlineClassifier",
     "MarketStage",
-    "STATE_FRAME_COLUMNS",
-    "STATE_FRAME_SCHEMA",
     "SOURCE_FEATURE_MAX_AGE_MS",
     "StateDirection",
     "StructureState",
-    "classifier_health",
     "extract_continuous_features",
+    "kline_state_frame",
     "source_time_series_features_frame",
-    "validate_state_frame",
     "POTENTIAL_OBSERVATION_SCHEMA",
     "potential_observation_frame",
 ]

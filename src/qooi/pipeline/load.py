@@ -37,6 +37,19 @@ SourceName = Literal[
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CACHE_ROOT = PROJECT_ROOT / "data" / "cache"
+MINUTE_MS = 60_000
+BAR_KEY = ("timestamp",)
+SOURCE_KEY = ("symbol", "timestamp")
+BAR_LOADER_COLUMNS = ("symbol", "timeframe")
+SOURCE_SYMBOL_ALIASES = ("instId", "inst_id")
+SOURCE_TIMESTAMP_ALIASES = ("ts", "funding_time")
+
+
+@dataclass(frozen=True)
+class BarFreshnessRequest:
+    timeframe: str
+    max_lag: int
+    max_age_minutes: int
 
 
 @dataclass(frozen=True)
@@ -45,18 +58,11 @@ class BarLoadRequest:
     timeframes: tuple[str, ...]
     target_days: int
     max_staleness_hours: int
-    latest_staleness_hours: int | None = None
     refresh_mode: LoadMode = "incremental"
+    freshness: BarFreshnessRequest | None = None
 
     def rows_per_day(self, timeframe: str) -> float:
-        normalized = timeframe.strip().upper()
-        if normalized.endswith("H"):
-            hours = int(normalized[:-1] or "1")
-            return 24.0 / max(1, hours)
-        if normalized.endswith("D"):
-            days = int(normalized[:-1] or "1")
-            return 1.0 / max(1, days)
-        return 24.0
+        return _rows_per_day(timeframe)
 
     def target_rows_for(self, timeframe: str) -> int:
         per_symbol = max(1, ceil(self.target_days * self.rows_per_day(timeframe)))
@@ -87,6 +93,16 @@ class SourceLoadRequest:
 class MarketLoadRequest:
     bars: BarLoadRequest
     sources: SourceLoadRequest
+
+    def coverage_page_budget(self) -> int:
+        source_limit = min((p.limit for p in self.sources.products if p.limit > 0), default=100)
+        source_pages = ceil(self.sources.target_days * 24 / source_limit) + 4
+        bar_pages = ceil(self.bars.target_days * 24 / 100) + 4
+        return max(24, source_pages, bar_pages)
+
+    def coverage_request_budget(self) -> int:
+        product_count = len(self.bars.timeframes) + len(self.sources.products)
+        return max(1000, len(self.bars.symbols) * product_count * self.coverage_page_budget())
 
 
 @dataclass(frozen=True)
@@ -193,8 +209,7 @@ def _plan_market_coverage(
         spec = bar_spec(
             timeframe=timeframe,
             target_days=request.bars.target_days,
-            max_staleness_hours=request.bars.latest_staleness_hours
-            or request.bars.max_staleness_hours,
+            max_staleness_hours=request.bars.max_staleness_hours,
         )
         bar_plans.append(
             plan_product_coverage(
@@ -266,23 +281,32 @@ async def _execute_source_jobs(
     bounded: set[tuple[str, str, str]],
 ) -> tuple[dict[str, pl.DataFrame], dict[str, int]]:
     pages_by_product: dict[str, int] = {}
-    product_by_name: dict[str, SourceProductLoadRequest] = {
-        product.name: product for product in request.products
-    }
+    product_by_name = {product.name: product for product in request.products}
     for name, plan in plans.items():
         if name == "bars" or name not in product_by_name:
             continue
         product = product_by_name[name]
         path = _source_cache_path(policy.cache_root, name)
         existing = source_cache.get(name, pl.DataFrame())
+        by_symbol: dict[str, pl.DataFrame] = {}
+        if not existing.is_empty() and "symbol" in existing.columns:
+            for value in existing.get_column("symbol").unique().drop_nulls().to_list():
+                symbol = str(value)
+                by_symbol[symbol] = existing.filter(pl.col("symbol") == symbol)
         pages = 0
         current_symbols = tuple(job.symbol for job in plan.jobs if job.kind == "current_snapshot")
         if current_symbols:
             fetched = await _fetch_current_sources(okx, product, current_symbols, policy)
-            existing = merge_frames(existing, fetched, ("symbol", "timestamp"))
+            if not fetched.is_empty():
+                for value in fetched.get_column("symbol").unique().drop_nulls().to_list():
+                    symbol = str(value)
+                    by_symbol[symbol] = _merge_source(
+                        by_symbol.get(symbol, pl.DataFrame()),
+                        fetched.filter(pl.col("symbol") == symbol),
+                    )
             pages += len(current_symbols)
         for job in (job for job in plan.jobs if job.kind != "current_snapshot"):
-            local = _symbol_frame(existing, job.symbol)
+            local = by_symbol.get(job.symbol, pl.DataFrame())
             if job.kind == "latest_refresh":
                 fetched, symbol_pages, is_bounded = await _refresh_latest_source(
                     okx, product, job.symbol, local, policy
@@ -294,8 +318,11 @@ async def _execute_source_jobs(
             if is_bounded:
                 bounded.add((job.symbol, product.name, job.timeframe))
             if not fetched.is_empty():
-                existing = merge_frames(existing, fetched, ("symbol", "timestamp"))
+                by_symbol[job.symbol] = fetched
             pages += symbol_pages
+        existing = _concat(by_symbol.values())
+        if not existing.is_empty():
+            existing = existing.sort(["symbol", "timestamp"])
         if not existing.is_empty() or path.exists():
             save_frame(path, existing, {}, fmt="parquet")
         source_cache[name] = existing
@@ -310,7 +337,7 @@ def _bar_output_frames(
     for timeframe, by_symbol in bar_cache.items():
         for symbol in request.symbols:
             frames[(symbol, timeframe)] = _bar_window(
-                by_symbol.get(symbol, pl.DataFrame()), request.target_days
+                by_symbol.get(symbol, pl.DataFrame()), request.target_days, timeframe
             )
     return frames
 
@@ -536,14 +563,89 @@ def _bar_cache_frames(
 ) -> dict[str, pl.DataFrame]:
     frames = {}
     for symbol in symbols:
-        path = root / symbol / f"bars_{timeframe}.parquet"
-        frame = load_frame(path, {}, fmt="parquet") if path.exists() else pl.DataFrame()
+        path = _bar_cache_path(root, symbol, timeframe)
+        if path.exists():
+            frame = load_frame(path, {}, fmt="parquet")
+        else:
+            frame = pl.DataFrame()
         if not frame.is_empty():
             frame = frame.with_columns(
                 pl.lit(symbol).alias("symbol"), pl.lit(timeframe).alias("timeframe")
             )
         frames[symbol] = frame
     return frames
+
+
+def _bar_cache_path(root: Path, symbol: str, timeframe: str) -> Path:
+    nested = root / symbol / f"bars_{timeframe}.parquet"
+    if nested.exists():
+        return nested
+    flat = root / f"{symbol.replace('-', '_')}_{timeframe.strip().upper()}.parquet"
+    return flat if flat.exists() else nested
+
+
+def bar_freshness_frame(
+    frames: dict[tuple[str, str], pl.DataFrame],
+    *,
+    symbols: tuple[str, ...],
+    freshness: BarFreshnessRequest,
+    now: int | None = None,
+) -> pl.DataFrame:
+    """Diagnose short-bar freshness by closed-bar lag and loaded data age."""
+    current_ms = now_ms() if now is None else int(now)
+    timeframe_ms = _timeframe_ms(freshness.timeframe)
+    rows: list[dict[str, object]] = []
+    for symbol in symbols:
+        frame = frames.get((symbol, freshness.timeframe), pl.DataFrame())
+        latest = _latest(frame)
+        if latest is None:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "decision_timeframe": freshness.timeframe,
+                    "latest_bar_close_ms": None,
+                    "closed_bar_lag": None,
+                    "data_age_minutes": None,
+                    "bar_freshness": "missing",
+                    "bar_freshness_reason": "missing latest closed bar",
+                }
+            )
+            continue
+        age_ms = max(0, current_ms - latest)
+        closed_bar_lag = max(0, age_ms // timeframe_ms)
+        age_minutes = age_ms / MINUTE_MS
+        if closed_bar_lag > freshness.max_lag:
+            status = "stale_bar_lag"
+            reason = f"closed_bar_lag {closed_bar_lag} > {freshness.max_lag}"
+        elif age_minutes > freshness.max_age_minutes:
+            status = "stale_data_age"
+            reason = f"data_age_minutes {age_minutes:.1f} > {freshness.max_age_minutes}"
+        else:
+            status = "fresh"
+            reason = "within bar freshness policy"
+        rows.append(
+            {
+                "symbol": symbol,
+                "decision_timeframe": freshness.timeframe,
+                "latest_bar_close_ms": latest,
+                "closed_bar_lag": int(closed_bar_lag),
+                "data_age_minutes": float(age_minutes),
+                "bar_freshness": status,
+                "bar_freshness_reason": reason,
+            }
+        )
+    return pl.DataFrame(rows)
+
+
+def _timeframe_ms(timeframe: str) -> int:
+    normalized = timeframe.strip().upper()
+    if normalized.endswith("M"):
+        return max(1, int(normalized[:-1] or "1")) * MINUTE_MS
+    if normalized.endswith("H"):
+        return max(1, int(normalized[:-1] or "1")) * HOUR_MS
+    if normalized.endswith("D"):
+        return max(1, int(normalized[:-1] or "1")) * 24 * HOUR_MS
+    return HOUR_MS
 
 
 def _cache_bar_frame(
@@ -556,13 +658,28 @@ def _cache_bar_frame(
     return _bar_window(
         bare.with_columns(pl.lit(symbol).alias("symbol"), pl.lit(timeframe).alias("timeframe")),
         days,
+        timeframe,
     )
 
 
-def _bar_window(frame: pl.DataFrame, days: int) -> pl.DataFrame:
+def _bar_window(frame: pl.DataFrame, days: int, timeframe: str) -> pl.DataFrame:
     if frame.is_empty() or "timestamp" not in frame.columns:
         return frame
-    return frame.sort("timestamp").tail(days * 24)
+    return frame.sort("timestamp").tail(max(1, int(days * _rows_per_day(timeframe))))
+
+
+def _rows_per_day(timeframe: str) -> float:
+    normalized = timeframe.strip().upper()
+    if normalized.endswith("M"):
+        minutes = int(normalized[:-1] or "1")
+        return 24.0 * 60.0 / max(1, minutes)
+    if normalized.endswith("H"):
+        hours = int(normalized[:-1] or "1")
+        return 24.0 / max(1, hours)
+    if normalized.endswith("D"):
+        days = int(normalized[:-1] or "1")
+        return 1.0 / max(1, days)
+    return 24.0
 
 
 def _save_bar_frame(root: Path, symbol: str, timeframe: str, frame: pl.DataFrame) -> None:
@@ -633,25 +750,17 @@ def _bars_product(
 def _source_identity(frame: pl.DataFrame, symbol: str) -> pl.DataFrame:
     if frame.is_empty():
         return frame
-    if "instId" in frame.columns and "symbol" not in frame.columns:
-        frame = frame.rename({"instId": "symbol"})
-    if "inst_id" in frame.columns and "symbol" not in frame.columns:
-        frame = frame.rename({"inst_id": "symbol"})
-    if "ts" in frame.columns and "timestamp" not in frame.columns:
-        frame = frame.rename({"ts": "timestamp"})
-    if "funding_time" in frame.columns and "timestamp" not in frame.columns:
-        frame = frame.with_columns(pl.col("funding_time").alias("timestamp"))
+    for alias in SOURCE_SYMBOL_ALIASES:
+        if alias in frame.columns and "symbol" not in frame.columns:
+            frame = frame.rename({alias: "symbol"})
+    for alias in SOURCE_TIMESTAMP_ALIASES:
+        if alias in frame.columns and "timestamp" not in frame.columns:
+            frame = frame.rename({alias: "timestamp"})
     if "symbol" not in frame.columns:
         frame = frame.with_columns(pl.lit(symbol).alias("symbol"))
     if "timestamp" not in frame.columns:
         frame = frame.with_columns(pl.lit(now_ms()).alias("timestamp"))
     return frame.with_columns(pl.col("timestamp").cast(pl.Int64, strict=False))
-
-
-def _symbol_frame(frame: pl.DataFrame, symbol: str) -> pl.DataFrame:
-    if frame.is_empty() or "symbol" not in frame.columns:
-        return pl.DataFrame()
-    return frame.filter(pl.col("symbol") == symbol)
 
 
 def _depth_satisfied(frame: pl.DataFrame, *, target_rows: int, target_start_ms: int) -> bool:
@@ -688,7 +797,7 @@ def _merge_symbol(existing: pl.DataFrame, page: pl.DataFrame) -> pl.DataFrame:
         return existing
     existing = _drop_loader_columns(existing)
     page = _drop_loader_columns(page)
-    merged = merge_frames(existing, page, ("timestamp",))
+    merged = merge_frames(existing, page, BAR_KEY)
     return merged.sort("timestamp") if "timestamp" in merged.columns else merged
 
 
@@ -697,7 +806,7 @@ def _merge_source(existing: pl.DataFrame, page: pl.DataFrame) -> pl.DataFrame:
         return existing
     if existing.is_empty():
         return page.sort("timestamp") if "timestamp" in page.columns else page
-    merged = merge_frames(existing, page, ("symbol", "timestamp"))
+    merged = merge_frames(existing, page, SOURCE_KEY)
     return merged.sort(["symbol", "timestamp"]) if "timestamp" in merged.columns else merged
 
 
@@ -789,7 +898,7 @@ def _failed_frame(symbol: str, timeframe: str, warning: str) -> pl.DataFrame:
 
 
 def _drop_loader_columns(frame: pl.DataFrame) -> pl.DataFrame:
-    return frame.drop([c for c in ("symbol", "timeframe") if c in frame.columns])
+    return frame.drop([column for column in BAR_LOADER_COLUMNS if column in frame.columns])
 
 
 def _concat(frames) -> pl.DataFrame:
